@@ -1140,6 +1140,13 @@ pub fn detect_ue_layout(
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CatalogCandidate {
+    pub id: String,
+    pub name: String,
+    pub score: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CatalogSuggestion {
     pub nexus_domain: Option<String>,
@@ -1148,6 +1155,14 @@ pub struct CatalogSuggestion {
     pub thunderstore_name: Option<String>,
     pub modio_game_id: Option<u32>,
     pub modio_name: Option<String>,
+    #[serde(default)]
+    pub nexus_candidates: Vec<CatalogCandidate>,
+    #[serde(default)]
+    pub thunderstore_candidates: Vec<CatalogCandidate>,
+    #[serde(default)]
+    pub modio_candidates: Vec<CatalogCandidate>,
+    #[serde(default)]
+    pub ambiguous: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1157,6 +1172,9 @@ pub struct CatalogSuggestRequest {
 }
 
 const CATALOG_MATCH_MIN_SCORE: u32 = 50;
+const CATALOG_MATCH_TOP_N: usize = 8;
+/// Scores within this window of the best score count as a near-tie.
+const CATALOG_AMBIGUOUS_SCORE_WINDOW: u32 = 10;
 
 fn empty_catalog_suggestion() -> CatalogSuggestion {
     CatalogSuggestion {
@@ -1166,7 +1184,51 @@ fn empty_catalog_suggestion() -> CatalogSuggestion {
         thunderstore_name: None,
         modio_game_id: None,
         modio_name: None,
+        nexus_candidates: Vec::new(),
+        thunderstore_candidates: Vec::new(),
+        modio_candidates: Vec::new(),
+        ambiguous: false,
     }
+}
+
+fn candidates_are_ambiguous(candidates: &[CatalogCandidate]) -> bool {
+    if candidates.len() < 2 {
+        return false;
+    }
+    let best = candidates[0].score;
+    candidates
+        .iter()
+        .skip(1)
+        .any(|c| best.saturating_sub(c.score) <= CATALOG_AMBIGUOUS_SCORE_WINDOW)
+}
+
+fn apply_ranked_nexus(suggestion: &mut CatalogSuggestion, ranked: Vec<CatalogCandidate>) {
+    suggestion.ambiguous |= candidates_are_ambiguous(&ranked);
+    if let Some(best) = ranked.first() {
+        suggestion.nexus_domain = Some(best.id.clone());
+        suggestion.nexus_name = Some(best.name.clone());
+    }
+    suggestion.nexus_candidates = ranked;
+}
+
+fn apply_ranked_thunderstore(suggestion: &mut CatalogSuggestion, ranked: Vec<CatalogCandidate>) {
+    suggestion.ambiguous |= candidates_are_ambiguous(&ranked);
+    if let Some(best) = ranked.first() {
+        suggestion.thunderstore_community = Some(best.id.clone());
+        suggestion.thunderstore_name = Some(best.name.clone());
+    }
+    suggestion.thunderstore_candidates = ranked;
+}
+
+fn apply_ranked_modio(suggestion: &mut CatalogSuggestion, ranked: Vec<CatalogCandidate>) {
+    suggestion.ambiguous |= candidates_are_ambiguous(&ranked);
+    if let Some(best) = ranked.first() {
+        if let Ok(id) = best.id.parse::<u32>() {
+            suggestion.modio_game_id = Some(id);
+            suggestion.modio_name = Some(best.name.clone());
+        }
+    }
+    suggestion.modio_candidates = ranked;
 }
 
 fn match_catalog_lists(
@@ -1179,24 +1241,20 @@ fn match_catalog_lists(
     if title.is_empty() {
         return suggestion;
     }
-    if let Some(hit) = best_catalog_match(
+    let nexus_ranked = rank_catalog_matches(
         title,
         nexus_games,
         |g| g.name.as_str(),
         |g| g.domain_name.as_str(),
-    ) {
-        suggestion.nexus_domain = Some(hit.domain_name.clone());
-        suggestion.nexus_name = Some(hit.name.clone());
-    }
-    if let Some(hit) = best_catalog_match(
+    );
+    apply_ranked_nexus(&mut suggestion, nexus_ranked);
+    let ts_ranked = rank_catalog_matches(
         title,
         ts_communities,
         |c| c.name.as_str(),
         |c| c.identifier.as_str(),
-    ) {
-        suggestion.thunderstore_community = Some(hit.identifier.clone());
-        suggestion.thunderstore_name = Some(hit.name.clone());
-    }
+    );
+    apply_ranked_thunderstore(&mut suggestion, ts_ranked);
     suggestion
 }
 
@@ -1276,12 +1334,26 @@ async fn enrich_modio_suggestion(
     match ModioClient::new(&key) {
         Ok(client) => match client.search_games(title, 25).await {
             Ok(games) => {
-                if let Some(hit) =
-                    best_catalog_match(title, &games, |g| g.name.as_str(), |g| g.name_id.as_str())
-                {
-                    suggestion.modio_game_id = Some(hit.id);
-                    suggestion.modio_name = Some(hit.name.clone());
-                }
+                let mut scored: Vec<CatalogCandidate> = games
+                    .iter()
+                    .map(|g| CatalogCandidate {
+                        id: g.id.to_string(),
+                        name: g.name.clone(),
+                        score: catalog_match_score(title, &g.name, &g.name_id),
+                    })
+                    .filter(|c| c.score >= CATALOG_MATCH_MIN_SCORE)
+                    .collect();
+                scored.sort_by(|a, b| {
+                    b.score
+                        .cmp(&a.score)
+                        .then_with(|| a.name.len().cmp(&b.name.len()))
+                        .then_with(|| a.name.cmp(&b.name))
+                        .then_with(|| a.id.cmp(&b.id))
+                });
+                let mut seen = std::collections::HashSet::new();
+                scored.retain(|c| seen.insert(c.id.clone()));
+                scored.truncate(CATALOG_MATCH_TOP_N);
+                apply_ranked_modio(suggestion, scored);
             }
             Err(e) => {
                 log::warn!("suggest_catalog_ids: mod.io search_games failed: {e:#}");
@@ -1309,6 +1381,66 @@ fn normalize_catalog_text(s: &str) -> String {
     out.trim().to_string()
 }
 
+/// Strip edition / storefront noise so "Game Deluxe Edition (2024)" matches "Game".
+fn strip_edition_noise(normalized: &str) -> String {
+    const PHRASES: &[&str] = &[
+        "game of the year edition",
+        "game of the year",
+        "definitive edition",
+        "enhanced edition",
+        "complete edition",
+        "ultimate edition",
+        "deluxe edition",
+        "gold edition",
+        "standard edition",
+        "special edition",
+        "anniversary edition",
+        "remastered",
+        "remake",
+        "goty",
+        "deluxe",
+        "ultimate",
+        "complete",
+        "edition",
+    ];
+    let mut tokens: Vec<&str> = normalized.split_whitespace().collect();
+    // Drop a trailing 4-digit year.
+    if let Some(last) = tokens.last() {
+        if last.len() == 4 && last.chars().all(|c| c.is_ascii_digit()) {
+            tokens.pop();
+        }
+    }
+    let mut joined = tokens.join(" ");
+    for phrase in PHRASES {
+        while let Some(idx) = joined.find(phrase) {
+            let end = idx + phrase.len();
+            let before = joined[..idx].trim_end();
+            let after = joined[end..].trim_start();
+            joined = if before.is_empty() {
+                after.to_string()
+            } else if after.is_empty() {
+                before.to_string()
+            } else {
+                format!("{before} {after}")
+            };
+        }
+    }
+    joined.trim().to_string()
+}
+
+fn catalog_query_variants(query: &str) -> Vec<String> {
+    let raw = normalize_catalog_text(query);
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    let stripped = strip_edition_noise(&raw);
+    if stripped.is_empty() || stripped == raw {
+        vec![raw]
+    } else {
+        vec![raw, stripped]
+    }
+}
+
 fn slug_compact(normalized: &str) -> String {
     normalized.chars().filter(|c| *c != ' ').collect()
 }
@@ -1321,18 +1453,15 @@ fn slug_hyphen(normalized: &str) -> String {
         .join("-")
 }
 
-fn catalog_match_score(query: &str, candidate_name: &str, candidate_id: &str) -> u32 {
-    let q = normalize_catalog_text(query);
+fn catalog_match_score_normalized(q: &str, name: &str, id_norm: &str) -> u32 {
     if q.is_empty() {
         return 0;
     }
-    let name = normalize_catalog_text(candidate_name);
-    let id_norm = normalize_catalog_text(candidate_id);
-    let q_compact = slug_compact(&q);
-    let q_hyphen = slug_hyphen(&q);
-    let name_compact = slug_compact(&name);
-    let id_compact = slug_compact(&id_norm);
-    let id_hyphen = slug_hyphen(&id_norm);
+    let q_compact = slug_compact(q);
+    let q_hyphen = slug_hyphen(q);
+    let name_compact = slug_compact(name);
+    let id_compact = slug_compact(id_norm);
+    let id_hyphen = slug_hyphen(id_norm);
 
     if !name.is_empty() && name == q {
         return 100;
@@ -1343,7 +1472,7 @@ fn catalog_match_score(query: &str, candidate_name: &str, candidate_id: &str) ->
     if !name_compact.is_empty() && name_compact == q_compact {
         return 90;
     }
-    if (!name.is_empty() && (name.contains(&q) || q.contains(&name)))
+    if (!name.is_empty() && (name.contains(q) || q.contains(name)))
         || (!id_compact.is_empty()
             && (id_compact.contains(&q_compact) || q_compact.contains(&id_compact)))
     {
@@ -1370,23 +1499,44 @@ fn catalog_match_score(query: &str, candidate_name: &str, candidate_id: &str) ->
     0
 }
 
-fn best_catalog_match<'a, T>(
+fn catalog_match_score(query: &str, candidate_name: &str, candidate_id: &str) -> u32 {
+    let name = normalize_catalog_text(candidate_name);
+    let id_norm = normalize_catalog_text(candidate_id);
+    catalog_query_variants(query)
+        .into_iter()
+        .map(|q| catalog_match_score_normalized(&q, &name, &id_norm))
+        .max()
+        .unwrap_or(0)
+}
+
+fn rank_catalog_matches<T>(
     title: &str,
-    items: &'a [T],
+    items: &[T],
     name_fn: impl Fn(&T) -> &str,
     id_fn: impl Fn(&T) -> &str,
-) -> Option<&'a T> {
-    let mut best: Option<(&T, u32)> = None;
-    for item in items {
-        let score = catalog_match_score(title, name_fn(item), id_fn(item));
-        if score < CATALOG_MATCH_MIN_SCORE {
-            continue;
-        }
-        if best.map(|(_, s)| score > s).unwrap_or(true) {
-            best = Some((item, score));
-        }
-    }
-    best.map(|(item, _)| item)
+) -> Vec<CatalogCandidate> {
+    let mut scored: Vec<CatalogCandidate> = items
+        .iter()
+        .map(|item| {
+            let name = name_fn(item).to_string();
+            let id = id_fn(item).to_string();
+            let score = catalog_match_score(title, &name, &id);
+            CatalogCandidate { id, name, score }
+        })
+        .filter(|c| c.score >= CATALOG_MATCH_MIN_SCORE)
+        .collect();
+    scored.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| a.name.len().cmp(&b.name.len()))
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    // Deduplicate by id, keeping the best entry.
+    let mut seen = std::collections::HashSet::new();
+    scored.retain(|c| seen.insert(c.id.clone()));
+    scored.truncate(CATALOG_MATCH_TOP_N);
+    scored
 }
 
 #[tauri::command]
@@ -7867,6 +8017,116 @@ mod download_cache_cleanup_tests {
         let result = clear_download_cache_dir(&downloads, &HashSet::new()).unwrap();
         assert_eq!(result.files_removed, 0);
         assert_eq!(result.bytes_freed, 0);
+    }
+}
+
+#[cfg(test)]
+mod catalog_match_tests {
+    use super::{
+        candidates_are_ambiguous, catalog_match_score, normalize_catalog_text,
+        rank_catalog_matches, strip_edition_noise, CatalogCandidate,
+    };
+
+    struct FakeGame {
+        name: &'static str,
+        id: &'static str,
+    }
+
+    #[test]
+    fn edition_noise_stripped_from_titles() {
+        assert_eq!(
+            strip_edition_noise(&normalize_catalog_text(
+                "Palworld Deluxe Edition"
+            )),
+            "palworld"
+        );
+        assert_eq!(
+            strip_edition_noise(&normalize_catalog_text(
+                "Some Game Game of the Year Edition 2024"
+            )),
+            "some game"
+        );
+        assert_eq!(
+            strip_edition_noise(&normalize_catalog_text("Lethal Company")),
+            "lethal company"
+        );
+    }
+
+    #[test]
+    fn edition_suffix_still_matches_clean_catalog_name() {
+        let score = catalog_match_score("Palworld Deluxe Edition", "Palworld", "palworld");
+        assert!(score >= 90, "expected strong match, got {score}");
+    }
+
+    #[test]
+    fn rank_returns_top_scores_preferring_shorter_names_on_tie() {
+        let games = [
+            FakeGame {
+                name: "Resident Evil",
+                id: "residentevil",
+            },
+            FakeGame {
+                name: "Resident Evil Village",
+                id: "residentevilvillage",
+            },
+            FakeGame {
+                name: "Totally Unrelated",
+                id: "other",
+            },
+        ];
+        let ranked = rank_catalog_matches(
+            "Resident Evil",
+            &games,
+            |g| g.name,
+            |g| g.id,
+        );
+        assert!(!ranked.is_empty());
+        assert_eq!(ranked[0].id, "residentevil");
+        assert_eq!(ranked[0].score, 100);
+    }
+
+    #[test]
+    fn near_tie_candidates_are_ambiguous() {
+        let candidates = vec![
+            CatalogCandidate {
+                id: "a".into(),
+                name: "Alpha".into(),
+                score: 70,
+            },
+            CatalogCandidate {
+                id: "b".into(),
+                name: "Beta".into(),
+                score: 70,
+            },
+        ];
+        assert!(candidates_are_ambiguous(&candidates));
+    }
+
+    #[test]
+    fn clear_winner_is_not_ambiguous() {
+        let candidates = vec![
+            CatalogCandidate {
+                id: "a".into(),
+                name: "Alpha".into(),
+                score: 100,
+            },
+            CatalogCandidate {
+                id: "b".into(),
+                name: "Beta".into(),
+                score: 55,
+            },
+        ];
+        assert!(!candidates_are_ambiguous(&candidates));
+    }
+
+    #[test]
+    fn below_min_score_excluded_from_rank() {
+        let games = [FakeGame {
+            name: "zzzz",
+            id: "zzzz",
+        }];
+        let ranked = rank_catalog_matches("Palworld", &games, |g| g.name, |g| g.id);
+        assert!(ranked.is_empty());
     }
 }
 

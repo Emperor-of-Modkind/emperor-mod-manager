@@ -15,6 +15,7 @@ mod baldursgate3;
 mod bepinex_install;
 mod bladeandsorcery;
 mod controlresonant;
+mod firstlight;
 mod creation_engine;
 mod cyberpunk2077;
 mod daysgone;
@@ -56,6 +57,7 @@ pub use controlresonant::ControlResonantPlugin;
 pub use creation_engine::{
     Fallout4Plugin, OblivionRemasteredPlugin, SkyrimSpecialEditionPlugin, StarfieldPlugin,
 };
+pub use firstlight::FirstLightPlugin;
 pub use cyberpunk2077::Cyberpunk2077Plugin;
 pub use daysgone::DaysGonePlugin;
 pub(crate) use dressmaker::plugin_id_for_install;
@@ -386,6 +388,7 @@ pub fn all_plugins() -> Vec<&'static dyn GamePlugin> {
         &BaldursGate3Plugin,
         &Cyberpunk2077Plugin,
         &Witcher3Plugin,
+        &FirstLightPlugin,
         &ControlResonantPlugin,
         &DaysGonePlugin,
         &Warhammer40kDarktidePlugin,
@@ -780,6 +783,14 @@ mod tests {
         );
         assert!(match_plugin("Control", None).is_none());
         assert!(match_plugin("Control Ultimate Edition", None).is_none());
+        assert_eq!(
+            match_plugin("007 First Light", None).unwrap().id,
+            "007firstlight"
+        );
+        assert_eq!(
+            match_plugin("007FirstLight", None).unwrap().id,
+            "007firstlight"
+        );
         assert_eq!(
             match_plugin("Monster Hunter: World", None).unwrap().id,
             "monsterhunterworld"

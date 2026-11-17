@@ -855,6 +855,94 @@ ul.list.browse-virtual {
   height: min(44rem, calc(100vh - 3rem));
 }
 
+.modal.modal-catalog-match {
+  width: min(36rem, calc(100vw - 3rem));
+  max-height: min(40rem, calc(100vh - 3rem));
+}
+
+.catalog-match-suggestions,
+.catalog-match-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+}
+
+.catalog-match-suggestions {
+  margin-bottom: 1rem;
+}
+
+.catalog-match-suggestions h3,
+.catalog-match-fields h3 {
+  margin: 0;
+  font-size: 0.85rem;
+  font-weight: 650;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.catalog-match-list {
+  max-height: 14rem;
+  overflow: auto;
+  margin: 0;
+}
+
+.catalog-match-list > li {
+  padding: 0;
+  border: none;
+  background: transparent;
+}
+
+.catalog-match-row {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  text-align: left;
+  border: 1px solid var(--line);
+  border-radius: 0.5rem;
+  background: var(--bg-2);
+  color: inherit;
+  padding: 0.55rem 0.7rem;
+  font: inherit;
+  cursor: pointer;
+}
+
+.catalog-match-row:hover:not(:disabled),
+.catalog-match-row:focus-visible:not(:disabled) {
+  border-color: var(--accent, var(--ink));
+}
+
+.catalog-match-row-selected {
+  border-color: var(--accent, var(--ink));
+  background: var(--panel);
+}
+
+.catalog-match-row-main {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  min-width: 0;
+}
+
+.catalog-match-row-main strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.catalog-match-row-main small {
+  color: var(--muted);
+}
+
+.catalog-match-score {
+  flex: none;
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--muted);
+}
+
 .modal.modal-nexus-login .modal-body {
   flex: 1;
   min-height: 0;

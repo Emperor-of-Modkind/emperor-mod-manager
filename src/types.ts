@@ -164,6 +164,12 @@ export type UeLayoutInfo = {
   binaries_dir: string;
 };
 
+export type CatalogCandidate = {
+  id: string;
+  name: string;
+  score: number;
+};
+
 export type CatalogSuggestion = {
   nexus_domain: string | null;
   nexus_name: string | null;
@@ -171,6 +177,10 @@ export type CatalogSuggestion = {
   thunderstore_name: string | null;
   modio_game_id: number | null;
   modio_name: string | null;
+  nexus_candidates?: CatalogCandidate[];
+  thunderstore_candidates?: CatalogCandidate[];
+  modio_candidates?: CatalogCandidate[];
+  ambiguous?: boolean;
 };
 
 export type CatalogSuggestRequest = {

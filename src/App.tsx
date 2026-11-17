@@ -54,7 +54,17 @@ import {
   type EmperorOpenMod,
 } from "./modDeepLink";
 import { chosenFileLabel, stagedModSourceLine } from "./stagedLabel";
+import {
+  reorderStagedMods,
+  sameEnabledNeighborIndex,
+  stagedModsInLoadOrder,
+} from "./stagedLoadOrder";
 import { Modal } from "./Modal";
+import {
+  CatalogMatchDialog,
+  type CatalogMatchEngine,
+  type CatalogMatchSubmit,
+} from "./CatalogMatchDialog";
 import { LoadLogDialog } from "./LoadLogDialog";
 import { ModOptionsDialog } from "./ModOptionsDialog";
 import { QuickInstallDialog } from "./QuickInstallDialog";
@@ -139,12 +149,71 @@ function isUnrealPlugin(pluginId: string): boolean {
   return UNREAL_PLUGIN_IDS.has(pluginId);
 }
 
+const CATALOG_HIGH_CONFIDENCE_SCORE = 90;
+
 function catalogHasHit(s: CatalogSuggestion | null | undefined): boolean {
   return Boolean(
     s?.nexus_domain ||
       s?.thunderstore_community ||
       (s?.modio_game_id != null && s.modio_game_id > 0),
   );
+}
+
+function catalogBestScore(s: CatalogSuggestion | null | undefined): number {
+  if (!s) {
+    return 0;
+  }
+  const scores = [
+    ...(s.nexus_candidates ?? []).map((c) => c.score),
+    ...(s.thunderstore_candidates ?? []).map((c) => c.score),
+    ...(s.modio_candidates ?? []).map((c) => c.score),
+  ];
+  if (scores.length === 0) {
+    return catalogHasHit(s) ? CATALOG_HIGH_CONFIDENCE_SCORE : 0;
+  }
+  return Math.max(...scores);
+}
+
+/** One-click manage only when a unique high-confidence match exists. */
+function catalogReadyToQuickManage(s: CatalogSuggestion | null | undefined): boolean {
+  return Boolean(
+    s &&
+      catalogHasHit(s) &&
+      !s.ambiguous &&
+      catalogBestScore(s) >= CATALOG_HIGH_CONFIDENCE_SCORE,
+  );
+}
+
+export type CatalogMatchCardKind = "ready" | "review" | "needs";
+
+function catalogMatchCardKind(
+  s: CatalogSuggestion | null | undefined,
+): CatalogMatchCardKind {
+  if (catalogReadyToQuickManage(s)) {
+    return "ready";
+  }
+  if (catalogHasHit(s) || (s?.ambiguous && catalogBestScore(s) > 0)) {
+    return "review";
+  }
+  return "needs";
+}
+
+function catalogMatchBadge(kind: CatalogMatchCardKind): string | null {
+  if (kind === "needs") return "Needs catalog";
+  if (kind === "review") return "Review match";
+  return null;
+}
+
+function catalogMatchHover(kind: CatalogMatchCardKind): string {
+  if (kind === "ready") return "Manage";
+  if (kind === "review") return "Choose catalog";
+  return "Find catalog";
+}
+
+function catalogMatchActionLabel(kind: CatalogMatchCardKind): string {
+  if (kind === "ready") return "Manage";
+  if (kind === "review") return "Choose catalog";
+  return "Find catalog";
 }
 
 function catalogHintTags(s: CatalogSuggestion | null | undefined): string[] {
@@ -628,20 +697,6 @@ function filterAndSortStagedMods(
     ...sortPartition(filtered.filter((m) => m.enabled)),
     ...sortPartition(filtered.filter((m) => !m.enabled)),
   ];
-}
-
-function sameEnabledNeighborIndex(
-  list: StagedMod[],
-  index: number,
-  dir: -1 | 1,
-): number {
-  const enabled = list[index]?.enabled;
-  if (enabled === undefined) return -1;
-  let j = index + dir;
-  while (j >= 0 && j < list.length && list[j].enabled !== enabled) {
-    j += dir;
-  }
-  return j >= 0 && j < list.length ? j : -1;
 }
 
 function resolveTheme(pref: ThemePreference): "light" | "dark" {
@@ -1282,18 +1337,14 @@ export default function App() {
   const [assistHint, setAssistHint] = useState<string | null>(null);
   const [assistActive, setAssistActive] = useState(false);
   const [assistLoginBanner, setAssistLoginBanner] = useState(false);
-  const [unrealManage, setUnrealManage] = useState<DetectedGame | null>(null);
-  const [unrealDomain, setUnrealDomain] = useState("");
-  const [unrealCommunity, setUnrealCommunity] = useState("");
-  const [unrealModioId, setUnrealModioId] = useState("");
-  const [unrealProject, setUnrealProject] = useState("");
-  const [bepinexManage, setBepinexManage] = useState<DetectedGame | null>(null);
-  const [bepinexDomain, setBepinexDomain] = useState("");
-  const [bepinexCommunity, setBepinexCommunity] = useState("");
-  const [bepinexModioId, setBepinexModioId] = useState("");
-  const [catalogHints, setCatalogHints] = useState<CatalogSuggestion | null>(
-    null,
-  );
+  const [catalogMatchPrompt, setCatalogMatchPrompt] = useState<{
+    game: DetectedGame;
+    engine: CatalogMatchEngine;
+  } | null>(null);
+  const [catalogMatchSuggestion, setCatalogMatchSuggestion] =
+    useState<CatalogSuggestion | null>(null);
+  const [catalogMatchLookingUp, setCatalogMatchLookingUp] = useState(false);
+  const [catalogMatchProject, setCatalogMatchProject] = useState("");
   const [catalogSuggestions, setCatalogSuggestions] = useState<
     Record<string, CatalogSuggestion>
   >({});
@@ -1712,11 +1763,13 @@ export default function App() {
     modsSourceFilter === "all" &&
     !modsCollectionFilter;
 
+  const modsInLoadOrder = useMemo(() => stagedModsInLoadOrder(mods), [mods]);
+
   const modIndexById = useMemo(() => {
     const map = new Map<string, number>();
-    mods.forEach((m, i) => map.set(m.id, i));
+    modsInLoadOrder.forEach((m, i) => map.set(m.id, i));
     return map;
-  }, [mods]);
+  }, [modsInLoadOrder]);
 
   const stagedUpdateCount = useMemo(
     () => mods.reduce((n, m) => n + (modUpdates[m.id] ? 1 : 0), 0),
@@ -3415,103 +3468,69 @@ export default function App() {
     });
   }
 
-  function applySuggestionToUnrealForm(s: CatalogSuggestion) {
-    if (s.nexus_domain) {
-      setUnrealDomain(s.nexus_domain);
-    }
-    if (s.thunderstore_community) {
-      setUnrealCommunity(s.thunderstore_community);
-    }
-    if (s.modio_game_id != null) {
-      setUnrealModioId(String(s.modio_game_id));
-    }
-    setCatalogHints(s);
+  function closeCatalogMatchPrompt() {
+    catalogSuggestGen.current += 1;
+    setCatalogMatchPrompt(null);
+    setCatalogMatchSuggestion(null);
+    setCatalogMatchLookingUp(false);
+    setCatalogMatchProject("");
   }
 
-  function applySuggestionToBepinexForm(s: CatalogSuggestion, game: DetectedGame) {
-    if (s.nexus_domain) {
-      setBepinexDomain(s.nexus_domain);
-    } else if (!game.nexus_domain) {
-      setBepinexDomain("");
+  function beginCatalogMatch(game: DetectedGame, engine: CatalogMatchEngine) {
+    if (!game.install_path) {
+      setError(
+        engine === "unreal"
+          ? "Install path is required to manage this Unreal game."
+          : "Install path is required to manage this Unity game.",
+      );
+      return;
     }
-    if (s.thunderstore_community) {
-      setBepinexCommunity(s.thunderstore_community);
+    setError(null);
+    setCatalogMatchPrompt({ game, engine });
+    setCatalogMatchProject("");
+    const cached = catalogSuggestions[game.id] ?? null;
+    setCatalogMatchSuggestion(cached);
+    setCatalogMatchLookingUp(true);
+    if (engine === "unreal") {
+      void api.detectUeLayout(game.install_path).then((layout) => {
+        if (layout?.project_name) {
+          setCatalogMatchProject(layout.project_name);
+        }
+      });
     }
-    if (s.modio_game_id != null) {
-      setBepinexModioId(String(s.modio_game_id));
-    }
-    setCatalogHints(s);
+    const gen = ++catalogSuggestGen.current;
+    void (async () => {
+      try {
+        const s = await api.suggestCatalogIds(game.title);
+        if (catalogSuggestGen.current !== gen) {
+          return;
+        }
+        setCatalogMatchSuggestion(s);
+        setCatalogSuggestions((prev) => ({ ...prev, [game.id]: s }));
+      } catch {
+        if (catalogSuggestGen.current !== gen) {
+          return;
+        }
+        // Keep cached suggestion / empty for manual entry.
+      } finally {
+        if (catalogSuggestGen.current === gen) {
+          setCatalogMatchLookingUp(false);
+        }
+      }
+    })();
   }
 
   function beginUnrealManage(game: DetectedGame) {
-    if (!game.install_path) {
-      setError("Install path is required to manage this Unreal game.");
-      return;
-    }
-    setError(null);
-    setBepinexManage(null);
-    setUnrealManage(game);
-    setUnrealDomain("");
-    setUnrealCommunity("");
-    setUnrealModioId("");
-    setUnrealProject("");
-    setCatalogHints(null);
-    const cached = catalogSuggestions[game.id];
-    if (cached) {
-      applySuggestionToUnrealForm(cached);
-    }
-    void api.detectUeLayout(game.install_path).then((layout) => {
-      if (layout?.project_name) {
-        setUnrealProject(layout.project_name);
-      }
-    });
-    const gen = ++catalogSuggestGen.current;
-    void withBusy("Looking up catalogs…", async () => {
-      try {
-        const s = await api.suggestCatalogIds(game.title);
-        if (catalogSuggestGen.current !== gen) {
-          return;
-        }
-        applySuggestionToUnrealForm(s);
-      } catch {
-        // Leave fields empty for manual entry.
-      }
-    });
+    beginCatalogMatch(game, "unreal");
   }
 
   function beginBepinexManage(game: DetectedGame) {
-    if (!game.install_path) {
-      setError("Install path is required to manage this Unity game.");
-      return;
-    }
-    setError(null);
-    setUnrealManage(null);
-    setBepinexManage(game);
-    setBepinexDomain(game.nexus_domain ?? "");
-    setBepinexCommunity("");
-    setBepinexModioId("");
-    setCatalogHints(null);
-    const cached = catalogSuggestions[game.id];
-    if (cached) {
-      applySuggestionToBepinexForm(cached, game);
-    }
-    const gen = ++catalogSuggestGen.current;
-    void withBusy("Looking up catalogs…", async () => {
-      try {
-        const s = await api.suggestCatalogIds(game.title);
-        if (catalogSuggestGen.current !== gen) {
-          return;
-        }
-        applySuggestionToBepinexForm(s, game);
-      } catch {
-        // Leave fields empty for manual entry.
-      }
-    });
+    beginCatalogMatch(game, "bepinex");
   }
 
   async function manageUnrealQuick(game: DetectedGame) {
     const suggestion = catalogSuggestions[game.id];
-    if (!suggestion || !catalogHasHit(suggestion)) {
+    if (!catalogReadyToQuickManage(suggestion)) {
       beginUnrealManage(game);
       return;
     }
@@ -3530,14 +3549,14 @@ export default function App() {
       await api.manageGame({
         id: game.id,
         title: game.title,
-        nexusDomain: suggestion.nexus_domain ?? "",
+        nexusDomain: suggestion!.nexus_domain ?? "",
         installPath: game.install_path!,
         launcher: game.launcher,
         pluginId: "unreal",
         coverPath: game.cover_path,
         projectName,
-        thunderstoreCommunity: suggestion.thunderstore_community ?? null,
-        modioGameId: suggestion.modio_game_id ?? null,
+        thunderstoreCommunity: suggestion!.thunderstore_community ?? null,
+        modioGameId: suggestion!.modio_game_id ?? null,
       });
       const list = await refreshManaged();
       const managedGame = list.find((g) => g.id === game.id);
@@ -3551,7 +3570,7 @@ export default function App() {
 
   async function manageBepinexQuick(game: DetectedGame) {
     const suggestion = catalogSuggestions[game.id];
-    if (!suggestion || !catalogHasHit(suggestion)) {
+    if (!catalogReadyToQuickManage(suggestion)) {
       beginBepinexManage(game);
       return;
     }
@@ -3563,13 +3582,13 @@ export default function App() {
       await api.manageGame({
         id: game.id,
         title: game.title,
-        nexusDomain: suggestion.nexus_domain ?? "",
+        nexusDomain: suggestion!.nexus_domain ?? "",
         installPath: game.install_path!,
         launcher: game.launcher,
         pluginId: "bepinex",
         coverPath: game.cover_path,
-        thunderstoreCommunity: suggestion.thunderstore_community ?? null,
-        modioGameId: suggestion.modio_game_id ?? null,
+        thunderstoreCommunity: suggestion!.thunderstore_community ?? null,
+        modioGameId: suggestion!.modio_game_id ?? null,
       });
       const list = await refreshManaged();
       const managedGame = list.find((g) => g.id === game.id);
@@ -3581,16 +3600,17 @@ export default function App() {
     });
   }
 
-  async function confirmUnrealManage() {
-    const game = unrealManage;
-    if (!game?.install_path) {
+  async function confirmCatalogMatch(values: CatalogMatchSubmit) {
+    const prompt = catalogMatchPrompt;
+    if (!prompt?.game.install_path) {
       return;
     }
-    const domain = unrealDomain.trim().toLowerCase().replace(/\s+/g, "");
-    const community = unrealCommunity.trim().toLowerCase();
-    const midRaw = unrealModioId.trim();
-    const modioGameId = midRaw ? Number.parseInt(midRaw, 10) : 0;
-    if (!domain && !community && !(Number.isFinite(modioGameId) && modioGameId > 0)) {
+    const { game, engine } = prompt;
+    if (
+      !values.nexusDomain &&
+      !values.thunderstoreCommunity &&
+      values.modioGameId == null
+    ) {
       setError(
         "Enter a Nexus Mods domain, Thunderstore community, and/or mod.io game ID.",
       );
@@ -3600,17 +3620,16 @@ export default function App() {
       await api.manageGame({
         id: game.id,
         title: game.title,
-        nexusDomain: domain,
+        nexusDomain: values.nexusDomain,
         installPath: game.install_path!,
         launcher: game.launcher,
-        pluginId: "unreal",
+        pluginId: engine === "unreal" ? "unreal" : "bepinex",
         coverPath: game.cover_path,
-        projectName: unrealProject.trim() || null,
-        thunderstoreCommunity: community || null,
-        modioGameId: Number.isFinite(modioGameId) && modioGameId > 0 ? modioGameId : null,
+        projectName: engine === "unreal" ? values.projectName : null,
+        thunderstoreCommunity: values.thunderstoreCommunity || null,
+        modioGameId: values.modioGameId,
       });
-      setUnrealManage(null);
-      setCatalogHints(null);
+      closeCatalogMatchPrompt();
       const list = await refreshManaged();
       const managedGame = list.find((g) => g.id === game.id);
       if (managedGame) {
@@ -3663,44 +3682,6 @@ export default function App() {
     });
   }
 
-  async function confirmBepinexManage() {
-    const game = bepinexManage;
-    if (!game?.install_path) {
-      return;
-    }
-    const domain = bepinexDomain.trim().toLowerCase().replace(/\s+/g, "");
-    const community = bepinexCommunity.trim().toLowerCase();
-    const midRaw = bepinexModioId.trim();
-    const modioGameId = midRaw ? Number.parseInt(midRaw, 10) : 0;
-    if (!domain && !community && !(Number.isFinite(modioGameId) && modioGameId > 0)) {
-      setError(
-        "Enter a Nexus Mods domain, Thunderstore community, and/or mod.io game ID.",
-      );
-      return;
-    }
-    await withBusy(`Managing ${game.title}…`, async () => {
-      await api.manageGame({
-        id: game.id,
-        title: game.title,
-        nexusDomain: domain,
-        installPath: game.install_path!,
-        launcher: game.launcher,
-        pluginId: "bepinex",
-        coverPath: game.cover_path,
-        thunderstoreCommunity: community || null,
-        modioGameId: Number.isFinite(modioGameId) && modioGameId > 0 ? modioGameId : null,
-      });
-      setBepinexManage(null);
-      setCatalogHints(null);
-      const list = await refreshManaged();
-      const managedGame = list.find((g) => g.id === game.id);
-      if (managedGame) {
-        await openGame(managedGame, "mods");
-      } else {
-        setActiveId(game.id);
-      }
-    });
-  }
 
   async function saveUeGameSettings() {
     if (!libraryDetail) {
@@ -5306,12 +5287,8 @@ export default function App() {
 
   async function moveMod(modId: string, dir: -1 | 1) {
     if (!activeGame || !canReorderMods) return;
-    const next = [...mods];
-    const i = next.findIndex((m) => m.id === modId);
-    if (i < 0) return;
-    const j = sameEnabledNeighborIndex(next, i, dir);
-    if (j < 0) return;
-    [next[i], next[j]] = [next[j], next[i]];
+    const next = reorderStagedMods(mods, modId, dir);
+    if (!next) return;
     await api.setLoadOrder(
       activeGame.id,
       next.map((m) => m.id),
@@ -6457,11 +6434,11 @@ export default function App() {
                         const canMoveUp =
                           canReorderMods &&
                           idx >= 0 &&
-                          sameEnabledNeighborIndex(mods, idx, -1) >= 0;
+                          sameEnabledNeighborIndex(modsInLoadOrder, idx, -1) >= 0;
                         const canMoveDown =
                           canReorderMods &&
                           idx >= 0 &&
-                          sameEnabledNeighborIndex(mods, idx, 1) >= 0;
+                          sameEnabledNeighborIndex(modsInLoadOrder, idx, 1) >= 0;
                         const pageHit = activeGame
                           ? catalogHitFromStaged(m, activeGame)
                           : null;
@@ -6921,151 +6898,6 @@ export default function App() {
                     <button onClick={scan}>Scan games</button>
                   </div>
                 </div>
-                <Reveal show={unrealManage != null} className="panel unreal-manage-panel">
-                  {unrealManage ? (
-                    <>
-                    <h2>Add as Unreal Engine game</h2>
-                    <p>
-                      <strong>{unrealManage.title}</strong> looks like an Unreal
-                      install. Catalog IDs are suggested from the game title when
-                      possible — edit them if needed, then confirm the project
-                      folder.
-                    </p>
-                    <label>
-                      Nexus domain (optional)
-                      <input
-                        value={unrealDomain}
-                        onChange={(e) => setUnrealDomain(e.target.value)}
-                        placeholder="e.g. palworld"
-                        autoFocus
-                      />
-                      {catalogHints?.nexus_name ? (
-                        <span className="field-hint">
-                          Matched: {catalogHints.nexus_name}
-                        </span>
-                      ) : null}
-                    </label>
-                    <label>
-                      Thunderstore community (optional)
-                      <input
-                        value={unrealCommunity}
-                        onChange={(e) => setUnrealCommunity(e.target.value)}
-                        placeholder="e.g. palworld"
-                      />
-                      {catalogHints?.thunderstore_name ? (
-                        <span className="field-hint">
-                          Matched: {catalogHints.thunderstore_name}
-                        </span>
-                      ) : null}
-                    </label>
-                    <label>
-                      mod.io game ID (optional)
-                      <input
-                        value={unrealModioId}
-                        onChange={(e) => setUnrealModioId(e.target.value)}
-                        placeholder="e.g. 1234"
-                        inputMode="numeric"
-                      />
-                      {catalogHints?.modio_name ? (
-                        <span className="field-hint">
-                          Matched: {catalogHints.modio_name}
-                        </span>
-                      ) : null}
-                    </label>
-                    <label>
-                      Project folder (optional)
-                      <input
-                        value={unrealProject}
-                        onChange={(e) => setUnrealProject(e.target.value)}
-                        placeholder="Auto-detected when possible"
-                      />
-                    </label>
-                    <div className="row-actions">
-                      <button onClick={() => void confirmUnrealManage()}>
-                        Manage
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          catalogSuggestGen.current += 1;
-                          setUnrealManage(null);
-                          setCatalogHints(null);
-                        }}
-                      >
-                        Cancel
-                      </button>
-                    </div>
-                    </>
-                  ) : null}
-                </Reveal>
-                <Reveal show={bepinexManage != null} className="panel unreal-manage-panel">
-                  {bepinexManage ? (
-                    <>
-                    <h2>Add as Unity / BepInEx game</h2>
-                    <p>
-                      <strong>{bepinexManage.title}</strong> looks like a Unity
-                      install. Catalog IDs are suggested from the game title when
-                      possible — edit them if needed.
-                    </p>
-                    <label>
-                      Nexus domain (optional)
-                      <input
-                        value={bepinexDomain}
-                        onChange={(e) => setBepinexDomain(e.target.value)}
-                        placeholder="e.g. lethalcompany"
-                        autoFocus
-                      />
-                      {catalogHints?.nexus_name ? (
-                        <span className="field-hint">
-                          Matched: {catalogHints.nexus_name}
-                        </span>
-                      ) : null}
-                    </label>
-                    <label>
-                      Thunderstore community (optional)
-                      <input
-                        value={bepinexCommunity}
-                        onChange={(e) => setBepinexCommunity(e.target.value)}
-                        placeholder="e.g. lethal-company"
-                      />
-                      {catalogHints?.thunderstore_name ? (
-                        <span className="field-hint">
-                          Matched: {catalogHints.thunderstore_name}
-                        </span>
-                      ) : null}
-                    </label>
-                    <label>
-                      mod.io game ID (optional)
-                      <input
-                        value={bepinexModioId}
-                        onChange={(e) => setBepinexModioId(e.target.value)}
-                        placeholder="e.g. 1234"
-                        inputMode="numeric"
-                      />
-                      {catalogHints?.modio_name ? (
-                        <span className="field-hint">
-                          Matched: {catalogHints.modio_name}
-                        </span>
-                      ) : null}
-                    </label>
-                    <div className="row-actions">
-                      <button onClick={() => void confirmBepinexManage()}>
-                        Manage
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          catalogSuggestGen.current += 1;
-                          setBepinexManage(null);
-                          setCatalogHints(null);
-                        }}
-                      >
-                        Cancel
-                      </button>
-                    </div>
-                    </>
-                  ) : null}
-                </Reveal>
                 {relinkPrompt && (
                   <div className="panel relink-panel">
                     <h3>Relink {relinkPrompt.game.title}</h3>
@@ -7237,33 +7069,37 @@ export default function App() {
                         );
                       }
                       if (g.engine_hint === "unreal" && g.install_path) {
-                        const quick = catalogHasHit(suggestion);
+                        const kind = catalogMatchCardKind(suggestion);
+                        const ready = kind === "ready";
                         return (
                           <MediaCard
                             key={g.id}
                             enterIndex={index}
                             title={g.title}
                             imageSrc={mediaSrc(g.cover_path)}
+                            badge={catalogMatchBadge(kind)}
                             coverTags={hints}
-                            hoverLabel={quick ? "Manage" : "Add as Unreal"}
+                            hoverLabel={catalogMatchHover(kind)}
                             onClick={() =>
-                              quick ? manageUnrealQuick(g) : beginUnrealManage(g)
+                              ready ? manageUnrealQuick(g) : beginUnrealManage(g)
                             }
                           />
                         );
                       }
                       if (g.engine_hint === "bepinex" && g.install_path) {
-                        const quick = catalogHasHit(suggestion);
+                        const kind = catalogMatchCardKind(suggestion);
+                        const ready = kind === "ready";
                         return (
                           <MediaCard
                             key={g.id}
                             enterIndex={index}
                             title={g.title}
                             imageSrc={mediaSrc(g.cover_path)}
+                            badge={catalogMatchBadge(kind)}
                             coverTags={hints}
-                            hoverLabel={quick ? "Manage" : "Add as BepInEx"}
+                            hoverLabel={catalogMatchHover(kind)}
                             onClick={() =>
-                              quick
+                              ready
                                 ? manageBepinexQuick(g)
                                 : beginBepinexManage(g)
                             }
@@ -7294,6 +7130,12 @@ export default function App() {
                     {unmanaged.map((g) => {
                       const suggestion = catalogSuggestions[g.id];
                       const hintLine = catalogHintLine(suggestion);
+                      const kind =
+                        !g.supported &&
+                        (g.engine_hint === "unreal" || g.engine_hint === "bepinex") &&
+                        g.install_path
+                          ? catalogMatchCardKind(suggestion)
+                          : null;
                       return (
                         <li key={g.id}>
                           <div>
@@ -7312,6 +7154,8 @@ export default function App() {
                               {g.engine_hint === "bepinex" && !g.supported
                                 ? " · Unity / BepInEx"
                                 : ""}
+                              {kind === "needs" ? " · needs catalog" : ""}
+                              {kind === "review" ? " · review match" : ""}
                               {hintLine ? ` · ${hintLine}` : ""}
                             </small>
                           </div>
@@ -7324,27 +7168,23 @@ export default function App() {
                               <button
                                 type="button"
                                 onClick={() =>
-                                  catalogHasHit(suggestion)
+                                  kind === "ready"
                                     ? manageUnrealQuick(g)
                                     : beginUnrealManage(g)
                                 }
                               >
-                                {catalogHasHit(suggestion)
-                                  ? "Manage"
-                                  : "Add as Unreal"}
+                                {catalogMatchActionLabel(kind ?? "needs")}
                               </button>
                             ) : g.engine_hint === "bepinex" && g.install_path ? (
                               <button
                                 type="button"
                                 onClick={() =>
-                                  catalogHasHit(suggestion)
+                                  kind === "ready"
                                     ? manageBepinexQuick(g)
                                     : beginBepinexManage(g)
                                 }
                               >
-                                {catalogHasHit(suggestion)
-                                  ? "Manage"
-                                  : "Add as BepInEx"}
+                                {catalogMatchActionLabel(kind ?? "needs")}
                               </button>
                             ) : null}
                           </div>
@@ -9301,6 +9141,18 @@ export default function App() {
             <p className="note">Opening Nexus…</p>
           </div>
         </Modal>
+      )}
+      {catalogMatchPrompt && (
+        <CatalogMatchDialog
+          game={catalogMatchPrompt.game}
+          engine={catalogMatchPrompt.engine}
+          suggestion={catalogMatchSuggestion}
+          lookingUp={catalogMatchLookingUp}
+          projectName={catalogMatchProject}
+          busy={Boolean(busy)}
+          onClose={closeCatalogMatchPrompt}
+          onSubmit={(values) => void confirmCatalogMatch(values)}
+        />
       )}
       {quickInstall && (
         <QuickInstallDialog
