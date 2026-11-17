@@ -1,18 +1,34 @@
 import {
+  Fragment,
   useCallback,
   useEffect,
   useLayoutEffect,
   useMemo,
   useRef,
   useState,
+  type CSSProperties,
   type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
 } from "react";
+import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
+import {
+  faArrowDown,
+  faArrowUp,
+  faBars,
+  faCopy,
+  faFilter,
+  faLink,
+  faMagnifyingGlass,
+  faTrashCan,
+  faXmark,
+} from "@fortawesome/free-solid-svg-icons";
+import { motion, useReducedMotion } from "motion/react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import appLogo from "./assets/app-logo.png";
 import { AccountConnections } from "./AccountConnections";
+import { SettingsSection } from "./SettingsSection";
 import { UpdateToast } from "./UpdateToast";
 import { api } from "./api";
 import { setupCanFinish } from "./setupGate";
@@ -33,8 +49,11 @@ import {
 import { ImageCarousel } from "./ImageCarousel";
 import {
   FadeIn,
+  MOTION_EASE,
+  MOTION_FAST,
   MotionCard,
   NavTab,
+  Collapse,
   PopIn,
   Reveal,
   Segment,
@@ -56,9 +75,11 @@ import {
 import { chosenFileLabel, stagedModSourceLine } from "./stagedLabel";
 import {
   reorderStagedMods,
+  reorderStagedModToGroupIndex,
   sameEnabledNeighborIndex,
   stagedModsInLoadOrder,
 } from "./stagedLoadOrder";
+import { useStagedModDrag } from "./useStagedModDrag";
 import { Modal } from "./Modal";
 import {
   CatalogMatchDialog,
@@ -86,6 +107,7 @@ import {
 } from "./StatusBanner";
 import { WineOverrideNotice } from "./WineOverrideNotice";
 import type {
+  AuthorSuggestion,
   BrowseMeta,
   BrowseSearchOpts,
   CatalogHit,
@@ -112,11 +134,16 @@ import type {
   WineOverrideAdvice,
   TagFilterState,
   ThemePreference,
+  ThemeStyle,
+  LinuxSystemBackend,
+  SystemPalette,
   InstallClickBehavior,
   TsPackageDetail,
   ModioModDetail,
   ModioFileInfo,
   OrphanScan,
+  CollectionVersionAdvice,
+  GamePluginInfo,
   SavedCollectionEntry,
   SavedCollectionDetail,
   ShareImportResult,
@@ -125,6 +152,11 @@ import type {
   AppInstallVia,
   AppUpdateStatus,
 } from "./types";
+import {
+  formatCollectionGameVersions,
+  groupSavedCollectionsByGame,
+  savedCollectionMatchesGame,
+} from "./savedCollectionGroups";
 import "./App.css";
 
 type Tab = "setup" | "library" | "collections" | "browse" | "downloads" | "tools" | "settings";
@@ -462,6 +494,13 @@ function tagListsFromMap(map: BrowseTagMap): {
   return { tagsInclude, tagsExclude };
 }
 
+/** If `q` starts with `@`, return the author prefix (may be empty while typing). */
+function parseAuthorQuery(q: string): string | null {
+  const trimmed = q.trimStart();
+  if (!trimmed.startsWith("@")) return null;
+  return trimmed.slice(1).trimStart().replace(/\s+$/, "");
+}
+
 function setTagInMap(map: BrowseTagMap, tag: string): BrowseTagMap {
   const next = { ...map };
   const cycled = cycleTagState(map[tag]);
@@ -699,13 +738,107 @@ function filterAndSortStagedMods(
   ];
 }
 
+const DEFAULT_ACCENT = "#0078d4";
+const ACCENT_PRESETS = [
+  "#0078d4",
+  "#8764b8",
+  "#038387",
+  "#00cc6a",
+  "#c239b3",
+  "#e74856",
+  "#0f6a5c",
+  "#d35400",
+] as const;
+
+const SYSTEM_PALETTE_VARS = [
+  "--bg",
+  "--bg-2",
+  "--panel",
+  "--ink",
+  "--muted",
+  "--line",
+  "--accent",
+  "--accent-2",
+  "--input-bg",
+] as const;
+
 function resolveTheme(pref: ThemePreference): "light" | "dark" {
   if (pref === "light" || pref === "dark") return pref;
   return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
 }
 
-function applyTheme(pref: ThemePreference) {
-  document.documentElement.dataset.theme = resolveTheme(pref);
+function normalizeAccent(raw: string | undefined | null): string {
+  const s = (raw ?? "").trim();
+  const hex = s.startsWith("#") ? s.slice(1) : s;
+  if (/^[0-9a-fA-F]{6}$/.test(hex)) return `#${hex.toLowerCase()}`;
+  return DEFAULT_ACCENT;
+}
+
+function clearInlinePaletteVars() {
+  const root = document.documentElement;
+  for (const key of SYSTEM_PALETTE_VARS) {
+    root.style.removeProperty(key);
+  }
+}
+
+function applySystemPaletteVars(palette: SystemPalette) {
+  const root = document.documentElement;
+  root.style.setProperty("--bg", palette.bg);
+  root.style.setProperty("--bg-2", palette.bg_2);
+  root.style.setProperty("--panel", palette.panel);
+  root.style.setProperty("--ink", palette.ink);
+  root.style.setProperty("--muted", palette.muted);
+  root.style.setProperty("--line", palette.line);
+  root.style.setProperty("--accent", palette.accent);
+  root.style.setProperty(
+    "--accent-2",
+    `color-mix(in srgb, ${palette.accent} 72%, #ff8c00)`,
+  );
+  root.style.setProperty("--input-bg", palette.input_bg);
+}
+
+async function applyAppearance(
+  pref: ThemePreference,
+  style: ThemeStyle,
+  accentRaw?: string | null,
+) {
+  const root = document.documentElement;
+  const accent = normalizeAccent(accentRaw);
+  root.dataset.themeStyle = style;
+
+  if (style === "system") {
+    try {
+      const palette = await api.getSystemPalette();
+      const resolved =
+        pref === "system" ? (palette.dark ? "dark" : "light") : resolveTheme(pref);
+      root.dataset.theme = resolved;
+      applySystemPaletteVars(palette);
+      return;
+    } catch {
+      /* fall through to app monochrome */
+    }
+  }
+
+  root.dataset.theme = resolveTheme(pref);
+  clearInlinePaletteVars();
+  if (style === "app") {
+    root.style.setProperty("--accent", accent);
+    root.style.setProperty(
+      "--accent-2",
+      `color-mix(in srgb, ${accent} 72%, #ff8c00)`,
+    );
+  }
+}
+
+// Match config defaults before settings load to avoid a Brand-palette flash.
+if (typeof document !== "undefined") {
+  document.documentElement.dataset.themeStyle = "app";
+  document.documentElement.dataset.theme = resolveTheme("system");
+  document.documentElement.style.setProperty("--accent", DEFAULT_ACCENT);
+  document.documentElement.style.setProperty(
+    "--accent-2",
+    `color-mix(in srgb, ${DEFAULT_ACCENT} 72%, #ff8c00)`,
+  );
 }
 
 function mediaSrc(localPath?: string | null, remoteUrl?: string | null): string | null {
@@ -1268,6 +1401,8 @@ export default function App() {
     useState<CatalogSourceFilter>("all");
   const [modsSort, setModsSort] = useState<ModsSort>("loadOrder");
   const [modsCollectionFilter, setModsCollectionFilter] = useState("");
+  const [modsFiltersOpen, setModsFiltersOpen] = useState(false);
+  const [modsActionsMenuOpen, setModsActionsMenuOpen] = useState(false);
   const [installedCollections, setInstalledCollections] = useState<
     InstalledCollection[]
   >([]);
@@ -1286,6 +1421,19 @@ export default function App() {
   );
   const [savedRename, setSavedRename] = useState("");
   const [savedInstallGameId, setSavedInstallGameId] = useState("");
+  const [expandedCollectionGameKey, setExpandedCollectionGameKey] = useState<
+    string | null
+  >(null);
+  const [installedEmperorShareIds, setInstalledEmperorShareIds] = useState(
+    () => new Set<string>(),
+  );
+  const [savedEntryShareIds, setSavedEntryShareIds] = useState<
+    Record<string, string>
+  >({});
+  const [savedCollectionAdvice, setSavedCollectionAdvice] = useState<
+    Record<string, CollectionVersionAdvice>
+  >({});
+  const [gamePlugins, setGamePlugins] = useState<GamePluginInfo[]>([]);
   const [gameSavedDetail, setGameSavedDetail] = useState<SavedCollectionDetail | null>(
     null,
   );
@@ -1305,6 +1453,14 @@ export default function App() {
   const [browseSort, setBrowseSort] = useState("endorsements");
   const [browseCategory, setBrowseCategory] = useState("");
   const [browseVersion, setBrowseVersion] = useState("");
+  const [browseAuthor, setBrowseAuthor] = useState("");
+  const [browseAuthorDraft, setBrowseAuthorDraft] = useState("");
+  const [authorSuggestions, setAuthorSuggestions] = useState<AuthorSuggestion[]>(
+    [],
+  );
+  const [authorSuggestOpen, setAuthorSuggestOpen] = useState(false);
+  const [authorSuggestIndex, setAuthorSuggestIndex] = useState(0);
+  const [authorSuggestLoading, setAuthorSuggestLoading] = useState(false);
   const [browseTags, setBrowseTags] = useState<BrowseTagMap>({});
   const [tagQuery, setTagQuery] = useState("");
   const [tagsOpen, setTagsOpen] = useState(false);
@@ -1403,7 +1559,10 @@ export default function App() {
   const downloadStartedAtRef = useRef<number>(0);
   const downloadProgressAtRef = useRef<Map<string, { bytes: number; at: number }>>(new Map());
   const tagPickerRef = useRef<HTMLDivElement | null>(null);
+  const authorSuggestRef = useRef<HTMLDivElement | null>(null);
+  const authorSuggestReqRef = useRef(0);
   const tagSearchRef = useRef<HTMLInputElement | null>(null);
+  const modsActionsMenuRef = useRef<HTMLDivElement | null>(null);
   const mainScrollRef = useRef<HTMLElement | null>(null);
   const browseResultsRef = useRef<HTMLDivElement | null>(null);
   const browseScrollRef = useRef(0);
@@ -1434,6 +1593,7 @@ export default function App() {
     tagsInclude: [],
     tagsExclude: [],
     gameVersion: browseVersion || null,
+    author: browseAuthor || null,
     offset: 0,
   });
 
@@ -1441,6 +1601,7 @@ export default function App() {
     () => managed.find((g) => g.id === activeId) ?? managed[0] ?? null,
     [managed, activeId],
   );
+  const activeGameCoverSrc = mediaSrc(activeGame?.cover_path ?? null);
   const installedIds = useMemo(
     () => (activeGame ? installedCatalogIds(mods, activeGame) : new Set<string>()),
     [mods, activeGame],
@@ -1516,6 +1677,12 @@ export default function App() {
     setBrowseHasMore(false);
     setBrowseCategory("");
     setBrowseVersion("");
+    setBrowseAuthor("");
+    setBrowseAuthorDraft("");
+    setAuthorSuggestions([]);
+    setAuthorSuggestOpen(false);
+    setAuthorSuggestIndex(0);
+    setAuthorSuggestLoading(false);
     setBrowseTags({});
     setTagQuery("");
     setTagsOpen(false);
@@ -1665,6 +1832,14 @@ export default function App() {
       setTagsOpen(false);
       return true;
     }
+    if (modsActionsMenuOpen) {
+      setModsActionsMenuOpen(false);
+      return true;
+    }
+    if (modsFiltersOpen) {
+      setModsFiltersOpen(false);
+      return true;
+    }
     if (profileImportOpen) {
       setProfileImportOpen(false);
       return true;
@@ -1693,6 +1868,8 @@ export default function App() {
     setShareImportOpen(false);
     setShareImportCode("");
     setLastShareCode(null);
+    setModsFiltersOpen(false);
+    setModsActionsMenuOpen(false);
   }, []);
 
   const unmanaged = useMemo(() => {
@@ -1771,6 +1948,28 @@ export default function App() {
     return map;
   }, [modsInLoadOrder]);
 
+  const reduceMotion = useReducedMotion() === true;
+
+  const commitModDrag = useCallback(
+    async (modId: string, targetGroupIndex: number) => {
+      if (!activeGame || !canReorderMods) return;
+      const next = reorderStagedModToGroupIndex(mods, modId, targetGroupIndex);
+      if (!next) return;
+      await api.setLoadOrder(
+        activeGame.id,
+        next.map((m) => m.id),
+      );
+      setMods(next);
+    },
+    [activeGame, canReorderMods, mods],
+  );
+
+  const modDrag = useStagedModDrag({
+    canReorder: canReorderMods,
+    visibleMods,
+    onCommit: commitModDrag,
+  });
+
   const stagedUpdateCount = useMemo(
     () => mods.reduce((n, m) => n + (modUpdates[m.id] ? 1 : 0), 0),
     [mods, modUpdates],
@@ -1806,13 +2005,21 @@ export default function App() {
   }, [unmanaged]);
 
   const themePref: ThemePreference = settings?.theme ?? "system";
+  const themeStyle: ThemeStyle = settings?.theme_style ?? "app";
+  const accentColor = normalizeAccent(settings?.accent_color);
+  const linuxSystemBackend: LinuxSystemBackend =
+    settings?.linux_system_backend ?? "gtk";
 
   const refreshSettings = useCallback(async () => {
     const s = await api.getSettings();
     setupCompleteRef.current = s.initial_setup_complete === true;
     setSettings(s);
     setActiveId(s.last_active_game_id);
-    applyTheme(s.theme ?? "system");
+    await applyAppearance(
+      s.theme ?? "system",
+      s.theme_style ?? "app",
+      s.accent_color,
+    );
     return s;
   }, []);
 
@@ -1930,16 +2137,16 @@ export default function App() {
     const req = ++modUpdatesReqRef.current;
     try {
       const updates = await api.checkStagedModUpdates(gameId);
-      if (req !== modUpdatesReqRef.current) return;
-      if (activeGameRef.current?.id !== gameId) return;
+      if (req !== modUpdatesReqRef.current) return null;
+      if (activeGameRef.current?.id !== gameId) return null;
       const map: Record<string, StagedModUpdate> = {};
       for (const u of updates) {
         map[u.staged_id] = u;
       }
       setModUpdates(map);
       const list = await api.listMods(gameId);
-      if (req !== modUpdatesReqRef.current) return;
-      if (activeGameRef.current?.id !== gameId) return;
+      if (req !== modUpdatesReqRef.current) return null;
+      if (activeGameRef.current?.id !== gameId) return null;
       const named = new Map(
         list.filter((m) => m.file_name).map((m) => [m.id, m.file_name] as const),
       );
@@ -1953,8 +2160,10 @@ export default function App() {
         });
         return changed ? next : prev;
       });
+      return updates;
     } catch (e) {
       console.warn("check_staged_mod_updates failed", e);
+      return null;
     }
   }, []);
 
@@ -2102,16 +2311,24 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (themePref !== "system") {
-      applyTheme(themePref);
-      return;
-    }
-    applyTheme("system");
+    void applyAppearance(themePref, themeStyle, accentColor);
+    if (themePref !== "system" && themeStyle !== "system") return;
     const mq = window.matchMedia("(prefers-color-scheme: dark)");
-    const onChange = () => applyTheme("system");
+    const onChange = () => {
+      void applyAppearance(themePref, themeStyle, accentColor);
+    };
     mq.addEventListener("change", onChange);
-    return () => mq.removeEventListener("change", onChange);
-  }, [themePref]);
+    const onFocus = () => {
+      if (themeStyle === "system") {
+        void applyAppearance(themePref, themeStyle, accentColor);
+      }
+    };
+    window.addEventListener("focus", onFocus);
+    return () => {
+      mq.removeEventListener("change", onChange);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [themePref, themeStyle, accentColor, linuxSystemBackend]);
 
   useEffect(() => {
     const nextId = activeGame?.id ?? null;
@@ -2328,6 +2545,8 @@ export default function App() {
     setModsSourceFilter("all");
     setModsSort("loadOrder");
     setModsCollectionFilter("");
+    setModsFiltersOpen(false);
+    setModsActionsMenuOpen(false);
   }, [libraryDetail?.game.id]);
 
   useEffect(() => {
@@ -2389,6 +2608,88 @@ export default function App() {
       window.clearTimeout(id);
     };
   }, [tagsOpen]);
+
+  useEffect(() => {
+    if (!authorSuggestOpen) return;
+    const onPointerDown = (e: MouseEvent) => {
+      if (
+        authorSuggestRef.current &&
+        !authorSuggestRef.current.contains(e.target as Node)
+      ) {
+        setAuthorSuggestOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", onPointerDown);
+    return () => document.removeEventListener("mousedown", onPointerDown);
+  }, [authorSuggestOpen]);
+
+  useEffect(() => {
+    if (tab !== "browse" || browseMode !== "mods" || !activeGame) {
+      setAuthorSuggestions([]);
+      setAuthorSuggestOpen(false);
+      setAuthorSuggestLoading(false);
+      return;
+    }
+    const prefix = parseAuthorQuery(searchQuery);
+    if (prefix === null) {
+      setAuthorSuggestions([]);
+      setAuthorSuggestOpen(false);
+      setAuthorSuggestLoading(false);
+      return;
+    }
+    if (prefix.length < 2) {
+      authorSuggestReqRef.current += 1;
+      setAuthorSuggestions([]);
+      setAuthorSuggestOpen(false);
+      setAuthorSuggestLoading(false);
+      return;
+    }
+    const reqId = ++authorSuggestReqRef.current;
+    setAuthorSuggestLoading(true);
+    const timer = window.setTimeout(() => {
+      void (async () => {
+        try {
+          const hits = await api.suggestAuthors(activeGame.id, prefix);
+          if (authorSuggestReqRef.current !== reqId) return;
+          setAuthorSuggestions(hits);
+          setAuthorSuggestIndex(0);
+          setAuthorSuggestOpen(true);
+        } catch {
+          if (authorSuggestReqRef.current !== reqId) return;
+          setAuthorSuggestions([]);
+          setAuthorSuggestOpen(false);
+        } finally {
+          if (authorSuggestReqRef.current === reqId) {
+            setAuthorSuggestLoading(false);
+          }
+        }
+      })();
+    }, 300);
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [tab, browseMode, activeGame?.id, searchQuery]);
+
+  useEffect(() => {
+    if (!modsActionsMenuOpen) return;
+    const onPointerDown = (e: MouseEvent) => {
+      if (
+        modsActionsMenuRef.current &&
+        !modsActionsMenuRef.current.contains(e.target as Node)
+      ) {
+        setModsActionsMenuOpen(false);
+      }
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setModsActionsMenuOpen(false);
+    };
+    document.addEventListener("mousedown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [modsActionsMenuOpen]);
 
   useEffect(() => {
     navHistoryRef.current = new AppNavHistory(captureNavEntry());
@@ -3711,9 +4012,10 @@ export default function App() {
       tagsInclude,
       tagsExclude,
       gameVersion: browseVersion || null,
+      author: browseAuthor || null,
       offset: 0,
     };
-  }, [browseSort, browseCategory, browseTags, browseVersion]);
+  }, [browseSort, browseCategory, browseTags, browseVersion, browseAuthor]);
 
   browseOptsRef.current = browseOpts;
 
@@ -4054,7 +4356,37 @@ export default function App() {
     collectionHits.length,
   ]);
 
+  function clearAuthorSuggestions() {
+    authorSuggestReqRef.current += 1;
+    setAuthorSuggestions([]);
+    setAuthorSuggestOpen(false);
+    setAuthorSuggestIndex(0);
+    setAuthorSuggestLoading(false);
+  }
+
+  function pickAuthorSuggestion(hit: AuthorSuggestion) {
+    clearAuthorSuggestions();
+    browseByAuthor(hit.name, hit.source);
+  }
+
   async function search() {
+    if (browseMode === "mods") {
+      const prefix = parseAuthorQuery(searchQuery);
+      if (prefix !== null) {
+        if (authorSuggestOpen && authorSuggestions.length > 0) {
+          const pick =
+            authorSuggestions[authorSuggestIndex] ?? authorSuggestions[0];
+          pickAuthorSuggestion(pick);
+          return;
+        }
+        if (prefix.length > 0) {
+          clearAuthorSuggestions();
+          browseByAuthor(prefix);
+          return;
+        }
+        return;
+      }
+    }
     await runSearch();
   }
 
@@ -4073,11 +4405,70 @@ export default function App() {
   function clearBrowseFilters() {
     setBrowseCategory("");
     setBrowseVersion("");
+    setBrowseAuthor("");
+    setBrowseAuthorDraft("");
     setBrowseTags({});
     setTagQuery("");
     setTagsOpen(false);
     runSearch(browseMode, searchQuery, {
       ...browseOpts,
+      category: null,
+      gameVersion: null,
+      author: null,
+      tagsInclude: [],
+      tagsExclude: [],
+      offset: 0,
+    });
+  }
+
+  function applyBrowseAuthor(raw: string) {
+    const author = raw.trim();
+    setBrowseAuthorDraft(author);
+    if (author === browseAuthor) return;
+    setBrowseAuthor(author);
+    // Author filter skips mod.io; move off a mod.io-only source when applying.
+    if (author && sourceFilter === "modio" && activeGame) {
+      setSourceFilter(clampCatalogSourceFilter("all", activeGame, "mods"));
+    }
+    void runSearch(browseMode, searchQuery, {
+      ...browseOpts,
+      author: author || null,
+      offset: 0,
+    });
+  }
+
+  function browseByAuthor(
+    name: string,
+    source?: CatalogHit["source"] | null,
+  ) {
+    const author = name.trim();
+    if (!author || !activeGame) return;
+    let nextSource = sourceFilter;
+    if (source === "nexus" || source === "thunderstore") {
+      nextSource = source;
+    } else if (source === "modio") {
+      // Author filter skips mod.io; prefer merged Nexus/Thunderstore results.
+      nextSource = "all";
+    }
+    nextSource = clampCatalogSourceFilter(nextSource, activeGame, "mods");
+    setTab("browse");
+    setBrowseMode("mods");
+    closeBrowseDetail();
+    setSearchQuery("");
+    clearAuthorSuggestions();
+    setBrowseAuthor(author);
+    setBrowseAuthorDraft(author);
+    setBrowseCategory("");
+    setBrowseVersion("");
+    setBrowseTags({});
+    setTagQuery("");
+    setTagsOpen(false);
+    if (nextSource !== sourceFilter) {
+      setSourceFilter(nextSource);
+    }
+    void runSearch("mods", "", {
+      ...browseOpts,
+      author,
       category: null,
       gameVersion: null,
       tagsInclude: [],
@@ -4996,43 +5387,105 @@ export default function App() {
     );
   }
 
-  function savedCollectionMatchesGame(
-    entry: SavedCollectionEntry,
-    game: ManagedGame,
-  ): boolean {
-    const h = entry.game;
-    if (
-      h.nexus_domain &&
-      game.nexus_domain &&
-      h.nexus_domain.toLowerCase() === game.nexus_domain.toLowerCase()
-    ) {
-      return true;
-    }
-    if (
-      h.thunderstore_community &&
-      game.thunderstore_community &&
-      h.thunderstore_community.toLowerCase() ===
-        game.thunderstore_community.toLowerCase()
-    ) {
-      return true;
-    }
-    if (
-      h.modio_game_id != null &&
-      h.modio_game_id > 0 &&
-      game.modio_game_id === h.modio_game_id
-    ) {
-      return true;
-    }
-    if (entry.source_game_id && entry.source_game_id === game.id) return true;
-    return false;
-  }
-
   const gameSavedCollections = useMemo(() => {
     if (!libraryDetail) return [];
     return savedCollections.filter((c) =>
       savedCollectionMatchesGame(c, libraryDetail.game),
     );
   }, [savedCollections, libraryDetail]);
+
+  const savedCollectionGameGroups = useMemo(
+    () =>
+      groupSavedCollectionsByGame(
+        savedCollections,
+        managed,
+        detected,
+        gamePlugins,
+      ),
+    [savedCollections, managed, detected, gamePlugins],
+  );
+
+  const refreshCollectionsPageMeta = useCallback(async () => {
+    if (gamePlugins.length === 0) {
+      try {
+        setGamePlugins(await api.listPlugins());
+      } catch {
+        /* plugin titles are optional */
+      }
+    }
+
+    const managedMatches = managed.filter((game) =>
+      savedCollections.some((entry) => savedCollectionMatchesGame(entry, game)),
+    );
+
+    const installedIds = new Set<string>();
+    const adviceEntries: Record<string, CollectionVersionAdvice> = {};
+
+    await Promise.all(
+      managedMatches.map(async (game) => {
+        try {
+          const list = await api.listInstalledCollections(game.id);
+          for (const c of list) {
+            if (c.source !== "emperor") continue;
+            installedIds.add(c.id);
+            if (c.profile_code?.trim()) {
+              installedIds.add(c.profile_code.trim());
+            }
+          }
+        } catch {
+          /* ignore per-game failures */
+        }
+
+        const entries = savedCollections.filter((entry) =>
+          savedCollectionMatchesGame(entry, game),
+        );
+        if (entries.length === 0) return;
+        try {
+          const advice = await api.adviseCollectionVersions(
+            game.id,
+            entries.map((entry) => ({
+              id: entry.id,
+              gameVersions: entry.game_versions,
+            })),
+          );
+          for (const row of advice) {
+            adviceEntries[row.id] = row;
+          }
+        } catch {
+          /* ignore advice failures */
+        }
+      }),
+    );
+
+    const shareIdByEntry: Record<string, string> = {};
+    await Promise.all(
+      savedCollections.map(async (entry) => {
+        try {
+          shareIdByEntry[entry.id] = await api.emperorShareId(entry.code);
+        } catch {
+          /* ignore */
+        }
+      }),
+    );
+
+    setInstalledEmperorShareIds(installedIds);
+    setSavedEntryShareIds(shareIdByEntry);
+    setSavedCollectionAdvice(adviceEntries);
+  }, [gamePlugins.length, managed, savedCollections]);
+
+  useEffect(() => {
+    if (tab !== "collections") return;
+    void refreshCollectionsPageMeta();
+  }, [tab, refreshCollectionsPageMeta]);
+
+  const isSavedCollectionInstalled = useCallback(
+    (entry: SavedCollectionEntry) => {
+      if (installedEmperorShareIds.has(entry.code.trim())) return true;
+      const shareId = savedEntryShareIds[entry.id];
+      return Boolean(shareId && installedEmperorShareIds.has(shareId));
+    },
+    [installedEmperorShareIds, savedEntryShareIds],
+  );
 
   function shareModLabel(m: ShareModEntry): string {
     return (
@@ -5059,6 +5512,7 @@ export default function App() {
       savedDetail.entry.code,
       savedDetail.entry.name,
     );
+    if (tab === "collections") void refreshCollectionsPageMeta();
   }
 
   async function uninstallInstalledCollection(c: InstalledCollection) {
@@ -5075,6 +5529,7 @@ export default function App() {
       await refreshMods(activeGame.id);
       await refreshCollections(activeGame.id);
       if (modsCollectionFilter === c.id) setModsCollectionFilter("");
+      if (tab === "collections") await refreshCollectionsPageMeta();
     });
   }
 
@@ -5122,6 +5577,23 @@ export default function App() {
       await refreshCollections(activeGame.id);
       clearUpdateBadge();
       void refreshModUpdates(activeGame.id);
+    });
+  }
+
+  async function checkStagedModUpdatesNow() {
+    if (!activeGame) return;
+    const gameId = activeGame.id;
+    await withBusy("Checking for updates…", async () => {
+      const updates = await refreshModUpdates(gameId);
+      if (updates == null) return;
+      const count = updates.length;
+      setNotice({
+        kind: "ok",
+        message:
+          count === 0
+            ? "No updates available."
+            : `${count} update${count === 1 ? "" : "s"} available.`,
+      });
     });
   }
 
@@ -5554,6 +6026,27 @@ export default function App() {
     });
   }
 
+  function setThemeStyle(style: ThemeStyle) {
+    withBusy("Saving theme style…", async () => {
+      await api.setThemeStyle(style);
+      await refreshSettings();
+    });
+  }
+
+  function setAccentColor(color: string) {
+    withBusy("Saving accent…", async () => {
+      await api.setAccentColor(color);
+      await refreshSettings();
+    });
+  }
+
+  function setLinuxSystemBackend(backend: LinuxSystemBackend) {
+    withBusy("Saving toolkit…", async () => {
+      await api.setLinuxSystemBackend(backend);
+      await refreshSettings();
+    });
+  }
+
   function setInstallClickBehavior(behavior: InstallClickBehavior) {
     withBusy("Saving…", async () => {
       await api.setInstallClickBehavior(behavior);
@@ -5647,7 +6140,19 @@ export default function App() {
   );
 
   return (
-    <div className="app">
+    <div
+      className="app"
+      style={
+        activeGameCoverSrc
+          ? ({
+              "--active-game-cover": `url("${activeGameCoverSrc.replace(/"/g, '\\"')}")`,
+            } as CSSProperties)
+          : undefined
+      }
+    >
+      {activeGameCoverSrc ? (
+        <div className="app-game-backdrop" aria-hidden="true" />
+      ) : null}
       <aside className="sidebar">
         <div className="brand">
           <img className="brand-mark" src={appLogo} alt="Emperor Mod Manager" />
@@ -5879,32 +6384,6 @@ export default function App() {
                         >
                           Forum
                         </button>
-                      )}
-                    </div>
-                    <div className="detail-mod-actions">
-                      {libraryDetail.tab === "mods" && (
-                        <>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setShareExportOpen((v) => !v);
-                              setShareImportOpen(false);
-                            }}
-                          >
-                            Share loadout
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setShareImportOpen((v) => !v);
-                              setShareExportOpen(false);
-                            }}
-                          >
-                            Import code
-                          </button>
-                          <button onClick={importArchive}>Import archive</button>
-                          <button onClick={importFolder}>Import folder</button>
-                        </>
                       )}
                     </div>
                   </div>
@@ -6147,11 +6626,14 @@ export default function App() {
                             <div className="actions">
                               <button
                                 type="button"
+                                className="icon-btn"
+                                aria-label="Copy again"
+                                title="Copy again"
                                 onClick={() =>
                                   void navigator.clipboard.writeText(lastShareCode)
                                 }
                               >
-                                Copy again
+                                <FontAwesomeIcon icon={faCopy} />
                               </button>
                               <button
                                 type="button"
@@ -6230,117 +6712,8 @@ export default function App() {
                       </div>
                     )}
                     <div className="mods-toolbar">
-                      <div className="row">
-                        <input
-                          placeholder="Search staged mods…"
-                          value={modsQuery}
-                          onChange={(e) => setModsQuery(e.target.value)}
-                          aria-label="Search staged mods"
-                        />
-                      </div>
-                      <div className="filters">
-                        <label>
-                          Game version
-                          <input
-                            value={gameVersionDraft}
-                            placeholder={
-                              gameVersionReport ? "Unknown" : "Checking…"
-                            }
-                            aria-label="Game version"
-                            onChange={(e) => setGameVersionDraft(e.target.value)}
-                            onBlur={() => void commitGameVersion(gameVersionDraft)}
-                            onKeyDown={(e) => {
-                              if (e.key === "Enter") {
-                                e.currentTarget.blur();
-                              }
-                            }}
-                          />
-                        </label>
-                        {gameVersionReport?.source === "override" && (
-                          <button
-                            type="button"
-                            className="filters-clear"
-                            onClick={() => void commitGameVersion("")}
-                          >
-                            Use detected
-                          </button>
-                        )}
-                        <label>
-                          Status
-                          <select
-                            value={modsStatusFilter}
-                            onChange={(e) =>
-                              setModsStatusFilter(e.target.value as ModsStatusFilter)
-                            }
-                          >
-                            <option value="all">All</option>
-                            <option value="enabled">Enabled</option>
-                            <option value="disabled">Disabled</option>
-                          </select>
-                        </label>
-                        <label>
-                          Sort
-                          <select
-                            value={modsSort}
-                            onChange={(e) => setModsSort(e.target.value as ModsSort)}
-                          >
-                            {STAGED_MOD_SORTS.map((o) => (
-                              <option key={o.value} value={o.value}>
-                                {o.label}
-                              </option>
-                            ))}
-                          </select>
-                        </label>
-                        <label>
-                          Collection
-                          <select
-                            value={modsCollectionFilter}
-                            onChange={(e) => setModsCollectionFilter(e.target.value)}
-                          >
-                            <option value="">All</option>
-                            <option value={MODS_COLLECTION_FILTER_NONE}>None</option>
-                            {installedCollections.map((c) => (
-                              <option key={c.id} value={c.id}>
-                                {c.name}
-                              </option>
-                            ))}
-                          </select>
-                        </label>
-                        <Segment className="source-filter">
-                          {(
-                            [
-                              ["all", "All"] as const,
-                              ["nexus", "Nexus"] as const,
-                              ["thunderstore", "Thunderstore"] as const,
-                              ["modio", "mod.io"] as const,
-                            ] as const
-                          ).map(([id, label]) => (
-                            <SegmentTab
-                              key={id}
-                              layoutId="mods-source"
-                              active={modsSourceFilter === id}
-                              onClick={() => setModsSourceFilter(id)}
-                            >
-                              {label}
-                            </SegmentTab>
-                          ))}
-                        </Segment>
-                        {modsFiltersActive && (
-                          <button
-                            type="button"
-                            className="filters-clear"
-                            onClick={() => {
-                              setModsQuery("");
-                              setModsStatusFilter("all");
-                              setModsSourceFilter("all");
-                              setModsSort("loadOrder");
-                              setModsCollectionFilter("");
-                            }}
-                          >
-                            Clear filters
-                          </button>
-                        )}
-                        <div className="mods-toolbar-actions">
+                      <div className="mods-toolbar-actions">
+                        <div className="mods-toolbar-actions-left">
                           {stagedUpdateCount > 0 && (
                             <button
                               type="button"
@@ -6352,25 +6725,247 @@ export default function App() {
                           <button type="button" onClick={deploy}>
                             Deploy
                           </button>
-                          <button type="button" onClick={() => void checkLoadLogs()}>
-                            Check logs
-                          </button>
                           <button type="button" onClick={purge}>
                             Purge
                           </button>
-                          <button
-                            type="button"
-                            className="danger"
-                            onClick={removeAllMods}
-                            disabled={mods.length === 0}
-                          >
-                            Remove all mods
-                          </button>
+                          <div className="mods-actions-menu" ref={modsActionsMenuRef}>
+                            <button
+                              type="button"
+                              className="mods-toolbar-icon-btn"
+                              aria-label="More"
+                              aria-haspopup="menu"
+                              aria-expanded={modsActionsMenuOpen}
+                              onClick={() =>
+                                setModsActionsMenuOpen((open) => !open)
+                              }
+                            >
+                              <FontAwesomeIcon icon={faBars} />
+                            </button>
+                            <PopIn
+                              show={modsActionsMenuOpen}
+                              className="mods-actions-menu-popup"
+                              role="menu"
+                            >
+                              <button
+                                type="button"
+                                role="menuitem"
+                                onClick={() => {
+                                  setModsActionsMenuOpen(false);
+                                  setShareExportOpen((v) => !v);
+                                  setShareImportOpen(false);
+                                }}
+                              >
+                                Share loadout
+                              </button>
+                              <button
+                                type="button"
+                                role="menuitem"
+                                onClick={() => {
+                                  setModsActionsMenuOpen(false);
+                                  setShareImportOpen((v) => !v);
+                                  setShareExportOpen(false);
+                                }}
+                              >
+                                Import code
+                              </button>
+                              <button
+                                type="button"
+                                role="menuitem"
+                                onClick={() => {
+                                  setModsActionsMenuOpen(false);
+                                  void importArchive();
+                                }}
+                              >
+                                Import archive
+                              </button>
+                              <button
+                                type="button"
+                                role="menuitem"
+                                onClick={() => {
+                                  setModsActionsMenuOpen(false);
+                                  void importFolder();
+                                }}
+                              >
+                                Import folder
+                              </button>
+                              <button
+                                type="button"
+                                role="menuitem"
+                                onClick={() => {
+                                  setModsActionsMenuOpen(false);
+                                  void checkLoadLogs();
+                                }}
+                              >
+                                Check logs
+                              </button>
+                              <button
+                                type="button"
+                                role="menuitem"
+                                onClick={() => {
+                                  setModsActionsMenuOpen(false);
+                                  void checkStagedModUpdatesNow();
+                                }}
+                              >
+                                Check for updates
+                              </button>
+                              <button
+                                type="button"
+                                role="menuitem"
+                                className="danger"
+                                disabled={mods.length === 0}
+                                onClick={() => {
+                                  setModsActionsMenuOpen(false);
+                                  void removeAllMods();
+                                }}
+                              >
+                                Remove all mods
+                              </button>
+                            </PopIn>
+                          </div>
                         </div>
+                        <button
+                          type="button"
+                          className={
+                            modsFiltersActive
+                              ? "mods-toolbar-icon-btn mods-filters-toggle active"
+                              : "mods-toolbar-icon-btn mods-filters-toggle"
+                          }
+                          aria-label="Filters"
+                          aria-expanded={modsFiltersOpen}
+                          aria-pressed={modsFiltersActive}
+                          onClick={() => setModsFiltersOpen((open) => !open)}
+                        >
+                          <FontAwesomeIcon icon={faFilter} />
+                        </button>
                       </div>
+                      <Collapse show={modsFiltersOpen}>
+                        <div className="filters">
+                          <div className="row">
+                            <input
+                              placeholder="Search staged mods…"
+                              value={modsQuery}
+                              onChange={(e) => setModsQuery(e.target.value)}
+                              aria-label="Search staged mods"
+                            />
+                          </div>
+                          <label>
+                            Game version
+                            <input
+                              value={gameVersionDraft}
+                              placeholder={
+                                gameVersionReport ? "Unknown" : "Checking…"
+                              }
+                              aria-label="Game version"
+                              onChange={(e) =>
+                                setGameVersionDraft(e.target.value)
+                              }
+                              onBlur={() =>
+                                void commitGameVersion(gameVersionDraft)
+                              }
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter") {
+                                  e.currentTarget.blur();
+                                }
+                              }}
+                            />
+                          </label>
+                          {gameVersionReport?.source === "override" && (
+                            <button
+                              type="button"
+                              className="filters-clear"
+                              onClick={() => void commitGameVersion("")}
+                            >
+                              Use detected
+                            </button>
+                          )}
+                          <label>
+                            Status
+                            <select
+                              value={modsStatusFilter}
+                              onChange={(e) =>
+                                setModsStatusFilter(
+                                  e.target.value as ModsStatusFilter,
+                                )
+                              }
+                            >
+                              <option value="all">All</option>
+                              <option value="enabled">Enabled</option>
+                              <option value="disabled">Disabled</option>
+                            </select>
+                          </label>
+                          <label>
+                            Sort
+                            <select
+                              value={modsSort}
+                              onChange={(e) =>
+                                setModsSort(e.target.value as ModsSort)
+                              }
+                            >
+                              {STAGED_MOD_SORTS.map((o) => (
+                                <option key={o.value} value={o.value}>
+                                  {o.label}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                          <label>
+                            Collection
+                            <select
+                              value={modsCollectionFilter}
+                              onChange={(e) =>
+                                setModsCollectionFilter(e.target.value)
+                              }
+                            >
+                              <option value="">All</option>
+                              <option value={MODS_COLLECTION_FILTER_NONE}>
+                                None
+                              </option>
+                              {installedCollections.map((c) => (
+                                <option key={c.id} value={c.id}>
+                                  {c.name}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                          <Segment className="source-filter">
+                            {(
+                              [
+                                ["all", "All"] as const,
+                                ["nexus", "Nexus"] as const,
+                                ["thunderstore", "Thunderstore"] as const,
+                                ["modio", "mod.io"] as const,
+                              ] as const
+                            ).map(([id, label]) => (
+                              <SegmentTab
+                                key={id}
+                                layoutId="mods-source"
+                                active={modsSourceFilter === id}
+                                onClick={() => setModsSourceFilter(id)}
+                              >
+                                {label}
+                              </SegmentTab>
+                            ))}
+                          </Segment>
+                          {modsFiltersActive && (
+                            <button
+                              type="button"
+                              className="filters-clear"
+                              onClick={() => {
+                                setModsQuery("");
+                                setModsStatusFilter("all");
+                                setModsSourceFilter("all");
+                                setModsSort("loadOrder");
+                                setModsCollectionFilter("");
+                              }}
+                            >
+                              Clear filters
+                            </button>
+                          )}
+                        </div>
+                      </Collapse>
                       {!canReorderMods && mods.length > 0 && (
                         <p className="note mods-reorder-hint">
-                          Clear filters and use Load order to reorder with ↑↓.
+                          Clear filters and use Load order to reorder by dragging or ↑↓.
                         </p>
                       )}
                       {modsFiltersActive && mods.length > 0 && (
@@ -6428,8 +7023,13 @@ export default function App() {
                         />
                       ) : null}
                     </Reveal>
-                    <ul className="list mods">
-                      {visibleMods.map((m) => {
+                    <ul
+                      className={
+                        modDrag.isDragging ? "list mods mod-list-dragging" : "list mods"
+                      }
+                      ref={modDrag.listRef}
+                    >
+                      {modDrag.displayMods.map((m) => {
                         const idx = modIndexById.get(m.id) ?? -1;
                         const canMoveUp =
                           canReorderMods &&
@@ -6449,6 +7049,7 @@ export default function App() {
                           m,
                           installedCollections,
                         );
+                        const isDragged = modDrag.draggingId === m.id;
                         const identity = (
                           <>
                             <ListPoster src={mediaSrc(null, m.picture_url)} />
@@ -6487,15 +7088,17 @@ export default function App() {
                             </div>
                           </>
                         );
-                        return (
-                          <li
-                            key={m.id}
-                            className={
-                              m.enabled
-                                ? "list-row-poster"
-                                : "mod-disabled list-row-poster"
-                            }
-                          >
+                        const rowClass = [
+                          m.enabled
+                            ? "list-row-poster"
+                            : "mod-disabled list-row-poster",
+                          canReorderMods ? "mod-drag-ready" : "",
+                          isDragged ? "mod-dragging" : "",
+                        ]
+                          .filter(Boolean)
+                          .join(" ");
+                        const rowBody = (
+                          <>
                             <label className="check">
                               <input
                                 type="checkbox"
@@ -6509,7 +7112,10 @@ export default function App() {
                                 className="mod-identity staged-mod-page"
                                 role="button"
                                 tabIndex={0}
-                                onClick={() => void openStagedMod(m)}
+                                onClick={() => {
+                                  if (modDrag.suppressClick) return;
+                                  void openStagedMod(m);
+                                }}
                                 onKeyDown={(e) => {
                                   if (e.key === "Enter" || e.key === " ") {
                                     e.preventDefault();
@@ -6549,30 +7155,37 @@ export default function App() {
                               )}
                               <button
                                 type="button"
+                                className="icon-btn"
                                 onClick={() => moveMod(m.id, -1)}
                                 disabled={!canMoveUp}
+                                aria-label="Move up in load order"
                                 title={
                                   canReorderMods
                                     ? "Move up in load order"
                                     : "Clear filters and use Load order to reorder"
                                 }
                               >
-                                ↑
+                                <FontAwesomeIcon icon={faArrowUp} />
                               </button>
                               <button
                                 type="button"
+                                className="icon-btn"
                                 onClick={() => moveMod(m.id, 1)}
                                 disabled={!canMoveDown}
+                                aria-label="Move down in load order"
                                 title={
                                   canReorderMods
                                     ? "Move down in load order"
                                     : "Clear filters and use Load order to reorder"
                                 }
                               >
-                                ↓
+                                <FontAwesomeIcon icon={faArrowDown} />
                               </button>
                               <button
-                                className="danger"
+                                type="button"
+                                className="danger icon-btn"
+                                aria-label={`Remove ${m.name}`}
+                                title="Remove"
                                 onClick={() =>
                                   withBusy("Removing mod…", async () => {
                                     if (!activeGame) return;
@@ -6587,10 +7200,70 @@ export default function App() {
                                   })
                                 }
                               >
-                                Remove
+                                <FontAwesomeIcon icon={faTrashCan} />
                               </button>
                             </div>
-                          </li>
+                          </>
+                        );
+                        if (isDragged && modDrag.lift) {
+                          return (
+                            <Fragment key={m.id}>
+                              <li
+                                className="mod-drag-placeholder"
+                                style={{ height: modDrag.lift.height }}
+                                aria-hidden="true"
+                              />
+                              <li
+                                className={rowClass}
+                                style={{
+                                  position: "fixed",
+                                  left: modDrag.lift.x,
+                                  top: modDrag.lift.y,
+                                  width: modDrag.lift.width,
+                                  height: modDrag.lift.height,
+                                  zIndex: 40,
+                                  margin: 0,
+                                  pointerEvents: "none",
+                                  transform: reduceMotion
+                                    ? undefined
+                                    : "scale(1.02)",
+                                }}
+                              >
+                                {rowBody}
+                              </li>
+                            </Fragment>
+                          );
+                        }
+                        return (
+                          <motion.li
+                            key={m.id}
+                            layout={
+                              !reduceMotion &&
+                              modDrag.isDragging &&
+                              !isDragged
+                            }
+                            transition={{
+                              layout: {
+                                duration:
+                                  reduceMotion || !modDrag.isDragging
+                                    ? 0
+                                    : MOTION_FAST,
+                                ease: MOTION_EASE,
+                              },
+                            }}
+                            className={rowClass}
+                            ref={(el) => modDrag.setRowRef(m.id, el)}
+                            onPointerDown={(e) =>
+                              modDrag.onDragPointerDown(m.id, e)
+                            }
+                            title={
+                              canReorderMods
+                                ? "Click and hold to drag in load order"
+                                : undefined
+                            }
+                          >
+                            {rowBody}
+                          </motion.li>
                         );
                       })}
                       {mods.length === 0 && (
@@ -6671,17 +7344,22 @@ export default function App() {
                           </button>
                           <button
                             type="button"
+                            className="icon-btn"
+                            aria-label="Copy code"
+                            title="Copy code"
                             onClick={() =>
                               void navigator.clipboard.writeText(
                                 gameSavedDetail.entry.code,
                               )
                             }
                           >
-                            Copy code
+                            <FontAwesomeIcon icon={faCopy} />
                           </button>
                           <button
                             type="button"
-                            className="danger"
+                            className="danger icon-btn"
+                            aria-label={`Delete ${gameSavedDetail.entry.name}`}
+                            title="Delete"
                             onClick={() =>
                               void (async () => {
                                 if (
@@ -6703,7 +7381,7 @@ export default function App() {
                               })()
                             }
                           >
-                            Delete
+                            <FontAwesomeIcon icon={faTrashCan} />
                           </button>
                         </div>
                         <h2>Contained mods</h2>
@@ -6830,15 +7508,20 @@ export default function App() {
                               >
                                 <button
                                   type="button"
+                                  className="icon-btn"
+                                  aria-label={`Copy ${c.name}`}
+                                  title="Copy"
                                   onClick={() =>
                                     void navigator.clipboard.writeText(c.code)
                                   }
                                 >
-                                  Copy
+                                  <FontAwesomeIcon icon={faCopy} />
                                 </button>
                                 <button
                                   type="button"
-                                  className="danger"
+                                  className="danger icon-btn"
+                                  aria-label={`Delete ${c.name}`}
+                                  title="Delete"
                                   onClick={() =>
                                     void (async () => {
                                       if (!window.confirm(`Delete ${c.name}?`)) {
@@ -6853,7 +7536,7 @@ export default function App() {
                                     })()
                                   }
                                 >
-                                  Delete
+                                  <FontAwesomeIcon icon={faTrashCan} />
                                 </button>
                               </div>
                             </li>
@@ -7290,20 +7973,67 @@ export default function App() {
                       </div>
                       <div className="detail-meta">
                         <p className="detail-author">
-                          {(browseDetail.hit.source === "modio"
-                            ? modioDetail?.author
-                            : modDetail?.author) ??
-                            browseDetail.hit.author ??
-                            "Unknown author"}
-                          {modDetail?.uploaded_by &&
-                            browseDetail.hit.source !== "modio" &&
-                            modDetail.uploaded_by !==
-                              (modDetail.author ?? browseDetail.hit.author) && (
-                              <span className="detail-author-secondary">
-                                {" "}
-                                · uploaded by {modDetail.uploaded_by}
-                              </span>
-                            )}
+                          {(() => {
+                            const primaryAuthor =
+                              (browseDetail.hit.source === "modio"
+                                ? modioDetail?.author
+                                : browseDetail.hit.source === "thunderstore"
+                                  ? (tsDetail?.namespace ??
+                                    browseDetail.hit.author)
+                                  : (modDetail?.author ??
+                                    browseDetail.hit.author)) ?? null;
+                            const uploader =
+                              browseDetail.hit.source === "nexus"
+                                ? (modDetail?.uploaded_by ?? null)
+                                : null;
+                            const showUploader =
+                              Boolean(uploader) && uploader !== primaryAuthor;
+                            // Nexus browse filters by uploader account name.
+                            const primaryBrowseName =
+                              browseDetail.hit.source === "nexus"
+                                ? (uploader ?? primaryAuthor)
+                                : primaryAuthor;
+                            return (
+                              <>
+                                {primaryAuthor && primaryBrowseName ? (
+                                  <button
+                                    type="button"
+                                    className="detail-author-link"
+                                    title={`Browse mods by ${primaryBrowseName}`}
+                                    onClick={() =>
+                                      browseByAuthor(
+                                        primaryBrowseName,
+                                        browseDetail.hit.source,
+                                      )
+                                    }
+                                  >
+                                    {primaryAuthor}
+                                  </button>
+                                ) : (
+                                  "Unknown author"
+                                )}
+                                {showUploader && uploader ? (
+                                  <span className="detail-author-secondary">
+                                    {" "}
+                                    · uploaded by{" "}
+                                    <button
+                                      type="button"
+                                      className="detail-author-link"
+                                      title={`Browse mods by ${uploader}`}
+                                      onClick={() =>
+                                        browseByAuthor(
+                                          uploader,
+                                          browseDetail.hit.source,
+                                        )
+                                      }
+                                    >
+                                      {uploader}
+                                    </button>
+                                  </span>
+                                ) : null}
+                              </>
+                            );
+                          })()}
                         </p>
                         <div className="detail-stats">
                           {browseDetail.hit.source !== "modio" &&
@@ -7386,9 +8116,12 @@ export default function App() {
                           {modDeepLinkFromHit(browseDetail.hit) ? (
                             <button
                               type="button"
+                              className="icon-btn"
+                              aria-label="Copy link"
+                              title="Copy link"
                               onClick={() => void copyModDeepLink(browseDetail.hit)}
                             >
-                              Copy link
+                              <FontAwesomeIcon icon={faLink} />
                             </button>
                           ) : null}
                           {browseDetail.hit.source === "thunderstore" ? (
@@ -7830,6 +8563,8 @@ export default function App() {
                           setBrowseSort("endorsements");
                           setBrowseCategory("");
                           setBrowseVersion("");
+                          setBrowseAuthor("");
+                          setBrowseAuthorDraft("");
                           setBrowseTags({});
                           setBrowseDetail(null);
                           runSearch("mods", searchQuery, {
@@ -7837,6 +8572,7 @@ export default function App() {
                             sort: "endorsements",
                             category: null,
                             gameVersion: null,
+                            author: null,
                             tagsInclude: [],
                             tagsExclude: [],
                             offset: 0,
@@ -7853,6 +8589,8 @@ export default function App() {
                           setBrowseSort("endorsements");
                           setBrowseCategory("");
                           setBrowseVersion("");
+                          setBrowseAuthor("");
+                          setBrowseAuthorDraft("");
                           setBrowseTags({});
                           setBrowseDetail(null);
                           if (sourceFilter === "modio") setSourceFilter("all");
@@ -7861,6 +8599,7 @@ export default function App() {
                             sort: "endorsements",
                             category: null,
                             gameVersion: null,
+                            author: null,
                             tagsInclude: [],
                             tagsExclude: [],
                             offset: 0,
@@ -7969,18 +8708,115 @@ export default function App() {
                   <p>Select a managed game first.</p>
                 ) : (
                   <>
-                    <div className="row">
-                      <input
-                        placeholder={
-                          browseMode === "collections"
-                            ? "Search collections and modpacks…"
-                            : `Search ${activeGame.nexus_domain || activeGame.thunderstore_community || "mods"}…`
-                        }
-                        value={searchQuery}
-                        onChange={(e) => setSearchQuery(e.target.value)}
-                        onKeyDown={(e) => e.key === "Enter" && search()}
-                      />
-                      <button onClick={search}>Search</button>
+                    <div className="row browse-search-row" ref={authorSuggestRef}>
+                      <div className="browse-search-field">
+                        <input
+                          placeholder={
+                            browseMode === "collections"
+                              ? "Search collections and modpacks…"
+                              : "Search mods or @creator…"
+                          }
+                          value={searchQuery}
+                          onChange={(e) => setSearchQuery(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (
+                              browseMode === "mods" &&
+                              authorSuggestOpen &&
+                              authorSuggestions.length > 0
+                            ) {
+                              if (e.key === "ArrowDown") {
+                                e.preventDefault();
+                                setAuthorSuggestIndex(
+                                  (i) => (i + 1) % authorSuggestions.length,
+                                );
+                                return;
+                              }
+                              if (e.key === "ArrowUp") {
+                                e.preventDefault();
+                                setAuthorSuggestIndex(
+                                  (i) =>
+                                    (i - 1 + authorSuggestions.length) %
+                                    authorSuggestions.length,
+                                );
+                                return;
+                              }
+                              if (e.key === "Escape") {
+                                e.preventDefault();
+                                setAuthorSuggestOpen(false);
+                                return;
+                              }
+                            }
+                            if (e.key === "Enter") {
+                              e.preventDefault();
+                              void search();
+                            }
+                          }}
+                          aria-autocomplete={
+                            browseMode === "mods" ? "list" : undefined
+                          }
+                          aria-expanded={
+                            browseMode === "mods" ? authorSuggestOpen : undefined
+                          }
+                          aria-controls={
+                            browseMode === "mods"
+                              ? "browse-author-suggest"
+                              : undefined
+                          }
+                        />
+                        <PopIn
+                          show={
+                            browseMode === "mods" &&
+                            authorSuggestOpen &&
+                            (authorSuggestions.length > 0 || authorSuggestLoading)
+                          }
+                          className="browse-author-suggest"
+                          id="browse-author-suggest"
+                          role="listbox"
+                          aria-label="Creator suggestions"
+                        >
+                          {authorSuggestLoading &&
+                          authorSuggestions.length === 0 ? (
+                            <div className="browse-author-suggest-empty">
+                              Searching creators…
+                            </div>
+                          ) : (
+                            authorSuggestions.map((hit, i) => (
+                              <button
+                                key={`${hit.source}:${hit.name}`}
+                                type="button"
+                                role="option"
+                                aria-selected={i === authorSuggestIndex}
+                                className={`browse-author-suggest-item${
+                                  i === authorSuggestIndex ? " active" : ""
+                                }`}
+                                onMouseEnter={() => setAuthorSuggestIndex(i)}
+                                onClick={() => pickAuthorSuggestion(hit)}
+                              >
+                                <span className="browse-author-suggest-name">
+                                  @{hit.name}
+                                </span>
+                                <span className="browse-author-suggest-meta">
+                                  {hit.source === "thunderstore"
+                                    ? "Thunderstore"
+                                    : "Nexus"}
+                                  {hit.mod_count != null
+                                    ? ` · ${hit.mod_count.toLocaleString()} mods`
+                                    : ""}
+                                </span>
+                              </button>
+                            ))
+                          )}
+                        </PopIn>
+                      </div>
+                      <button
+                        type="button"
+                        className="icon-btn"
+                        onClick={() => void search()}
+                        aria-label="Search"
+                        title="Search"
+                      >
+                        <FontAwesomeIcon icon={faMagnifyingGlass} />
+                      </button>
                     </div>
                     <Reveal
                       show={profileImportOpen && browseMode === "collections"}
@@ -8091,6 +8927,25 @@ export default function App() {
                           ))}
                         </select>
                       </label>
+                      {browseMode === "mods" && (
+                        <label>
+                          Author
+                          <input
+                            type="text"
+                            value={browseAuthorDraft}
+                            placeholder="e.g. CyanideX"
+                            title="Nexus uploader or Thunderstore owner (exact)"
+                            onChange={(e) => setBrowseAuthorDraft(e.target.value)}
+                            onBlur={() => applyBrowseAuthor(browseAuthorDraft)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") {
+                                e.preventDefault();
+                                applyBrowseAuthor(browseAuthorDraft);
+                              }
+                            }}
+                          />
+                        </label>
+                      )}
                       <div className="tag-picker" ref={tagPickerRef}>
                         <span className="tag-picker-label" id="browse-tags-label">
                           Tags
@@ -8196,6 +9051,22 @@ export default function App() {
                 </div>
                 {activeGame ? (
                   <div className="browse-results" ref={browseResultsRef}>
+                    {browseMode === "mods" && browseAuthor ? (
+                      <div className="browse-author-chip" role="status">
+                        <span>
+                          Creator: <strong>{browseAuthor}</strong>
+                        </span>
+                        <button
+                          type="button"
+                          className="browse-author-chip-clear icon-btn"
+                          aria-label={`Clear creator filter ${browseAuthor}`}
+                          title="Clear"
+                          onClick={() => applyBrowseAuthor("")}
+                        >
+                          <FontAwesomeIcon icon={faXmark} />
+                        </button>
+                      </div>
+                    ) : null}
                     {browseMode === "mods" ? (
                       browseView === "grid" ? (
                         <FadeIn key={modHits[0]?.id ?? `mods:${searchQuery}`}>
@@ -8378,7 +9249,21 @@ export default function App() {
                                         ? "mod.io"
                                         : "Nexus"}
                                     {" · "}
-                                    {m.author ?? "unknown"}
+                                    {m.author ? (
+                                      <button
+                                        type="button"
+                                        className="detail-author-link"
+                                        title={`Browse mods by ${m.author}`}
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          browseByAuthor(m.author!, m.source);
+                                        }}
+                                      >
+                                        {m.author}
+                                      </button>
+                                    ) : (
+                                      "unknown"
+                                    )}
                                     {m.source === "nexus" && m.endorsements != null
                                       ? ` · ${m.endorsements} endorsements`
                                       : m.downloads != null
@@ -8641,7 +9526,23 @@ export default function App() {
                     {savedDetail.entry.modio_count
                       ? ` · ${savedDetail.entry.modio_count} mod.io`
                       : ""}
+                    {formatCollectionGameVersions(savedDetail.entry.game_versions)
+                      ? ` · Built for ${formatCollectionGameVersions(savedDetail.entry.game_versions)}`
+                      : ""}
+                    {isSavedCollectionInstalled(savedDetail.entry) ? (
+                      <>
+                        {" "}
+                        <span className="pill ok">Installed</span>
+                      </>
+                    ) : null}
                   </p>
+                  {showGameVersionWarnings &&
+                    savedCollectionAdvice[savedDetail.entry.id]?.status ===
+                      "mismatch" && (
+                      <p className="mod-version-warn">
+                        {savedCollectionAdvice[savedDetail.entry.id]?.message}
+                      </p>
+                    )}
                   <label>
                     Name
                     <div className="row">
@@ -8693,15 +9594,20 @@ export default function App() {
                     </button>
                     <button
                       type="button"
+                      className="icon-btn"
+                      aria-label="Copy code"
+                      title="Copy code"
                       onClick={() =>
                         void navigator.clipboard.writeText(savedDetail.entry.code)
                       }
                     >
-                      Copy code
+                      <FontAwesomeIcon icon={faCopy} />
                     </button>
                     <button
                       type="button"
-                      className="danger"
+                      className="danger icon-btn"
+                      aria-label={`Delete ${savedDetail.entry.name}`}
+                      title="Delete"
                       onClick={() =>
                         void (async () => {
                           if (!window.confirm(`Delete ${savedDetail.entry.name}?`)) {
@@ -8717,7 +9623,7 @@ export default function App() {
                         })()
                       }
                     >
-                      Delete
+                      <FontAwesomeIcon icon={faTrashCan} />
                     </button>
                   </div>
                   <h2>Contained mods</h2>
@@ -8756,60 +9662,149 @@ export default function App() {
                   <h1>Saved Collections</h1>
                 </div>
                 <p className="note">
-                  Local Emperor share codes. Create one from Library → game → Mods → Share
-                  loadout, or paste a code there and choose Save only.
+                  Local Emperor share codes grouped by game. Create one from Library →
+                  game → Mods → Share loadout, or paste a code there and choose Save only.
                 </p>
-                <ul className="list">
-                  {savedCollections.map((c) => (
-                    <li
-                      key={c.id}
-                      className="list-row-clickable"
-                      onClick={() => void openSavedCollection(c.id)}
-                    >
-                      <div className="list-row-main">
-                        <strong>{c.name}</strong>
-                        <small>
-                          {c.mod_count} mods
-                          {c.game.nexus_domain
-                            ? ` · ${c.game.nexus_domain}`
-                            : ""}
-                          {c.game.thunderstore_community
-                            ? ` · ${c.game.thunderstore_community}`
-                            : ""}
-                          {c.game.modio_game_id
-                            ? ` · mod.io ${c.game.modio_game_id}`
-                            : ""}
-                          {` · ${new Date(c.created_at).toLocaleString()}`}
-                        </small>
-                      </div>
-                      <div className="actions" onClick={(e) => e.stopPropagation()}>
-                        <button
-                          type="button"
-                          onClick={() => void navigator.clipboard.writeText(c.code)}
-                        >
-                          Copy
-                        </button>
-                        <button
-                          type="button"
-                          className="danger"
+                <ul className="list collections-by-game">
+                  {savedCollectionGameGroups.map((group) => {
+                    const expanded = expandedCollectionGameKey === group.key;
+                    return (
+                      <li
+                        key={group.key}
+                        className="collections-game-row list-row-poster"
+                      >
+                        <div
+                          className="collections-game-header list-row-clickable"
+                          aria-expanded={expanded}
                           onClick={() =>
-                            void (async () => {
-                              if (!window.confirm(`Delete ${c.name}?`)) return;
-                              try {
-                                await api.deleteSavedCollection(c.id);
-                                await refreshSavedCollections();
-                              } catch (err) {
-                                setError(String(err));
-                              }
-                            })()
+                            setExpandedCollectionGameKey(
+                              expanded ? null : group.key,
+                            )
                           }
+                          onKeyDown={(e: ReactKeyboardEvent<HTMLDivElement>) => {
+                            if (e.key === "Enter" || e.key === " ") {
+                              e.preventDefault();
+                              setExpandedCollectionGameKey(
+                                expanded ? null : group.key,
+                              );
+                            }
+                          }}
+                          role="button"
+                          tabIndex={0}
                         >
-                          Delete
-                        </button>
-                      </div>
-                    </li>
-                  ))}
-                  {savedCollections.length === 0 && (
+                          <ListPoster src={mediaSrc(group.coverPath)} />
+                          <div className="list-row-main">
+                            <strong>{group.title}</strong>
+                            <small>
+                              {group.collections.length} collection
+                              {group.collections.length === 1 ? "" : "s"}
+                              {group.managed ? " · managed" : " · not managed"}
+                            </small>
+                          </div>
+                        </div>
+                        <Collapse
+                          show={expanded}
+                          className="collections-game-expand"
+                        >
+                          <ul className="list collections-game-children">
+                            {group.collections.map((c) => {
+                              const builtFor = formatCollectionGameVersions(
+                                c.game_versions,
+                              );
+                              const advice = savedCollectionAdvice[c.id];
+                              const installed = isSavedCollectionInstalled(c);
+                              return (
+                                <li
+                                  key={c.id}
+                                  className="list-row-clickable"
+                                  onClick={() => void openSavedCollection(c.id)}
+                                >
+                                  <div className="list-row-main">
+                                    <strong>
+                                      {c.name}
+                                      {installed ? (
+                                        <span className="pill ok">Installed</span>
+                                      ) : null}
+                                    </strong>
+                                    <small>
+                                      {c.mod_count} mods
+                                      {builtFor ? ` · Built for ${builtFor}` : ""}
+                                      {` · ${new Date(c.created_at).toLocaleString()}`}
+                                    </small>
+                                    {showGameVersionWarnings &&
+                                      advice?.status === "mismatch" && (
+                                        <small className="mod-version-warn">
+                                          {advice.message}
+                                        </small>
+                                      )}
+                                  </div>
+                                  <div
+                                    className="actions"
+                                    onClick={(e) => e.stopPropagation()}
+                                  >
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        void (async () => {
+                                          if (group.managed) {
+                                            await runUnifiedImport(
+                                              group.managed.id,
+                                              c.code,
+                                              c.name,
+                                            );
+                                            await refreshCollectionsPageMeta();
+                                            return;
+                                          }
+                                          await openSavedCollection(c.id);
+                                        })()
+                                      }
+                                    >
+                                      Install
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className="icon-btn"
+                                      aria-label={`Copy ${c.name}`}
+                                      title="Copy"
+                                      onClick={() =>
+                                        void navigator.clipboard.writeText(c.code)
+                                      }
+                                    >
+                                      <FontAwesomeIcon icon={faCopy} />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className="danger icon-btn"
+                                      aria-label={`Delete ${c.name}`}
+                                      title="Delete"
+                                      onClick={() =>
+                                        void (async () => {
+                                          if (
+                                            !window.confirm(`Delete ${c.name}?`)
+                                          ) {
+                                            return;
+                                          }
+                                          try {
+                                            await api.deleteSavedCollection(c.id);
+                                            await refreshSavedCollections();
+                                          } catch (err) {
+                                            setError(String(err));
+                                          }
+                                        })()
+                                      }
+                                    >
+                                      <FontAwesomeIcon icon={faTrashCan} />
+                                    </button>
+                                  </div>
+                                </li>
+                              );
+                            })}
+                          </ul>
+                        </Collapse>
+                      </li>
+                    );
+                  })}
+                  {savedCollectionGameGroups.length === 0 && (
                     <li className="empty">
                       No saved share codes yet. Share a loadout from a managed game.
                     </li>
@@ -8855,12 +9850,7 @@ export default function App() {
         {tab === "settings" && (
           <section className="panel">
             <h1>Settings</h1>
-            <div className="setting-block">
-              <span>Accounts</span>
-              {accountConnections}
-            </div>
-            <div className="setting-block">
-              <span>App updates</span>
+            <SettingsSection title="App updates">
               <p className="note">
                 Current version:{" "}
                 <strong>v{appInfo?.version ?? appUpdate?.current_version ?? "…"}</strong>
@@ -8908,197 +9898,304 @@ export default function App() {
                   </button>
                 )}
               </div>
-            </div>
-            <div className="setting-block">
-              <span>Theme</span>
-              <Segment>
-                {(["light", "dark", "system"] as const).map((t) => (
-                  <SegmentTab
-                    key={t}
-                    layoutId="settings-theme"
-                    active={themePref === t}
-                    onClick={() => setTheme(t)}
-                  >
-                    {t === "light" ? "Light" : t === "dark" ? "Dark" : "System"}
-                  </SegmentTab>
-                ))}
-              </Segment>
-            </div>
-            <div className="setting-block">
-              <span>After Install</span>
-              <Segment>
-                {(
-                  [
-                    ["stay", "Stay here"],
-                    ["downloads", "Go to Downloads"],
-                  ] as const
-                ).map(([value, label]) => (
-                  <SegmentTab
-                    key={value}
-                    layoutId="settings-after-install"
-                    active={(settings?.install_click_behavior ?? "downloads") === value}
-                    onClick={() => setInstallClickBehavior(value)}
-                  >
-                    {label}
-                  </SegmentTab>
-                ))}
-              </Segment>
-            </div>
-            <div className="setting-block">
-              <span>Recent downloads</span>
-              <p className="note">
-                Finished downloads stay in the Recent list until you clear them,
-                or until the list reaches this length. The oldest entries drop
-                off first.
-              </p>
-              <label className="inline">
-                Keep
-                <input
-                  type="number"
-                  min={1}
-                  max={500}
-                  key={settings?.recent_downloads_limit ?? 50}
-                  defaultValue={settings?.recent_downloads_limit ?? 50}
-                  aria-label="Recent downloads limit"
-                  onBlur={(e) => {
-                    const n = Math.round(Number(e.target.value));
-                    if (!Number.isFinite(n)) return;
-                    const limit = Math.min(500, Math.max(1, n));
-                    e.target.value = String(limit);
-                    if (limit === (settings?.recent_downloads_limit ?? 50)) return;
-                    void withBusy("Saving…", async () => {
-                      await api.setRecentDownloadsLimit(limit);
-                      await refreshSettings();
-                      await refreshDownloads();
-                    });
-                  }}
-                />
-              </label>
-            </div>
-            <label className="inline">
-              <input
-                type="checkbox"
-                checked={settings?.adult_content ?? true}
-                onChange={(e) =>
-                  withBusy("Saving…", async () => {
-                    await api.setAdultContent(e.target.checked);
-                    await refreshSettings();
-                  })
-                }
-              />
-              Show adult content in search
-            </label>
-            <label className="inline">
-              <input
-                type="checkbox"
-                checked={settings?.game_version_warnings !== false}
-                onChange={(e) =>
-                  withBusy("Saving…", async () => {
-                    await api.setGameVersionWarnings(e.target.checked);
-                    await refreshSettings();
-                  })
-                }
-              />
-              Warn when a mod does not match the game version
-            </label>
-            <label className="inline">
-              <input
-                type="checkbox"
-                checked={settings?.autoclick_free_download ?? true}
-                onChange={(e) =>
-                  withBusy("Saving…", async () => {
-                    await api.setAutoclickFreeDownload(e.target.checked);
-                    await refreshSettings();
-                  })
-                }
-              />
-              Autoclick free download button in Download Assist (Nexus Fast
-              Download–style; waits for countdown)
-            </label>
-            <div className="setting-block">
-              <span>Mod recovery</span>
-              <p className="note">
-                Scan staging data left behind by older versions or recover data from
-                nexus-manager. Recovery copies data first, so deployed symlinks remain
-                safe until you deploy again.
-              </p>
-              {orphanScan &&
-                (orphanScan.legacy_game_ids.length > 0 ||
-                  orphanScan.missing_staging.length > 0 ||
-                  orphanScan.untracked_staging.length > 0 ||
-                  orphanScan.deploy_without_loadorder.length > 0) && (
+            </SettingsSection>
+            <SettingsSection title="Appearance">
+              <div className="setting-block">
+                <span>Theme</span>
+                <Segment>
+                  {(["light", "dark", "system"] as const).map((t) => (
+                    <SegmentTab
+                      key={t}
+                      layoutId="settings-theme"
+                      active={themePref === t}
+                      onClick={() => setTheme(t)}
+                    >
+                      {t === "light" ? "Light" : t === "dark" ? "Dark" : "System"}
+                    </SegmentTab>
+                  ))}
+                </Segment>
+              </div>
+              <div className="setting-block">
+                <span>Style</span>
+                <Segment>
+                  {(
+                    [
+                      ["app", "App"],
+                      ["brand", "Brand"],
+                      ["system", "System"],
+                    ] as const
+                  ).map(([value, label]) => (
+                    <SegmentTab
+                      key={value}
+                      layoutId="settings-theme-style"
+                      active={themeStyle === value}
+                      onClick={() => setThemeStyle(value)}
+                    >
+                      {label}
+                    </SegmentTab>
+                  ))}
+                </Segment>
+                <p className="note">
+                  App is a monochrome light/dark look with a chosen accent. Brand keeps
+                  the warm palette. System uses{" "}
+                  {settings?.platform_windows
+                    ? "Windows window, border, and accent colors"
+                    : settings?.platform_linux
+                      ? "GTK or Qt theme colors (pick the toolkit below)"
+                      : "operating system colors"}
+                  .
+                </p>
+              </div>
+              {themeStyle === "system" && settings?.platform_linux && (
+                <div className="setting-block">
+                  <span>Toolkit</span>
+                  <Segment>
+                    {(
+                      [
+                        ["gtk", "Gtk"],
+                        ["qt", "Qt"],
+                      ] as const
+                    ).map(([value, label]) => (
+                      <SegmentTab
+                        key={value}
+                        layoutId="settings-linux-toolkit"
+                        active={linuxSystemBackend === value}
+                        onClick={() => setLinuxSystemBackend(value)}
+                      >
+                        {label}
+                      </SegmentTab>
+                    ))}
+                  </Segment>
                   <p className="note">
-                    Found {orphanScan.legacy_game_ids.length} legacy game data folder
-                    {orphanScan.legacy_game_ids.length === 1 ? "" : "s"}, {" "}
-                    {orphanScan.missing_staging.length} missing staging path
-                    {orphanScan.missing_staging.length === 1 ? "" : "s"}, and {" "}
-                    {orphanScan.untracked_staging.length} untracked staging folder
-                    {orphanScan.untracked_staging.length === 1 ? "" : "s"}.
+                    Gtk reads the GTK theme; Qt reads qt6ct/qt5ct or Plasma
+                    color schemes (same source as apps like qBittorrent).
                   </p>
-                )}
-              <div className="actions">
-                <button type="button" onClick={() => void refreshOrphanScan()}>
-                  Scan staged mods
-                </button>
-                <button type="button" onClick={() => void recoverLegacyMods()}>
-                  Recover from nexus-manager
-                </button>
+                </div>
+              )}
+              {themeStyle === "app" && (
+                <div className="setting-block">
+                  <span>Accent</span>
+                  <div className="accent-swatches">
+                    {ACCENT_PRESETS.map((swatch) => (
+                      <button
+                        key={swatch}
+                        type="button"
+                        className={
+                          accentColor === swatch
+                            ? "accent-swatch active"
+                            : "accent-swatch"
+                        }
+                        style={{ ["--swatch" as string]: swatch }}
+                        aria-label={`Accent ${swatch}`}
+                        title={swatch}
+                        onClick={() => setAccentColor(swatch)}
+                      />
+                    ))}
+                    <label className="inline">
+                      <span className="note">Hex</span>
+                      <input
+                        className="accent-hex"
+                        type="text"
+                        spellCheck={false}
+                        key={accentColor}
+                        defaultValue={accentColor}
+                        aria-label="Accent color hex"
+                        onBlur={(e) => {
+                          const next = normalizeAccent(e.target.value);
+                          e.target.value = next;
+                          if (next === accentColor) return;
+                          setAccentColor(next);
+                        }}
+                      />
+                    </label>
+                  </div>
+                </div>
+              )}
+            </SettingsSection>
+            <SettingsSection title="Downloads & install">
+              <div className="setting-block">
+                <span>After Install</span>
+                <Segment>
+                  {(
+                    [
+                      ["stay", "Stay here"],
+                      ["downloads", "Go to Downloads"],
+                    ] as const
+                  ).map(([value, label]) => (
+                    <SegmentTab
+                      key={value}
+                      layoutId="settings-after-install"
+                      active={(settings?.install_click_behavior ?? "downloads") === value}
+                      onClick={() => setInstallClickBehavior(value)}
+                    >
+                      {label}
+                    </SegmentTab>
+                  ))}
+                </Segment>
               </div>
-            </div>
-            {settings && (
-              <dl className="meta">
-                <dt>Config</dt>
-                <dd>{settings.config_dir}</dd>
-                <dt>Data</dt>
-                <dd>{settings.data_dir}</dd>
-                <dt>Cache</dt>
-                <dd>{settings.cache_dir}</dd>
-              </dl>
-            )}
-            <div className="setting-block">
-              <span>Download cache</span>
-              <p className="note">
-                Removes leftover archives under the cache downloads folder. Active
-                downloads are left alone. Staging and installed mods are not touched.
-              </p>
-              <div className="actions">
-                <button
-                  type="button"
-                  onClick={() => {
-                    if (
-                      !window.confirm(
-                        "Clear cached download archives? Active downloads will be kept."
-                      )
-                    ) {
-                      return;
-                    }
-                    void withBusy("Clearing download cache…", async () => {
-                      const result = await api.clearDownloadCache();
-                      setNotice({
-                        kind: "ok",
-                        message:
-                          result.files_removed === 0
-                            ? "Download cache is already empty."
-                            : `Cleared ${result.files_removed} cached file${
-                                result.files_removed === 1 ? "" : "s"
-                              } (${formatBytes(result.bytes_freed)}).`,
+              <div className="setting-block">
+                <span>Recent downloads</span>
+                <p className="note">
+                  Finished downloads stay in the Recent list until you clear them,
+                  or until the list reaches this length. The oldest entries drop
+                  off first.
+                </p>
+                <label className="inline">
+                  Keep
+                  <input
+                    type="number"
+                    min={1}
+                    max={500}
+                    key={settings?.recent_downloads_limit ?? 50}
+                    defaultValue={settings?.recent_downloads_limit ?? 50}
+                    aria-label="Recent downloads limit"
+                    onBlur={(e) => {
+                      const n = Math.round(Number(e.target.value));
+                      if (!Number.isFinite(n)) return;
+                      const limit = Math.min(500, Math.max(1, n));
+                      e.target.value = String(limit);
+                      if (limit === (settings?.recent_downloads_limit ?? 50)) return;
+                      void withBusy("Saving…", async () => {
+                        await api.setRecentDownloadsLimit(limit);
+                        await refreshSettings();
+                        await refreshDownloads();
                       });
-                    });
-                  }}
-                >
-                  Clear download cache
-                </button>
+                    }}
+                  />
+                </label>
               </div>
-            </div>
-            <p className="note">
-              Free accounts: Install opens the Downloads workspace with an embedded
-              Nexus Assist panel. Sign in once with Stay signed in, using Log in to
-              Nexus in Accounts or that panel. The website session is saved separately
-              from your API key. Autoclick can press Slow download
-              for you. Premium: one-click Install and Collections. Register{" "}
-              <code>nxm://</code> via the desktop entry for browser “Download with
-              manager” links.
-            </p>
+              <label className="inline">
+                <input
+                  type="checkbox"
+                  checked={settings?.autoclick_free_download ?? true}
+                  onChange={(e) =>
+                    withBusy("Saving…", async () => {
+                      await api.setAutoclickFreeDownload(e.target.checked);
+                      await refreshSettings();
+                    })
+                  }
+                />
+                Autoclick free download button in Download Assist (Nexus Fast
+                Download–style; waits for countdown)
+              </label>
+              <p className="note">
+                Free accounts: Install opens the Downloads workspace with an embedded
+                Nexus Assist panel. Sign in once with Stay signed in, using Log in to
+                Nexus in Accounts or that panel. The website session is saved separately
+                from your API key. Autoclick can press Slow download
+                for you. Premium: one-click Install and Collections. Register{" "}
+                <code>nxm://</code> via the desktop entry for browser “Download with
+                manager” links.
+              </p>
+            </SettingsSection>
+            <SettingsSection title="Content">
+              <label className="inline">
+                <input
+                  type="checkbox"
+                  checked={settings?.adult_content ?? true}
+                  onChange={(e) =>
+                    withBusy("Saving…", async () => {
+                      await api.setAdultContent(e.target.checked);
+                      await refreshSettings();
+                    })
+                  }
+                />
+                Show adult content in search
+              </label>
+              <label className="inline">
+                <input
+                  type="checkbox"
+                  checked={settings?.game_version_warnings !== false}
+                  onChange={(e) =>
+                    withBusy("Saving…", async () => {
+                      await api.setGameVersionWarnings(e.target.checked);
+                      await refreshSettings();
+                    })
+                  }
+                />
+                Warn when a mod does not match the game version
+              </label>
+            </SettingsSection>
+            <SettingsSection title="Data & maintenance">
+              {settings && (
+                <dl className="meta">
+                  <dt>Config</dt>
+                  <dd>{settings.config_dir}</dd>
+                  <dt>Data</dt>
+                  <dd>{settings.data_dir}</dd>
+                  <dt>Cache</dt>
+                  <dd>{settings.cache_dir}</dd>
+                </dl>
+              )}
+              <div className="setting-block">
+                <span>Download cache</span>
+                <p className="note">
+                  Removes leftover archives under the cache downloads folder. Active
+                  downloads are left alone. Staging and installed mods are not touched.
+                </p>
+                <div className="actions">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (
+                        !window.confirm(
+                          "Clear cached download archives? Active downloads will be kept."
+                        )
+                      ) {
+                        return;
+                      }
+                      void withBusy("Clearing download cache…", async () => {
+                        const result = await api.clearDownloadCache();
+                        setNotice({
+                          kind: "ok",
+                          message:
+                            result.files_removed === 0
+                              ? "Download cache is already empty."
+                              : `Cleared ${result.files_removed} cached file${
+                                  result.files_removed === 1 ? "" : "s"
+                                } (${formatBytes(result.bytes_freed)}).`,
+                        });
+                      });
+                    }}
+                  >
+                    Clear download cache
+                  </button>
+                </div>
+              </div>
+              <div className="setting-block">
+                <span>Mod recovery</span>
+                <p className="note">
+                  Scan staging data left behind by older versions or recover data from
+                  nexus-manager. Recovery copies data first, so deployed symlinks remain
+                  safe until you deploy again.
+                </p>
+                {orphanScan &&
+                  (orphanScan.legacy_game_ids.length > 0 ||
+                    orphanScan.missing_staging.length > 0 ||
+                    orphanScan.untracked_staging.length > 0 ||
+                    orphanScan.deploy_without_loadorder.length > 0) && (
+                    <p className="note">
+                      Found {orphanScan.legacy_game_ids.length} legacy game data folder
+                      {orphanScan.legacy_game_ids.length === 1 ? "" : "s"}, {" "}
+                      {orphanScan.missing_staging.length} missing staging path
+                      {orphanScan.missing_staging.length === 1 ? "" : "s"}, and {" "}
+                      {orphanScan.untracked_staging.length} untracked staging folder
+                      {orphanScan.untracked_staging.length === 1 ? "" : "s"}.
+                    </p>
+                  )}
+                <div className="actions">
+                  <button type="button" onClick={() => void refreshOrphanScan()}>
+                    Scan staged mods
+                  </button>
+                  <button type="button" onClick={() => void recoverLegacyMods()}>
+                    Recover from nexus-manager
+                  </button>
+                </div>
+              </div>
+            </SettingsSection>
+            <SettingsSection title="Accounts">
+              {accountConnections}
+            </SettingsSection>
           </section>
         )}
         </ViewSwitch>

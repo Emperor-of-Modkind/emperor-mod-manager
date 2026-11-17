@@ -1,4 +1,6 @@
 import { useEffect, useState } from "react";
+import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
+import { faCheck, faCopy } from "@fortawesome/free-solid-svg-icons";
 
 import type { WineOverrideAdvice } from "./types";
 
@@ -42,6 +44,9 @@ export function WineOverrideNotice({
       <div className="wine-override-actions">
         <button
           type="button"
+          className="icon-btn"
+          aria-label={copied ? "Copied" : "Copy"}
+          title={copied ? "Copied" : "Copy"}
           onClick={() => {
             void navigator.clipboard.writeText(advice.launch_options).then(
               () => setCopied(true),
@@ -49,7 +54,7 @@ export function WineOverrideNotice({
             );
           }}
         >
-          {copied ? "Copied" : "Copy"}
+          <FontAwesomeIcon icon={copied ? faCheck : faCopy} />
         </button>
         {advice.can_apply && (
           <button type="button" onClick={onApply} disabled={busy}>

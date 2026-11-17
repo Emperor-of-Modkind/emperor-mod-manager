@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { EmperorOpenMod } from "./modDeepLink";
 import type {
+  AuthorSuggestion,
   BrowseMeta,
   BrowseSearchOpts,
   CatalogSearchPage,
@@ -9,12 +10,14 @@ import type {
   CollectionDetail,
   CollectionModFile,
   CollectionSearchPage,
+  CollectionVersionAdvice,
   DeployResult,
   LoadDiagnosis,
   DetectedGame,
   DownloadItem,
   GameHealth,
   GameInfo,
+  GamePluginInfo,
   GameVersionReport,
   ImportFolderResult,
   InstalledCollection,
@@ -37,6 +40,9 @@ import type {
   StagedModUpdate,
   WineOverrideAdvice,
   ThemePreference,
+  ThemeStyle,
+  LinuxSystemBackend,
+  SystemPalette,
   InstallClickBehavior,
   TsPackageDetail,
   UeLayoutInfo,
@@ -76,6 +82,11 @@ export const api = {
   setAutoclickFreeDownload: (enabled: boolean) =>
     invoke<void>("set_autoclick_free_download", { enabled }),
   setTheme: (theme: ThemePreference) => invoke<void>("set_theme", { theme }),
+  setThemeStyle: (style: ThemeStyle) => invoke<void>("set_theme_style", { style }),
+  setAccentColor: (color: string) => invoke<void>("set_accent_color", { color }),
+  setLinuxSystemBackend: (backend: LinuxSystemBackend) =>
+    invoke<void>("set_linux_system_backend", { backend }),
+  getSystemPalette: () => invoke<SystemPalette>("get_system_palette"),
   setInstallClickBehavior: (behavior: InstallClickBehavior) =>
     invoke<void>("set_install_click_behavior", { behavior }),
   setRecentDownloadsLimit: (limit: number) =>
@@ -115,6 +126,18 @@ export const api = {
     invoke<ManagedGame>("set_ignored_requirements", { id, ignored }),
   checkModGameVersions: (gameId: string) =>
     invoke<GameVersionReport>("check_mod_game_versions", { gameId }),
+  adviseCollectionVersions: (
+    gameId: string,
+    collections: { id: string; gameVersions?: string[] | null }[],
+  ) =>
+    invoke<CollectionVersionAdvice[]>("advise_collection_versions", {
+      gameId,
+      collections: collections.map((c) => ({
+        id: c.id,
+        gameVersions: c.gameVersions ?? null,
+      })),
+    }),
+  listPlugins: () => invoke<GamePluginInfo[]>("list_plugins"),
   detectUeLayout: (installPath: string, projectName?: string | null) =>
     invoke<UeLayoutInfo | null>("detect_ue_layout", {
       installPath,
@@ -137,6 +160,7 @@ export const api = {
       tagsInclude: opts.tagsInclude ?? null,
       tagsExclude: opts.tagsExclude ?? null,
       gameVersion: opts.gameVersion ?? null,
+      author: opts.author ?? null,
       offset: opts.offset ?? null,
       count: opts.count ?? null,
     }),
@@ -154,9 +178,12 @@ export const api = {
       tagsInclude: opts.tagsInclude ?? null,
       tagsExclude: opts.tagsExclude ?? null,
       gameVersion: opts.gameVersion ?? null,
+      author: opts.author ?? null,
       offset: opts.offset ?? null,
       count: opts.count ?? null,
     }),
+  suggestAuthors: (gameId: string, query: string) =>
+    invoke<AuthorSuggestion[]>("suggest_authors", { gameId, query }),
   getThunderstorePackage: (
     community: string,
     namespace: string,
@@ -233,6 +260,7 @@ export const api = {
       tagsInclude: opts.tagsInclude ?? null,
       tagsExclude: opts.tagsExclude ?? null,
       gameVersion: opts.gameVersion ?? null,
+      author: opts.author ?? null,
       offset: opts.offset ?? null,
       count: opts.count ?? null,
     }),
@@ -250,6 +278,7 @@ export const api = {
       tagsInclude: opts.tagsInclude ?? null,
       tagsExclude: opts.tagsExclude ?? null,
       gameVersion: opts.gameVersion ?? null,
+      author: opts.author ?? null,
       offset: opts.offset ?? null,
       count: opts.count ?? null,
     }),
@@ -369,6 +398,7 @@ export const api = {
       memberIds: args.memberIds ?? null,
       existingModIds: args.existingModIds ?? null,
     }),
+  emperorShareId: (code: string) => invoke<string>("emperor_share_id", { code }),
   listSavedCollections: () =>
     invoke<SavedCollectionEntry[]>("list_saved_collections"),
   saveCollectionCode: (args: {

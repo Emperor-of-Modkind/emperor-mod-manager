@@ -1,4 +1,6 @@
 import { useState } from "react";
+import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
+import { faCheck, faCopy } from "@fortawesome/free-solid-svg-icons";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 
 import { Modal } from "./Modal";
@@ -27,6 +29,9 @@ export function LoadLogDialog({
         <div className="modal-foot-actions">
           <button
             type="button"
+            className="icon-btn"
+            aria-label={copied ? "Copied" : "Copy report"}
+            title={copied ? "Copied" : "Copy report"}
             onClick={() => {
               void navigator.clipboard.writeText(diagnosis.report).then(
                 () => setCopied(true),
@@ -34,7 +39,7 @@ export function LoadLogDialog({
               );
             }}
           >
-            {copied ? "Copied" : "Copy report"}
+            <FontAwesomeIcon icon={copied ? faCheck : faCopy} />
           </button>
         </div>
       }

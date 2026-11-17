@@ -27,6 +27,67 @@ impl Default for ThemePreference {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
+pub enum ThemeStyle {
+    Brand,
+    App,
+    System,
+}
+
+impl Default for ThemeStyle {
+    fn default() -> Self {
+        Self::App
+    }
+}
+
+/// Which Linux toolkit palette System style should read.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LinuxSystemBackend {
+    Gtk,
+    Qt,
+}
+
+impl Default for LinuxSystemBackend {
+    fn default() -> Self {
+        default_linux_system_backend()
+    }
+}
+
+/// True when the session looks like KDE/Plasma.
+pub fn is_kde_desktop() -> bool {
+    if std::env::var_os("KDE_SESSION_VERSION").is_some() {
+        return true;
+    }
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+    desktop
+        .to_ascii_lowercase()
+        .split(':')
+        .any(|part| part == "kde")
+}
+
+fn default_linux_system_backend() -> LinuxSystemBackend {
+    if is_kde_desktop() {
+        LinuxSystemBackend::Qt
+    } else {
+        LinuxSystemBackend::Gtk
+    }
+}
+
+pub const DEFAULT_ACCENT_COLOR: &str = "#0078d4";
+
+/// Normalize a `#rrggbb` accent, or return the default when the value is invalid.
+pub fn normalize_accent_color(raw: &str) -> String {
+    let s = raw.trim();
+    let hex = s.strip_prefix('#').unwrap_or(s);
+    if hex.len() == 6 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        format!("#{}", hex.to_ascii_lowercase())
+    } else {
+        DEFAULT_ACCENT_COLOR.to_string()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
 pub enum InstallClickBehavior {
     Stay,
     Downloads,
@@ -50,6 +111,15 @@ pub struct AppConfig {
     /// When true, the free-download WebView auto-clicks Mod Manager / Slow Download once ready.
     pub autoclick_free_download: bool,
     pub theme: ThemePreference,
+    /// Brand (warm palette), App (monochrome + accent), or System (OS colors).
+    #[serde(default)]
+    pub theme_style: ThemeStyle,
+    /// Accent used when `theme_style` is App (`#rrggbb`).
+    #[serde(default = "default_accent_color")]
+    pub accent_color: String,
+    /// Linux System style toolkit: Gtk or Qt. Ignored on other platforms.
+    #[serde(default = "default_linux_system_backend")]
+    pub linux_system_backend: LinuxSystemBackend,
     /// Whether Install switches to the Downloads tab or keeps the current tab.
     pub install_click_behavior: InstallClickBehavior,
     /// How many finished downloads to keep in the Recent list.
@@ -114,6 +184,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_accent_color() -> String {
+    DEFAULT_ACCENT_COLOR.to_string()
+}
+
 pub const MIN_RECENT_DOWNLOADS_LIMIT: u32 = 1;
 pub const MAX_RECENT_DOWNLOADS_LIMIT: u32 = 500;
 
@@ -144,6 +218,9 @@ impl Default for AppConfig {
             last_active_game_id: None,
             autoclick_free_download: true,
             theme: ThemePreference::System,
+            theme_style: ThemeStyle::App,
+            accent_color: default_accent_color(),
+            linux_system_backend: default_linux_system_backend(),
             install_click_behavior: InstallClickBehavior::Downloads,
             recent_downloads_limit: default_recent_downloads_limit(),
             legacy_games_merged: false,
@@ -381,5 +458,20 @@ mod tests {
         let cfg: AppConfig = toml::from_str("").unwrap();
         assert_eq!(cfg.initial_setup_complete, None);
         assert!(!cfg.nexus_website_signed_in);
+    }
+
+    #[test]
+    fn theme_style_defaults_to_app() {
+        let cfg: AppConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.theme_style, ThemeStyle::App);
+        assert_eq!(normalize_accent_color(&cfg.accent_color), DEFAULT_ACCENT_COLOR);
+        assert_eq!(cfg.linux_system_backend, default_linux_system_backend());
+    }
+
+    #[test]
+    fn normalize_accent_color_accepts_hex() {
+        assert_eq!(normalize_accent_color("#AABBCC"), "#aabbcc");
+        assert_eq!(normalize_accent_color("112233"), "#112233");
+        assert_eq!(normalize_accent_color("nope"), DEFAULT_ACCENT_COLOR);
     }
 }

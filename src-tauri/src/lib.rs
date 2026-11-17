@@ -23,6 +23,7 @@ mod modio_api;
 mod mods;
 mod nexus;
 mod share;
+mod system_theme;
 mod thunderstore;
 mod tools;
 
@@ -98,6 +99,10 @@ pub fn run() {
             commands::set_adult_content,
             commands::set_game_version_warnings,
             commands::set_theme,
+            commands::set_theme_style,
+            commands::set_accent_color,
+            commands::set_linux_system_backend,
+            commands::get_system_palette,
             commands::set_autoclick_free_download,
             commands::set_install_click_behavior,
             commands::set_recent_downloads_limit,
@@ -109,6 +114,7 @@ pub fn run() {
             commands::clear_modio_api_key,
             commands::search_mods,
             commands::search_catalog,
+            commands::suggest_authors,
             commands::get_thunderstore_package,
             commands::download_thunderstore_mod,
             commands::get_modio_mod,
@@ -118,6 +124,7 @@ pub fn run() {
             commands::get_mod,
             commands::missing_nexus_requirements,
             commands::check_mod_game_versions,
+            commands::advise_collection_versions,
             commands::nexus_mod_requirements,
             commands::link_staged_requirements,
             commands::mod_files,
@@ -137,6 +144,7 @@ pub fn run() {
             commands::import_code,
             commands::import_share_code,
             commands::record_emperor_share,
+            commands::emperor_share_id,
             commands::list_saved_collections,
             commands::save_collection_code,
             commands::get_saved_collection,

@@ -99,6 +99,15 @@ pub struct NexusGameEntry {
     pub domain_name: String,
 }
 
+/// Nexus user hit from GraphQL `users` search (author autocomplete).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthorSuggestion {
+    pub name: String,
+    pub member_id: Option<u64>,
+    pub mod_count: Option<u64>,
+    pub avatar: Option<String>,
+}
+
 /// One slide from the author gallery on the Nexus mod page.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModGalleryImage {
@@ -235,6 +244,8 @@ pub struct BrowseSearchOpts {
     pub tags_include: Vec<String>,
     pub tags_exclude: Vec<String>,
     pub game_version: Option<String>,
+    /// Nexus uploader / Thunderstore owner account name (exact match).
+    pub author: Option<String>,
     pub offset: u32,
     pub count: u32,
 }
@@ -1601,6 +1612,63 @@ impl NexusClient {
         Ok(versions)
     }
 
+    /// Fuzzy username search for browse `@creator` autocomplete.
+    pub async fn search_users(&self, query: &str, count: u32) -> Result<Vec<AuthorSuggestion>> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let count = count.clamp(1, 25);
+        let gql = r#"
+        query SearchUsers($filter: UsersSearchFilter, $count: Int!) {
+          users(
+            filter: $filter,
+            count: $count,
+            sort: [{ relevance: { direction: DESC } }]
+          ) {
+            nodes {
+              memberId
+              name
+              modCount
+              avatar
+            }
+          }
+        }
+        "#;
+        let variables = json!({
+            "filter": {
+                "nameWildcard": [{ "value": query, "op": "WILDCARD" }]
+            },
+            "count": count,
+        });
+        let data = self.graphql(gql, variables).await?;
+        let nodes = data
+            .get("users")
+            .and_then(|v| v.get("nodes"))
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        Ok(nodes
+            .into_iter()
+            .filter_map(|n| {
+                let name = n.get("name")?.as_str()?.trim().to_string();
+                if name.is_empty() {
+                    return None;
+                }
+                Some(AuthorSuggestion {
+                    name,
+                    member_id: n.get("memberId").and_then(|v| v.as_u64()),
+                    mod_count: n.get("modCount").and_then(|v| v.as_u64()),
+                    avatar: n
+                        .get("avatar")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string),
+                })
+            })
+            .collect())
+    }
+
     pub(super) async fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
         let resp = self
             .http
@@ -1888,6 +1956,7 @@ fn has_extra_filters(opts: &BrowseSearchOpts) -> bool {
         || !opts.tags_include.is_empty()
         || !opts.tags_exclude.is_empty()
         || opts.game_version.as_ref().is_some_and(|s| !s.is_empty())
+        || opts.author.as_ref().is_some_and(|s| !s.trim().is_empty())
 }
 
 fn mods_sort_json(sort_key: &str, has_query: bool) -> Value {
@@ -1989,6 +2058,14 @@ fn build_mods_filter(
     apply_adult_content_filter(&mut filter, adult_content, true);
     if let Some(cat) = opts.category.as_ref().filter(|s| !s.is_empty()) {
         filter["categoryName"] = json!([{ "value": cat, "op": "EQUALS" }]);
+    }
+    if let Some(author) = opts
+        .author
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        filter["uploader"] = json!([{ "value": author, "op": "EQUALS" }]);
     }
     // ModsFilter has no gameVersion field. Authors publish support as tags.
     let mut include = opts.tags_include.clone();
@@ -2469,6 +2546,22 @@ mod tests {
             json!([{ "value": "Performance", "op": "EQUALS" }])
         );
         assert!(filter.get("filter").is_none());
+    }
+
+    #[test]
+    fn mods_filter_author_uses_uploader_equals() {
+        let mut opts = base_opts();
+        opts.author = Some("CyanideX".into());
+        let filter = build_mods_filter("cyberpunk2077", "", true, &opts);
+        assert_eq!(
+            filter["uploader"],
+            json!([{ "value": "CyanideX", "op": "EQUALS" }])
+        );
+        assert_eq!(
+            filter["gameDomainName"],
+            json!([{ "value": "cyberpunk2077", "op": "EQUALS" }])
+        );
+        assert!(has_extra_filters(&opts));
     }
 
     #[test]

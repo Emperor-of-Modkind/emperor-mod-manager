@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
+import { faXmark } from "@fortawesome/free-solid-svg-icons";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import { MOTION_EASE, MOTION_FAST } from "./motion";
 
@@ -108,8 +110,14 @@ export function Modal({ title, subtitle, className, onClose, children, footer }:
                 <h2>{title}</h2>
                 {subtitle ? <small>{subtitle}</small> : null}
               </div>
-              <button type="button" className="linkish" onClick={requestClose} aria-label="Close">
-                Close
+              <button
+                type="button"
+                className="linkish icon-btn"
+                onClick={requestClose}
+                aria-label="Close"
+                title="Close"
+              >
+                <FontAwesomeIcon icon={faXmark} />
               </button>
             </div>
             <div className="modal-body">{children}</div>

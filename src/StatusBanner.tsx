@@ -1,4 +1,6 @@
 import { useLayoutEffect, useRef, useState } from "react";
+import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
+import { faXmark } from "@fortawesome/free-solid-svg-icons";
 
 import { requirementsNeedAttention } from "./RequirementsDialog";
 import type { DeployResult, MissingRequirements } from "./types";
@@ -128,8 +130,14 @@ export function StatusBanner({
             {expanded ? "Show less" : "Show more"}
           </button>
         ) : null}
-        <button className="linkish" type="button" onClick={onDismiss}>
-          dismiss
+        <button
+          className="linkish icon-btn"
+          type="button"
+          onClick={onDismiss}
+          aria-label="Dismiss"
+          title="Dismiss"
+        >
+          <FontAwesomeIcon icon={faXmark} />
         </button>
       </span>
     </div>

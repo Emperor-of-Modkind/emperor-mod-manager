@@ -83,11 +83,35 @@ export function Reveal({ show, className, children }: RevealProps) {
   );
 }
 
+/** Height collapse so siblings below track the open/close instead of jumping. */
+export function Collapse({ show, className, children }: RevealProps) {
+  const reduced = useReduced();
+  return (
+    <AnimatePresence initial={false}>
+      {show ? (
+        <motion.div
+          key="collapse"
+          className={className}
+          style={{ overflow: "hidden" }}
+          initial={reduced ? false : { height: 0, opacity: 0 }}
+          animate={{ height: "auto", opacity: 1 }}
+          exit={reduced ? { height: "auto", opacity: 1 } : { height: 0, opacity: 0 }}
+          transition={{ duration: reduced ? 0 : MOTION_FAST, ease: MOTION_EASE }}
+        >
+          {children}
+        </motion.div>
+      ) : null}
+    </AnimatePresence>
+  );
+}
+
 type PopInProps = {
   show: boolean;
   className?: string;
   children: ReactNode;
+  id?: string;
   role?: string;
+  "aria-label"?: string;
   "aria-multiselectable"?: boolean;
   "aria-labelledby"?: string;
 };
@@ -97,7 +121,9 @@ export function PopIn({
   show,
   className,
   children,
+  id,
   role,
+  "aria-label": ariaLabel,
   "aria-multiselectable": ariaMultiselectable,
   "aria-labelledby": ariaLabelledBy,
 }: PopInProps) {
@@ -107,8 +133,10 @@ export function PopIn({
       {show ? (
         <motion.div
           key="pop"
+          id={id}
           className={className}
           role={role}
+          aria-label={ariaLabel}
           aria-multiselectable={ariaMultiselectable}
           aria-labelledby={ariaLabelledBy}
           style={{ transformOrigin: "top center" }}

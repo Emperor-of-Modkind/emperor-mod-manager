@@ -1,5 +1,20 @@
 export type ThemePreference = "light" | "dark" | "system";
+export type ThemeStyle = "brand" | "app" | "system";
+export type LinuxSystemBackend = "gtk" | "qt";
 export type InstallClickBehavior = "stay" | "downloads";
+
+export type SystemPalette = {
+  source: string;
+  dark: boolean;
+  bg: string;
+  bg_2: string;
+  panel: string;
+  ink: string;
+  muted: string;
+  line: string;
+  accent: string;
+  input_bg: string;
+};
 
 export type AppInfo = {
   name: string;
@@ -400,8 +415,19 @@ export type BrowseSearchOpts = {
   tagsInclude?: string[];
   tagsExclude?: string[];
   gameVersion?: string | null;
+  /** Nexus uploader / Thunderstore owner account name (exact match). */
+  author?: string | null;
   offset?: number;
   count?: number;
+};
+
+/** Creator autocomplete hit from `suggest_authors`. */
+export type AuthorSuggestion = {
+  name: string;
+  source: "nexus" | "thunderstore";
+  member_id: number | null;
+  mod_count: number | null;
+  avatar: string | null;
 };
 
 export type ModSearchPage = {
@@ -467,6 +493,8 @@ export type SavedCollectionEntry = {
   updated_at: string;
   source_game_id?: string | null;
   game: ShareGameHint;
+  /** Game versions this share was created against. */
+  game_versions?: string[] | null;
   mod_count: number;
   nexus_count: number;
   thunderstore_count: number;
@@ -539,6 +567,19 @@ export type GameVersionReport = {
   current: string | null;
   source: "override" | "detected" | "unknown";
   mods: ModVersionAdvice[];
+};
+
+export type CollectionVersionAdvice = {
+  id: string;
+  status: ModVersionStatus;
+  supported: string[];
+  message: string;
+};
+
+export type GamePluginInfo = {
+  id: string;
+  display_name: string;
+  nexus_domain: string;
 };
 
 export type WineDllNeed = {
@@ -794,6 +835,9 @@ export type Settings = {
   autoclick_free_download: boolean;
   last_active_game_id: string | null;
   theme?: ThemePreference;
+  theme_style?: ThemeStyle;
+  accent_color?: string;
+  linux_system_backend?: LinuxSystemBackend;
   install_click_behavior?: InstallClickBehavior;
   recent_downloads_limit?: number;
   has_api_key: boolean;
@@ -805,4 +849,5 @@ export type Settings = {
   data_dir: string;
   cache_dir: string;
   platform_linux?: boolean;
+  platform_windows?: boolean;
 };

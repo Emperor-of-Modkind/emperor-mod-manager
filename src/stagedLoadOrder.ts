@@ -38,3 +38,35 @@ export function reorderStagedMods(
   [sorted[i], sorted[j]] = [sorted[j], sorted[i]];
   return sorted.map((m, index) => ({ ...m, order: index + 1 }));
 }
+
+/**
+ * Move one mod to a new index within its enabled or disabled group.
+ * Opposite-enabled rows keep their absolute slots; same-enabled slots
+ * consume the reordered subsequence. Equivalent to repeated one-step swaps.
+ * Returns null when the mod is missing or the group index is unchanged.
+ */
+export function reorderStagedModToGroupIndex(
+  mods: StagedMod[],
+  modId: string,
+  targetGroupIndex: number,
+): StagedMod[] | null {
+  const sorted = stagedModsInLoadOrder(mods);
+  const fromAbs = sorted.findIndex((m) => m.id === modId);
+  if (fromAbs < 0) return null;
+  const enabled = sorted[fromAbs].enabled;
+  const group = sorted.filter((m) => m.enabled === enabled);
+  const fromGroup = group.findIndex((m) => m.id === modId);
+  if (fromGroup < 0) return null;
+  const clamped = Math.max(0, Math.min(group.length - 1, targetGroupIndex));
+  if (clamped === fromGroup) return null;
+
+  const nextGroup = [...group];
+  const [moved] = nextGroup.splice(fromGroup, 1);
+  nextGroup.splice(clamped, 0, moved);
+
+  let gi = 0;
+  const next = sorted.map((m) =>
+    m.enabled === enabled ? nextGroup[gi++] : m,
+  );
+  return next.map((m, index) => ({ ...m, order: index + 1 }));
+}

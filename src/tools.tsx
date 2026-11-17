@@ -1,5 +1,8 @@
 import { Component, useCallback, useEffect, useState, type ReactNode } from "react";
+import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
+import { faGear } from "@fortawesome/free-solid-svg-icons";
 import { api } from "./api";
+import { Modal } from "./Modal";
 import type {
   AutoHdrVkConfig,
   AutoHdrVkGlobal,
@@ -13,6 +16,8 @@ import type {
   ToolGameState,
   ToolStatus,
 } from "./types";
+
+type SettingsTool = "lsfg_vk" | "autohdr_vk";
 
 const defaultToolState = (): ToolGameState => ({
   enabled: false,
@@ -106,12 +111,20 @@ export class ToolsErrorBoundary extends Component<
   }
 }
 
+function toolStatusBadge(status: ToolStatus): { label: string; kind: string } {
+  if (!status.installed) return { label: "Not installed", kind: "muted" };
+  if (status.update_available) return { label: "Update available", kind: "warn" };
+  return { label: "Installed", kind: "ok" };
+}
+
 function ToolInstallCard({
   label,
   status,
   repo,
   onInstall,
   onCheckUpdates,
+  onOpenSettings,
+  settingsDisabled,
   busy,
   checkingUpdates,
 }: {
@@ -120,33 +133,27 @@ function ToolInstallCard({
   repo: string;
   onInstall: () => void;
   onCheckUpdates: () => void;
+  onOpenSettings: () => void;
+  settingsDisabled: boolean;
   busy: boolean;
   checkingUpdates: boolean;
 }) {
+  const badge = toolStatusBadge(status);
   return (
-    <div className="panel tool-card">
-      <div className="panel-head">
+    <article className="panel tool-card">
+      <div className="tool-card-head">
         <h2>{label}</h2>
-        <div className="panel-head-actions">
-          <button type="button" onClick={onCheckUpdates} disabled={busy || checkingUpdates}>
-            {checkingUpdates ? "Checking…" : "Check updates"}
-          </button>
-          <button type="button" onClick={onInstall} disabled={busy || checkingUpdates}>
-            {status.installed ? "Update" : "Install"}
-          </button>
-        </div>
+        <span className={`tool-status-badge tool-status-badge-${badge.kind}`}>{badge.label}</span>
       </div>
-      <div className="detail-body">
-        <p>
-          <strong>Status:</strong>{" "}
-          {status.installed
-            ? `Installed${status.version ? ` (${status.version})` : ""}`
-            : "Not installed"}
-        </p>
+      <div className="tool-card-body">
+        {status.version && (
+          <p>
+            <strong>Version:</strong> {status.version}
+          </p>
+        )}
         {status.latest_version && (
           <p>
             <strong>Latest:</strong> {status.latest_version}
-            {status.update_available ? " (update available)" : ""}
           </p>
         )}
         <p className="muted">
@@ -155,20 +162,34 @@ function ToolInstallCard({
           </a>
         </p>
       </div>
-    </div>
+      <div className="tool-card-actions">
+        <button type="button" onClick={onCheckUpdates} disabled={busy || checkingUpdates}>
+          {checkingUpdates ? "Checking…" : "Check updates"}
+        </button>
+        <button type="button" onClick={onInstall} disabled={busy || checkingUpdates}>
+          {busy ? "Working…" : status.installed ? "Update" : "Install"}
+        </button>
+        <button
+          type="button"
+          className="icon-btn"
+          onClick={onOpenSettings}
+          disabled={settingsDisabled || busy}
+          aria-label="Settings"
+          title="Settings"
+        >
+          <FontAwesomeIcon icon={faGear} />
+        </button>
+      </div>
+    </article>
   );
 }
 
-function LsfgGlobalSettings({
+function LsfgSettingsForm({
   config,
   onChange,
-  onSave,
-  saving,
 }: {
   config: LsfgVkConfig;
   onChange: (cfg: LsfgVkConfig) => void;
-  onSave: () => void;
-  saving: boolean;
 }) {
   const global = config.global ?? defaultLsfgGlobal();
   const profile = config.profiles?.[0] ?? defaultLsfgProfile();
@@ -178,102 +199,88 @@ function LsfgGlobalSettings({
     onChange({ ...config, global, profiles });
   };
   return (
-    <div className="panel">
-      <div className="panel-head">
-        <h2>lsfg-vk global settings</h2>
-        <div className="panel-head-actions">
-          <button type="button" onClick={onSave} disabled={saving}>
-            Save
-          </button>
-        </div>
-      </div>
-      <div className="detail-body tool-settings">
-        <label>
-          Lossless.dll path
-          <input
-            value={global.dll ?? ""}
-            onChange={(e) =>
-              onChange({
-                ...config,
-                global: { ...global, dll: e.target.value || null },
-                profiles: config.profiles ?? [defaultLsfgProfile()],
-              })
-            }
-          />
-        </label>
-        <label className="checkbox">
-          <input
-            type="checkbox"
-            checked={global.allow_fp16 ?? true}
-            onChange={(e) =>
-              onChange({
-                ...config,
-                global: { ...global, allow_fp16: e.target.checked },
-                profiles: config.profiles ?? [defaultLsfgProfile()],
-              })
-            }
-          />
-          Allow half-precision (FP16)
-        </label>
-        <label>
-          Multiplier
-          <input
-            type="number"
-            min={2}
-            value={profile.multiplier ?? 2}
-            onChange={(e) => setProfile({ multiplier: Number(e.target.value) || 2 })}
-          />
-        </label>
-        <label>
-          Flow scale
-          <input
-            type="number"
-            min={0.25}
-            max={1}
-            step={0.05}
-            value={profile.flow_scale ?? 1}
-            onChange={(e) => setProfile({ flow_scale: Number(e.target.value) || 1 })}
-          />
-        </label>
-        <label>
-          Target FPS (0 = off)
-          <input
-            type="number"
-            min={0}
-            value={profile.target_fps ?? 0}
-            onChange={(e) => setProfile({ target_fps: Number(e.target.value) || 0 })}
-          />
-        </label>
-        <label className="checkbox">
-          <input
-            type="checkbox"
-            checked={profile.performance_mode ?? false}
-            onChange={(e) => setProfile({ performance_mode: e.target.checked })}
-          />
-          Performance mode
-        </label>
-        <label>
-          GPU
-          <input
-            value={profile.gpu ?? ""}
-            onChange={(e) => setProfile({ gpu: e.target.value || null })}
-          />
-        </label>
-      </div>
+    <div className="tool-settings">
+      <label>
+        Lossless.dll path
+        <input
+          value={global.dll ?? ""}
+          onChange={(e) =>
+            onChange({
+              ...config,
+              global: { ...global, dll: e.target.value || null },
+              profiles: config.profiles ?? [defaultLsfgProfile()],
+            })
+          }
+        />
+      </label>
+      <label className="checkbox">
+        <input
+          type="checkbox"
+          checked={global.allow_fp16 ?? true}
+          onChange={(e) =>
+            onChange({
+              ...config,
+              global: { ...global, allow_fp16: e.target.checked },
+              profiles: config.profiles ?? [defaultLsfgProfile()],
+            })
+          }
+        />
+        Allow half-precision (FP16)
+      </label>
+      <label>
+        Multiplier
+        <input
+          type="number"
+          min={2}
+          value={profile.multiplier ?? 2}
+          onChange={(e) => setProfile({ multiplier: Number(e.target.value) || 2 })}
+        />
+      </label>
+      <label>
+        Flow scale
+        <input
+          type="number"
+          min={0.25}
+          max={1}
+          step={0.05}
+          value={profile.flow_scale ?? 1}
+          onChange={(e) => setProfile({ flow_scale: Number(e.target.value) || 1 })}
+        />
+      </label>
+      <label>
+        Target FPS (0 = off)
+        <input
+          type="number"
+          min={0}
+          value={profile.target_fps ?? 0}
+          onChange={(e) => setProfile({ target_fps: Number(e.target.value) || 0 })}
+        />
+      </label>
+      <label className="checkbox">
+        <input
+          type="checkbox"
+          checked={profile.performance_mode ?? false}
+          onChange={(e) => setProfile({ performance_mode: e.target.checked })}
+        />
+        Performance mode
+      </label>
+      <label>
+        GPU
+        <input
+          value={profile.gpu ?? ""}
+          onChange={(e) => setProfile({ gpu: e.target.value || null })}
+        />
+      </label>
     </div>
   );
 }
 
-function AutoHdrGlobalSettings({
+function AutoHdrSettingsForm({
   config,
   onChange,
-  onSave,
-  saving,
 }: {
   config: AutoHdrVkConfig;
   onChange: (cfg: AutoHdrVkConfig) => void;
-  onSave: () => void;
-  saving: boolean;
 }) {
   const g = config.global ?? defaultHdrGlobal();
   const setGlobal = (patch: Partial<AutoHdrVkGlobal>) =>
@@ -283,102 +290,189 @@ function AutoHdrGlobalSettings({
       profiles: config.profiles ?? [],
     });
   return (
-    <div className="panel">
-      <div className="panel-head">
-        <h2>AutoHDR-VK global settings</h2>
-        <div className="panel-head-actions">
-          <button type="button" onClick={onSave} disabled={saving}>
-            Save
-          </button>
-        </div>
-      </div>
-      <div className="detail-body tool-settings">
-        <label>
-          Intensity
-          <input
-            type="range"
-            min={0}
-            max={1}
-            step={0.01}
-            value={g.intensity ?? 0.5}
-            onChange={(e) => setGlobal({ intensity: Number(e.target.value) })}
-          />
-          <span>{(g.intensity ?? 0).toFixed(2)}</span>
-        </label>
-        <label>
-          Color intensity
-          <input
-            type="range"
-            min={0}
-            max={1}
-            step={0.01}
-            value={g.color_intensity ?? 0.33}
-            onChange={(e) => setGlobal({ color_intensity: Number(e.target.value) })}
-          />
-        </label>
-        <label>
-          Expansion shape
-          <input
-            type="range"
-            min={0}
-            max={1}
-            step={0.01}
-            value={g.expansion_shape ?? 0.55}
-            onChange={(e) => setGlobal({ expansion_shape: Number(e.target.value) })}
-          />
-        </label>
-        <label>
-          Black floor
-          <input
-            type="range"
-            min={0}
-            max={1}
-            step={0.01}
-            value={g.black_floor ?? 0}
-            onChange={(e) => setGlobal({ black_floor: Number(e.target.value) })}
-          />
-        </label>
-        <label>
-          Highlight stretch
-          <input
-            type="range"
-            min={0}
-            max={2}
-            step={0.05}
-            value={g.highlight_stretch ?? 0.45}
-            onChange={(e) => setGlobal({ highlight_stretch: Number(e.target.value) })}
-          />
-        </label>
-        <label>
-          Encoding
-          <select
-            value={g.encoding ?? "auto"}
-            onChange={(e) => setGlobal({ encoding: e.target.value })}
-          >
-            <option value="auto">auto</option>
-            <option value="pq">pq</option>
-            <option value="scrgb">scrgb</option>
-            <option value="sdr_preview">sdr_preview</option>
-          </select>
-        </label>
-        <label className="checkbox">
-          <input
-            type="checkbox"
-            checked={g.prefer_hdr_swapchain ?? true}
-            onChange={(e) => setGlobal({ prefer_hdr_swapchain: e.target.checked })}
-          />
-          Prefer HDR swapchain
-        </label>
-        <label className="checkbox">
-          <input
-            type="checkbox"
-            checked={g.set_hdr_metadata ?? true}
-            onChange={(e) => setGlobal({ set_hdr_metadata: e.target.checked })}
-          />
-          Set HDR metadata
-        </label>
-      </div>
+    <div className="tool-settings">
+      <label>
+        Intensity
+        <input
+          type="range"
+          min={0}
+          max={1}
+          step={0.01}
+          value={g.intensity ?? 0.5}
+          onChange={(e) => setGlobal({ intensity: Number(e.target.value) })}
+        />
+        <span>{(g.intensity ?? 0).toFixed(2)}</span>
+      </label>
+      <label>
+        Color intensity
+        <input
+          type="range"
+          min={0}
+          max={1}
+          step={0.01}
+          value={g.color_intensity ?? 0.33}
+          onChange={(e) => setGlobal({ color_intensity: Number(e.target.value) })}
+        />
+      </label>
+      <label>
+        Expansion shape
+        <input
+          type="range"
+          min={0}
+          max={1}
+          step={0.01}
+          value={g.expansion_shape ?? 0.55}
+          onChange={(e) => setGlobal({ expansion_shape: Number(e.target.value) })}
+        />
+      </label>
+      <label>
+        Black floor
+        <input
+          type="range"
+          min={0}
+          max={1}
+          step={0.01}
+          value={g.black_floor ?? 0}
+          onChange={(e) => setGlobal({ black_floor: Number(e.target.value) })}
+        />
+      </label>
+      <label>
+        Highlight stretch
+        <input
+          type="range"
+          min={0}
+          max={2}
+          step={0.05}
+          value={g.highlight_stretch ?? 0.45}
+          onChange={(e) => setGlobal({ highlight_stretch: Number(e.target.value) })}
+        />
+      </label>
+      <label>
+        Encoding
+        <select
+          value={g.encoding ?? "auto"}
+          onChange={(e) => setGlobal({ encoding: e.target.value })}
+        >
+          <option value="auto">auto</option>
+          <option value="pq">pq</option>
+          <option value="scrgb">scrgb</option>
+          <option value="sdr_preview">sdr_preview</option>
+        </select>
+      </label>
+      <label className="checkbox">
+        <input
+          type="checkbox"
+          checked={g.prefer_hdr_swapchain ?? true}
+          onChange={(e) => setGlobal({ prefer_hdr_swapchain: e.target.checked })}
+        />
+        Prefer HDR swapchain
+      </label>
+      <label className="checkbox">
+        <input
+          type="checkbox"
+          checked={g.set_hdr_metadata ?? true}
+          onChange={(e) => setGlobal({ set_hdr_metadata: e.target.checked })}
+        />
+        Set HDR metadata
+      </label>
     </div>
+  );
+}
+
+function LsfgSettingsDialog({
+  initial,
+  onClose,
+  onSaved,
+}: {
+  initial: LsfgVkConfig;
+  onClose: () => void;
+  onSaved: (cfg: LsfgVkConfig) => void;
+}) {
+  const [draft, setDraft] = useState(initial);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const save = async () => {
+    setSaving(true);
+    setError(null);
+    try {
+      await api.setLsfgVkConfig(draft);
+      onSaved(draft);
+      onClose();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const footer = (
+    <div className="modal-foot-actions">
+      <button type="button" className="linkish" onClick={onClose} disabled={saving}>
+        Cancel
+      </button>
+      <button type="button" onClick={() => void save()} disabled={saving}>
+        {saving ? "Saving…" : "Save"}
+      </button>
+    </div>
+  );
+
+  return (
+    <Modal title="lsfg-vk settings" subtitle="Global defaults for all games" onClose={onClose} footer={footer}>
+      {error ? <p className="error-banner">{error}</p> : null}
+      <LsfgSettingsForm config={draft} onChange={setDraft} />
+    </Modal>
+  );
+}
+
+function AutoHdrSettingsDialog({
+  initial,
+  onClose,
+  onSaved,
+}: {
+  initial: AutoHdrVkConfig;
+  onClose: () => void;
+  onSaved: (cfg: AutoHdrVkConfig) => void;
+}) {
+  const [draft, setDraft] = useState(initial);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const save = async () => {
+    setSaving(true);
+    setError(null);
+    try {
+      await api.setAutohdrVkConfig(draft);
+      onSaved(draft);
+      onClose();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const footer = (
+    <div className="modal-foot-actions">
+      <button type="button" className="linkish" onClick={onClose} disabled={saving}>
+        Cancel
+      </button>
+      <button type="button" onClick={() => void save()} disabled={saving}>
+        {saving ? "Saving…" : "Save"}
+      </button>
+    </div>
+  );
+
+  return (
+    <Modal
+      title="AutoHDR-VK settings"
+      subtitle="Global defaults for all games"
+      onClose={onClose}
+      footer={footer}
+    >
+      {error ? <p className="error-banner">{error}</p> : null}
+      <AutoHdrSettingsForm config={draft} onChange={setDraft} />
+    </Modal>
   );
 }
 
@@ -390,6 +484,7 @@ export function ToolsWorkspace() {
   const [busy, setBusy] = useState<string | null>(null);
   const [checkingUpdates, setCheckingUpdates] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState<SettingsTool | null>(null);
 
   const refresh = useCallback(async () => {
     setError(null);
@@ -435,7 +530,7 @@ export function ToolsWorkspace() {
     }
   }
 
-  async function install(tool: "lsfg_vk" | "autohdr_vk") {
+  async function install(tool: SettingsTool) {
     setBusy(tool);
     setError(null);
     try {
@@ -505,8 +600,10 @@ export function ToolsWorkspace() {
           label="lsfg-vk"
           status={status.lsfg_vk}
           repo={status.lsfg_vk_repo}
-          onInstall={() => install("lsfg_vk")}
+          onInstall={() => void install("lsfg_vk")}
           onCheckUpdates={() => void checkUpdates()}
+          onOpenSettings={() => setSettingsOpen("lsfg_vk")}
+          settingsDisabled={!lsfgConfig}
           busy={busy === "lsfg_vk"}
           checkingUpdates={checkingUpdates}
         />
@@ -514,46 +611,26 @@ export function ToolsWorkspace() {
           label="AutoHDR-VK"
           status={status.autohdr_vk}
           repo={status.autohdr_vk_repo}
-          onInstall={() => install("autohdr_vk")}
+          onInstall={() => void install("autohdr_vk")}
           onCheckUpdates={() => void checkUpdates()}
+          onOpenSettings={() => setSettingsOpen("autohdr_vk")}
+          settingsDisabled={!hdrConfig}
           busy={busy === "autohdr_vk"}
           checkingUpdates={checkingUpdates}
         />
       </div>
-      {lsfgConfig && (
-        <LsfgGlobalSettings
-          config={lsfgConfig}
-          onChange={setLsfgConfig}
-          saving={busy === "save_lsfg"}
-          onSave={async () => {
-            if (!lsfgConfig) return;
-            setBusy("save_lsfg");
-            try {
-              await api.setLsfgVkConfig(lsfgConfig);
-            } catch (e) {
-              setError(String(e));
-            } finally {
-              setBusy(null);
-            }
-          }}
+      {settingsOpen === "lsfg_vk" && lsfgConfig && (
+        <LsfgSettingsDialog
+          initial={lsfgConfig}
+          onClose={() => setSettingsOpen(null)}
+          onSaved={setLsfgConfig}
         />
       )}
-      {hdrConfig && (
-        <AutoHdrGlobalSettings
-          config={hdrConfig}
-          onChange={setHdrConfig}
-          saving={busy === "save_hdr"}
-          onSave={async () => {
-            if (!hdrConfig) return;
-            setBusy("save_hdr");
-            try {
-              await api.setAutohdrVkConfig(hdrConfig);
-            } catch (e) {
-              setError(String(e));
-            } finally {
-              setBusy(null);
-            }
-          }}
+      {settingsOpen === "autohdr_vk" && hdrConfig && (
+        <AutoHdrSettingsDialog
+          initial={hdrConfig}
+          onClose={() => setSettingsOpen(null)}
+          onSaved={setHdrConfig}
         />
       )}
     </section>

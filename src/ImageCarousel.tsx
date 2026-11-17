@@ -1,4 +1,6 @@
 import { useEffect, useRef, useState, type CSSProperties } from "react";
+import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
+import { faChevronLeft, faChevronRight } from "@fortawesome/free-solid-svg-icons";
 import { motion, useReducedMotion } from "motion/react";
 import { MOTION_EASE, MOTION_FAST } from "./motion";
 
@@ -118,7 +120,7 @@ export function ImageCarousel({ slides }: { slides: GallerySlide[] }) {
               aria-label="Previous image"
               onClick={() => step(-1)}
             >
-              ‹
+              <FontAwesomeIcon icon={faChevronLeft} />
             </button>
             <button
               type="button"
@@ -126,7 +128,7 @@ export function ImageCarousel({ slides }: { slides: GallerySlide[] }) {
               aria-label="Next image"
               onClick={() => step(1)}
             >
-              ›
+              <FontAwesomeIcon icon={faChevronRight} />
             </button>
             <span className="detail-carousel-count" aria-live="polite">
               {current + 1} / {slides.length}

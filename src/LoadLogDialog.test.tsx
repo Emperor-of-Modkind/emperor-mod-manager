@@ -61,14 +61,17 @@ describe("LoadLogDialog", () => {
     expect(document.body.textContent).toContain("BepInEx LogOutput.log");
     expect(document.body.textContent).toContain("Chainloader startup complete");
 
-    const button = [...document.querySelectorAll("button")].find(
-      (el) => el.textContent === "Copy report",
+    const button = document.querySelector(
+      'button[aria-label="Copy report"]',
     ) as HTMLButtonElement;
+    expect(button).not.toBeNull();
     await act(async () => {
       button.click();
     });
     expect(written).toEqual([diagnosis.report]);
-    expect(document.body.textContent).toContain("Copied");
+    expect(
+      document.querySelector('button[aria-label="Copied"]'),
+    ).not.toBeNull();
 
     await act(async () => {
       root.unmount();

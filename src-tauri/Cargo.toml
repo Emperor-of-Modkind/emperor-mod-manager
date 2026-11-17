@@ -1,6 +1,6 @@
 [package]
 name = "emperor-mod-manager"
-version = "0.6.7"
+version = "0.7.0"
 description = "Mod manager for Linux and Windows"
 authors = ["emperor-mod-manager contributors"]
 edition = "2021"
@@ -60,6 +60,7 @@ webkit2gtk = { version = "2.0.2", features = ["v2_40"] }
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3", default-features = false, features = ["windows-native"] }
 winreg = "0.56"
+windows-sys = { version = "0.59", features = ["Win32_Graphics_Gdi"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", default-features = false, features = ["apple-native"] }

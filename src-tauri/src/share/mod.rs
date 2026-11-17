@@ -77,6 +77,9 @@ pub struct ShareManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub game: ShareGameHint,
+    /// Game versions this loadout was created against (install / override at export).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub game_versions: Option<Vec<String>>,
     pub mods: Vec<ShareModEntry>,
 }
 
@@ -138,6 +141,9 @@ pub struct SavedCollectionEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_game_id: Option<String>,
     pub game: ShareGameHint,
+    /// Game versions this share was created against (from manifest at save time).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub game_versions: Option<Vec<String>>,
     pub mod_count: usize,
     pub nexus_count: usize,
     pub thunderstore_count: usize,
@@ -460,6 +466,7 @@ pub fn build_manifest_from_loadorder(
         v: 1,
         name,
         game: game_hint_from_managed(game),
+        game_versions: None,
         mods,
     };
     (manifest, skipped, member_ids)
@@ -488,7 +495,8 @@ pub fn entry_from_code(
         created_at: now.clone(),
         updated_at: now,
         source_game_id,
-        game: manifest.game,
+        game: manifest.game.clone(),
+        game_versions: manifest.game_versions.clone(),
         mod_count: preview.mods.len(),
         nexus_count: preview.nexus_count,
         thunderstore_count: preview.thunderstore_count,
@@ -604,6 +612,7 @@ mod tests {
                 thunderstore_community: Some("lethal-company".into()),
                 modio_game_id: Some(42),
             },
+            game_versions: Some(vec!["1.6.1170".into()]),
             mods: vec![
                 ShareModEntry {
                     s: ShareModSource::Nexus,

@@ -166,9 +166,9 @@ describe("StatusBanner", () => {
     expect(view.host.textContent).toContain("Skipped C: missing master D.");
     expect(view.host.textContent).toContain("Review requirements");
 
-    const dismiss = [...view.host.querySelectorAll("button")].find(
-      (button) => button.textContent === "dismiss",
-    );
+    const dismiss = view.host.querySelector(
+      'button[aria-label="Dismiss"]',
+    ) as HTMLButtonElement | null;
     await act(async () => {
       dismiss?.click();
     });
@@ -181,7 +181,7 @@ describe("StatusBanner", () => {
       <StatusBanner kind="error" message="Install path is required." onDismiss={() => {}} />,
     );
     expect(view.host.textContent).not.toContain("Show more");
-    expect(view.host.textContent).toContain("dismiss");
+    expect(view.host.querySelector('button[aria-label="Dismiss"]')).not.toBeNull();
     await view.unmount();
   });
 });

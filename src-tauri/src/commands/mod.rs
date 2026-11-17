@@ -1643,6 +1643,9 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<serde_json::Value, Str
         "autoclick_free_download": cfg.autoclick_free_download,
         "last_active_game_id": cfg.last_active_game_id,
         "theme": cfg.theme,
+        "theme_style": cfg.theme_style,
+        "accent_color": config::normalize_accent_color(&cfg.accent_color),
+        "linux_system_backend": cfg.linux_system_backend,
         "install_click_behavior": cfg.install_click_behavior,
         "recent_downloads_limit": config::clamp_recent_downloads_limit(cfg.recent_downloads_limit),
         "has_api_key": has_key,
@@ -1654,6 +1657,7 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<serde_json::Value, Str
         "data_dir": state.paths.data_dir,
         "cache_dir": state.paths.cache_dir,
         "platform_linux": cfg!(target_os = "linux"),
+        "platform_windows": cfg!(target_os = "windows"),
     }))
 }
 
@@ -1716,6 +1720,58 @@ pub fn set_theme(state: State<'_, AppState>, theme: config::ThemePreference) -> 
     let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
     cfg.theme = theme;
     config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn set_theme_style(
+    state: State<'_, AppState>,
+    style: config::ThemeStyle,
+) -> Result<(), String> {
+    let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
+    cfg.theme_style = style;
+    config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn set_accent_color(state: State<'_, AppState>, color: String) -> Result<(), String> {
+    let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
+    cfg.accent_color = config::normalize_accent_color(&color);
+    config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn set_linux_system_backend(
+    state: State<'_, AppState>,
+    backend: config::LinuxSystemBackend,
+) -> Result<(), String> {
+    let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
+    cfg.linux_system_backend = backend;
+    config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn get_system_palette(
+    state: State<'_, AppState>,
+) -> Result<crate::system_theme::SystemPalette, String> {
+    let cfg = state.config.lock().map_err(|e| e.to_string())?;
+    let preferred = match cfg.theme {
+        config::ThemePreference::Light => crate::system_theme::PreferredLuminance::Light,
+        config::ThemePreference::Dark => crate::system_theme::PreferredLuminance::Dark,
+        config::ThemePreference::System => crate::system_theme::PreferredLuminance::System,
+    };
+    let accent = config::normalize_accent_color(&cfg.accent_color);
+    #[cfg(target_os = "linux")]
+    {
+        return Ok(crate::system_theme::get_system_palette(
+            preferred,
+            &accent,
+            cfg.linux_system_backend.clone(),
+        ));
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(crate::system_theme::get_system_palette(preferred, &accent))
+    }
 }
 
 #[tauri::command]
@@ -1832,6 +1888,7 @@ pub async fn search_mods(
     tags_include: Option<Vec<String>>,
     tags_exclude: Option<Vec<String>>,
     game_version: Option<String>,
+    author: Option<String>,
     offset: Option<u32>,
     count: Option<u32>,
 ) -> Result<nexus::ModSearchPage, String> {
@@ -1847,6 +1904,7 @@ pub async fn search_mods(
         tags_include: tags_include.unwrap_or_default(),
         tags_exclude: tags_exclude.unwrap_or_default(),
         game_version,
+        author,
         offset: offset.unwrap_or(0),
         count: count.unwrap_or(0),
     };
@@ -2049,6 +2107,7 @@ pub async fn search_catalog(
     tags_include: Option<Vec<String>>,
     tags_exclude: Option<Vec<String>>,
     game_version: Option<String>,
+    author: Option<String>,
     offset: Option<u32>,
     count: Option<u32>,
 ) -> Result<CatalogSearchPage, String> {
@@ -2072,9 +2131,17 @@ pub async fn search_catalog(
     };
 
     let filter = source_filter.unwrap_or_else(|| "all".into()).to_lowercase();
+    let author_filter = author
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
     let want_nexus = (filter == "all" || filter == "nexus") && nexus_domain.is_some();
     let want_ts = (filter == "all" || filter == "thunderstore") && ts_community.is_some();
-    let want_modio = (filter == "all" || filter == "modio") && modio_game_id.is_some();
+    // mod.io has no reliable submitted-by filter in this client; skip when author is set.
+    let want_modio = (filter == "all" || filter == "modio")
+        && modio_game_id.is_some()
+        && author_filter.is_none();
     if !want_nexus && !want_ts && !want_modio {
         return Err(catalog_source_unavailable_error(
             &filter,
@@ -2125,6 +2192,7 @@ pub async fn search_catalog(
                         tags_include: tags_include.clone().unwrap_or_default(),
                         tags_exclude: tags_exclude.clone().unwrap_or_default(),
                         game_version: game_version.clone(),
+                        author: author_filter.clone(),
                         offset: offset as u32,
                         count: count as u32,
                     };
@@ -2159,7 +2227,15 @@ pub async fn search_catalog(
                 })
             };
             let (page, total) = if let Some(packages) = cached {
-                filter_ts_packages(community, &packages, &query, adult, offset, count)
+                filter_ts_packages(
+                    community,
+                    &packages,
+                    &query,
+                    author_filter.as_deref(),
+                    adult,
+                    offset,
+                    count,
+                )
             } else {
                 let packages = client
                     .list_packages(community)
@@ -2168,7 +2244,15 @@ pub async fn search_catalog(
                 if let Ok(mut cache) = state.ts_package_cache.lock() {
                     cache.insert(community.clone(), (Instant::now(), packages.clone()));
                 }
-                filter_ts_packages(community, &packages, &query, adult, offset, count)
+                filter_ts_packages(
+                    community,
+                    &packages,
+                    &query,
+                    author_filter.as_deref(),
+                    adult,
+                    offset,
+                    count,
+                )
             };
             ts_total = total as u32;
             ts_hits = page.into_iter().map(catalog_from_ts).collect();
@@ -2247,10 +2331,128 @@ pub async fn search_catalog(
     })
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct CatalogAuthorSuggestion {
+    pub name: String,
+    pub source: String,
+    pub member_id: Option<u64>,
+    pub mod_count: Option<u64>,
+    pub avatar: Option<String>,
+}
+
+const AUTHOR_SUGGEST_LIMIT: usize = 10;
+const AUTHOR_SUGGEST_MIN_CHARS: usize = 2;
+
+#[tauri::command]
+pub async fn suggest_authors(
+    state: State<'_, AppState>,
+    game_id: String,
+    query: String,
+) -> Result<Vec<CatalogAuthorSuggestion>, String> {
+    let query = query.trim().to_string();
+    if query.chars().count() < AUTHOR_SUGGEST_MIN_CHARS {
+        return Ok(Vec::new());
+    }
+
+    let (nexus_domain, ts_community) = {
+        let cfg = state.config.lock().map_err(|e| e.to_string())?;
+        let game = cfg
+            .managed_games
+            .iter()
+            .find(|g| g.id == game_id)
+            .ok_or_else(|| "Managed game not found".to_string())?;
+        (
+            if game.nexus_domain.is_empty() {
+                None
+            } else {
+                Some(game.nexus_domain.clone())
+            },
+            game.thunderstore_community.clone(),
+        )
+    };
+
+    let mut out: Vec<CatalogAuthorSuggestion> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    if nexus_domain.is_some() {
+        match state.client() {
+            Ok(client) => match client
+                .search_users(&query, AUTHOR_SUGGEST_LIMIT as u32)
+                .await
+            {
+                Ok(hits) => {
+                    for hit in hits {
+                        let key = hit.name.to_lowercase();
+                        if !seen.insert(key) {
+                            continue;
+                        }
+                        out.push(CatalogAuthorSuggestion {
+                            name: hit.name,
+                            source: "nexus".into(),
+                            member_id: hit.member_id,
+                            mod_count: hit.mod_count,
+                            avatar: hit.avatar,
+                        });
+                        if out.len() >= AUTHOR_SUGGEST_LIMIT {
+                            break;
+                        }
+                    }
+                }
+                Err(e) => log::warn!("Nexus author suggest failed: {e}"),
+            },
+            Err(e) => log::warn!("Nexus client unavailable for author suggest: {e}"),
+        }
+    }
+
+    if out.len() < AUTHOR_SUGGEST_LIMIT {
+        if let Some(community) = &ts_community {
+            match load_ts_packages_cached(&state, community).await {
+                Ok(packages) => {
+                    let q = query.to_lowercase();
+                    let mut owners: HashMap<String, (String, u64)> = HashMap::new();
+                    for p in &packages {
+                        if p.is_deprecated {
+                            continue;
+                        }
+                        if !p.owner.to_lowercase().contains(&q) {
+                            continue;
+                        }
+                        let key = p.owner.to_lowercase();
+                        let entry = owners.entry(key).or_insert_with(|| (p.owner.clone(), 0));
+                        entry.1 = entry.1.saturating_add(1);
+                    }
+                    let mut ranked: Vec<_> = owners.into_values().collect();
+                    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                    for (name, count) in ranked {
+                        let key = name.to_lowercase();
+                        if !seen.insert(key) {
+                            continue;
+                        }
+                        out.push(CatalogAuthorSuggestion {
+                            name,
+                            source: "thunderstore".into(),
+                            member_id: None,
+                            mod_count: Some(count),
+                            avatar: None,
+                        });
+                        if out.len() >= AUTHOR_SUGGEST_LIMIT {
+                            break;
+                        }
+                    }
+                }
+                Err(e) => log::warn!("Thunderstore author suggest failed: {e}"),
+            }
+        }
+    }
+
+    Ok(out)
+}
+
 fn filter_ts_packages(
     community: &str,
     packages: &[thunderstore::TsPackage],
     query: &str,
+    author: Option<&str>,
     include_nsfw: bool,
     offset: usize,
     count: usize,
@@ -2262,6 +2464,9 @@ fn filter_ts_packages(
         .collect();
     if !include_nsfw {
         packages.retain(|p| !p.has_nsfw_content);
+    }
+    if let Some(author) = author.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        packages.retain(|p| p.owner.eq_ignore_ascii_case(author));
     }
     let q = query.trim().to_lowercase();
     if !q.is_empty() {
@@ -2326,7 +2531,7 @@ fn filter_ts_modpacks(
         .filter(|p| thunderstore::is_modpack_category(&p.categories))
         .cloned()
         .collect();
-    filter_ts_packages(community, &packs, query, include_nsfw, offset, count)
+    filter_ts_packages(community, &packs, query, None, include_nsfw, offset, count)
 }
 
 fn snapshot_mod_ids(
@@ -3369,6 +3574,68 @@ pub async fn check_mod_game_versions(
     })
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollectionVersionAdviceInput {
+    pub id: String,
+    pub game_versions: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CollectionVersionAdvice {
+    pub id: String,
+    pub status: mods::game_version::ModVersionStatus,
+    pub supported: Vec<String>,
+    pub message: String,
+}
+
+/// Advise saved/installed collections against a managed game's effective version.
+#[tauri::command]
+pub fn advise_collection_versions(
+    state: State<'_, AppState>,
+    game_id: String,
+    collections: Vec<CollectionVersionAdviceInput>,
+) -> Result<Vec<CollectionVersionAdvice>, String> {
+    let (install_path, override_version, nexus_domain) = {
+        let cfg = state.config.lock().map_err(|e| e.to_string())?;
+        let game = cfg
+            .managed_games
+            .iter()
+            .find(|g| g.id == game_id)
+            .ok_or_else(|| "Managed game not found".to_string())?;
+        (
+            game.install_path.clone(),
+            game.game_version
+                .clone()
+                .filter(|version| !version.trim().is_empty()),
+            game.nexus_domain.clone(),
+        )
+    };
+    let installed = games::detect_install_version(Path::new(&install_path));
+    let current = override_version.or(installed);
+
+    Ok(collections
+        .into_iter()
+        .map(|entry| {
+            let versions = entry.game_versions.unwrap_or_default();
+            let advice = mods::game_version::advise(&mods::game_version::AdviseInput {
+                domain: &nexus_domain,
+                current: current.as_deref(),
+                tags: &[],
+                file_name: None,
+                mod_version: None,
+                collection_versions: &versions,
+            });
+            CollectionVersionAdvice {
+                id: entry.id,
+                status: advice.status,
+                supported: advice.supported,
+                message: advice.message,
+            }
+        })
+        .collect())
+}
+
 async fn refresh_version_support(
     state: &AppState,
     game_id: &str,
@@ -3583,6 +3850,7 @@ pub async fn search_collections(
     tags_include: Option<Vec<String>>,
     tags_exclude: Option<Vec<String>>,
     game_version: Option<String>,
+    author: Option<String>,
     offset: Option<u32>,
     count: Option<u32>,
 ) -> Result<nexus::CollectionSearchPage, String> {
@@ -3598,6 +3866,8 @@ pub async fn search_collections(
         tags_include: tags_include.unwrap_or_default(),
         tags_exclude: tags_exclude.unwrap_or_default(),
         game_version,
+        // CollectionsFilter has no author field; accepted for API symmetry and ignored.
+        author,
         offset: offset.unwrap_or(0),
         count: count.unwrap_or(0),
     };
@@ -3651,6 +3921,7 @@ pub async fn search_collection_catalog(
     tags_include: Option<Vec<String>>,
     tags_exclude: Option<Vec<String>>,
     game_version: Option<String>,
+    #[allow(unused_variables)] author: Option<String>,
     offset: Option<u32>,
     count: Option<u32>,
 ) -> Result<CollectionCatalogPage, String> {
@@ -3708,6 +3979,7 @@ pub async fn search_collection_catalog(
                         tags_include: tags_include.unwrap_or_default(),
                         tags_exclude: tags_exclude.unwrap_or_default(),
                         game_version,
+                        author: None,
                         offset: offset as u32,
                         count: count as u32,
                     };
@@ -6203,7 +6475,7 @@ pub fn export_share_code(
 ) -> Result<ExportShareResult, String> {
     let game = managed_game(&state, &game_id)?;
     let order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
-    let (manifest, skipped, member_ids) =
+    let (mut manifest, skipped, member_ids) =
         share::build_manifest_from_loadorder(&order, &game, name.clone());
     if manifest.mods.is_empty() {
         return Err(if skipped.is_empty() {
@@ -6215,6 +6487,15 @@ pub fn export_share_code(
             )
         });
     }
+    let override_version = game
+        .game_version
+        .clone()
+        .filter(|version| !version.trim().is_empty());
+    let detected = games::detect_install_version(Path::new(&game.install_path));
+    let game_versions = override_version
+        .or(detected)
+        .map(|version| vec![version]);
+    manifest.game_versions = game_versions.clone();
     let code = share::encode_share_manifest(&manifest).map_err(|e| e.to_string())?;
     let mut warnings = Vec::new();
     if !skipped.is_empty() {
@@ -6252,7 +6533,7 @@ pub fn export_share_code(
         profile_code: Some(code.clone()),
         mod_ids: member_ids,
         installed_at: String::new(),
-        game_versions: None,
+        game_versions,
     };
     // Empty new_mod_ids: mods were already staged; keep independent so uninstall
     // of this share collection does not delete the user's loadout.
@@ -6638,7 +6919,7 @@ pub async fn import_share_code(
             profile_code: Some(code),
             mod_ids: member_ids.clone(),
             installed_at: String::new(),
-            game_versions: None,
+            game_versions: manifest.game_versions.clone(),
         };
         Some(
             mods::record_installed_collection(&state.paths, &game_id, col, &new_ids)
@@ -6702,6 +6983,10 @@ pub fn record_emperor_share(
         .filter(|id| !preexisting.contains(*id))
         .cloned()
         .collect();
+    let game_versions = code
+        .as_deref()
+        .and_then(|raw| share::decode_share_code(raw).ok())
+        .and_then(|manifest| manifest.game_versions);
     let collection = InstalledCollection {
         id: collection_id.clone(),
         source: CollectionSource::Emperor,
@@ -6716,10 +7001,15 @@ pub fn record_emperor_share(
         profile_code: code,
         mod_ids: ids,
         installed_at: String::new(),
-        game_versions: None,
+        game_versions,
     };
     mods::record_installed_collection(&state.paths, &game_id, collection, &new_ids)
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn emperor_share_id(code: String) -> String {
+    share::emperor_share_id(code.trim())
 }
 
 #[tauri::command]

@@ -1,3 +1,5 @@
+import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
+import { faTrashCan } from "@fortawesome/free-solid-svg-icons";
 import { useEffect, useRef, useState } from "react";
 import type { DownloadItem } from "./types";
 
@@ -357,6 +359,7 @@ export function DownloadsWorkspace(props: DownloadsWorkspaceProps) {
                 <h2 className="downloads-recent-heading">Recent</h2>
                 <button
                   type="button"
+                  className="downloads-recent-clear"
                   onClick={() => onClearRecent(recentDownloads.map((d) => d.id))}
                 >
                   Clear
@@ -416,11 +419,12 @@ export function DownloadsWorkspace(props: DownloadsWorkspaceProps) {
                         ) : null}
                         <button
                           type="button"
-                          className="downloads-recent-remove"
+                          className="downloads-recent-remove icon-btn"
                           onClick={() => onRemoveDownload(d.id)}
                           aria-label={`Remove ${d.label}`}
+                          title="Remove"
                         >
-                          Remove
+                          <FontAwesomeIcon icon={faTrashCan} />
                         </button>
                       </div>
                     </li>
