@@ -1,5 +1,6 @@
 //! Mod staging, extraction, load order, and deploy.
 
+pub mod fomod;
 pub mod game_version;
 pub mod options;
 
@@ -21,7 +22,10 @@ use crate::{
         bepinex_pack_deploy_root, normalize_relative, normalize_staging_root, plugin_by_id,
         DeployContext, GamePlugin,
     },
-    mods::options::{IncludeFilter, ModOptionSelection},
+    mods::{
+        fomod::FomodSelection,
+        options::{IncludeFilter, ModOptionSelection},
+    },
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -82,6 +86,9 @@ pub struct StagedMod {
     /// options, or the user has not touched the defaults yet.
     #[serde(default)]
     pub option_selection: Option<ModOptionSelection>,
+    /// FOMOD installer picks. `None` means no ModuleConfig, or defaults not saved yet.
+    #[serde(default)]
+    pub fomod_selection: Option<FomodSelection>,
     /// Name of the file that was staged, when it is distinct from the mod title.
     /// The file chooser's title is preferred; the archive name is the fallback.
     #[serde(default)]
@@ -126,6 +133,7 @@ impl Default for StagedMod {
             depends_on: Vec::new(),
             staged_file_count: None,
             option_selection: None,
+            fomod_selection: None,
             file_name: None,
             picture_url: None,
             supported_game_versions: None,
@@ -224,6 +232,7 @@ struct StagingProvenance {
     enabled: bool,
     order: Option<u32>,
     option_selection: Option<ModOptionSelection>,
+    fomod_selection: Option<FomodSelection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -791,6 +800,7 @@ fn provenance_from_removed(old: Option<StagedMod>, _new_staging: &Path) -> Stagi
         // the same options keeps the user's picks. Anything the new manifest
         // dropped is discarded when the selection is normalized.
         option_selection: old.option_selection,
+        fomod_selection: old.fomod_selection,
     }
 }
 
@@ -1188,6 +1198,7 @@ pub fn stage_overlay_dir(
             independent: provenance.independent,
             depends_on: provenance.depends_on,
             option_selection: provenance.option_selection,
+            fomod_selection: provenance.fomod_selection,
             picture_url: resolve_picture_url(None, &removed),
             ..Default::default()
         };
@@ -1628,6 +1639,7 @@ fn stage_filled_mod(
             depends_on: provenance.depends_on,
             staged_file_count: Some(count_staged_files(&staging)),
             option_selection: provenance.option_selection,
+            fomod_selection: provenance.fomod_selection,
             file_name: stored_file_name,
             picture_url: resolve_picture_url(None, &removed),
             supported_game_versions: removed
@@ -1991,6 +2003,7 @@ pub fn stage_thunderstore_mod(
             depends_on: provenance.depends_on,
             staged_file_count: Some(count_staged_files(&staging)),
             option_selection: provenance.option_selection,
+            fomod_selection: provenance.fomod_selection,
             file_name,
             picture_url: resolve_picture_url(picture_url, &removed),
             supported_game_versions: None,
@@ -2062,6 +2075,7 @@ pub fn stage_modio_mod(
             depends_on: provenance.depends_on,
             staged_file_count: Some(count_staged_files(&staging)),
             option_selection: provenance.option_selection,
+            fomod_selection: provenance.fomod_selection,
             file_name,
             picture_url: resolve_picture_url(picture_url, &removed),
             supported_game_versions: None,
@@ -2143,6 +2157,21 @@ pub fn set_mod_options(
             bail!("mod not found: {mod_uid}");
         };
         m.option_selection = Some(selection);
+        Ok(())
+    })
+}
+
+pub fn set_fomod_selection(
+    paths: &Paths,
+    game_id: &str,
+    mod_uid: &str,
+    selection: FomodSelection,
+) -> Result<()> {
+    mutate_load_order(paths, game_id, |order| {
+        let Some(m) = order.mods.iter_mut().find(|m| m.id == mod_uid) else {
+            bail!("mod not found: {mod_uid}");
+        };
+        m.fomod_selection = Some(selection);
         Ok(())
     })
 }
@@ -2505,10 +2534,46 @@ pub fn deploy(
         let root = normalize_staging_root(&staging, plugin)?;
         warnings.extend(plugin.staging_deploy_warnings(&root, &staged.name));
         warnings.extend(plugin.deploy_staged_extra(install_path, &root, &staged.name)?);
-        let filter = plugin
-            .mod_options(&root)
-            .map(|set| IncludeFilter::build(&set, staged.option_selection.as_ref()))
-            .filter(|f| !f.is_passthrough());
+        let fomod_module = match fomod::load_module(&root) {
+            Ok(m) => m,
+            Err(e) => {
+                warnings.push(format!(
+                    "Could not read FOMOD installer for {}: {e:#}",
+                    staged.name
+                ));
+                None
+            }
+        };
+        if fomod_module
+            .as_ref()
+            .is_some_and(|m| m.unsupported_scripted)
+        {
+            warnings.push(format!(
+                "{} uses a scripted FOMOD installer, which Emperor does not run yet.",
+                staged.name
+            ));
+        }
+        let fomod_map = fomod_module.as_ref().and_then(|module| {
+            let selection = fomod::effective_selection(module, staged.fomod_selection.as_ref());
+            match fomod::build_file_map(&root, module, &selection) {
+                Ok(map) => Some(map),
+                Err(e) => {
+                    warnings.push(format!(
+                        "Could not resolve FOMOD files for {}: {e:#}",
+                        staged.name
+                    ));
+                    None
+                }
+            }
+        });
+        let filter = if fomod_map.is_some() {
+            None
+        } else {
+            plugin
+                .mod_options(&root)
+                .map(|set| IncludeFilter::build(&set, staged.option_selection.as_ref()))
+                .filter(|f| !f.is_passthrough())
+        };
         let to_root = plugin.deploys_to_install_root(&root);
         enabled_mod_folders.extend(plugin.load_order_entries(&root, &staged.name));
         let deploy_root = if to_root {
@@ -2516,19 +2581,31 @@ pub fn deploy(
         } else {
             root.clone()
         };
-        let stats = deploy_tree(
-            plugin,
-            install_path,
-            &deploy_root,
-            &staged.name,
-            project_name,
-            filter.as_ref(),
-            &mut deployed,
-        )?;
+        let stats = if let Some(map) = fomod_map.as_ref() {
+            deploy_fomod_map(
+                plugin,
+                install_path,
+                &deploy_root,
+                &staged.name,
+                project_name,
+                map,
+                &mut deployed,
+            )?
+        } else {
+            deploy_tree(
+                plugin,
+                install_path,
+                &deploy_root,
+                &staged.name,
+                project_name,
+                filter.as_ref(),
+                &mut deployed,
+            )?
+        };
         if stats.linked == 0 && !plugin.allows_empty_deploy(&root) {
-            let msg = if filter.is_some() {
+            let msg = if fomod_map.is_some() || filter.is_some() {
                 format!(
-                    "No files deployed from {}; check its options, every one may be turned off.",
+                    "No files deployed from {}; check its installer options.",
                     staged.name
                 )
             } else {
@@ -2594,6 +2671,59 @@ struct TreeStats {
     linked: usize,
     copied: usize,
     skipped: usize,
+}
+
+fn deploy_fomod_map(
+    plugin: &dyn GamePlugin,
+    install_path: &Path,
+    content_root: &Path,
+    mod_name: &str,
+    project_name: Option<&str>,
+    map: &[fomod::FomodMappedFile],
+    deployed: &mut DeployManifest,
+) -> Result<TreeStats> {
+    let mut stats = TreeStats::default();
+    let to_root = plugin.deploys_to_install_root(content_root);
+    let wrap =
+        !to_root && (plugin.prefers_mod_folder() || plugin.should_wrap_as_mod_folder(content_root));
+    let folder_name = plugin.wrap_mod_folder_name(content_root, mod_name);
+
+    for entry in map {
+        if !entry.source.is_file() {
+            continue;
+        }
+        let rel = normalize_relative(&entry.dest_rel);
+        let ctx = DeployContext {
+            project_name,
+            content_root: Some(content_root),
+            source_dir: rel.parent(),
+        };
+        if !plugin.should_deploy_file_ctx(&rel, &ctx) {
+            if !plugin.allows_empty_deploy(content_root) {
+                stats.skipped += 1;
+            }
+            continue;
+        }
+        let deploy_rel: PathBuf = if wrap {
+            Path::new(&folder_name).join(&rel)
+        } else {
+            rel.clone()
+        };
+        let dest = if to_root {
+            install_path.join(&deploy_rel)
+        } else {
+            plugin.resolve_deploy_root_ctx(install_path, &deploy_rel, &ctx)?
+        };
+        if let Some(parent) = dest.parent() {
+            ensure_deploy_dir(parent)?;
+        }
+        if link_or_copy(&entry.source, &dest)? == LinkKind::Copied {
+            stats.copied += 1;
+        }
+        deployed.paths.push(dest.to_string_lossy().to_string());
+        stats.linked += 1;
+    }
+    Ok(stats)
 }
 
 fn deploy_tree(
@@ -2922,6 +3052,115 @@ mod tests {
         )
         .unwrap();
         assert_eq!(staged.option_selection, Some(selection));
+    }
+
+    #[test]
+    fn deploy_fomod_selection_for_cyberpunk() {
+        let (_tmp, paths) = test_paths();
+        let game_id = "cp_fomod";
+        let install = tempfile::tempdir().unwrap();
+
+        let staging = paths.mods_dir(game_id).join("TCP_1_1");
+        for (dir, body) in [
+            ("00 Core", b"core" as &[u8]),
+            ("01 English", b"en"),
+            ("02 Russian", b"ru"),
+            ("10 All Voices", b"all"),
+            ("11 Jackie Only", b"jackie"),
+        ] {
+            let p = staging.join(dir).join("r6").join("scripts");
+            std::fs::create_dir_all(&p).unwrap();
+            std::fs::write(p.join("mod.reds"), body).unwrap();
+        }
+        std::fs::create_dir_all(staging.join("fomod")).unwrap();
+        std::fs::write(
+            staging.join("fomod").join("ModuleConfig.xml"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<config>
+  <moduleName>True Cyberpsychosis</moduleName>
+  <requiredInstallFiles>
+    <folder source="00 Core" destination="" priority="0"/>
+  </requiredInstallFiles>
+  <installSteps order="Explicit">
+    <installStep name="Voice Language">
+      <optionalFileGroups order="Explicit">
+        <group name="Language" type="SelectExactlyOne">
+          <plugins order="Explicit">
+            <plugin name="English">
+              <files><folder source="01 English" destination=""/></files>
+              <typeDescriptor><type name="Recommended"/></typeDescriptor>
+            </plugin>
+            <plugin name="Russian">
+              <files><folder source="02 Russian" destination=""/></files>
+              <typeDescriptor><type name="Optional"/></typeDescriptor>
+            </plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+    <installStep name="Voice Set">
+      <optionalFileGroups order="Explicit">
+        <group name="Voices" type="SelectExactlyOne">
+          <plugins order="Explicit">
+            <plugin name="All voices">
+              <files><folder source="10 All Voices" destination="" priority="2"/></files>
+              <typeDescriptor><type name="Recommended"/></typeDescriptor>
+            </plugin>
+            <plugin name="Jackie only">
+              <files><folder source="11 Jackie Only" destination="" priority="2"/></files>
+              <typeDescriptor><type name="Optional"/></typeDescriptor>
+            </plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+  </installSteps>
+</config>"#,
+        )
+        .unwrap();
+
+        let module = fomod::load_module(&staging).unwrap().unwrap();
+        let mut selection = fomod::default_selection(&module);
+        // Pick Russian + Jackie only.
+        let lang = &module.steps[0].groups[0];
+        let voices = &module.steps[1].groups[0];
+        selection
+            .selected
+            .insert(lang.id.clone(), vec![lang.plugins[1].id.clone()]);
+        selection
+            .selected
+            .insert(voices.id.clone(), vec![voices.plugins[1].id.clone()]);
+
+        save_loadorder(
+            &paths,
+            game_id,
+            &LoadOrder {
+                mods: vec![StagedMod {
+                    id: "1_1".into(),
+                    name: "True Cyberpsychosis".into(),
+                    nexus_mod_id: 1,
+                    nexus_file_id: 1,
+                    version: None,
+                    domain: "cyberpunk2077".into(),
+                    staging_path: staging.to_string_lossy().into(),
+                    enabled: true,
+                    order: 1,
+                    fomod_selection: Some(selection),
+                    ..Default::default()
+                }],
+            },
+        )
+        .unwrap();
+
+        let result = deploy(&paths, game_id, "cyberpunk2077", install.path(), None).unwrap();
+        assert!(result.file_count >= 1, "warnings: {:?}", result.warnings);
+        let deployed = install.path().join("r6/scripts/mod.reds");
+        assert!(deployed.exists(), "missing {deployed:?}; warnings: {:?}", result.warnings);
+        // Highest priority among overlapping dests is Jackie (priority 2).
+        assert_eq!(std::fs::read(&deployed).unwrap(), b"jackie");
+        // FOMOD metadata must not deploy.
+        assert!(!install.path().join("fomod").exists());
+        assert!(!install.path().join("mods/fomod").exists());
     }
 
     #[test]

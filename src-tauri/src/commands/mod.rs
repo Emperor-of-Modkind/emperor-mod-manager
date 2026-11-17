@@ -23,6 +23,7 @@ use crate::{
     modio_api::{self, ModioClient, ModioFileInfo, ModioModDetail},
     mods::{
         self,
+        fomod::{self, FomodInstallerView, FomodSelection},
         options::{self, ModOptionSelection, ModOptionSet},
         CollectionKind, CollectionSource, InstalledCollection, ModSource, StagedMod,
         StagedModUpdate,
@@ -7230,8 +7231,8 @@ pub fn set_mod_options(
     Ok(normalized)
 }
 
-/// Ids of staged mods that declare options, so the Mods list can show the
-/// button without asking about every row one at a time.
+/// Ids of staged mods that declare options or a FOMOD installer, so the Mods
+/// list can show the button without asking about every row one at a time.
 #[tauri::command]
 pub fn list_mods_with_options(
     state: State<'_, AppState>,
@@ -7243,9 +7244,87 @@ pub fn list_mods_with_options(
         .mods
         .iter()
         .filter(|staged| {
-            staged_content_root(staged, plugin)
-                .and_then(|root| plugin.mod_options(&root))
+            let Some(root) = staged_content_root(staged, plugin) else {
+                return false;
+            };
+            if fomod::has_fomod(&root) {
+                return true;
+            }
+            plugin
+                .mod_options(&root)
                 .is_some_and(|set| !set.is_empty())
+        })
+        .map(|staged| staged.id.clone())
+        .collect())
+}
+
+#[tauri::command]
+pub fn get_fomod_installer(
+    state: State<'_, AppState>,
+    game_id: String,
+    mod_id: String,
+) -> Result<Option<FomodInstallerView>, String> {
+    let plugin = plugin_for_game(&state, &game_id)?;
+    let order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
+    let staged = order
+        .mods
+        .iter()
+        .find(|m| m.id == mod_id)
+        .ok_or_else(|| format!("Mod not found: {mod_id}"))?;
+    let Some(root) = staged_content_root(staged, plugin) else {
+        return Ok(None);
+    };
+    fomod::installer_view(&root, staged.fomod_selection.as_ref()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn set_fomod_selection(
+    state: State<'_, AppState>,
+    game_id: String,
+    mod_id: String,
+    selection: FomodSelection,
+) -> Result<FomodSelection, String> {
+    let plugin = plugin_for_game(&state, &game_id)?;
+    let order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
+    let staged = order
+        .mods
+        .iter()
+        .find(|m| m.id == mod_id)
+        .ok_or_else(|| format!("Mod not found: {mod_id}"))?;
+    let root = staged_content_root(staged, plugin)
+        .ok_or_else(|| format!("Staging folder is missing for {}", staged.name))?;
+    let module = fomod::load_module(&root)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("{} does not have a FOMOD installer", staged.name))?;
+    if module.unsupported_scripted {
+        return Err(format!(
+            "{} uses a scripted FOMOD installer, which is not supported yet",
+            staged.name
+        ));
+    }
+    let normalized = fomod::normalize_selection(&module, &selection);
+    fomod::selection_is_valid(&module, &normalized).map_err(|e| e.to_string())?;
+    mods::set_fomod_selection(&state.paths, &game_id, &mod_id, normalized.clone())
+        .map_err(|e| e.to_string())?;
+    Ok(normalized)
+}
+
+/// Staged mod ids that have a FOMOD and no saved selection yet (prompt after stage).
+#[tauri::command]
+pub fn list_mods_needing_fomod(
+    state: State<'_, AppState>,
+    game_id: String,
+) -> Result<Vec<String>, String> {
+    let plugin = plugin_for_game(&state, &game_id)?;
+    let order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
+    Ok(order
+        .mods
+        .iter()
+        .filter(|staged| {
+            if staged.fomod_selection.is_some() {
+                return false;
+            }
+            staged_content_root(staged, plugin).is_some_and(|root| fomod::has_fomod(&root))
         })
         .map(|staged| staged.id.clone())
         .collect())

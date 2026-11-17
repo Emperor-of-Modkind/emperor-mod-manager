@@ -616,6 +616,7 @@ export type StagedMod = {
   independent?: boolean;
   depends_on?: string[];
   option_selection?: ModOptionSelection | null;
+  fomod_selection?: FomodSelection | null;
   /** File chooser title or archive name, when it differs from the mod title. */
   file_name?: string | null;
   /** Catalog poster. Null means not looked up yet; empty means there is no image. */
@@ -664,6 +665,53 @@ export type ModOptionSelection = {
 export type ModOptionsView = {
   set: ModOptionSet;
   selection: ModOptionSelection;
+};
+
+export type FomodGroupType =
+  | "SelectAny"
+  | "SelectAll"
+  | "SelectExactlyOne"
+  | "SelectAtMostOne"
+  | "SelectAtLeastOne";
+
+export type FomodPluginType =
+  | "Optional"
+  | "Required"
+  | "Recommended"
+  | "CouldBeUsable"
+  | "NotUsable";
+
+export type FomodPluginView = {
+  id: string;
+  name: string;
+  description: string | null;
+  image: string | null;
+  plugin_type: FomodPluginType;
+};
+
+export type FomodGroupView = {
+  id: string;
+  name: string;
+  type: FomodGroupType;
+  plugins: FomodPluginView[];
+};
+
+export type FomodStepView = {
+  id: string;
+  name: string;
+  visible: boolean;
+  groups: FomodGroupView[];
+};
+
+export type FomodSelection = {
+  selected: Record<string, string[]>;
+};
+
+export type FomodInstallerView = {
+  module_name: string;
+  steps: FomodStepView[];
+  selection: FomodSelection;
+  unsupported_scripted: boolean;
 };
 
 export type StagedModUpdate = {

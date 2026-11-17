@@ -3,7 +3,7 @@
 //! v1: overlay into Data/ (or ObvData/Data + Paks/~mods for the remaster), rewrite
 //! Plugins.txt, and warn when the matching script extender is missing.
 //! Starfield also writes `StarfieldCustom.ini` in My Games so loose files load.
-//! Not in v1: LOOT, FOMOD, BSA/BA2 extraction.
+//! Not in v1: LOOT, BSA/BA2 extraction. FOMOD is handled game-agnostically in `mods::fomod`.
 
 use std::path::{Component, Path, PathBuf};
 

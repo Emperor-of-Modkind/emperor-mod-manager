@@ -87,6 +87,7 @@ import {
   type CatalogMatchSubmit,
 } from "./CatalogMatchDialog";
 import { LoadLogDialog } from "./LoadLogDialog";
+import { FomodDialog } from "./FomodDialog";
 import { ModOptionsDialog } from "./ModOptionsDialog";
 import { QuickInstallDialog } from "./QuickInstallDialog";
 import {
@@ -1393,6 +1394,8 @@ export default function App() {
   );
   const [modsWithOptions, setModsWithOptions] = useState<Set<string>>(new Set());
   const [modOptionsFor, setModOptionsFor] = useState<StagedMod | null>(null);
+  const [fomodFor, setFomodFor] = useState<StagedMod | null>(null);
+  const fomodPromptedRef = useRef<Set<string>>(new Set());
   const [loadDiagnosis, setLoadDiagnosis] = useState<LoadDiagnosis | null>(null);
   const [modsQuery, setModsQuery] = useState("");
   const [modsStatusFilter, setModsStatusFilter] =
@@ -1804,6 +1807,10 @@ export default function App() {
       setQuickInstall(null);
       return true;
     }
+    if (fomodFor) {
+      setFomodFor(null);
+      return true;
+    }
     if (modOptionsFor) {
       setModOptionsFor(null);
       return true;
@@ -2130,8 +2137,38 @@ export default function App() {
     } catch (e) {
       console.warn("list_mods_with_options failed", e);
     }
+    try {
+      const needing = await api.listModsNeedingFomod(gameId);
+      if (activeGameRef.current?.id !== gameId) return;
+      setFomodFor((open) => {
+        if (open) return open;
+        const nextId = needing.find((id) => !fomodPromptedRef.current.has(id));
+        if (!nextId) return null;
+        const staged = list.find((m) => m.id === nextId);
+        if (!staged) return null;
+        fomodPromptedRef.current.add(nextId);
+        return staged;
+      });
+    } catch (e) {
+      console.warn("list_mods_needing_fomod failed", e);
+    }
     void refreshWineAdvice(gameId);
   }, [refreshWineAdvice]);
+
+  const openModInstaller = useCallback(async (m: StagedMod) => {
+    if (!activeGameRef.current) return;
+    const gameId = activeGameRef.current.id;
+    try {
+      const fomod = await api.getFomodInstaller(gameId, m.id);
+      if (fomod) {
+        setFomodFor(m);
+        return;
+      }
+    } catch (e) {
+      console.warn("get_fomod_installer failed", e);
+    }
+    setModOptionsFor(m);
+  }, []);
 
   const refreshModUpdates = useCallback(async (gameId: string) => {
     const req = ++modUpdatesReqRef.current;
@@ -7147,7 +7184,7 @@ export default function App() {
                               {modsWithOptions.has(m.id) && (
                                 <button
                                   type="button"
-                                  onClick={() => setModOptionsFor(m)}
+                                  onClick={() => void openModInstaller(m)}
                                   title="Choose which parts of this mod install"
                                 >
                                   Options
@@ -10306,6 +10343,24 @@ export default function App() {
           if (appUpdate?.latest_version) setDismissedUpdateVersion(appUpdate.latest_version);
         }}
       />
+      {fomodFor && activeGame && (
+        <FomodDialog
+          gameId={activeGame.id}
+          mod={fomodFor}
+          onClose={() => setFomodFor(null)}
+          onSaved={(selection) => {
+            setMods((prev) =>
+              prev.map((m) =>
+                m.id === fomodFor.id ? { ...m, fomod_selection: selection } : m,
+              ),
+            );
+            setNotice({
+              kind: "ok",
+              message: `Saved installer choices for ${fomodFor.name}. Deploy to apply them.`,
+            });
+          }}
+        />
+      )}
       {modOptionsFor && activeGame && (
         <ModOptionsDialog
           gameId={activeGame.id}

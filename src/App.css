@@ -1338,6 +1338,17 @@ button.mods-filters-toggle.active:hover:not(:disabled) {
   flex-shrink: 0;
 }
 
+.fomod-step {
+  display: flex;
+  flex-direction: column;
+  gap: 1.1rem;
+}
+
+.fomod-group h3 {
+  margin: 0 0 0.45rem;
+  font-size: 0.95rem;
+}
+
 .list.mods li.mod-disabled {
   opacity: 0.72;
 }

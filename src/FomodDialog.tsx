@@ -1,0 +1,253 @@
+import { useEffect, useMemo, useState } from "react";
+import { convertFileSrc } from "@tauri-apps/api/core";
+
+import { api } from "./api";
+import { Modal } from "./Modal";
+import type {
+  FomodGroupType,
+  FomodGroupView,
+  FomodInstallerView,
+  FomodPluginView,
+  FomodSelection,
+  StagedMod,
+} from "./types";
+
+type Props = {
+  gameId: string;
+  mod: StagedMod;
+  onClose: () => void;
+  onSaved: (selection: FomodSelection) => void;
+};
+
+function OptionImage({ path, alt }: { path: string | null; alt: string }) {
+  if (!path) return null;
+  return <img className="mod-option-image" src={convertFileSrc(path)} alt={alt} loading="lazy" />;
+}
+
+function isExact(type: FomodGroupType) {
+  return type === "SelectExactlyOne" || type === "SelectAtMostOne";
+}
+
+function pluginLockedOn(plugin: FomodPluginView) {
+  return plugin.plugin_type === "Required";
+}
+
+function pluginDisabled(plugin: FomodPluginView) {
+  return plugin.plugin_type === "NotUsable";
+}
+
+export function FomodDialog({ gameId, mod, onClose, onSaved }: Props) {
+  const [view, setView] = useState<FomodInstallerView | null>(null);
+  const [selection, setSelection] = useState<FomodSelection | null>(null);
+  const [stepIndex, setStepIndex] = useState(0);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    api
+      .getFomodInstaller(gameId, mod.id)
+      .then((next) => {
+        if (cancelled) return;
+        setView(next);
+        setSelection(next?.selection ?? null);
+        setStepIndex(0);
+        if (!next) {
+          setError("This mod no longer has a FOMOD installer.");
+        } else if (next.unsupported_scripted) {
+          setError("This mod uses a scripted FOMOD installer, which is not supported yet.");
+        } else {
+          setError(null);
+        }
+      })
+      .catch((e) => !cancelled && setError(String(e)))
+      .finally(() => !cancelled && setLoading(false));
+    return () => {
+      cancelled = true;
+    };
+  }, [gameId, mod.id]);
+
+  const visibleSteps = useMemo(
+    () => (view?.steps ?? []).filter((s) => s.visible),
+    [view],
+  );
+
+  const current = visibleSteps[Math.min(stepIndex, Math.max(visibleSteps.length - 1, 0))];
+  const isLast = stepIndex >= visibleSteps.length - 1;
+  const canFinish = Boolean(view && selection && !view.unsupported_scripted);
+
+  const selectedIn = (groupId: string) => selection?.selected[groupId] ?? [];
+
+  const setGroupSelection = (group: FomodGroupView, nextIds: string[]) => {
+    setSelection((prev) => {
+      if (!prev) return prev;
+      const selected = { ...prev.selected, [group.id]: nextIds };
+      return { selected };
+    });
+  };
+
+  const togglePlugin = (group: FomodGroupView, plugin: FomodPluginView) => {
+    if (pluginDisabled(plugin) || pluginLockedOn(plugin)) return;
+    const currentIds = selectedIn(group.id);
+    if (isExact(group.type)) {
+      if (group.type === "SelectAtMostOne" && currentIds.includes(plugin.id)) {
+        setGroupSelection(group, []);
+        return;
+      }
+      setGroupSelection(group, [plugin.id]);
+      return;
+    }
+    if (group.type === "SelectAll") return;
+    const on = currentIds.includes(plugin.id);
+    const next = on
+      ? currentIds.filter((id) => id !== plugin.id)
+      : [...currentIds, plugin.id];
+    // Keep required plugins selected.
+    for (const p of group.plugins) {
+      if (pluginLockedOn(p) && !next.includes(p.id)) next.push(p.id);
+    }
+    setGroupSelection(group, next);
+  };
+
+  const groupValid = (group: FomodGroupView) => {
+    const ids = selectedIn(group.id);
+    switch (group.type) {
+      case "SelectExactlyOne":
+        return ids.length === 1;
+      case "SelectAtLeastOne":
+        return ids.length >= 1;
+      case "SelectAtMostOne":
+        return ids.length <= 1;
+      default:
+        return true;
+    }
+  };
+
+  const stepValid = current ? current.groups.every(groupValid) : true;
+
+  const finish = async () => {
+    if (!selection || !canFinish) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const saved = await api.setFomodSelection(gameId, mod.id, selection);
+      onSaved(saved);
+      onClose();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const footer = (
+    <>
+      <small className="field-hint">
+        {visibleSteps.length > 1
+          ? `Step ${Math.min(stepIndex + 1, visibleSteps.length)} of ${visibleSteps.length}. Deploy again to apply.`
+          : "Deploy again to apply these choices."}
+      </small>
+      <div className="modal-foot-actions">
+        <button type="button" className="linkish" onClick={onClose} disabled={saving}>
+          Cancel
+        </button>
+        {stepIndex > 0 ? (
+          <button
+            type="button"
+            className="linkish"
+            onClick={() => setStepIndex((i) => Math.max(0, i - 1))}
+            disabled={saving}
+          >
+            Back
+          </button>
+        ) : null}
+        {isLast || visibleSteps.length === 0 ? (
+          <button type="button" onClick={finish} disabled={saving || !canFinish || !stepValid}>
+            {saving ? "Saving…" : "Finish"}
+          </button>
+        ) : (
+          <button
+            type="button"
+            onClick={() => setStepIndex((i) => i + 1)}
+            disabled={saving || !stepValid}
+          >
+            Next
+          </button>
+        )}
+      </div>
+    </>
+  );
+
+  return (
+    <Modal
+      title={view?.module_name || mod.name}
+      subtitle={current?.name ?? "FOMOD installer"}
+      onClose={onClose}
+      footer={view && selection && !view.unsupported_scripted ? footer : undefined}
+    >
+      {error ? <p className="error">{error}</p> : null}
+      {loading ? <p>Reading installer…</p> : null}
+      {view && selection && !view.unsupported_scripted && current ? (
+        <div className="fomod-step">
+          {current.groups.map((group) => {
+            const ids = selectedIn(group.id);
+            const exact = isExact(group.type);
+            return (
+              <section key={group.id} className="fomod-group">
+                <h3>{group.name}</h3>
+                {!groupValid(group) ? (
+                  <p className="field-hint">
+                    {group.type === "SelectExactlyOne"
+                      ? "Choose one option."
+                      : group.type === "SelectAtLeastOne"
+                        ? "Choose at least one option."
+                        : null}
+                  </p>
+                ) : null}
+                <ul className="mod-option-list">
+                  {group.plugins.map((plugin) => {
+                    const checked = ids.includes(plugin.id);
+                    const disabled =
+                      pluginDisabled(plugin) ||
+                      pluginLockedOn(plugin) ||
+                      group.type === "SelectAll";
+                    const off = !checked && !pluginLockedOn(plugin);
+                    return (
+                      <li key={plugin.id} className={off ? "mod-option-off" : undefined}>
+                        <label className="check">
+                          <input
+                            type={exact ? "radio" : "checkbox"}
+                            name={exact ? `fomod-${group.id}` : undefined}
+                            checked={checked || pluginLockedOn(plugin)}
+                            disabled={disabled && !pluginLockedOn(plugin)}
+                            onChange={() => togglePlugin(group, plugin)}
+                          />
+                          <OptionImage path={plugin.image} alt={plugin.name} />
+                          <div>
+                            <strong>{plugin.name}</strong>
+                            {plugin.description ? <small>{plugin.description}</small> : null}
+                            {plugin.plugin_type === "Recommended" ? (
+                              <small className="field-hint">Recommended</small>
+                            ) : null}
+                            {plugin.plugin_type === "Required" ? (
+                              <small className="field-hint">Required</small>
+                            ) : null}
+                          </div>
+                        </label>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </section>
+            );
+          })}
+        </div>
+      ) : null}
+      {view && selection && !view.unsupported_scripted && visibleSteps.length === 0 ? (
+        <p>No installer steps to show. You can finish with the required files only.</p>
+      ) : null}
+    </Modal>
+  );
+}
