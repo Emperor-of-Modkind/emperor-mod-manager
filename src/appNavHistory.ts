@@ -57,14 +57,22 @@ export class AppNavHistory {
     this.index = this.entries.length - 1;
   }
 
+  canBack(): boolean {
+    return this.index > 0;
+  }
+
+  canForward(): boolean {
+    return this.index < this.entries.length - 1;
+  }
+
   back(): NavEntry | null {
-    if (this.index <= 0) return null;
+    if (!this.canBack()) return null;
     this.index -= 1;
     return this.entries[this.index];
   }
 
   forward(): NavEntry | null {
-    if (this.index >= this.entries.length - 1) return null;
+    if (!this.canForward()) return null;
     this.index += 1;
     return this.entries[this.index];
   }

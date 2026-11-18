@@ -335,6 +335,20 @@ fn findings_for(kind: LogKind, text: &str, mods: &ModIndex<'_>) -> Vec<LoadFindi
 
 fn bepinex_findings(text: &str, mods: &ModIndex<'_>) -> Vec<LoadFinding> {
     let mut findings = Vec::new();
+    if let Some(prune_line) = text.lines().find(|line| {
+        let lower = line.to_lowercase();
+        lower.contains("deleting folder") && lower.contains("ror2bepinexpack")
+    }) {
+        findings.push(LoadFinding {
+            severity: "error".into(),
+            title: "RoR2 Preloader deleted RoR2BepInExPack.".into(),
+            detail: format!(
+                "{}\nRoR2's forked BepInEx Preloader removes BepInEx/plugins/RoR2BepInExPack on every launch, which also removes Newtonsoft.Json. Purge and redeploy so Emperor places those files under plugins/RiskofThunder-RoR2BepInExPack instead.",
+                prune_line.trim()
+            ),
+            related_mod: None,
+        });
+    }
     let chain: Vec<&str> = text
         .lines()
         .filter(|line| is_chainloader_failure(line))
@@ -1133,6 +1147,32 @@ mod tests {
                 .to_lowercase()
                 .contains("chainloader startup failed")
         }));
+    }
+
+    #[test]
+    fn ror2_preloader_prune_is_a_finding() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("BepInEx").join("LogOutput.log");
+        fs::create_dir_all(log.parent().unwrap()).unwrap();
+        fs::write(
+            &log,
+            "[Info   :   BepInEx] Deleting folder: S:\\common\\Risk of Rain 2\\BepInEx\\plugins\\RoR2BepInExPack\n\
+             [Info   :   BepInEx] 76 plugins to load\n\
+             [Error  :   BepInEx] Error loading [R2API 5.3.0] : Could not load file or assembly 'Newtonsoft.Json'\n\
+             [Message:   BepInEx] Chainloader startup complete\n",
+        )
+        .unwrap();
+        let enabled = vec!["R2API".to_string()];
+        let deployed = Vec::new();
+        let diagnosis = diagnose(&input(dir.path(), &enabled, &deployed, None));
+        assert!(
+            diagnosis.findings.iter().any(|f| {
+                f.title.contains("RoR2 Preloader deleted RoR2BepInExPack")
+                    && f.detail.contains("RiskofThunder-RoR2BepInExPack")
+            }),
+            "{:?}",
+            diagnosis.findings
+        );
     }
 
     #[test]

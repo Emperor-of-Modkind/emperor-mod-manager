@@ -20,7 +20,7 @@ use crate::{
     config::Paths,
     games::{
         bepinex_pack_deploy_root, normalize_relative, normalize_staging_root, plugin_by_id,
-        DeployContext, GamePlugin,
+        rewrite_ror2_bepinexpack_dest, DeployContext, GamePlugin,
     },
     mods::{
         fomod::FomodSelection,
@@ -2737,7 +2737,7 @@ fn deploy_fomod_map(
             rel.clone()
         };
         let dest = if to_root {
-            install_path.join(&deploy_rel)
+            rewrite_ror2_bepinexpack_dest(&install_path.join(&deploy_rel))
         } else {
             plugin.resolve_deploy_root_ctx(install_path, &deploy_rel, &ctx)?
         };
@@ -2804,7 +2804,7 @@ fn deploy_tree(
             rel
         };
         let dest = if to_root {
-            install_path.join(&deploy_rel)
+            rewrite_ror2_bepinexpack_dest(&install_path.join(&deploy_rel))
         } else {
             plugin.resolve_deploy_root_ctx(install_path, &deploy_rel, &ctx)?
         };
@@ -3649,6 +3649,87 @@ mod tests {
                     .join("plugins")
                     .exists(),
             "must not double-wrap plugins/"
+        );
+    }
+
+    #[test]
+    fn deploy_ror2_bepinexpack_avoids_pruned_folder() {
+        let (_tmp, paths) = test_paths();
+        let game_id = "ror2_pack_prune";
+        let install = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(install.path().join("BepInEx").join("core")).unwrap();
+
+        let staging = paths.mods_dir(game_id).join("RoR2BepInExPack_1");
+        std::fs::create_dir_all(staging.join("plugins").join("RoR2BepInExPack")).unwrap();
+        std::fs::write(
+            staging
+                .join("plugins")
+                .join("RoR2BepInExPack")
+                .join("Newtonsoft.Json.dll"),
+            b"json",
+        )
+        .unwrap();
+        std::fs::write(
+            staging
+                .join("plugins")
+                .join("RoR2BepInExPack")
+                .join("RoR2BepInExPack.dll"),
+            b"dll",
+        )
+        .unwrap();
+
+        save_loadorder(
+            &paths,
+            game_id,
+            &LoadOrder {
+                mods: vec![StagedMod {
+                    id: "ror2pack".into(),
+                    name: "RoR2BepInExPack".into(),
+                    source: ModSource::Thunderstore,
+                    domain: "riskofrain2".into(),
+                    staging_path: staging.to_string_lossy().into(),
+                    enabled: true,
+                    order: 1,
+                    ..Default::default()
+                }],
+            },
+        )
+        .unwrap();
+
+        let result = deploy(&paths, game_id, "riskofrain2", install.path(), None).unwrap();
+        assert!(result.file_count >= 2, "{:?}", result.warnings);
+        let safe = install
+            .path()
+            .join("BepInEx")
+            .join("plugins")
+            .join("RiskofThunder-RoR2BepInExPack");
+        assert!(
+            safe.join("Newtonsoft.Json.dll").is_file(),
+            "expected rewrite to RiskofThunder-RoR2BepInExPack, got {:?}",
+            std::fs::read_dir(install.path().join("BepInEx").join("plugins"))
+                .map(|d| d
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name())
+                    .collect::<Vec<_>>())
+                .ok()
+        );
+        assert!(safe.join("RoR2BepInExPack.dll").is_file());
+        assert!(
+            !install
+                .path()
+                .join("BepInEx")
+                .join("plugins")
+                .join("RoR2BepInExPack")
+                .exists(),
+            "must not deploy into the Preloader-pruned folder name"
+        );
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| w.contains("Preloader deletes")),
+            "preflight should not warn after a correct deploy: {:?}",
+            result.warnings
         );
     }
 
@@ -5036,5 +5117,53 @@ mod tests {
         fs::write(staging.join("One.zip"), zip_bytes()).unwrap();
         let err = import_folder(&paths, "game", &staging, "skyrim", None).unwrap_err();
         assert!(err.to_string().contains("staging"), "{err}");
+    }
+
+    /// Live check: redeploy managed Risk of Rain 2 and ensure RoR2BepInExPack
+    /// ships Newtonsoft.Json. Opt-in via `EMPEROR_VERIFY_ROR2=1`.
+    #[test]
+    #[ignore = "writes to the live RoR2 install; set EMPEROR_VERIFY_ROR2=1"]
+    fn verify_live_ror2_deploy_includes_newtonsoft() {
+        if std::env::var_os("EMPEROR_VERIFY_ROR2").is_none() {
+            return;
+        }
+        let paths = Paths::resolve().expect("resolve paths");
+        let cfg = crate::config::load_config(&paths).expect("load config");
+        let game = cfg
+            .managed_games
+            .iter()
+            .find(|g| g.plugin_id == "riskofrain2")
+            .expect("managed Risk of Rain 2");
+        let install = std::path::Path::new(&game.install_path);
+        let result = deploy(&paths, &game.id, "riskofrain2", install, None).expect("deploy");
+        eprintln!(
+            "deployed {} files from {} mods; warnings={:?}",
+            result.file_count, result.enabled_mods, result.warnings
+        );
+        let safe = install
+            .join("BepInEx")
+            .join("plugins")
+            .join("RiskofThunder-RoR2BepInExPack");
+        let newtonsoft = safe.join("Newtonsoft.Json.dll");
+        assert!(
+            newtonsoft.is_file(),
+            "expected {} after deploy",
+            newtonsoft.display()
+        );
+        assert!(
+            !install
+                .join("BepInEx")
+                .join("plugins")
+                .join("RoR2BepInExPack")
+                .exists(),
+            "must not leave files in the Preloader-pruned folder"
+        );
+        let dll = safe.join("RoR2BepInExPack.dll");
+        let meta = fs::metadata(&dll).expect("RoR2BepInExPack.dll metadata");
+        assert!(
+            meta.len() > 100_000,
+            "expected RoR2BepInExPack 1.50+ (got {} bytes)",
+            meta.len()
+        );
     }
 }

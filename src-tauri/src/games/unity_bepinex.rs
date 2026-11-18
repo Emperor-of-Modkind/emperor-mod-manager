@@ -40,6 +40,13 @@ const DOORSTOP_FILES: &[&str] = &[
 /// Subdirectories BepInEx itself loads from, relative to the `BepInEx/` root.
 const BEPINEX_SUBDIRS: &[&str] = &["plugins", "patchers", "config", "core", "monomod", "cache"];
 
+/// Folder name RoR2's forked Preloader deletes on every launch (migration leftover
+/// from when RoR2BepInExPack was embedded inside BepInExPack).
+const ROR2_PRUNED_PLUGIN_DIR: &str = "RoR2BepInExPack";
+
+/// Safe deploy folder so Newtonsoft.Json and the plugin survive Preloader cleanup.
+const ROR2_SAFE_PLUGIN_DIR: &str = "RiskofThunder-RoR2BepInExPack";
+
 /// Thunderstore package metadata that BepInEx never loads. Kept for wrapped mods
 /// (BepInEx.GUI reads `manifest.json` next to a plugin to show "TS Manifest"),
 /// dropped when a mod merges into the shared `BepInEx/` tree.
@@ -1077,6 +1084,15 @@ pub fn bepinex_preflight_warnings(install_path: &Path) -> Vec<String> {
                 ));
             }
         }
+        // RoR2's forked Preloader deletes this exact folder on every launch.
+        let pruned = root.join("plugins").join(ROR2_PRUNED_PLUGIN_DIR);
+        if pruned.is_dir() && dir_has_entries(&pruned) {
+            warnings.push(format!(
+                "RoR2's BepInEx Preloader deletes {} on every launch (Newtonsoft.Json / RoR2BepInExPack will vanish). Purge and redeploy so files land under plugins/{}.",
+                pruned.display(),
+                ROR2_SAFE_PLUGIN_DIR,
+            ));
+        }
     }
     if !doorstop_dll_at_root(install_path) {
         if let Some(nested) = nested_doorstop_dir(install_path) {
@@ -1126,6 +1142,36 @@ pub fn bepinex_log_sources(install_path: &Path) -> Vec<super::LogSource> {
     sources
 }
 
+/// Rewrite `plugins/RoR2BepInExPack/...` → `plugins/RiskofThunder-RoR2BepInExPack/...`.
+///
+/// RoR2's forked BepInEx.Preloader deletes the exact folder name `RoR2BepInExPack`
+/// on every launch. Thunderstore still ships that path, so deploy must rename it.
+pub fn rewrite_ror2_bepinexpack_dest(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    let mut rewritten = false;
+    for component in path.components() {
+        match component {
+            Component::Normal(name)
+                if !rewritten && name.to_string_lossy().eq_ignore_ascii_case(ROR2_PRUNED_PLUGIN_DIR) =>
+            {
+                // Only rewrite when this segment sits under a plugins/ directory.
+                let under_plugins = out
+                    .file_name()
+                    .map(|n| n.to_string_lossy().eq_ignore_ascii_case("plugins"))
+                    .unwrap_or(false);
+                if under_plugins {
+                    out.push(ROR2_SAFE_PLUGIN_DIR);
+                    rewritten = true;
+                } else {
+                    out.push(name);
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 pub fn resolve_bepinex_deploy(install_path: &Path, relative: &Path) -> Result<PathBuf> {
     let normalized = normalize_relative(relative);
     let parts: Vec<_> = normalized
@@ -1153,7 +1199,7 @@ pub fn resolve_bepinex_deploy(install_path: &Path, relative: &Path) -> Result<Pa
         for p in parts.iter().skip(1) {
             out.push(p);
         }
-        return Ok(out);
+        return Ok(rewrite_ror2_bepinexpack_dest(&out));
     }
 
     // Doorstop / pack files at install root
@@ -1168,7 +1214,7 @@ pub fn resolve_bepinex_deploy(install_path: &Path, relative: &Path) -> Result<Pa
         for p in &parts {
             out.push(p);
         }
-        return Ok(out);
+        return Ok(rewrite_ror2_bepinexpack_dest(&out));
     }
 
     // plugins/, patchers/, config/, monomod/ without BepInEx prefix
@@ -1177,7 +1223,7 @@ pub fn resolve_bepinex_deploy(install_path: &Path, relative: &Path) -> Result<Pa
         for p in &parts {
             out.push(p);
         }
-        return Ok(out);
+        return Ok(rewrite_ror2_bepinexpack_dest(&out));
     }
 
     // Default: <detected>/plugins/<relative>
@@ -1185,7 +1231,7 @@ pub fn resolve_bepinex_deploy(install_path: &Path, relative: &Path) -> Result<Pa
     for p in &parts {
         out.push(p);
     }
-    Ok(out)
+    Ok(rewrite_ror2_bepinexpack_dest(&out))
 }
 
 macro_rules! bepinex_title_plugin {
@@ -1907,6 +1953,61 @@ mod tests {
         )
         .unwrap();
         assert!(!should_wrap_bepinex_mod(tmp.path()));
+    }
+
+    #[test]
+    fn ror2_bepinexpack_deploy_path_is_rewritten() {
+        let dest = resolve_bepinex_deploy(
+            Path::new("/ror2"),
+            Path::new("plugins/RoR2BepInExPack/Newtonsoft.Json.dll"),
+        )
+        .unwrap();
+        assert_eq!(
+            dest,
+            PathBuf::from(
+                "/ror2/BepInEx/plugins/RiskofThunder-RoR2BepInExPack/Newtonsoft.Json.dll"
+            )
+        );
+        let nested = resolve_bepinex_deploy(
+            Path::new("/ror2"),
+            Path::new("BepInEx/plugins/RoR2BepInExPack/RoR2BepInExPack.dll"),
+        )
+        .unwrap();
+        assert_eq!(
+            nested,
+            PathBuf::from(
+                "/ror2/BepInEx/plugins/RiskofThunder-RoR2BepInExPack/RoR2BepInExPack.dll"
+            )
+        );
+        // Unrelated paths must stay intact.
+        assert_eq!(
+            rewrite_ror2_bepinexpack_dest(Path::new("/ror2/BepInEx/plugins/OtherMod/x.dll")),
+            PathBuf::from("/ror2/BepInEx/plugins/OtherMod/x.dll")
+        );
+    }
+
+    #[test]
+    fn preflight_warns_when_pruned_ror2_folder_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(
+            tmp.path()
+                .join("BepInEx")
+                .join("core"),
+        )
+        .unwrap();
+        let pruned = tmp
+            .path()
+            .join("BepInEx")
+            .join("plugins")
+            .join("RoR2BepInExPack");
+        fs::create_dir_all(&pruned).unwrap();
+        fs::write(pruned.join("Newtonsoft.Json.dll"), b"x").unwrap();
+        let warnings = bepinex_preflight_warnings(tmp.path());
+        assert!(
+            warnings.iter().any(|w| w.contains("Preloader deletes")
+                && w.contains("RiskofThunder-RoR2BepInExPack")),
+            "{warnings:?}"
+        );
     }
 
     #[test]

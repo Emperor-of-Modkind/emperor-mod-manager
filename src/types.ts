@@ -548,9 +548,18 @@ export type DetectImportResult = {
   message: string;
 };
 
+export type ThunderstoreProfileImportResult = {
+  collection: InstalledCollection;
+  warnings: string[];
+};
+
 export type ImportCodeResult =
   | { kind: "emperor"; result: ShareImportResult }
-  | { kind: "thunderstore_profile"; collection: InstalledCollection };
+  | {
+      kind: "thunderstore_profile";
+      collection: InstalledCollection;
+      warnings?: string[];
+    };
 
 export type ModVersionStatus = "ok" | "mismatch" | "unknown";
 

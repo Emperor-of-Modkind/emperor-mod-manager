@@ -53,6 +53,7 @@ import type {
   DetectImportResult,
   ImportCodeResult,
   ShareImportResult,
+  ThunderstoreProfileImportResult,
   SavedCollectionEntry,
   SavedCollectionDetail,
   ToolsStatusResponse,
@@ -357,7 +358,10 @@ export const api = {
     name?: string | null;
   }) => invoke<number>("install_collection", args),
   importThunderstoreProfile: (gameId: string, code: string) =>
-    invoke<InstalledCollection>("import_thunderstore_profile", { gameId, code }),
+    invoke<ThunderstoreProfileImportResult>("import_thunderstore_profile", {
+      gameId,
+      code,
+    }),
   exportShareCode: (gameId: string, name?: string | null) =>
     invoke<ExportShareResult>("export_share_code", {
       gameId,

@@ -2942,13 +2942,20 @@ pub async fn download_thunderstore_mod(
     Ok(staged_all)
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ThunderstoreProfileImportResult {
+    pub collection: InstalledCollection,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
 #[tauri::command]
 pub async fn import_thunderstore_profile(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     game_id: String,
     code: String,
-) -> Result<InstalledCollection, String> {
+) -> Result<ThunderstoreProfileImportResult, String> {
     let community = {
         let cfg = state.config.lock().map_err(|e| e.to_string())?;
         let game = cfg
@@ -2995,15 +3002,20 @@ pub async fn import_thunderstore_profile(
     let mut member_ids = Vec::new();
     let mut seen_pkg_ids: HashSet<String> = HashSet::new();
     let mut details_for_deps = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
 
     for m in &manifest.mods {
         let Some((ns, pkg_name)) = thunderstore::parse_package_ident(&m.name) else {
-            log::warn!("Skipping unreadable profile package {}", m.name);
+            let msg = format!("Skipping unreadable profile package {}", m.name);
+            log::warn!("{msg}");
+            warnings.push(msg);
             continue;
         };
         let key = format!("{ns}-{pkg_name}").to_lowercase();
         if !by_key.contains_key(&key) {
-            log::warn!("Profile package {ns}-{pkg_name} not found in {community}");
+            let msg = format!("Profile package {ns}-{pkg_name} not found in {community}");
+            log::warn!("{msg}");
+            warnings.push(msg);
             continue;
         }
         let ver = m.version.as_string();
@@ -3038,7 +3050,9 @@ pub async fn import_thunderstore_profile(
                 }
             }
             Err(e) => {
-                log::warn!("Failed to stage profile package {ns}-{pkg_name}: {e}");
+                let msg = format!("Failed to stage profile package {ns}-{pkg_name}: {e}");
+                log::warn!("{msg}");
+                warnings.push(msg);
             }
         }
     }
@@ -3079,8 +3093,13 @@ pub async fn import_thunderstore_profile(
         installed_at: String::new(),
         game_versions: None,
     };
-    mods::record_installed_collection(&state.paths, &game_id, collection, &new_ids)
-        .map_err(|e| e.to_string())
+    let collection =
+        mods::record_installed_collection(&state.paths, &game_id, collection, &new_ids)
+            .map_err(|e| e.to_string())?;
+    Ok(ThunderstoreProfileImportResult {
+        collection,
+        warnings,
+    })
 }
 
 #[tauri::command]
@@ -6609,7 +6628,11 @@ pub fn detect_import_code(code: String) -> Result<DetectImportResult, String> {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ImportCodeResult {
     Emperor { result: ShareImportResult },
-    ThunderstoreProfile { collection: InstalledCollection },
+    ThunderstoreProfile {
+        collection: InstalledCollection,
+        #[serde(default)]
+        warnings: Vec<String>,
+    },
 }
 
 #[tauri::command]
@@ -6627,8 +6650,11 @@ pub async fn import_code(
             Ok(ImportCodeResult::Emperor { result })
         }
         ImportCodeKind::ThunderstoreProfile => {
-            let collection = import_thunderstore_profile(app, state, game_id, code).await?;
-            Ok(ImportCodeResult::ThunderstoreProfile { collection })
+            let imported = import_thunderstore_profile(app, state, game_id, code).await?;
+            Ok(ImportCodeResult::ThunderstoreProfile {
+                collection: imported.collection,
+                warnings: imported.warnings,
+            })
         }
         ImportCodeKind::Unknown => Err(
             "Unrecognized code. Paste an Emperor share (#emperor1) or r2modman / Gale profile code."

@@ -34,12 +34,20 @@ describe("AppNavHistory", () => {
 
   it("back and forward move between entries", () => {
     const journal = new AppNavHistory(entry("browse"));
+    expect(journal.canBack()).toBe(false);
+    expect(journal.canForward()).toBe(false);
     journal.push(entry("browse", { savedDetailId: "c1" }));
     expect(journal.currentIndex).toBe(1);
+    expect(journal.canBack()).toBe(true);
+    expect(journal.canForward()).toBe(false);
     const prev = journal.back();
     expect(prev?.savedDetailId).toBeNull();
+    expect(journal.canBack()).toBe(false);
+    expect(journal.canForward()).toBe(true);
     const again = journal.forward();
     expect(again?.savedDetailId).toBe("c1");
+    expect(journal.canBack()).toBe(true);
+    expect(journal.canForward()).toBe(false);
   });
 
   it("reset collapses history", () => {

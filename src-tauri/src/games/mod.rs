@@ -90,12 +90,13 @@ pub use spaceengineers::SpaceEngineersPlugin;
 pub use stardewvalley::StardewValleyPlugin;
 pub use theforest::TheForestPlugin;
 pub use unity_bepinex::{
-    bepinex_pack_deploy_root, looks_like_unity_install, thunderstore_community_for_plugin,
-    AgainstTheStormPlugin, AmongUsPlugin, AtlyssPlugin, BepInExBuild, BepInExPlugin, ChefRpgPlugin,
-    ContentWarningPlugin, CultOfTheLambPlugin, DysonSphereProgramPlugin, GtfoPlugin, H3vrPlugin,
-    HollowKnightSilksongPlugin, InscryptionPlugin, LethalCompanyPlugin, PeakPlugin, RepoPlugin,
-    RiskOfRain2Plugin, RoundsPlugin, Schedule1Plugin, SonsOfTheForestPlugin,
-    SubnauticaBelowZeroPlugin, SubnauticaPlugin, TimberbornPlugin, UltrakillPlugin, ValheimPlugin,
+    bepinex_pack_deploy_root, looks_like_unity_install, rewrite_ror2_bepinexpack_dest,
+    thunderstore_community_for_plugin, AgainstTheStormPlugin, AmongUsPlugin, AtlyssPlugin,
+    BepInExBuild, BepInExPlugin, ChefRpgPlugin, ContentWarningPlugin, CultOfTheLambPlugin,
+    DysonSphereProgramPlugin, GtfoPlugin, H3vrPlugin, HollowKnightSilksongPlugin, InscryptionPlugin,
+    LethalCompanyPlugin, PeakPlugin, RepoPlugin, RiskOfRain2Plugin, RoundsPlugin, Schedule1Plugin,
+    SonsOfTheForestPlugin, SubnauticaBelowZeroPlugin, SubnauticaPlugin, TimberbornPlugin,
+    UltrakillPlugin, ValheimPlugin,
 };
 pub use unreal_engine::{
     detect_ue_layout, layout_info, DeepRockGalacticPlugin, DeployContext, HogwartsLegacyPlugin,

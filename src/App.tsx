@@ -17,6 +17,7 @@ import {
   faBars,
   faCopy,
   faFilter,
+  faGear,
   faLink,
   faMagnifyingGlass,
   faTrashCan,
@@ -1531,6 +1532,7 @@ export default function App() {
   const navHistoryRef = useRef<AppNavHistory | null>(null);
   const navBusyRef = useRef(false);
   const skipHistoryPushRef = useRef(false);
+  const [navCanBack, setNavCanBack] = useState(false);
   const browseReturnTabRef = useRef(browseReturnTab);
   browseReturnTabRef.current = browseReturnTab;
   const browseDetailRef = useRef(browseDetail);
@@ -1720,11 +1722,16 @@ export default function App() {
     };
   }
 
+  function syncNavCanBack() {
+    setNavCanBack(navHistoryRef.current?.canBack() ?? false);
+  }
+
   function pushNavTarget(next: NavEntry) {
     const journal = navHistoryRef.current;
     if (!journal || skipHistoryPushRef.current) return;
     journal.replaceCurrent(captureNavEntry());
     journal.push(next);
+    syncNavCanBack();
   }
 
   async function restoreNavEntry(entry: NavEntry) {
@@ -1793,6 +1800,7 @@ export default function App() {
     if (!journal) return;
     const entry = journal.back();
     if (!entry) return;
+    syncNavCanBack();
     await restoreNavEntry(entry);
   }
 
@@ -1802,6 +1810,7 @@ export default function App() {
     if (!journal) return;
     const entry = journal.forward();
     if (!entry) return;
+    syncNavCanBack();
     await restoreNavEntry(entry);
   }
 
@@ -2733,11 +2742,13 @@ export default function App() {
 
   useEffect(() => {
     navHistoryRef.current = new AppNavHistory(captureNavEntry());
+    syncNavCanBack();
   }, []);
 
   useEffect(() => {
     if (skipHistoryPushRef.current || navBusyRef.current) return;
     navHistoryRef.current?.replaceCurrent(captureNavEntry());
+    syncNavCanBack();
   }, [tab, browseDetail, browseReturnTab, libraryDetail, gameSavedDetail, savedDetail]);
 
   useEffect(() => {
@@ -5314,9 +5325,14 @@ export default function App() {
         await refreshMods(gameId);
         await refreshCollections(gameId);
         await refreshDownloads();
+        const warnings = imported.warnings ?? [];
         setNotice({
-          kind: "ok",
-          message: `Imported profile ${imported.collection.name}.`,
+          kind: warnings.length > 0 ? "warn" : "ok",
+          message:
+            warnings.length > 0
+              ? `Imported profile ${imported.collection.name} with ${warnings.length} staging warning${warnings.length === 1 ? "" : "s"}.`
+              : `Imported profile ${imported.collection.name}.`,
+          details: warnings.length > 0 ? warnings : undefined,
         });
         setProfileCode("");
         setShareImportCode("");
@@ -6279,8 +6295,21 @@ export default function App() {
         <div className="app-game-backdrop" aria-hidden="true" />
       ) : null}
       <aside className="sidebar">
-        <div className="brand">
-          <img className="brand-mark" src={appLogo} alt="Emperor Mod Manager" />
+        <div className="sidebar-top">
+          <div className="brand">
+            <img className="brand-mark" src={appLogo} alt="Emperor Mod Manager" />
+          </div>
+          <Collapse show={navCanBack} className="sidebar-history">
+            <div className="sidebar-history-inner">
+              <button
+                type="button"
+                className="sidebar-back"
+                onClick={() => void navBack()}
+              >
+                ← Back
+              </button>
+            </div>
+          </Collapse>
         </div>
         <nav>
           {navItems.map(([id, label]) => (
@@ -6437,8 +6466,8 @@ export default function App() {
               <>
                 <div className="panel-head">
                   <div className="detail-head-title">
-                    <button type="button" onClick={() => void navBack()}>
-                      ← Back
+                    <button type="button" onClick={() => closeLibraryDetail()}>
+                      Home
                     </button>
                     <h1>{libraryDetail.game.title}</h1>
                   </div>
@@ -6871,6 +6900,7 @@ export default function App() {
                           {stagedUpdateCount > 0 && (
                             <button
                               type="button"
+                              className="accent"
                               onClick={() => void updateAllStagedMods()}
                             >
                               Update all ({stagedUpdateCount})
@@ -7286,6 +7316,7 @@ export default function App() {
                               {modUpdates[m.id] && (
                                 <button
                                   type="button"
+                                  className="accent"
                                   title={
                                     modUpdates[m.id].available_version
                                       ? `Update to v${modUpdates[m.id].available_version}`
@@ -7301,10 +7332,12 @@ export default function App() {
                               {modsWithOptions.has(m.id) && (
                                 <button
                                   type="button"
+                                  className="icon-btn"
                                   onClick={() => void openModInstaller(m)}
+                                  aria-label="Mod options"
                                   title="Choose which parts of this mod install"
                                 >
-                                  Options
+                                  <FontAwesomeIcon icon={faGear} />
                                 </button>
                               )}
                               <button
@@ -7437,9 +7470,9 @@ export default function App() {
                           <button
                             type="button"
                             className="linkish"
-                            onClick={() => void navBack()}
+                            onClick={() => closeLibraryDetail()}
                           >
-                            ← Back
+                            Home
                           </button>
                           <h2>{gameSavedDetail.entry.name}</h2>
                         </div>
@@ -8056,8 +8089,8 @@ export default function App() {
               <>
                 <div className="panel-head">
                   <div className="detail-head-title">
-                    <button type="button" onClick={() => void navBack()}>
-                      ← Back
+                    <button type="button" onClick={() => closeBrowseDetail()}>
+                      Home
                     </button>
                     <h1>
                       {browseDetail.kind === "mod"
@@ -9660,9 +9693,12 @@ export default function App() {
                   <button
                     type="button"
                     className="linkish"
-                    onClick={() => void navBack()}
+                    onClick={() => {
+                      setSavedDetail(null);
+                      setSavedRename("");
+                    }}
                   >
-                    ← Back
+                    Home
                   </button>
                   <h1>{savedDetail.entry.name}</h1>
                 </div>

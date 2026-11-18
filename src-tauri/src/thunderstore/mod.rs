@@ -265,10 +265,11 @@ impl ThunderstoreClient {
 
     /// Resolve dependency closure (dependencies first). `root` is the leaf package.
     ///
-    /// Thunderstore dependencies are exact pins (`Owner-Name-1.2.3`) and mod sets
-    /// are tested against them, so install the pinned version rather than the
-    /// newest release. When two packages pin the same dependency, the higher pin
-    /// wins, which is the version both of them can load.
+    /// Thunderstore dependency versions are **minimums** (`Owner-Name-1.2.3`),
+    /// matching r2modman / Gale: install the newest published version that still
+    /// satisfies every required floor. When two packages require the same
+    /// dependency, the higher floor wins. An explicit `version` for the root
+    /// package is treated as an exact pin (profile / modpack entries).
     pub async fn resolve_install_order(
         &self,
         community: &str,
@@ -294,6 +295,8 @@ impl ThunderstoreClient {
         let mut visited: HashSet<String> = HashSet::new();
         collect_install_order(
             &root_key,
+            &root_key,
+            version,
             &pins,
             &by_key,
             community,
@@ -374,13 +377,43 @@ impl ThunderstoreClient {
     }
 }
 
-/// Highest pinned version per package across the whole dependency closure.
+/// True when `version` is semver-equal to or newer than `min`.
+fn version_satisfies_min(version: &str, min: &str) -> bool {
+    let version = version.trim();
+    let min = min.trim();
+    if version.is_empty() || min.is_empty() {
+        return false;
+    }
+    version == min || crate::mods::incoming_is_newer(Some(min), version)
+}
+
+/// Merge a newly requested minimum into the recorded floor (highest wins).
+/// Returns true when the floor was inserted or raised.
+fn raise_version_floor(floors: &mut HashMap<String, String>, key: &str, wanted: Option<&str>) -> bool {
+    let Some(wanted) = wanted.map(str::trim).filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    match floors.get(key).map(|s| s.as_str()) {
+        Some(existing) if !crate::mods::incoming_is_newer(Some(existing), wanted) => false,
+        _ => {
+            floors.insert(key.to_string(), wanted.to_string());
+            true
+        }
+    }
+}
+
+/// Highest minimum version required per package across the dependency closure.
+///
+/// The map stores **floors**, not the version that will be installed. Install
+/// selection (except an exact root pin) picks the newest published release that
+/// still satisfies the floor — see [`select_latest_satisfying`].
 fn resolve_dependency_pins(
     root_key: &str,
     root_version: Option<&str>,
     by_key: &HashMap<String, TsPackage>,
 ) -> Result<HashMap<String, String>> {
-    let mut pins: HashMap<String, String> = HashMap::new();
+    let mut floors: HashMap<String, String> = HashMap::new();
+    let mut walked: HashSet<String> = HashSet::new();
     let mut pending: Vec<(String, Option<String>)> =
         vec![(root_key.to_string(), root_version.map(str::to_string))];
 
@@ -389,12 +422,24 @@ fn resolve_dependency_pins(
         let Some(pkg) = by_key.get(&key) else {
             continue;
         };
-        let ver = select_version(pkg, wanted.as_deref())?;
-        if !crate::mods::incoming_is_newer(pins.get(&key).map(String::as_str), &ver.version_number)
-        {
+        let floor_raised = raise_version_floor(&mut floors, &key, wanted.as_deref());
+        let first_walk = walked.insert(key.clone());
+        if !first_walk && !floor_raised {
             continue;
         }
-        pins.insert(key.clone(), ver.version_number.clone());
+        let ver = if key == root_key {
+            select_root_version(pkg, root_version)?
+        } else {
+            select_latest_satisfying(pkg, floors.get(&key).map(String::as_str))?
+        };
+        if let Some(floor) = floors.get(&key) {
+            if !version_satisfies_min(&ver.version_number, floor) {
+                bail!(
+                    "No version of {} satisfies minimum {floor}",
+                    pkg.full_name
+                );
+            }
+        }
         for dep_raw in &ver.dependencies {
             if let Some(dep) = TsDependency::parse(dep_raw) {
                 pending.push((
@@ -404,12 +449,14 @@ fn resolve_dependency_pins(
             }
         }
     }
-    Ok(pins)
+    Ok(floors)
 }
 
 /// Emit packages dependencies-first, each at its resolved version.
 fn collect_install_order(
     key: &str,
+    root_key: &str,
+    root_exact: Option<&str>,
     pins: &HashMap<String, String>,
     by_key: &HashMap<String, TsPackage>,
     community: &str,
@@ -422,17 +469,32 @@ fn collect_install_order(
         return Ok(());
     }
     if !visiting.insert(key_l.clone()) {
-        bail!("Circular Thunderstore dependency involving {key}");
+        // Soft cycles are common on Thunderstore (e.g. BepInExPack ↔ RoR2BepInExPack).
+        // Skip the back-edge instead of aborting the whole install.
+        log::warn!("Skipping circular Thunderstore dependency involving {key}");
+        return Ok(());
     }
     let pkg = by_key
         .get(&key_l)
         .ok_or_else(|| anyhow!("Missing dependency package {key}"))?;
-    let ver = select_version(pkg, pins.get(&key_l).map(String::as_str))?;
+    let ver = if key_l == root_key {
+        select_exact_or_latest(pkg, root_exact)?
+    } else {
+        select_latest_satisfying(pkg, pins.get(&key_l).map(String::as_str))?
+    };
     for dep_raw in &ver.dependencies {
         if let Some(dep) = TsDependency::parse(dep_raw) {
             let dep_key = format!("{}-{}", dep.namespace, dep.name);
             collect_install_order(
-                &dep_key, pins, by_key, community, visiting, visited, ordered,
+                &dep_key,
+                root_key,
+                root_exact,
+                pins,
+                by_key,
+                community,
+                visiting,
+                visited,
+                ordered,
             )?;
         }
     }
@@ -457,8 +519,19 @@ fn collect_install_order(
     Ok(())
 }
 
-fn select_version<'a>(pkg: &'a TsPackage, preferred: Option<&str>) -> Result<&'a TsPackageVersion> {
-    if let Some(v) = preferred {
+/// Exact version when requested (profile / modpack root); otherwise latest.
+fn select_root_version<'a>(
+    pkg: &'a TsPackage,
+    root_version: Option<&str>,
+) -> Result<&'a TsPackageVersion> {
+    select_exact_or_latest(pkg, root_version)
+}
+
+fn select_exact_or_latest<'a>(
+    pkg: &'a TsPackage,
+    preferred: Option<&str>,
+) -> Result<&'a TsPackageVersion> {
+    if let Some(v) = preferred.map(str::trim).filter(|s| !s.is_empty()) {
         if let Some(found) = pkg.versions.iter().find(|x| x.version_number == v) {
             return Ok(found);
         }
@@ -467,6 +540,32 @@ fn select_version<'a>(pkg: &'a TsPackage, preferred: Option<&str>) -> Result<&'a
     pkg.versions
         .first()
         .ok_or_else(|| anyhow!("Package {} has no versions", pkg.full_name))
+}
+
+/// Newest published version that still satisfies an optional minimum floor.
+///
+/// Thunderstore lists versions newest-first, so the first match is the latest.
+fn select_latest_satisfying<'a>(
+    pkg: &'a TsPackage,
+    min: Option<&str>,
+) -> Result<&'a TsPackageVersion> {
+    let Some(min) = min.map(str::trim).filter(|s| !s.is_empty()) else {
+        return pkg
+            .versions
+            .first()
+            .ok_or_else(|| anyhow!("Package {} has no versions", pkg.full_name));
+    };
+    if let Some(found) = pkg
+        .versions
+        .iter()
+        .find(|v| version_satisfies_min(&v.version_number, min))
+    {
+        return Ok(found);
+    }
+    bail!(
+        "No version of {} satisfies minimum {min}",
+        pkg.full_name
+    )
 }
 
 pub fn detail_from_package(community: &str, pkg: TsPackage) -> TsPackageDetail {
@@ -732,7 +831,7 @@ mod tests {
     }
 
     #[test]
-    fn pins_dependencies_to_the_version_they_were_tested_against() {
+    fn dependency_floor_keeps_the_requested_minimum() {
         let by_key = index(vec![
             package(
                 "Author",
@@ -746,13 +845,17 @@ mod tests {
             ),
         ]);
 
-        let pins = resolve_dependency_pins("author-mod", None, &by_key).unwrap();
+        let floors = resolve_dependency_pins("author-mod", None, &by_key).unwrap();
+        assert_eq!(floors.get("bbepis-bepinexpack").unwrap(), "5.4.2120");
 
-        assert_eq!(pins.get("bbepis-bepinexpack").unwrap(), "5.4.2120");
+        let selected =
+            select_latest_satisfying(by_key.get("bbepis-bepinexpack").unwrap(), Some("5.4.2120"))
+                .unwrap();
+        assert_eq!(selected.version_number, "5.4.2122");
     }
 
     #[test]
-    fn highest_pin_wins_when_packages_disagree() {
+    fn highest_floor_wins_and_latest_satisfying_is_installed() {
         let by_key = index(vec![
             package(
                 "Author",
@@ -778,10 +881,13 @@ mod tests {
             ),
         ]);
 
-        let pins = resolve_dependency_pins("author-mod", None, &by_key).unwrap();
+        let floors = resolve_dependency_pins("author-mod", None, &by_key).unwrap();
 
-        // 1.5.0 satisfies both pins; 2.0.0 is newer than anything asked for.
-        assert_eq!(pins.get("author-shared").unwrap(), "1.5.0");
+        // Floor is the higher minimum; install picks newest that still satisfies it.
+        assert_eq!(floors.get("author-shared").unwrap(), "1.5.0");
+        let selected =
+            select_latest_satisfying(by_key.get("author-shared").unwrap(), Some("1.5.0")).unwrap();
+        assert_eq!(selected.version_number, "2.0.0");
     }
 
     #[test]
@@ -798,12 +904,14 @@ mod tests {
                 vec![version("1.1.0", &[]), version("1.0.0", &[])],
             ),
         ]);
-        let pins = resolve_dependency_pins("author-mod", None, &by_key).unwrap();
+        let floors = resolve_dependency_pins("author-mod", None, &by_key).unwrap();
 
         let mut ordered = Vec::new();
         collect_install_order(
             "author-mod",
-            &pins,
+            "author-mod",
+            None,
+            &floors,
             &by_key,
             "riskofrain2",
             &mut HashSet::new(),
@@ -814,7 +922,61 @@ mod tests {
 
         let names: Vec<_> = ordered.iter().map(|p| p.full_name.clone()).collect();
         assert_eq!(names, vec!["Author-Lib", "Author-Mod"]);
-        assert_eq!(ordered[0].latest_version.as_deref(), Some("1.0.0"));
-        assert_eq!(ordered[0].versions[0].version_number, "1.0.0");
+        // Lib floor is 1.0.0; newest satisfying release is 1.1.0.
+        assert_eq!(ordered[0].latest_version.as_deref(), Some("1.1.0"));
+        assert_eq!(ordered[0].versions[0].version_number, "1.1.0");
+    }
+
+    #[test]
+    fn ror2_bepinexpack_cycle_installs_latest_ror2_pack() {
+        // Modern bbepis-BepInExPack depends on RoR2BepInExPack-1.9.0; old 1.9.0
+        // still depends back on BepInExPack. Latest 1.50.0 does not — and ships
+        // Newtonsoft.Json. Soft cycles + min-version selection must pick 1.50.0.
+        let by_key = index(vec![
+            package(
+                "bbepis",
+                "BepInExPack",
+                vec![version(
+                    "5.4.2122",
+                    &["RiskofThunder-RoR2BepInExPack-1.9.0"],
+                )],
+            ),
+            package(
+                "RiskofThunder",
+                "RoR2BepInExPack",
+                vec![
+                    version("1.50.0", &[]),
+                    version("1.9.0", &["bbepis-BepInExPack-5.4.2100"]),
+                ],
+            ),
+        ]);
+
+        let floors = resolve_dependency_pins("bbepis-bepinexpack", Some("5.4.2122"), &by_key)
+            .expect("cycle must not abort pin resolve");
+        assert_eq!(
+            floors.get("riskofthunder-ror2bepinexpack").unwrap(),
+            "1.9.0"
+        );
+
+        let mut ordered = Vec::new();
+        collect_install_order(
+            "bbepis-bepinexpack",
+            "bbepis-bepinexpack",
+            Some("5.4.2122"),
+            &floors,
+            &by_key,
+            "riskofrain2",
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+            &mut ordered,
+        )
+        .expect("cycle must not abort install order");
+
+        let ror2 = ordered
+            .iter()
+            .find(|p| p.full_name == "RiskofThunder-RoR2BepInExPack")
+            .expect("RoR2BepInExPack in order");
+        assert_eq!(ror2.latest_version.as_deref(), Some("1.50.0"));
+        assert_eq!(ror2.versions[0].version_number, "1.50.0");
     }
 }
