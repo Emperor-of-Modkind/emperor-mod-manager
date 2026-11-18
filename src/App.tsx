@@ -1517,6 +1517,8 @@ export default function App() {
   const activeBatchRef = useRef<ActiveDownloadBatch | null>(null);
   activeBatchRef.current = activeBatch;
   const assistHostRef = useRef<HTMLDivElement | null>(null);
+  const sidebarAssistHostRef = useRef<HTMLDivElement | null>(null);
+  const assistActiveRef = useRef(false);
   const nexusLoginHostRef = useRef<HTMLDivElement | null>(null);
   const nexusLoginOpenRef = useRef(false);
   const nexusLoginGenRef = useRef(0);
@@ -1524,6 +1526,7 @@ export default function App() {
   const [nexusLoginConfirming, setNexusLoginConfirming] = useState(false);
   const tabRef = useRef(tab);
   tabRef.current = tab;
+  assistActiveRef.current = assistActive;
   const setupCompleteRef = useRef(false);
   const navHistoryRef = useRef<AppNavHistory | null>(null);
   const navBusyRef = useRef(false);
@@ -2796,42 +2799,88 @@ export default function App() {
 
   const isPremium = settings?.user?.is_premium ?? false;
 
+  const resolveAssistMeasureHost = useCallback((): HTMLElement | null => {
+    if (nexusLoginOpenRef.current) return nexusLoginHostRef.current;
+    if (tabRef.current === "downloads") return assistHostRef.current;
+    if (assistActiveRef.current) return sidebarAssistHostRef.current;
+    return null;
+  }, []);
+
   const syncAssistHost = useCallback(async () => {
     const gen = assistSyncGenRef.current;
-    const host = assistHostRef.current;
-    if (!host || tabRef.current !== "downloads" || nexusLoginOpenRef.current) return;
+    const host = resolveAssistMeasureHost();
+    if (!host) {
+      if (!assistActiveRef.current && !nexusLoginOpenRef.current) {
+        try {
+          await api.setAssistVisible(false);
+        } catch {
+          /* ignore */
+        }
+      }
+      return;
+    }
     const bounds = measureHostBounds(host);
     if (!bounds) return;
 
     try {
       await api.setAssistBounds(bounds);
-      // A superseded sync must not hide the embed. Only leaving Downloads does.
+      if (gen !== assistSyncGenRef.current) return;
       if (
-        gen !== assistSyncGenRef.current ||
-        tabRef.current !== "downloads" ||
-        nexusLoginOpenRef.current
+        nexusLoginOpenRef.current ||
+        tabRef.current === "downloads" ||
+        assistActiveRef.current
       ) {
-        return;
+        await api.setAssistVisible(true);
       }
-      await api.setAssistVisible(true);
     } catch {
       /* host may not be ready yet */
     }
-  }, []);
+  }, [resolveAssistMeasureHost]);
+
+  const waitForAssistMeasureHost = useCallback(
+    async (maxMs = 2500) => {
+      const stayOnPage = settings?.install_click_behavior === "stay";
+      const useSidebar =
+        stayOnPage && tabRef.current !== "downloads";
+      if (!useSidebar) {
+        setTab("downloads");
+      }
+      const deadline = Date.now() + maxMs;
+      while (Date.now() < deadline) {
+        await new Promise<void>((resolve) => {
+          requestAnimationFrame(() => resolve());
+        });
+        const host = useSidebar
+          ? sidebarAssistHostRef.current
+          : assistHostRef.current;
+        if (!host) continue;
+        const bounds = measureHostBounds(host);
+        if (!bounds) continue;
+        try {
+          await api.setAssistBounds(bounds);
+          return true;
+        } catch {
+          /* retry */
+        }
+      }
+      return false;
+    },
+    [settings?.install_click_behavior],
+  );
 
   useEffect(() => {
     if (nexusLoginOpen) return;
-    if (tab !== "downloads") {
+    if (!assistActive && tab !== "downloads") {
       assistSyncGenRef.current += 1;
       api.setAssistVisible(false).catch(() => {});
       return;
     }
     const syncSoon = () => {
       requestAnimationFrame(() => {
-        if (tabRef.current !== "downloads" || nexusLoginOpenRef.current) return;
+        if (nexusLoginOpenRef.current) return;
         void syncAssistHost();
         requestAnimationFrame(() => {
-          if (tabRef.current !== "downloads" || nexusLoginOpenRef.current) return;
+          if (nexusLoginOpenRef.current) return;
           void syncAssistHost();
         });
       });
@@ -2842,19 +2891,18 @@ export default function App() {
     window.addEventListener("scroll", onResize, true);
     window.visualViewport?.addEventListener("resize", onResize);
     window.visualViewport?.addEventListener("scroll", onResize);
-    const observer = assistHostRef.current
-      ? new ResizeObserver(() => syncSoon())
-      : null;
-    if (assistHostRef.current && observer) {
-      observer.observe(assistHostRef.current);
-    }
+    const observer = new ResizeObserver(() => syncSoon());
+    const fullHost = assistHostRef.current;
+    const miniHost = sidebarAssistHostRef.current;
+    if (fullHost) observer.observe(fullHost);
+    if (miniHost) observer.observe(miniHost);
     return () => {
       assistSyncGenRef.current += 1;
       window.removeEventListener("resize", onResize);
       window.removeEventListener("scroll", onResize, true);
       window.visualViewport?.removeEventListener("resize", onResize);
       window.visualViewport?.removeEventListener("scroll", onResize);
-      observer?.disconnect();
+      observer.disconnect();
     };
   }, [tab, syncAssistHost, assistActive, assistQueue?.head, nexusLoginOpen]);
 
@@ -3077,11 +3125,8 @@ export default function App() {
         return;
       }
       setAssistActive(true);
-      await new Promise<void>((resolve) => {
-        requestAnimationFrame(() => {
-          requestAnimationFrame(() => resolve());
-        });
-      });
+      assistActiveRef.current = true;
+      await waitForAssistMeasureHost();
       await syncAssistHost();
       setBusy(`Download Assist — ${entry.name}`);
       await api.openDownloadAssist({
@@ -3095,8 +3140,9 @@ export default function App() {
         version: entry.version ?? null,
         fileName: entry.fileName ?? null,
       });
+      await syncAssistHost();
     },
-    [finishAssistQueue, syncAssistHost],
+    [finishAssistQueue, syncAssistHost, waitForAssistMeasureHost],
   );
 
   const advanceAssistAfterStart = useCallback(async () => {
@@ -3340,7 +3386,17 @@ export default function App() {
     (el: HTMLDivElement | null) => {
       assistHostRef.current = el;
       if (el) {
-        syncAssistHost();
+        void syncAssistHost();
+      }
+    },
+    [syncAssistHost],
+  );
+
+  const handleSidebarAssistHost = useCallback(
+    (el: HTMLDivElement | null) => {
+      sidebarAssistHostRef.current = el;
+      if (el) {
+        void syncAssistHost();
       }
     },
     [syncAssistHost],
@@ -3485,6 +3541,7 @@ export default function App() {
     });
     const unlistenOpened = listen<{ autoclick: boolean }>("assist-opened", (event) => {
       setAssistActive(true);
+      assistActiveRef.current = true;
       setAssistLoginBanner(false);
       const q = assistQueueRef.current;
       const entry = q?.entries[q.head];
@@ -3493,6 +3550,12 @@ export default function App() {
           ? "Autoclick enabled — opening dialog then Slow download when ready."
           : "Click Mod Manager Download or Slow download in the panel above.",
       );
+      requestAnimationFrame(() => {
+        void syncAssistHost();
+        requestAnimationFrame(() => {
+          void syncAssistHost();
+        });
+      });
       if (q && entry) {
         setBusy(
           event.payload.autoclick
@@ -3716,7 +3779,7 @@ export default function App() {
       unlistenProgress.then((f) => f());
       unlistenStarted.then((f) => f());
     };
-  }, [advanceAssistAfterFailure, advanceAssistAfterStart, refreshDownloads, refreshMods, refreshCollections, refreshModUpdates, refreshMissingRequirements]);
+  }, [advanceAssistAfterFailure, advanceAssistAfterStart, refreshDownloads, refreshMods, refreshCollections, refreshModUpdates, refreshMissingRequirements, syncAssistHost]);
 
   async function withBusy<T>(label: string, fn: () => Promise<T>): Promise<T | undefined> {
     setBusy(label);
@@ -5570,6 +5633,29 @@ export default function App() {
     });
   }
 
+  async function deleteSavedCollectionEntry(entry: SavedCollectionEntry) {
+    let shareId: string | null = savedEntryShareIds[entry.id] ?? null;
+    if (!shareId) {
+      try {
+        shareId = await api.emperorShareId(entry.code);
+      } catch {
+        shareId = null;
+      }
+    }
+    await api.deleteSavedCollection(entry.id);
+    await refreshSavedCollections();
+    if (activeGame) {
+      await refreshMods(activeGame.id);
+      await refreshCollections(activeGame.id);
+      if (shareId && modsCollectionFilter === shareId) {
+        setModsCollectionFilter("");
+      }
+    }
+    if (tab === "collections") {
+      await refreshCollectionsPageMeta();
+    }
+  }
+
   async function updateOneStagedMod(stagedId: string) {
     if (!activeGame) return;
     const m = mods.find((x) => x.id === stagedId);
@@ -6118,6 +6204,8 @@ export default function App() {
 
   const sortOptions = browseMode === "mods" ? MOD_SORTS : COLLECTION_SORTS;
   const downloadStatus = statusSummary(busy, assistQueue, downloads, activeBatch);
+  const showSidebarAssist =
+    assistActive && tab !== "downloads" && !nexusLoginOpen;
 
   function browseResultsNote(kind: "mods" | "collections"): string {
     if (browseLoading && !browseSearched) return "Searching…";
@@ -6218,33 +6306,55 @@ export default function App() {
           <div className="active-game">
             <span>Active</span>
             <strong>{activeGame.title}</strong>
-            {downloadStatus && (
-              <button
-                type="button"
-                className="active-game-status"
-                onClick={openDownloadsTab}
-                title="Open Downloads"
-              >
-                <span className="status-primary">{downloadStatus.primary}</span>
-                {downloadStatus.secondary ? (
-                  <span className="status-secondary">{downloadStatus.secondary}</span>
+            {(downloadStatus || showSidebarAssist) && (
+              <div className="sidebar-status-block in-active-game">
+                {downloadStatus ? (
+                  <button
+                    type="button"
+                    className="active-game-status"
+                    onClick={openDownloadsTab}
+                    title="Open Downloads"
+                  >
+                    <span className="status-primary">{downloadStatus.primary}</span>
+                    {downloadStatus.secondary ? (
+                      <span className="status-secondary">{downloadStatus.secondary}</span>
+                    ) : null}
+                  </button>
                 ) : null}
-              </button>
+                {showSidebarAssist ? (
+                  <div
+                    ref={handleSidebarAssistHost}
+                    className="sidebar-assist-host active"
+                    aria-hidden
+                  />
+                ) : null}
+              </div>
             )}
           </div>
         ) : (
-          downloadStatus && (
-            <button
-              type="button"
-              className="sidebar-status"
-              onClick={openDownloadsTab}
-              title="Open Downloads"
-            >
-              <span className="status-primary">{downloadStatus.primary}</span>
-              {downloadStatus.secondary ? (
-                <span className="status-secondary">{downloadStatus.secondary}</span>
+          (downloadStatus || showSidebarAssist) && (
+            <div className="sidebar-status-block standalone">
+              {downloadStatus ? (
+                <button
+                  type="button"
+                  className="sidebar-status"
+                  onClick={openDownloadsTab}
+                  title="Open Downloads"
+                >
+                  <span className="status-primary">{downloadStatus.primary}</span>
+                  {downloadStatus.secondary ? (
+                    <span className="status-secondary">{downloadStatus.secondary}</span>
+                  ) : null}
+                </button>
               ) : null}
-            </button>
+              {showSidebarAssist ? (
+                <div
+                  ref={handleSidebarAssistHost}
+                  className="sidebar-assist-host active"
+                  aria-hidden
+                />
+              ) : null}
+            </div>
           )
         )}
       </aside>
@@ -6695,6 +6805,13 @@ export default function App() {
                                 }
                               >
                                 Save as file
+                              </button>
+                              <button
+                                type="button"
+                                className="linkish"
+                                onClick={() => setLastShareCode(null)}
+                              >
+                                Dismiss
                               </button>
                             </div>
                           </>
@@ -7407,11 +7524,10 @@ export default function App() {
                                   return;
                                 }
                                 try {
-                                  await api.deleteSavedCollection(
-                                    gameSavedDetail.entry.id,
+                                  await deleteSavedCollectionEntry(
+                                    gameSavedDetail.entry,
                                   );
                                   setGameSavedDetail(null);
-                                  await refreshSavedCollections();
                                 } catch (e) {
                                   setError(String(e));
                                 }
@@ -7565,8 +7681,7 @@ export default function App() {
                                         return;
                                       }
                                       try {
-                                        await api.deleteSavedCollection(c.id);
-                                        await refreshSavedCollections();
+                                        await deleteSavedCollectionEntry(c);
                                       } catch (err) {
                                         setError(String(err));
                                       }
@@ -9651,9 +9766,8 @@ export default function App() {
                             return;
                           }
                           try {
-                            await api.deleteSavedCollection(savedDetail.entry.id);
+                            await deleteSavedCollectionEntry(savedDetail.entry);
                             setSavedDetail(null);
-                            await refreshSavedCollections();
                           } catch (e) {
                             setError(String(e));
                           }
@@ -9822,8 +9936,7 @@ export default function App() {
                                             return;
                                           }
                                           try {
-                                            await api.deleteSavedCollection(c.id);
-                                            await refreshSavedCollections();
+                                            await deleteSavedCollectionEntry(c);
                                           } catch (err) {
                                             setError(String(err));
                                           }

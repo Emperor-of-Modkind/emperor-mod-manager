@@ -1094,6 +1094,33 @@ pub fn uninstall_collection(paths: &Paths, game_id: &str, collection_id: &str) -
     })
 }
 
+/// Drop an installed collection record and clear membership on staged mods,
+/// keeping staging dirs. Missing collection id is a no-op.
+pub fn forget_installed_collection(
+    paths: &Paths,
+    game_id: &str,
+    collection_id: &str,
+) -> Result<()> {
+    with_game_order(game_id, || {
+        let mut store = load_collections(paths, game_id)?;
+        if !store.collections.iter().any(|c| c.id == collection_id) {
+            return Ok(());
+        }
+        store.collections.retain(|c| c.id != collection_id);
+        let mut order = read_loadorder(paths, game_id)?;
+        collapse_load_order(paths, game_id, &mut order)?;
+        drop_collection_from_mods(&mut order, collection_id);
+        for m in &mut order.mods {
+            if m.collection_ids.is_empty() {
+                m.independent = true;
+            }
+        }
+        write_loadorder(paths, game_id, &order)?;
+        save_collections(paths, game_id, &store)?;
+        Ok(())
+    })
+}
+
 pub fn list_installed_collections(
     paths: &Paths,
     game_id: &str,
@@ -4792,6 +4819,77 @@ mod tests {
         assert!(ids.contains(&"W"));
         assert!(ids.contains(&"B"));
         assert!(!ids.contains(&"A"));
+    }
+
+    #[test]
+    fn forget_installed_collection_orphans_mods_and_keeps_staging() {
+        let (_tmp, paths) = test_paths();
+        let game_id = "forget_col_test";
+        crate::config::ensure_game_dirs(&paths, game_id).unwrap();
+        let staging_root = paths.mods_dir(game_id);
+        for id in ["A", "Z"] {
+            std::fs::create_dir_all(staging_root.join(id)).unwrap();
+        }
+        let staged =
+            |id: &str, independent: bool, collection_ids: Vec<String>| StagedMod {
+                id: id.into(),
+                name: id.into(),
+                staging_path: staging_root.join(id).to_string_lossy().into(),
+                independent,
+                collection_ids,
+                ..Default::default()
+            };
+        save_loadorder(
+            &paths,
+            game_id,
+            &LoadOrder {
+                mods: vec![
+                    staged("A", false, vec!["col-a".into()]),
+                    staged("Z", false, vec!["col-a".into()]),
+                ],
+            },
+        )
+        .unwrap();
+        save_collections(
+            &paths,
+            game_id,
+            &InstalledCollections {
+                collections: vec![InstalledCollection {
+                    id: "col-a".into(),
+                    source: CollectionSource::Emperor,
+                    kind: CollectionKind::Share,
+                    name: "Share".into(),
+                    slug: None,
+                    namespace: None,
+                    package_name: None,
+                    community: None,
+                    revision: None,
+                    version: None,
+                    profile_code: Some("#emperor1abc".into()),
+                    mod_ids: vec!["A".into(), "Z".into()],
+                    installed_at: "t".into(),
+                    game_versions: None,
+                }],
+            },
+        )
+        .unwrap();
+
+        forget_installed_collection(&paths, game_id, "col-a").unwrap();
+        forget_installed_collection(&paths, game_id, "missing").unwrap();
+
+        let installed = list_installed_collections(&paths, game_id).unwrap();
+        assert!(installed.is_empty());
+        let order = load_loadorder(&paths, game_id).unwrap();
+        assert_eq!(order.mods.len(), 2);
+        for m in &order.mods {
+            assert!(m.collection_ids.is_empty(), "{}", m.id);
+            assert!(m.independent, "{}", m.id);
+            assert!(
+                PathBuf::from(&m.staging_path).exists(),
+                "staging should remain for {}",
+                m.id
+            );
+        }
     }
 
     #[test]

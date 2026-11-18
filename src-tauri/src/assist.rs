@@ -1448,6 +1448,7 @@ fn inject_assist_scripts(
 
 fn assist_overlay_shown(state: &AppState) -> bool {
     state.assist_desired_visible.load(Ordering::SeqCst)
+        && state.assist_bounds_synced.load(Ordering::SeqCst)
         && !state.assist_hide_until_loaded.load(Ordering::SeqCst)
 }
 
@@ -1512,9 +1513,14 @@ pub fn set_assist_bounds(
         width,
         height,
     };
+    // Reject tiny / empty rects so we never mark the default top-left as synced.
+    if width < 8.0 || height < 8.0 {
+        return Ok(());
+    }
     if let Ok(mut lock) = state.assist_bounds.lock() {
         *lock = bounds;
     }
+    state.assist_bounds_synced.store(true, Ordering::SeqCst);
     if let Some(webview) = app.get_webview(ASSIST_LABEL) {
         apply_assist_bounds(&app, &webview, bounds)?;
         // Bounds must not force-show; respect Downloads-tab desired visibility.

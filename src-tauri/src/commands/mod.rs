@@ -122,6 +122,9 @@ pub struct AppState {
     pub pending_emperor_mod: Mutex<Option<crate::deep_link::EmperorOpenMod>>,
     /// Last embedded assist panel bounds (logical px, relative to main window).
     pub assist_bounds: Mutex<AssistBounds>,
+    /// True after the UI has pushed real host bounds at least once this session.
+    /// Prevents painting at the default top-left placeholder.
+    pub assist_bounds_synced: AtomicBool,
     /// Whether the assist webview should be shown (Downloads tab). Bounds/open must not force-show.
     pub assist_desired_visible: AtomicBool,
     /// Nexus URL waiting until the Linux embed is attached. Flushed even while the overlay is hidden.
@@ -295,6 +298,7 @@ impl AppState {
             last_emperor_mod_emit: Mutex::new(None),
             pending_emperor_mod: Mutex::new(None),
             assist_bounds: Mutex::new(AssistBounds::default()),
+            assist_bounds_synced: AtomicBool::new(false),
             assist_desired_visible: AtomicBool::new(false),
             assist_pending_url: Mutex::new(None),
             assist_hide_until_loaded: AtomicBool::new(false),
@@ -7062,7 +7066,48 @@ pub fn rename_saved_collection(
 
 #[tauri::command]
 pub fn delete_saved_collection(state: State<'_, AppState>, id: String) -> Result<(), String> {
-    share::delete_saved_collection(&state.paths, &id).map_err(|e| e.to_string())
+    let store =
+        share::load_saved_collections(&state.paths).map_err(|e| e.to_string())?;
+    let entry = store
+        .collections
+        .iter()
+        .find(|c| c.id == id)
+        .cloned()
+        .ok_or_else(|| "saved collection not found".to_string())?;
+    let share_id = share::emperor_share_id(entry.code.trim());
+    let code = entry.code.trim().to_string();
+
+    share::delete_saved_collection(&state.paths, &id).map_err(|e| e.to_string())?;
+
+    let game_ids: Vec<String> = {
+        let cfg = state.config.lock().map_err(|e| e.to_string())?;
+        cfg.managed_games.iter().map(|g| g.id.clone()).collect()
+    };
+    for game_id in game_ids {
+        let installed =
+            match mods::list_installed_collections(&state.paths, &game_id) {
+                Ok(list) => list,
+                Err(_) => continue,
+            };
+        let match_ids: Vec<String> = installed
+            .iter()
+            .filter(|c| {
+                c.id == share_id
+                    || (c.source == CollectionSource::Emperor
+                        && c
+                            .profile_code
+                            .as_deref()
+                            .map(|p| p.trim())
+                            == Some(code.as_str()))
+            })
+            .map(|c| c.id.clone())
+            .collect();
+        for collection_id in match_ids {
+            mods::forget_installed_collection(&state.paths, &game_id, &collection_id)
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
