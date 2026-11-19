@@ -49,6 +49,10 @@ export type DetectedGame = {
   plugin_id: string | null;
   nexus_domain: string | null;
   cover_path: string | null;
+  /** Remote poster when `cover_path` is empty. */
+  cover_url?: string | null;
+  /** Launcher icon used only when no poster is available. */
+  icon_path?: string | null;
   engine_hint: string | null;
 };
 
@@ -60,6 +64,8 @@ export type ManagedGame = {
   launcher: string;
   plugin_id: string;
   cover_path?: string | null;
+  /** Remote poster when `cover_path` is empty. */
+  cover_url?: string | null;
   project_name?: string | null;
   thunderstore_community?: string | null;
   modio_game_id?: number | null;
@@ -201,6 +207,18 @@ export type CatalogSuggestion = {
 export type CatalogSuggestRequest = {
   id: string;
   title: string;
+};
+
+export type CatalogCoverRequest = {
+  id: string;
+  nexus_domain?: string | null;
+  modio_game_id?: number | null;
+  icon_path?: string | null;
+};
+
+export type CatalogCoverHit = {
+  id: string;
+  cover_url: string;
 };
 
 export type CatalogSource = "nexus" | "thunderstore" | "modio";

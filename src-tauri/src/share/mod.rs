@@ -196,10 +196,7 @@ fn strip_bom(s: &str) -> &str {
 
 /// Discord and other chat apps wrap long pastes; strip all whitespace from the base64 body.
 fn compact_base64_payload(encoded: &str) -> String {
-    encoded
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect()
+    encoded.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
 pub fn decode_share_code(raw: &str) -> Result<ShareManifest> {
@@ -221,8 +218,11 @@ pub fn decode_share_code(raw: &str) -> Result<ShareManifest> {
     let mut json = Vec::new();
     // Discord truncation often still base64-decodes; inflate may fail, or yield
     // partial bytes that then fail JSON parse — treat both as altered paste.
-    decoder.read_to_end(&mut json).map_err(|_| anyhow!(ALTERED_SHARE_HINT))?;
-    let manifest: ShareManifest = serde_json::from_slice(&json).map_err(|_| anyhow!(ALTERED_SHARE_HINT))?;
+    decoder
+        .read_to_end(&mut json)
+        .map_err(|_| anyhow!(ALTERED_SHARE_HINT))?;
+    let manifest: ShareManifest =
+        serde_json::from_slice(&json).map_err(|_| anyhow!(ALTERED_SHARE_HINT))?;
     if manifest.v != 1 {
         bail!("unsupported share format version {}", manifest.v);
     }
@@ -766,6 +766,7 @@ mod tests {
             launcher: "steam".into(),
             plugin_id: "p".into(),
             cover_path: None,
+            cover_url: None,
             project_name: Some("Phoenix".into()),
             thunderstore_community: None,
             modio_game_id: None,
@@ -837,6 +838,7 @@ mod tests {
             launcher: "steam".into(),
             plugin_id: "p".into(),
             cover_path: None,
+            cover_url: None,
             project_name: None,
             thunderstore_community: Some("lethal-company".into()),
             modio_game_id: Some(42),
@@ -858,6 +860,7 @@ mod tests {
             launcher: "steam".into(),
             plugin_id: "p".into(),
             cover_path: None,
+            cover_url: None,
             project_name: None,
             thunderstore_community: None,
             modio_game_id: None,

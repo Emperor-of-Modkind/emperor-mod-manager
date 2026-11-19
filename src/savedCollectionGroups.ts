@@ -178,7 +178,7 @@ function resolveGroupMeta(
   if (managedMatch) {
     return {
       title: managedMatch.title,
-      coverPath: managedMatch.cover_path ?? null,
+      coverPath: managedMatch.cover_path || managedMatch.cover_url || null,
       managed: managedMatch,
     };
   }
@@ -188,7 +188,11 @@ function resolveGroupMeta(
   if (detectedMatch) {
     return {
       title: detectedMatch.title,
-      coverPath: detectedMatch.cover_path,
+      coverPath:
+        detectedMatch.cover_path ||
+        detectedMatch.cover_url ||
+        detectedMatch.icon_path ||
+        null,
       managed: null,
     };
   }

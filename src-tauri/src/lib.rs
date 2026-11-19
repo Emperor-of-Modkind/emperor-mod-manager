@@ -82,6 +82,7 @@ pub fn run() {
             app_update::check_app_update,
             app_update::install_app_update,
             commands::scan_games,
+            commands::resolve_catalog_covers,
             commands::list_plugins,
             commands::list_managed,
             commands::manage_game,

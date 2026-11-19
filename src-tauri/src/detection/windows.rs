@@ -15,6 +15,10 @@ use winreg::enums::HKEY_CURRENT_USER;
 #[cfg(target_os = "windows")]
 use winreg::RegKey;
 
+#[cfg(target_os = "windows")]
+use super::heroic_art::{HeroicResolver, HeroicStore};
+#[cfg(target_os = "windows")]
+use super::steam_shortcuts::{shortcut_games_from_roots, STEAM_SHORTCUTS_LAUNCHER};
 use super::DetectedGame;
 
 #[cfg(target_os = "windows")]
@@ -64,6 +68,26 @@ fn scan_steam() -> Vec<DetectedGame> {
                 out.push(game);
             }
         }
+    }
+    for shortcut in shortcut_games_from_roots(std::iter::once(&steam_root)) {
+        let key = normalize_windows_path_key(&shortcut.install_path);
+        if !seen_installs.insert(key) {
+            continue;
+        }
+        let app_id = shortcut.app_id.to_string();
+        let cover = resolve_steam_box_art(&steam_root, &app_id)
+            .map(|path| path.to_string_lossy().to_string());
+        let mut detected = super::finish_detected(
+            shortcut.title,
+            STEAM_SHORTCUTS_LAUNCHER.to_string(),
+            Some(shortcut.install_path.to_string_lossy().to_string()),
+            cover,
+        );
+        if detected.cover_path.is_none() {
+            detected.icon_path = resolve_steam_icon(&steam_root, &app_id)
+                .map(|path| path.to_string_lossy().to_string());
+        }
+        out.push(detected);
     }
     out
 }
@@ -141,34 +165,71 @@ fn parse_appmanifest(acf: &Path, steamapps: &Path, steam_root: &Path) -> Option<
         .as_deref()
         .and_then(|id| resolve_steam_box_art(steam_root, id))
         .map(|p| p.to_string_lossy().to_string());
-    Some(super::finish_detected(
+    let mut detected = super::finish_detected(
         name,
         "Steam".to_string(),
         Some(install_path.to_string_lossy().to_string()),
         cover_path,
-    ))
+    );
+    if detected.cover_path.is_none() {
+        detected.icon_path = appid
+            .as_deref()
+            .and_then(|id| resolve_steam_icon(steam_root, id))
+            .map(|path| path.to_string_lossy().to_string());
+    }
+    Some(detected)
 }
 
-/// Locate Steam library capsule / box art under `appcache/librarycache`.
+const COVER_EXTS: &[&str] = &["jpg", "jpeg", "png", "webp"];
+
+/// Locate Steam library capsule / box art.
 ///
-/// Supports the legacy flat layout (`{appid}_library_600x900.jpg`) and the newer
-/// `{appid}/[hash/]library_600x900*.jpg` / `library_capsule.*` layouts.
+/// Prefers portrait `library_600x900`, then `library_capsule`, then `library_hero`,
+/// `header`, and `logo`. Looks at the legacy flat cache, the newer
+/// `{appid}/[hash]/` layout, and custom grid art under `userdata/*/config/grid`.
 fn resolve_steam_box_art(steam_root: &Path, app_id: &str) -> Option<PathBuf> {
     let app_id = app_id.trim();
     if app_id.is_empty() {
         return None;
     }
+    if let Some(found) = resolve_librarycache_cover(steam_root, app_id) {
+        return Some(found);
+    }
+    if let Some(found) = resolve_userdata_grid(steam_root, app_id) {
+        return Some(found);
+    }
+    None
+}
+
+/// Steam's small `{appid}_icon` file. Kept off `cover_path` so a catalog tile can win.
+fn resolve_steam_icon(steam_root: &Path, app_id: &str) -> Option<PathBuf> {
+    let app_id = app_id.trim();
+    if app_id.is_empty() {
+        return None;
+    }
+    let cache = steam_root.join("appcache").join("librarycache");
+    for name in [format!("{app_id}_icon.jpg"), format!("{app_id}_icon.png")] {
+        let path = cache.join(&name);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn resolve_librarycache_cover(steam_root: &Path, app_id: &str) -> Option<PathBuf> {
     let cache = steam_root.join("appcache").join("librarycache");
     if !cache.is_dir() {
         return None;
     }
 
-    let legacy = [
-        format!("{app_id}_library_600x900.jpg"),
-        format!("{app_id}_library_600x900.png"),
-        format!("{app_id}_library_capsule.jpg"),
-        format!("{app_id}_library_capsule.png"),
-    ];
+    let mut legacy = Vec::new();
+    for ext in COVER_EXTS {
+        legacy.push(format!("{app_id}_library_600x900.{ext}"));
+    }
+    for ext in COVER_EXTS {
+        legacy.push(format!("{app_id}_library_capsule.{ext}"));
+    }
     for name in legacy {
         let path = cache.join(&name);
         if path.is_file() {
@@ -176,28 +237,107 @@ fn resolve_steam_box_art(steam_root: &Path, app_id: &str) -> Option<PathBuf> {
         }
     }
 
+    let mut best: Option<(u8, PathBuf)> = None;
     let app_dir = cache.join(app_id);
     if app_dir.is_dir() {
-        if let Some(found) = find_cover_in_dir(&app_dir, 0) {
-            return Some(found);
-        }
+        best = find_cover_in_dir(&app_dir, 0);
+    }
+    if best.as_ref().is_some_and(|(rank, _)| *rank == 0) {
+        return best.map(|(_, path)| path);
     }
 
-    // Last-resort icon from the flat cache.
-    for name in [format!("{app_id}_icon.jpg"), format!("{app_id}_icon.png")] {
-        let path = cache.join(&name);
-        if path.is_file() {
-            return Some(path);
+    // Flat `{appid}_library_hero.jpg` / `_header` / `_logo` next to the legacy files.
+    for stem in ["library_hero", "header", "logo"] {
+        for ext in COVER_EXTS {
+            let path = cache.join(format!("{app_id}_{stem}.{ext}"));
+            consider_cover(&mut best, path);
         }
     }
-
-    None
+    best.map(|(_, path)| path)
 }
 
-fn find_cover_in_dir(dir: &Path, depth: usize) -> Option<PathBuf> {
-    // Prefer portrait library art, then capsule, searching one hash subdirectory deep.
+/// Custom library posters Steam stores per account: `{appid}p.*` then `{appid}.*`.
+fn resolve_userdata_grid(steam_root: &Path, app_id: &str) -> Option<PathBuf> {
+    let userdata = steam_root.join("userdata");
+    let Ok(entries) = fs::read_dir(&userdata) else {
+        return None;
+    };
+    let mut plain: Option<PathBuf> = None;
+    for entry in entries.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let grid = entry.path().join("config").join("grid");
+        if !grid.is_dir() {
+            continue;
+        }
+        for ext in COVER_EXTS {
+            let portrait = grid.join(format!("{app_id}p.{ext}"));
+            if portrait.is_file() {
+                return Some(portrait);
+            }
+        }
+        if plain.is_none() {
+            for ext in COVER_EXTS {
+                let path = grid.join(format!("{app_id}.{ext}"));
+                if path.is_file() {
+                    plain = Some(path);
+                    break;
+                }
+            }
+        }
+    }
+    plain
+}
+
+fn is_cover_image(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    COVER_EXTS
+        .iter()
+        .any(|ext| lower.ends_with(&format!(".{ext}")))
+}
+
+/// Lower is better. Portrait beats capsule, then hero, header, and logo.
+fn cover_rank(name: &str) -> Option<u8> {
+    if !is_cover_image(name) {
+        return None;
+    }
+    let lower = name.to_ascii_lowercase();
+    if lower.contains("library_600x900") {
+        Some(0)
+    } else if lower.contains("library_capsule") {
+        Some(1)
+    } else if lower.contains("library_hero") {
+        // A blurred hero is a weaker stand-in than the sharp asset.
+        Some(if lower.contains("blur") { 5 } else { 2 })
+    } else if lower.contains("header") {
+        Some(3)
+    } else if lower.contains("logo") {
+        Some(4)
+    } else {
+        None
+    }
+}
+
+fn consider_cover(best: &mut Option<(u8, PathBuf)>, path: PathBuf) {
+    if !path.is_file() {
+        return;
+    }
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    let Some(rank) = cover_rank(name) else {
+        return;
+    };
+    if best.as_ref().is_none_or(|(current, _)| rank < *current) {
+        *best = Some((rank, path));
+    }
+}
+
+fn find_cover_in_dir(dir: &Path, depth: usize) -> Option<(u8, PathBuf)> {
+    // One hash subdirectory deep: `librarycache/{appid}/{hash}/library_600x900.jpg`.
     const MAX_DEPTH: usize = 1;
-    let mut capsule: Option<PathBuf> = None;
+    let mut best: Option<(u8, PathBuf)> = None;
     let Ok(entries) = fs::read_dir(dir) else {
         return None;
     };
@@ -205,18 +345,12 @@ fn find_cover_in_dir(dir: &Path, depth: usize) -> Option<PathBuf> {
         let path = entry.path();
         if path.is_dir() {
             if depth < MAX_DEPTH {
-                if let Some(found) = find_cover_in_dir(&path, depth + 1) {
-                    // Nested portrait wins immediately; nested capsule only if nothing else.
-                    let name = found
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("")
-                        .to_ascii_lowercase();
-                    if name.contains("library_600x900") {
-                        return Some(found);
+                if let Some((rank, found)) = find_cover_in_dir(&path, depth + 1) {
+                    if rank == 0 {
+                        return Some((0, found));
                     }
-                    if capsule.is_none() && name.contains("library_capsule") {
-                        capsule = Some(found);
+                    if best.as_ref().is_none_or(|(current, _)| rank < *current) {
+                        best = Some((rank, found));
                     }
                 }
             }
@@ -225,18 +359,17 @@ fn find_cover_in_dir(dir: &Path, depth: usize) -> Option<PathBuf> {
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        let lower = name.to_ascii_lowercase();
-        if !(lower.ends_with(".jpg") || lower.ends_with(".jpeg") || lower.ends_with(".png")) {
+        let Some(rank) = cover_rank(name) else {
             continue;
+        };
+        if rank == 0 {
+            return Some((0, path));
         }
-        if lower.contains("library_600x900") {
-            return Some(path);
-        }
-        if capsule.is_none() && lower.contains("library_capsule") {
-            capsule = Some(path);
+        if best.as_ref().is_none_or(|(current, _)| rank < *current) {
+            best = Some((rank, path));
         }
     }
-    capsule
+    best
 }
 
 fn vdf_string(text: &str, key: &str) -> Option<String> {
@@ -247,100 +380,165 @@ fn vdf_string(text: &str, key: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Heroic Games Launcher stores installed games under %APPDATA%/heroic/store_cache
-/// and config in legendary/gog configs. We read `installed.json` style paths when present.
+/// Heroic Games Launcher stores installed games under %APPDATA%/heroic.
+/// Posters come from the store library (`art_cover` / Epic tall art), not `icons/`.
 #[cfg(target_os = "windows")]
 fn scan_heroic() -> Vec<DetectedGame> {
-    let Some(appdata) = std::env::var_os("APPDATA").map(PathBuf::from) else {
+    let Some(mut resolver) = HeroicResolver::discover() else {
         return Vec::new();
     };
-    let heroic = appdata.join("heroic");
-    if !heroic.is_dir() {
-        return Vec::new();
-    }
 
     let mut out = Vec::new();
     let mut seen_installs = HashSet::new();
+    let config = heroic_config_from_env();
 
-    // Legendary (Epic) installed.json
-    let legendary = heroic
-        .join("legendaryConfig")
-        .join("legendary")
-        .join("installed.json");
-    if let Ok(text) = fs::read_to_string(&legendary) {
-        if let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&text) {
-            for (_id, val) in map {
-                let title = val
-                    .get("title")
-                    .or_else(|| val.get("app_name"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Unknown")
-                    .to_string();
-                let install_path = val
-                    .get("install_path")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                if install_path
-                    .as_ref()
-                    .map(|p| Path::new(p).is_dir())
-                    .unwrap_or(false)
-                {
-                    if let Some(ref p) = install_path {
-                        let key = normalize_windows_path_key(Path::new(p));
-                        if !seen_installs.insert(key) {
-                            continue;
-                        }
-                    }
-                    out.push(super::finish_detected(
-                        title,
-                        "Heroic".to_string(),
+    if let Some(heroic) = config.as_deref() {
+        let legendary = heroic
+            .join("legendaryConfig")
+            .join("legendary")
+            .join("installed.json");
+        if let Ok(text) = fs::read_to_string(&legendary) {
+            if let Ok(map) =
+                serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&text)
+            {
+                for (id, val) in map {
+                    let app_id = val
+                        .get("app_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(id.as_str())
+                        .to_string();
+                    let title = val
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let install_path = val
+                        .get("install_path")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    push_heroic_game(
+                        &mut out,
+                        &mut seen_installs,
+                        &mut resolver,
+                        HeroicStore::Epic,
+                        &app_id,
+                        &title,
                         install_path,
-                        None,
-                    ));
+                    );
                 }
             }
         }
-    }
 
-    // GOG installed games list used by Heroic
-    let gog = heroic.join("gog_store").join("installed.json");
-    if let Ok(text) = fs::read_to_string(&gog) {
-        if let Ok(list) = serde_json::from_str::<Vec<serde_json::Value>>(&text) {
-            for val in list {
-                let title = val
-                    .get("title")
-                    .or_else(|| val.get("appName"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Unknown")
-                    .to_string();
-                let install_path = val
-                    .get("install_path")
-                    .or_else(|| val.get("installPath"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                if install_path
-                    .as_ref()
-                    .map(|p| Path::new(p).is_dir())
-                    .unwrap_or(false)
-                {
-                    if let Some(ref p) = install_path {
-                        let key = normalize_windows_path_key(Path::new(p));
-                        if !seen_installs.insert(key) {
-                            continue;
-                        }
-                    }
-                    out.push(super::finish_detected(
-                        title,
-                        "Heroic".to_string(),
+        let gog = heroic.join("gog_store").join("installed.json");
+        if let Ok(text) = fs::read_to_string(&gog) {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                let list = value
+                    .as_array()
+                    .cloned()
+                    .or_else(|| value.get("installed").and_then(|v| v.as_array()).cloned())
+                    .unwrap_or_default();
+                for val in list {
+                    let app_id = val
+                        .get("appName")
+                        .or_else(|| val.get("app_name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let title = val
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let install_path = val
+                        .get("install_path")
+                        .or_else(|| val.get("installPath"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    push_heroic_game(
+                        &mut out,
+                        &mut seen_installs,
+                        &mut resolver,
+                        HeroicStore::Gog,
+                        &app_id,
+                        &title,
                         install_path,
-                        None,
-                    ));
+                    );
                 }
             }
         }
     }
 
     out
+}
+
+#[cfg(target_os = "windows")]
+fn heroic_config_from_env() -> Option<PathBuf> {
+    let appdata = std::env::var_os("APPDATA")?;
+    let path = PathBuf::from(appdata).join("heroic");
+    path.is_dir().then_some(path)
+}
+
+#[cfg(target_os = "windows")]
+fn push_heroic_game(
+    out: &mut Vec<DetectedGame>,
+    seen_installs: &mut HashSet<String>,
+    resolver: &mut HeroicResolver,
+    store: HeroicStore,
+    app_id: &str,
+    title: &str,
+    install_path: Option<String>,
+) {
+    let Some(install_path) = install_path.filter(|path| Path::new(path).is_dir()) else {
+        return;
+    };
+    let key = normalize_windows_path_key(Path::new(&install_path));
+    if !seen_installs.insert(key) {
+        return;
+    }
+    let library_title = if app_id.is_empty() {
+        None
+    } else {
+        resolver.library_title(store, app_id)
+    };
+    let title = prefer_heroic_title(title, library_title, app_id);
+    let art = resolver.resolve_store(
+        Some(store),
+        if app_id.is_empty() {
+            None
+        } else {
+            Some(app_id)
+        },
+        None,
+    );
+    let mut detected = super::finish_detected(
+        title,
+        "Heroic".to_string(),
+        Some(install_path),
+        art.cover_path,
+    );
+    detected.cover_url = art.cover_url;
+    detected.icon_path = art.icon_path;
+    out.push(detected);
+}
+
+#[cfg(target_os = "windows")]
+fn prefer_heroic_title(raw: &str, library: Option<String>, app_id: &str) -> String {
+    let raw = raw.trim();
+    let missing = raw.is_empty() || raw.eq_ignore_ascii_case("unknown") || raw == app_id;
+    if missing {
+        if let Some(title) = library.filter(|title| !title.trim().is_empty()) {
+            return title;
+        }
+    }
+    if raw.is_empty() {
+        if app_id.is_empty() {
+            "Unknown".to_string()
+        } else {
+            app_id.to_string()
+        }
+    } else {
+        raw.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -492,6 +690,54 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         fs::create_dir_all(root.path().join("appcache").join("librarycache")).unwrap();
         assert!(resolve_steam_box_art(root.path(), "999").is_none());
+    }
+
+    #[test]
+    fn resolve_steam_box_art_falls_back_to_hashed_hero() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root
+            .path()
+            .join("appcache")
+            .join("librarycache")
+            .join("730")
+            .join("abc123");
+        fs::create_dir_all(&nested).unwrap();
+        let hero = nested.join("library_hero.webp");
+        fs::write(&hero, b"hero").unwrap();
+        fs::write(nested.join("library_hero_blur.jpg"), b"blur").unwrap();
+
+        assert_eq!(
+            resolve_steam_box_art(root.path(), "730").as_deref(),
+            Some(hero.as_path())
+        );
+    }
+
+    #[test]
+    fn resolve_steam_box_art_uses_userdata_grid_portrait() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("appcache").join("librarycache")).unwrap();
+        let grid = root
+            .path()
+            .join("userdata")
+            .join("1000")
+            .join("config")
+            .join("grid");
+        fs::create_dir_all(&grid).unwrap();
+        let portrait = grid.join("730p.png");
+        let plain = grid.join("730.jpg");
+        fs::write(&portrait, b"p").unwrap();
+        fs::write(&plain, b"c").unwrap();
+        let plain_only = grid.join("731.jpg");
+        fs::write(&plain_only, b"c").unwrap();
+
+        assert_eq!(
+            resolve_steam_box_art(root.path(), "730").as_deref(),
+            Some(portrait.as_path())
+        );
+        assert_eq!(
+            resolve_steam_box_art(root.path(), "731").as_deref(),
+            Some(plain_only.as_path())
+        );
     }
 
     #[test]

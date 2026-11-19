@@ -1152,7 +1152,10 @@ pub fn rewrite_ror2_bepinexpack_dest(path: &Path) -> PathBuf {
     for component in path.components() {
         match component {
             Component::Normal(name)
-                if !rewritten && name.to_string_lossy().eq_ignore_ascii_case(ROR2_PRUNED_PLUGIN_DIR) =>
+                if !rewritten
+                    && name
+                        .to_string_lossy()
+                        .eq_ignore_ascii_case(ROR2_PRUNED_PLUGIN_DIR) =>
             {
                 // Only rewrite when this segment sits under a plugins/ directory.
                 let under_plugins = out
@@ -1989,12 +1992,7 @@ mod tests {
     #[test]
     fn preflight_warns_when_pruned_ror2_folder_exists() {
         let tmp = tempfile::tempdir().unwrap();
-        fs::create_dir_all(
-            tmp.path()
-                .join("BepInEx")
-                .join("core"),
-        )
-        .unwrap();
+        fs::create_dir_all(tmp.path().join("BepInEx").join("core")).unwrap();
         let pruned = tmp
             .path()
             .join("BepInEx")
@@ -2004,8 +2002,10 @@ mod tests {
         fs::write(pruned.join("Newtonsoft.Json.dll"), b"x").unwrap();
         let warnings = bepinex_preflight_warnings(tmp.path());
         assert!(
-            warnings.iter().any(|w| w.contains("Preloader deletes")
-                && w.contains("RiskofThunder-RoR2BepInExPack")),
+            warnings
+                .iter()
+                .any(|w| w.contains("Preloader deletes")
+                    && w.contains("RiskofThunder-RoR2BepInExPack")),
             "{warnings:?}"
         );
     }

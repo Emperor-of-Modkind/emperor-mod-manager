@@ -209,9 +209,7 @@ fn windows_apps_use_dark() -> bool {
 #[cfg(target_os = "windows")]
 fn windows_accent() -> Option<(u8, u8, u8)> {
     let hkcu = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
-    let key = hkcu
-        .open_subkey(r"Software\Microsoft\Windows\DWM")
-        .ok()?;
+    let key = hkcu.open_subkey(r"Software\Microsoft\Windows\DWM").ok()?;
     // AccentColor is ABGR DWORD.
     let abgr: u32 = key.get_value("AccentColor").ok()?;
     let r = (abgr & 0xff) as u8;
@@ -228,7 +226,11 @@ fn windows_palette(prefer_dark: bool, accent_fallback: &str) -> Option<SystemPal
 
     let sys = |idx: i32| -> (u8, u8, u8) {
         let c = unsafe { GetSysColor(idx) };
-        ((c & 0xff) as u8, ((c >> 8) & 0xff) as u8, ((c >> 16) & 0xff) as u8)
+        (
+            (c & 0xff) as u8,
+            ((c >> 8) & 0xff) as u8,
+            ((c >> 16) & 0xff) as u8,
+        )
     };
 
     let window = sys(COLOR_WINDOW as i32);
@@ -256,13 +258,7 @@ fn windows_palette(prefer_dark: bool, accent_fallback: &str) -> Option<SystemPal
         face
     };
     Some(build_palette(
-        "windows",
-        face3d,
-        panel,
-        text,
-        shadow,
-        accent,
-        window,
+        "windows", face3d, panel, text, shadow, accent, window,
     ))
 }
 
@@ -400,7 +396,9 @@ fn gnome_named_accent() -> Option<(u8, u8, u8)> {
 fn linux_accent(fallback: &str) -> (u8, u8, u8) {
     // GTK path only: portal / GNOME named accent, then kdeglobals as last resort.
     accent_or_fallback(
-        portal_accent().or_else(gnome_named_accent).or_else(kde_accent_only),
+        portal_accent()
+            .or_else(gnome_named_accent)
+            .or_else(kde_accent_only),
         fallback,
     )
 }
@@ -618,8 +616,7 @@ fn gtk_palette(prefer_dark: bool, accent_fallback: &str) -> Option<SystemPalette
     if !gtk::is_initialized() {
         return None;
     }
-    let bg = gtk_lookup_color("theme_bg_color")
-        .or_else(|| gtk_lookup_color("theme_base_color"))?;
+    let bg = gtk_lookup_color("theme_bg_color").or_else(|| gtk_lookup_color("theme_base_color"))?;
     let ink = gtk_lookup_color("theme_fg_color")
         .or_else(|| gtk_lookup_color("theme_text_color"))
         .unwrap_or(if prefer_dark || is_dark_bg(bg.0, bg.1, bg.2) {
@@ -633,7 +630,10 @@ fn gtk_palette(prefer_dark: bool, accent_fallback: &str) -> Option<SystemPalette
         .unwrap_or(mix(bg, ink, 0.22));
     let input_bg = gtk_lookup_color("theme_base_color").unwrap_or(panel);
     let selected = gtk_lookup_color("theme_selected_bg_color");
-    let accent = accent_or_fallback(selected.or_else(portal_accent).or_else(gnome_named_accent), accent_fallback);
+    let accent = accent_or_fallback(
+        selected.or_else(portal_accent).or_else(gnome_named_accent),
+        accent_fallback,
+    );
     Some(build_palette("gtk", bg, panel, ink, line, accent, input_bg))
 }
 

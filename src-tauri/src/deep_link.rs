@@ -16,13 +16,19 @@ use crate::commands::AppState;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "source", rename_all = "lowercase")]
 pub enum EmperorOpenMod {
-    Nexus { domain: String, mod_id: u32 },
+    Nexus {
+        domain: String,
+        mod_id: u32,
+    },
     Thunderstore {
         community: String,
         namespace: String,
         package_name: String,
     },
-    Modio { game_id: u32, mod_id: u32 },
+    Modio {
+        game_id: u32,
+        mod_id: u32,
+    },
 }
 
 impl EmperorOpenMod {
@@ -199,9 +205,7 @@ pub fn take_pending_emperor_mod(state: &AppState) -> Option<EmperorOpenMod> {
 }
 
 #[tauri::command]
-pub fn take_pending_emperor_mod_link(
-    state: tauri::State<'_, AppState>,
-) -> Option<EmperorOpenMod> {
+pub fn take_pending_emperor_mod_link(state: tauri::State<'_, AppState>) -> Option<EmperorOpenMod> {
     take_pending_emperor_mod(&state)
 }
 
@@ -227,10 +231,9 @@ mod tests {
 
     #[test]
     fn parses_thunderstore() {
-        let link = parse_emperor_mod_url(
-            "emperor://mod/thunderstore/lethal-company/BepInEx/BepInExPack",
-        )
-        .unwrap();
+        let link =
+            parse_emperor_mod_url("emperor://mod/thunderstore/lethal-company/BepInEx/BepInExPack")
+                .unwrap();
         assert_eq!(
             link,
             EmperorOpenMod::Thunderstore {
@@ -265,8 +268,7 @@ mod tests {
 
     #[test]
     fn parses_percent_encoded_domain() {
-        let link =
-            parse_emperor_mod_url("emperor://mod/nexus/stardew%20valley/2400").unwrap();
+        let link = parse_emperor_mod_url("emperor://mod/nexus/stardew%20valley/2400").unwrap();
         assert_eq!(
             link,
             EmperorOpenMod::Nexus {

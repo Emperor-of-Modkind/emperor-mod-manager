@@ -1118,10 +1118,7 @@ fn nexus_session_cookie_names(webview: &Webview) -> Vec<String> {
             Ok(cookies) => {
                 for cookie in cookies {
                     let name = cookie.name().to_string();
-                    if !names
-                        .iter()
-                        .any(|n: &String| n.eq_ignore_ascii_case(&name))
-                    {
+                    if !names.iter().any(|n: &String| n.eq_ignore_ascii_case(&name)) {
                         names.push(name);
                     }
                 }
@@ -1158,9 +1155,7 @@ fn try_complete_nexus_website_login(
         && !is_nexus_login_url(&href)
         && !has_nexus_session_cookie(&names)
     {
-        log::warn!(
-            "nexus login: on post-login page without nexusmods_session yet ({href})"
-        );
+        log::warn!("nexus login: on post-login page without nexusmods_session yet ({href})");
     }
     false
 }
@@ -1993,7 +1988,9 @@ pub fn confirm_nexus_website_login(
         "Nexus login window is not open. Open Log in to Nexus and sign in first.".to_string()
     })?;
     if !matches!(ctx.purpose, AssistPurpose::WebsiteLogin) {
-        return Err("Nexus login window is not open. Open Log in to Nexus and sign in first.".into());
+        return Err(
+            "Nexus login window is not open. Open Log in to Nexus and sign in first.".into(),
+        );
     }
     let webview = app
         .get_webview(ASSIST_LABEL)
@@ -2016,9 +2013,7 @@ pub fn confirm_nexus_website_login(
                     .into(),
             );
         }
-        return Err(
-            "Nexus login is not complete yet. Finish signing in, then try again.".into(),
-        );
+        return Err("Nexus login is not complete yet. Finish signing in, then try again.".into());
     }
     if let Err(e) = set_nexus_website_signed_in(&state, true) {
         log::warn!("nexus website sign-in flag: {e}");
@@ -2218,9 +2213,7 @@ mod tests {
         assert!(is_nexus_login_url(
             "https://users.nexusmods.com/auth/sign_in?redirect_url=https%3A%2F%2Fwww.nexusmods.com%2F"
         ));
-        assert!(is_nexus_login_url(
-            "https://www.nexusmods.com/login"
-        ));
+        assert!(is_nexus_login_url("https://www.nexusmods.com/login"));
         assert!(!nexus_website_login_succeeded(
             "https://users.nexusmods.com/auth/sign_in?redirect_url=https%3A%2F%2Fwww.nexusmods.com%2F",
             &session

@@ -244,6 +244,7 @@ mod tests {
             launcher: "Steam".to_string(),
             plugin_id: "example".to_string(),
             cover_path: None,
+            cover_url: None,
             project_name: None,
             thunderstore_community: None,
             modio_game_id: None,

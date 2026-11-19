@@ -3182,12 +3182,78 @@ mod tests {
         let result = deploy(&paths, game_id, "cyberpunk2077", install.path(), None).unwrap();
         assert!(result.file_count >= 1, "warnings: {:?}", result.warnings);
         let deployed = install.path().join("r6/scripts/mod.reds");
-        assert!(deployed.exists(), "missing {deployed:?}; warnings: {:?}", result.warnings);
+        assert!(
+            deployed.exists(),
+            "missing {deployed:?}; warnings: {:?}",
+            result.warnings
+        );
         // Highest priority among overlapping dests is Jackie (priority 2).
         assert_eq!(std::fs::read(&deployed).unwrap(), b"jackie");
         // FOMOD metadata must not deploy.
         assert!(!install.path().join("fomod").exists());
         assert!(!install.path().join("mods/fomod").exists());
+    }
+
+    #[test]
+    fn deploy_fomod_preserves_audioxl_case() {
+        let (_tmp, paths) = test_paths();
+        let game_id = "cp_fomod_case";
+        let install = tempfile::tempdir().unwrap();
+
+        let staging = paths.mods_dir(game_id).join("TCP_case");
+        let voice = staging
+            .join("red4ext")
+            .join("plugins")
+            .join("AudioXL")
+            .join("sounds")
+            .join("TrueCyberpsychosis");
+        std::fs::create_dir_all(&voice).unwrap();
+        std::fs::write(voice.join("tcp_heartbeat.ogg"), b"beat").unwrap();
+        std::fs::create_dir_all(staging.join("fomod")).unwrap();
+        std::fs::write(
+            staging.join("fomod").join("ModuleConfig.xml"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<config>
+  <moduleName>True Cyberpsychosis</moduleName>
+  <requiredInstallFiles>
+    <folder source="red4ext" destination="red4ext"/>
+  </requiredInstallFiles>
+</config>"#,
+        )
+        .unwrap();
+
+        save_loadorder(
+            &paths,
+            game_id,
+            &LoadOrder {
+                mods: vec![StagedMod {
+                    id: "case_1".into(),
+                    name: "True Cyberpsychosis".into(),
+                    nexus_mod_id: 1,
+                    nexus_file_id: 1,
+                    version: None,
+                    domain: "cyberpunk2077".into(),
+                    staging_path: staging.to_string_lossy().into(),
+                    enabled: true,
+                    order: 1,
+                    ..Default::default()
+                }],
+            },
+        )
+        .unwrap();
+
+        let result = deploy(&paths, game_id, "cyberpunk2077", install.path(), None).unwrap();
+        assert!(result.file_count >= 1, "warnings: {:?}", result.warnings);
+        let deployed = install
+            .path()
+            .join("red4ext/plugins/AudioXL/sounds/TrueCyberpsychosis/tcp_heartbeat.ogg");
+        assert!(
+            deployed.is_file(),
+            "missing {deployed:?}; warnings: {:?}",
+            result.warnings
+        );
+        assert_eq!(std::fs::read(&deployed).unwrap(), b"beat");
+        assert!(!install.path().join("red4ext/plugins/audioxl").exists());
     }
 
     #[test]
@@ -4911,15 +4977,14 @@ mod tests {
         for id in ["A", "Z"] {
             std::fs::create_dir_all(staging_root.join(id)).unwrap();
         }
-        let staged =
-            |id: &str, independent: bool, collection_ids: Vec<String>| StagedMod {
-                id: id.into(),
-                name: id.into(),
-                staging_path: staging_root.join(id).to_string_lossy().into(),
-                independent,
-                collection_ids,
-                ..Default::default()
-            };
+        let staged = |id: &str, independent: bool, collection_ids: Vec<String>| StagedMod {
+            id: id.into(),
+            name: id.into(),
+            staging_path: staging_root.join(id).to_string_lossy().into(),
+            independent,
+            collection_ids,
+            ..Default::default()
+        };
         save_loadorder(
             &paths,
             game_id,

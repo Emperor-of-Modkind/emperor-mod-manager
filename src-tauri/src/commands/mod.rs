@@ -908,20 +908,192 @@ pub fn get_app_info() -> serde_json::Value {
     })
 }
 
-#[tauri::command]
-pub fn scan_games(app: AppHandle) -> Result<Vec<DetectedGame>, String> {
-    let games = detection::scan_games();
-    // Steam covers typically live under Program Files, outside the default $HOME
-    // assetProtocol scope. Allow only the exact cover files we resolved.
+/// Steam covers typically live under Program Files, outside the default `$HOME`
+/// assetProtocol scope. Allow only the exact cover files we resolved.
+fn allow_cover_files<'a>(app: &AppHandle, covers: impl IntoIterator<Item = &'a str>) {
     let scope = app.asset_protocol_scope();
-    for game in &games {
-        if let Some(cover) = game.cover_path.as_deref() {
-            if let Err(e) = scope.allow_file(Path::new(cover)) {
-                log::debug!("asset scope allow_file({cover}): {e}");
+    for cover in covers {
+        if cover.is_empty() {
+            continue;
+        }
+        if let Err(e) = scope.allow_file(Path::new(cover)) {
+            log::debug!("asset scope allow_file({cover}): {e}");
+        }
+    }
+}
+
+#[tauri::command]
+pub fn scan_games(app: AppHandle, state: State<'_, AppState>) -> Result<Vec<DetectedGame>, String> {
+    let games = detection::scan_games();
+    allow_cover_files(&app, art_paths(&games));
+
+    // Managed games keep the cover from when they were added. Steam moves art
+    // into a new hash folder, and Heroic's icon must not stick once a poster
+    // or remote cover is found.
+    let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
+    let mut changed = false;
+    for managed in &mut cfg.managed_games {
+        let Some(detected) = games.iter().find(|game| {
+            detection::reconcile::games_match(
+                &managed.title,
+                &managed.launcher,
+                &game.title,
+                &game.launcher,
+            )
+        }) else {
+            continue;
+        };
+        if detection::sync_managed_cover(&mut managed.cover_path, &mut managed.cover_url, detected)
+        {
+            changed = true;
+        }
+    }
+    if changed {
+        config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())?;
+    }
+    allow_cover_files(
+        &app,
+        cfg.managed_games
+            .iter()
+            .filter_map(|game| game.cover_path.as_deref()),
+    );
+    Ok(games)
+}
+
+fn art_paths(games: &[DetectedGame]) -> Vec<&str> {
+    games
+        .iter()
+        .flat_map(|game| {
+            game.cover_path
+                .as_deref()
+                .into_iter()
+                .chain(game.icon_path.as_deref())
+        })
+        .collect()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CatalogCoverRequest {
+    id: String,
+    #[serde(default)]
+    nexus_domain: Option<String>,
+    #[serde(default)]
+    modio_game_id: Option<u32>,
+    #[serde(default)]
+    icon_path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CatalogCoverHit {
+    id: String,
+    cover_url: String,
+}
+
+/// Fill posters from Nexus, then mod.io, for games that still have no local cover.
+/// Only ids already stored on the game are used — titles are not fuzzy-matched.
+#[tauri::command]
+pub async fn resolve_catalog_covers(
+    state: State<'_, AppState>,
+    requests: Vec<CatalogCoverRequest>,
+) -> Result<Vec<CatalogCoverHit>, String> {
+    if requests.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut nexus_ids = HashMap::new();
+    if requests.iter().any(|request| {
+        request
+            .nexus_domain
+            .as_deref()
+            .is_some_and(|domain| !domain.trim().is_empty())
+    }) {
+        for game in load_nexus_games_cached(&state).await? {
+            if game.id > 0 {
+                nexus_ids.insert(game.domain_name.to_ascii_lowercase(), game.id);
             }
         }
     }
-    Ok(games)
+
+    let mut modio_ids = Vec::new();
+    for request in &requests {
+        if detection::catalog_cover_url(request.nexus_domain.as_deref(), &nexus_ids, None).is_none()
+        {
+            if let Some(id) = request.modio_game_id.filter(|id| *id > 0) {
+                modio_ids.push(id);
+            }
+        }
+    }
+    modio_ids.sort_unstable();
+    modio_ids.dedup();
+    let logos = modio_game_logos(&state, &modio_ids).await;
+
+    let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
+    let mut changed = false;
+    let mut hits = Vec::new();
+    for request in &requests {
+        let logo = request
+            .modio_game_id
+            .and_then(|id| logos.get(&id))
+            .map(String::as_str);
+        let Some(url) =
+            detection::catalog_cover_url(request.nexus_domain.as_deref(), &nexus_ids, logo)
+        else {
+            continue;
+        };
+        if let Some(game) = cfg
+            .managed_games
+            .iter_mut()
+            .find(|game| game.id == request.id)
+        {
+            let icon_like = game.cover_path.as_deref().is_some_and(|path| {
+                request.icon_path.as_deref() == Some(path) || detection::is_deferred_icon_path(path)
+            });
+            if game.cover_path.is_some() && !icon_like {
+                continue;
+            }
+            if icon_like {
+                game.cover_path = None;
+                changed = true;
+            }
+            if game.cover_url.as_deref() != Some(url.as_str()) {
+                game.cover_url = Some(url.clone());
+                changed = true;
+            }
+        }
+        hits.push(CatalogCoverHit {
+            id: request.id.clone(),
+            cover_url: url,
+        });
+    }
+    if changed {
+        config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())?;
+    }
+    Ok(hits)
+}
+
+async fn modio_game_logos(state: &AppState, ids: &[u32]) -> HashMap<u32, String> {
+    if ids.is_empty() {
+        return HashMap::new();
+    }
+    let key = state
+        .modio_api_key
+        .lock()
+        .ok()
+        .and_then(|key| key.clone())
+        .unwrap_or_default();
+    if key.trim().is_empty() {
+        return HashMap::new();
+    }
+    let Ok(client) = ModioClient::new(&key) else {
+        return HashMap::new();
+    };
+    match client.game_logos(ids).await {
+        Ok(logos) => logos,
+        Err(err) => {
+            log::warn!("mod.io game logos failed: {err:#}");
+            HashMap::new()
+        }
+    }
 }
 
 #[tauri::command]
@@ -930,13 +1102,25 @@ pub fn list_plugins() -> Vec<games::GamePluginInfo> {
 }
 
 #[tauri::command]
-pub fn list_managed(state: State<'_, AppState>) -> Result<Vec<ManagedGame>, String> {
+pub fn list_managed(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Vec<ManagedGame>, String> {
     let cfg = state.config.lock().map_err(|e| e.to_string())?;
+    // Grant before returning so the library's first paint can load covers that
+    // live outside $HOME. scan_games may not have run yet.
+    allow_cover_files(
+        &app,
+        cfg.managed_games
+            .iter()
+            .filter_map(|game| game.cover_path.as_deref()),
+    );
     Ok(cfg.managed_games.clone())
 }
 
 #[tauri::command]
 pub fn manage_game(
+    app: AppHandle,
     state: State<'_, AppState>,
     id: String,
     title: String,
@@ -945,6 +1129,7 @@ pub fn manage_game(
     launcher: String,
     plugin_id: String,
     cover_path: Option<String>,
+    cover_url: Option<String>,
     project_name: Option<String>,
     thunderstore_community: Option<String>,
     modio_game_id: Option<u32>,
@@ -1010,6 +1195,7 @@ pub fn manage_game(
         launcher: launcher.clone(),
         plugin_id,
         cover_path,
+        cover_url,
         project_name,
         thunderstore_community: ts_community,
         modio_game_id: modio_id,
@@ -1035,6 +1221,7 @@ pub fn manage_game(
     cfg.managed_games.push(managed.clone());
     cfg.last_active_game_id = Some(id);
     config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())?;
+    allow_cover_files(&app, managed.cover_path.as_deref());
     Ok(managed)
 }
 
@@ -6516,9 +6703,7 @@ pub fn export_share_code(
         .clone()
         .filter(|version| !version.trim().is_empty());
     let detected = games::detect_install_version(Path::new(&game.install_path));
-    let game_versions = override_version
-        .or(detected)
-        .map(|version| vec![version]);
+    let game_versions = override_version.or(detected).map(|version| vec![version]);
     manifest.game_versions = game_versions.clone();
     let code = share::encode_share_manifest(&manifest).map_err(|e| e.to_string())?;
     let mut warnings = Vec::new();
@@ -6539,8 +6724,8 @@ pub fn export_share_code(
             code.len() as f64 / 1024.0
         ));
     }
-    let saved = share::entry_from_code(&code, name, Some(game_id.clone()))
-        .map_err(|e| e.to_string())?;
+    let saved =
+        share::entry_from_code(&code, name, Some(game_id.clone())).map_err(|e| e.to_string())?;
     let saved = share::add_saved_collection(&state.paths, saved).map_err(|e| e.to_string())?;
     let collection_id = share::emperor_share_id(&code);
     let collection = InstalledCollection {
@@ -6627,7 +6812,9 @@ pub fn detect_import_code(code: String) -> Result<DetectImportResult, String> {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ImportCodeResult {
-    Emperor { result: ShareImportResult },
+    Emperor {
+        result: ShareImportResult,
+    },
     ThunderstoreProfile {
         collection: InstalledCollection,
         #[serde(default)]
@@ -7092,8 +7279,7 @@ pub fn rename_saved_collection(
 
 #[tauri::command]
 pub fn delete_saved_collection(state: State<'_, AppState>, id: String) -> Result<(), String> {
-    let store =
-        share::load_saved_collections(&state.paths).map_err(|e| e.to_string())?;
+    let store = share::load_saved_collections(&state.paths).map_err(|e| e.to_string())?;
     let entry = store
         .collections
         .iter()
@@ -7110,21 +7296,16 @@ pub fn delete_saved_collection(state: State<'_, AppState>, id: String) -> Result
         cfg.managed_games.iter().map(|g| g.id.clone()).collect()
     };
     for game_id in game_ids {
-        let installed =
-            match mods::list_installed_collections(&state.paths, &game_id) {
-                Ok(list) => list,
-                Err(_) => continue,
-            };
+        let installed = match mods::list_installed_collections(&state.paths, &game_id) {
+            Ok(list) => list,
+            Err(_) => continue,
+        };
         let match_ids: Vec<String> = installed
             .iter()
             .filter(|c| {
                 c.id == share_id
                     || (c.source == CollectionSource::Emperor
-                        && c
-                            .profile_code
-                            .as_deref()
-                            .map(|p| p.trim())
-                            == Some(code.as_str()))
+                        && c.profile_code.as_deref().map(|p| p.trim()) == Some(code.as_str()))
             })
             .map(|c| c.id.clone())
             .collect();
@@ -7321,9 +7502,7 @@ pub fn list_mods_with_options(
             if fomod::has_fomod(&root) {
                 return true;
             }
-            plugin
-                .mod_options(&root)
-                .is_some_and(|set| !set.is_empty())
+            plugin.mod_options(&root).is_some_and(|set| !set.is_empty())
         })
         .map(|staged| staged.id.clone())
         .collect())
@@ -8475,9 +8654,7 @@ mod catalog_match_tests {
     #[test]
     fn edition_noise_stripped_from_titles() {
         assert_eq!(
-            strip_edition_noise(&normalize_catalog_text(
-                "Palworld Deluxe Edition"
-            )),
+            strip_edition_noise(&normalize_catalog_text("Palworld Deluxe Edition")),
             "palworld"
         );
         assert_eq!(
@@ -8514,12 +8691,7 @@ mod catalog_match_tests {
                 id: "other",
             },
         ];
-        let ranked = rank_catalog_matches(
-            "Resident Evil",
-            &games,
-            |g| g.name,
-            |g| g.id,
-        );
+        let ranked = rank_catalog_matches("Resident Evil", &games, |g| g.name, |g| g.id);
         assert!(!ranked.is_empty());
         assert_eq!(ranked[0].id, "residentevil");
         assert_eq!(ranked[0].score, 100);

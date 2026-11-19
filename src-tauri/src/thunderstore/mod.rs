@@ -389,7 +389,11 @@ fn version_satisfies_min(version: &str, min: &str) -> bool {
 
 /// Merge a newly requested minimum into the recorded floor (highest wins).
 /// Returns true when the floor was inserted or raised.
-fn raise_version_floor(floors: &mut HashMap<String, String>, key: &str, wanted: Option<&str>) -> bool {
+fn raise_version_floor(
+    floors: &mut HashMap<String, String>,
+    key: &str,
+    wanted: Option<&str>,
+) -> bool {
     let Some(wanted) = wanted.map(str::trim).filter(|s| !s.is_empty()) else {
         return false;
     };
@@ -434,10 +438,7 @@ fn resolve_dependency_pins(
         };
         if let Some(floor) = floors.get(&key) {
             if !version_satisfies_min(&ver.version_number, floor) {
-                bail!(
-                    "No version of {} satisfies minimum {floor}",
-                    pkg.full_name
-                );
+                bail!("No version of {} satisfies minimum {floor}", pkg.full_name);
             }
         }
         for dep_raw in &ver.dependencies {
@@ -486,15 +487,7 @@ fn collect_install_order(
         if let Some(dep) = TsDependency::parse(dep_raw) {
             let dep_key = format!("{}-{}", dep.namespace, dep.name);
             collect_install_order(
-                &dep_key,
-                root_key,
-                root_exact,
-                pins,
-                by_key,
-                community,
-                visiting,
-                visited,
-                ordered,
+                &dep_key, root_key, root_exact, pins, by_key, community, visiting, visited, ordered,
             )?;
         }
     }
@@ -562,10 +555,7 @@ fn select_latest_satisfying<'a>(
     {
         return Ok(found);
     }
-    bail!(
-        "No version of {} satisfies minimum {min}",
-        pkg.full_name
-    )
+    bail!("No version of {} satisfies minimum {min}", pkg.full_name)
 }
 
 pub fn detail_from_package(community: &str, pkg: TsPackage) -> TsPackageDetail {

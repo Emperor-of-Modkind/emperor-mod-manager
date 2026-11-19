@@ -243,6 +243,9 @@ pub struct ManagedGame {
     pub plugin_id: String,
     #[serde(default)]
     pub cover_path: Option<String>,
+    /// Remote poster used when `cover_path` is empty (Heroic or a mod catalog).
+    #[serde(default)]
+    pub cover_url: Option<String>,
     /// Optional Unreal project folder override (e.g. "Pal", "Phoenix").
     #[serde(default)]
     pub project_name: Option<String>,
@@ -464,7 +467,10 @@ mod tests {
     fn theme_style_defaults_to_app() {
         let cfg: AppConfig = toml::from_str("").unwrap();
         assert_eq!(cfg.theme_style, ThemeStyle::App);
-        assert_eq!(normalize_accent_color(&cfg.accent_color), DEFAULT_ACCENT_COLOR);
+        assert_eq!(
+            normalize_accent_color(&cfg.accent_color),
+            DEFAULT_ACCENT_COLOR
+        );
         assert_eq!(cfg.linux_system_backend, default_linux_system_backend());
     }
 

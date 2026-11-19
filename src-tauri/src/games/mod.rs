@@ -15,12 +15,12 @@ mod baldursgate3;
 mod bepinex_install;
 mod bladeandsorcery;
 mod controlresonant;
-mod firstlight;
 mod creation_engine;
 mod cyberpunk2077;
 mod daysgone;
 mod dressmaker;
 mod exe_version;
+mod firstlight;
 mod fromsoft_loaders;
 mod fromsoftware;
 mod helldivers2;
@@ -57,12 +57,12 @@ pub use controlresonant::ControlResonantPlugin;
 pub use creation_engine::{
     Fallout4Plugin, OblivionRemasteredPlugin, SkyrimSpecialEditionPlugin, StarfieldPlugin,
 };
-pub use firstlight::FirstLightPlugin;
 pub use cyberpunk2077::Cyberpunk2077Plugin;
 pub use daysgone::DaysGonePlugin;
 pub(crate) use dressmaker::plugin_id_for_install;
 pub use dressmaker::DressmakerPlugin;
 pub use exe_version::detect_install_version;
+pub use firstlight::FirstLightPlugin;
 pub use fromsoft_loaders::install_legacy_from_archive;
 pub use fromsoftware::{
     DarkSouls2Plugin, DarkSouls3Plugin, DarkSoulsPlugin, DarkSoulsRemasteredPlugin, EldenRingPlugin,
@@ -93,10 +93,10 @@ pub use unity_bepinex::{
     bepinex_pack_deploy_root, looks_like_unity_install, rewrite_ror2_bepinexpack_dest,
     thunderstore_community_for_plugin, AgainstTheStormPlugin, AmongUsPlugin, AtlyssPlugin,
     BepInExBuild, BepInExPlugin, ChefRpgPlugin, ContentWarningPlugin, CultOfTheLambPlugin,
-    DysonSphereProgramPlugin, GtfoPlugin, H3vrPlugin, HollowKnightSilksongPlugin, InscryptionPlugin,
-    LethalCompanyPlugin, PeakPlugin, RepoPlugin, RiskOfRain2Plugin, RoundsPlugin, Schedule1Plugin,
-    SonsOfTheForestPlugin, SubnauticaBelowZeroPlugin, SubnauticaPlugin, TimberbornPlugin,
-    UltrakillPlugin, ValheimPlugin,
+    DysonSphereProgramPlugin, GtfoPlugin, H3vrPlugin, HollowKnightSilksongPlugin,
+    InscryptionPlugin, LethalCompanyPlugin, PeakPlugin, RepoPlugin, RiskOfRain2Plugin,
+    RoundsPlugin, Schedule1Plugin, SonsOfTheForestPlugin, SubnauticaBelowZeroPlugin,
+    SubnauticaPlugin, TimberbornPlugin, UltrakillPlugin, ValheimPlugin,
 };
 pub use unreal_engine::{
     detect_ue_layout, layout_info, DeepRockGalacticPlugin, DeployContext, HogwartsLegacyPlugin,

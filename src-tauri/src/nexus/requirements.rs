@@ -190,8 +190,7 @@ fn category_key(name: Option<&str>) -> String {
 
 fn is_historical_file(file: &ModFileInfo) -> bool {
     let key = category_key(file.category_name.as_deref());
-    key.is_empty()
-        || matches!(key.as_str(), "old_version" | "old version" | "archived")
+    key.is_empty() || matches!(key.as_str(), "old_version" | "old version" | "archived")
 }
 
 /// Current primary file, else a Main-category file, else the first current file.

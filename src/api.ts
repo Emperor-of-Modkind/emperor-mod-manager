@@ -7,6 +7,8 @@ import type {
   CatalogSearchPage,
   CatalogSuggestion,
   CatalogSuggestRequest,
+  CatalogCoverHit,
+  CatalogCoverRequest,
   CollectionDetail,
   CollectionModFile,
   CollectionSearchPage,
@@ -100,6 +102,8 @@ export const api = {
   recoverLegacyModData: () =>
     invoke<RecoveryReport>("recover_legacy_mod_data"),
   scanGames: () => invoke<DetectedGame[]>("scan_games"),
+  resolveCatalogCovers: (requests: CatalogCoverRequest[]) =>
+    invoke<CatalogCoverHit[]>("resolve_catalog_covers", { requests }),
   getGameHealth: () => invoke<GameHealth[]>("get_game_health"),
   relinkManagedGame: (oldId: string, newId: string) =>
     invoke<ManagedGame>("relink_managed_game", { oldId, newId }),
@@ -112,6 +116,7 @@ export const api = {
     launcher: string;
     pluginId: string;
     coverPath?: string | null;
+    coverUrl?: string | null;
     projectName?: string | null;
     thunderstoreCommunity?: string | null;
     modioGameId?: number | null;

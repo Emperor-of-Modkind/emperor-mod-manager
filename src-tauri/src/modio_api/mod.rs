@@ -127,6 +127,38 @@ impl ModioClient {
             .collect())
     }
 
+    /// Landscape logos for games that already have a mod.io id. One batched request.
+    pub async fn game_logos(&self, ids: &[u32]) -> Result<std::collections::HashMap<u32, String>> {
+        use std::collections::HashMap;
+
+        use modio::request::games::filters::Id as GameIdFilter;
+
+        let mut out = HashMap::new();
+        if ids.is_empty() {
+            return Ok(out);
+        }
+        for chunk in ids.chunks(100) {
+            let numeric: Vec<u64> = chunk.iter().map(|id| u64::from(*id)).collect();
+            let filter = with_limit(numeric.len()).and(GameIdFilter::_in(numeric));
+            let list = self
+                .inner
+                .get_games()
+                .filter(filter)
+                .await
+                .context("mod.io get_games logos")?
+                .data()
+                .await
+                .context("mod.io get_games logos body")?;
+            for game in list.data {
+                let url = game.logo.thumb_1280x720.to_string();
+                if url.starts_with("http://") || url.starts_with("https://") {
+                    out.insert(game.id.get() as u32, url);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     pub async fn search_mods(
         &self,
         game_id: u32,

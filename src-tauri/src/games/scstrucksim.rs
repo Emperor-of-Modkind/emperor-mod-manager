@@ -68,11 +68,7 @@ fn windows_build_mod_dir(install_path: &Path, title: &ScsTitle) -> Option<PathBu
     {
         super::user_data::proton_user_dir(install_path, title.steam_app_id)
             .or_else(|| super::user_data::wine_user_dir(install_path))
-            .map(|user| {
-                user.join("Documents")
-                    .join(title.user_folder)
-                    .join("mod")
-            })
+            .map(|user| user.join("Documents").join(title.user_folder).join("mod"))
     }
 }
 
@@ -141,7 +137,10 @@ fn looks_like_unpacked_scs_mod(content_root: &Path) -> bool {
     content_root.read_dir().ok().is_some_and(|entries| {
         entries.flatten().any(|entry| {
             let path = entry.path();
-            path.is_dir() || path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("scs"))
+            path.is_dir()
+                || path
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("scs"))
         })
     })
 }
@@ -217,11 +216,7 @@ scs_truck_plugin!(
     "eurotrucksimulator2",
     "Euro Truck Simulator 2",
     "eurotrucksimulator2",
-    &[
-        "euro truck simulator 2",
-        "eurotrucksimulator2",
-        "ets2",
-    ],
+    &["euro truck simulator 2", "eurotrucksimulator2", "ets2",],
     ETS2
 );
 
@@ -230,11 +225,7 @@ scs_truck_plugin!(
     "americantrucksimulator",
     "American Truck Simulator",
     "americantrucksimulator",
-    &[
-        "american truck simulator",
-        "americantrucksimulator",
-        "ats",
-    ],
+    &["american truck simulator", "americantrucksimulator", "ats",],
     ATS
 );
 
@@ -276,10 +267,7 @@ mod tests {
         let tmp = protonless_win_install();
         let install = tmp.path().join("game");
         let dest = EuroTruckSimulator2Plugin
-            .resolve_deploy_root(
-                &install,
-                Path::new("Euro Truck Simulator 2/mod/Cool.scs"),
-            )
+            .resolve_deploy_root(&install, Path::new("Euro Truck Simulator 2/mod/Cool.scs"))
             .unwrap();
         assert_eq!(dest, install.join("mod").join("Cool.scs"));
     }

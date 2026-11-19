@@ -109,7 +109,10 @@ fn is_skipped_deploy_file(relative: &Path) -> bool {
 
 fn collect_rpkg_stems(content_root: &Path) -> Vec<String> {
     let mut stems = Vec::new();
-    for entry in WalkDir::new(content_root).into_iter().filter_map(|e| e.ok()) {
+    for entry in WalkDir::new(content_root)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
         if !entry.file_type().is_file() {
             continue;
         }
@@ -176,8 +179,7 @@ fn sync_package_includes(install_path: &Path, enabled_stems: &[String]) -> Resul
         ]);
     }
 
-    let data = std::fs::read(&pkg_path)
-        .with_context(|| format!("read {}", pkg_path.display()))?;
+    let data = std::fs::read(&pkg_path).with_context(|| format!("read {}", pkg_path.display()))?;
     let encrypted = is_xtea_packagedefinition(&data);
     let content = if encrypted {
         let decrypted = decrypt_buffer(&data[20..]);
@@ -240,15 +242,12 @@ fn decrypt_block_xtea(a: &mut u32, b: &mut u32, keys: &[u32; 4]) {
     let mut sum: u32 = XTEA_SUM;
     for _ in 0..32 {
         *b = b.wrapping_sub(
-            ((*a << 4) ^ (*a >> 5))
-                .wrapping_add(*a)
+            ((*a << 4) ^ (*a >> 5)).wrapping_add(*a)
                 ^ sum.wrapping_add(keys[((sum >> 11) & 3) as usize]),
         );
         sum = sum.wrapping_add(XTEA_DELTA);
         *a = a.wrapping_sub(
-            ((*b << 4) ^ (*b >> 5))
-                .wrapping_add(*b)
-                ^ sum.wrapping_add(keys[(sum & 3) as usize]),
+            ((*b << 4) ^ (*b >> 5)).wrapping_add(*b) ^ sum.wrapping_add(keys[(sum & 3) as usize]),
         );
     }
 }
@@ -257,14 +256,11 @@ fn encrypt_block_xtea(a: &mut u32, b: &mut u32, keys: &[u32; 4]) {
     let mut sum: u32 = 0;
     for _ in 0..32 {
         *a = a.wrapping_add(
-            ((*b << 4) ^ (*b >> 5))
-                .wrapping_add(*b)
-                ^ sum.wrapping_add(keys[(sum & 3) as usize]),
+            ((*b << 4) ^ (*b >> 5)).wrapping_add(*b) ^ sum.wrapping_add(keys[(sum & 3) as usize]),
         );
         sum = sum.wrapping_sub(XTEA_DELTA);
         *b = b.wrapping_add(
-            ((*a << 4) ^ (*a >> 5))
-                .wrapping_add(*a)
+            ((*a << 4) ^ (*a >> 5)).wrapping_add(*a)
                 ^ sum.wrapping_add(keys[((sum >> 11) & 3) as usize]),
         );
     }
@@ -402,7 +398,10 @@ mod tests {
         std::fs::write(runtime.join(PKG_DEF_NAME), body).unwrap();
 
         FirstLightPlugin
-            .after_deploy(tmp.path(), &["chunk0patch203".into(), "chunk0patch204".into()])
+            .after_deploy(
+                tmp.path(),
+                &["chunk0patch203".into(), "chunk0patch204".into()],
+            )
             .unwrap();
         let after = std::fs::read_to_string(runtime.join(PKG_DEF_NAME)).unwrap();
         assert!(after.contains("@partition name=chunk0 parent=none"));
@@ -430,18 +429,12 @@ mod tests {
         let bare = FirstLightPlugin
             .resolve_deploy_root(Path::new("/game"), Path::new("chunk0patch203.rpkg"))
             .unwrap();
-        assert_eq!(
-            bare,
-            PathBuf::from("/game/Runtime/chunk0patch203.rpkg")
-        );
+        assert_eq!(bare, PathBuf::from("/game/Runtime/chunk0patch203.rpkg"));
 
         let nested = FirstLightPlugin
             .resolve_deploy_root(Path::new("/game"), Path::new("Runtime/chunk0patch203.rpkg"))
             .unwrap();
-        assert_eq!(
-            nested,
-            PathBuf::from("/game/Runtime/chunk0patch203.rpkg")
-        );
+        assert_eq!(nested, PathBuf::from("/game/Runtime/chunk0patch203.rpkg"));
 
         let retail = FirstLightPlugin
             .resolve_deploy_root(Path::new("/game"), Path::new("Retail/tool.dll"))

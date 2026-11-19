@@ -184,9 +184,7 @@ fn dir_contains_dll(dir: &Path) -> bool {
     false
 }
 
-pub use super::wine_overrides::{
-    launch_options_have_winmm_native, repair_winmm_override,
-};
+pub use super::wine_overrides::{launch_options_have_winmm_native, repair_winmm_override};
 
 fn resolve_steam_app_id(install_path: &Path) -> String {
     #[cfg(target_os = "linux")]

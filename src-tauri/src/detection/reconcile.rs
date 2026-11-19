@@ -117,9 +117,7 @@ pub fn relink_managed_game(
     let mut updated = old_game;
     updated.id = new_id.to_string();
     updated.install_path = new_install_path;
-    if detection.cover_path.is_some() {
-        updated.cover_path = detection.cover_path.clone();
-    }
+    super::sync_managed_cover(&mut updated.cover_path, &mut updated.cover_url, detection);
 
     config.managed_games.retain(|g| {
         g.id != old_id
@@ -222,6 +220,7 @@ mod tests {
             launcher: "Steam".to_string(),
             plugin_id: "example".to_string(),
             cover_path: None,
+            cover_url: None,
             project_name: None,
             thunderstore_community: None,
             modio_game_id: None,
@@ -241,6 +240,8 @@ mod tests {
             plugin_id: Some("example".to_string()),
             nexus_domain: Some("example".to_string()),
             cover_path: None,
+            cover_url: None,
+            icon_path: None,
             engine_hint: None,
         }
     }

@@ -6,7 +6,12 @@ use serde::Serialize;
 
 use crate::games::{match_plugin, GamePluginInfo};
 
+mod catalog_art;
+mod heroic_art;
 pub mod reconcile;
+mod steam_shortcuts;
+
+pub(crate) use catalog_art::{catalog_cover_url, is_deferred_icon_path};
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -23,7 +28,14 @@ pub struct DetectedGame {
     pub supported: bool,
     pub plugin_id: Option<String>,
     pub nexus_domain: Option<String>,
+    /// Local poster file. Never a launcher icon; those live in `icon_path`.
     pub cover_path: Option<String>,
+    /// Remote poster (Heroic store art or a linked catalog tile).
+    #[serde(default)]
+    pub cover_url: Option<String>,
+    /// Square launcher icon, used only when no poster is available.
+    #[serde(default)]
+    pub icon_path: Option<String>,
     /// When set (e.g. "unreal"), the install can be managed via a generic engine plugin.
     pub engine_hint: Option<String>,
 }
@@ -81,7 +93,34 @@ pub(crate) fn finish_detected(
         plugin_id,
         nexus_domain,
         cover_path,
+        cover_url: None,
+        icon_path: None,
         engine_hint,
+    }
+}
+
+/// Copy a freshly detected poster onto a managed game.
+///
+/// A local file wins and clears any remote URL. A remote poster clears a stored
+/// path so an old Heroic icon does not cover it. When detection has neither,
+/// the stored art is left alone (the icon can stay until a catalog tile replaces it).
+pub fn sync_managed_cover(
+    cover_path: &mut Option<String>,
+    cover_url: &mut Option<String>,
+    detected: &DetectedGame,
+) -> bool {
+    if detected.cover_path.is_some() {
+        let changed = cover_path != &detected.cover_path || cover_url.is_some();
+        *cover_path = detected.cover_path.clone();
+        *cover_url = None;
+        changed
+    } else if detected.cover_url.is_some() {
+        let changed = cover_url != &detected.cover_url || cover_path.is_some();
+        *cover_url = detected.cover_url.clone();
+        *cover_path = None;
+        changed
+    } else {
+        false
     }
 }
 

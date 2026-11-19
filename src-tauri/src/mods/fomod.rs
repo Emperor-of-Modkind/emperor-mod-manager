@@ -130,9 +130,15 @@ struct ConditionFlag {
 enum Dependency {
     And(Vec<Dependency>),
     Or(Vec<Dependency>),
-    Flag { name: String, value: String },
+    Flag {
+        name: String,
+        value: String,
+    },
     /// Soft: only fails when we can prove the file is missing from the game.
-    File { file: String, state: String },
+    File {
+        file: String,
+        state: String,
+    },
     /// Soft game version checks — treated as satisfied.
     GameVersion,
     /// Soft FOSE/etc — treated as satisfied.
@@ -249,7 +255,10 @@ pub fn load_module(content_root: &Path) -> Result<Option<FomodModule>> {
 }
 
 /// UI-facing view with absolute image paths and visibility against `selection`.
-pub fn installer_view(content_root: &Path, stored: Option<&FomodSelection>) -> Result<Option<FomodInstallerView>> {
+pub fn installer_view(
+    content_root: &Path,
+    stored: Option<&FomodSelection>,
+) -> Result<Option<FomodInstallerView>> {
     let Some(module) = load_module(content_root)? else {
         return Ok(None);
     };
@@ -344,7 +353,11 @@ pub fn default_selection(module: &FomodModule) -> FomodSelection {
                     }
                     continue;
                 }
-                let existing = selection.selected.get(&group.id).cloned().unwrap_or_default();
+                let existing = selection
+                    .selected
+                    .get(&group.id)
+                    .cloned()
+                    .unwrap_or_default();
                 next.insert(
                     group.id.clone(),
                     normalize_group_plugins(group, &existing, &flags),
@@ -361,7 +374,11 @@ pub fn normalize_selection(module: &FomodModule, selection: &FomodSelection) -> 
     let mut selected = BTreeMap::new();
     for step in &module.steps {
         for group in &step.groups {
-            let existing = selection.selected.get(&group.id).cloned().unwrap_or_default();
+            let existing = selection
+                .selected
+                .get(&group.id)
+                .cloned()
+                .unwrap_or_default();
             selected.insert(
                 group.id.clone(),
                 normalize_group_plugins(group, &existing, &flags),
@@ -371,7 +388,10 @@ pub fn normalize_selection(module: &FomodModule, selection: &FomodSelection) -> 
     FomodSelection { selected }
 }
 
-pub fn effective_selection(module: &FomodModule, stored: Option<&FomodSelection>) -> FomodSelection {
+pub fn effective_selection(
+    module: &FomodModule,
+    stored: Option<&FomodSelection>,
+) -> FomodSelection {
     match stored {
         Some(s) => normalize_selection(module, s),
         None => default_selection(module),
@@ -408,11 +428,7 @@ fn normalize_group_plugins(
             chosen.push(p.id.clone());
         }
     }
-    chosen.retain(|id| {
-        plugins
-            .iter()
-            .any(|(p, t)| p.id == *id && !t.is_disabled())
-    });
+    chosen.retain(|id| plugins.iter().any(|(p, t)| p.id == *id && !t.is_disabled()));
 
     match group.type_ {
         FomodGroupType::SelectAll => plugins
@@ -519,7 +535,10 @@ fn eval_dependency(
         Dependency::File { file, state } => {
             let lower = file.replace('\\', "/").to_ascii_lowercase();
             let present = game_files
-                .map(|set| set.iter().any(|f| f.replace('\\', "/").to_ascii_lowercase() == lower))
+                .map(|set| {
+                    set.iter()
+                        .any(|f| f.replace('\\', "/").to_ascii_lowercase() == lower)
+                })
                 .unwrap_or(true); // soft: unknown → satisfy
             match state.to_ascii_lowercase().as_str() {
                 "missing" => !present,
@@ -538,7 +557,7 @@ pub fn build_file_map(
     selection: &FomodSelection,
 ) -> Result<Vec<FomodMappedFile>> {
     let flags = collect_flags(module, selection);
-    let mut by_dest: BTreeMap<String, (PathBuf, i32)> = BTreeMap::new();
+    let mut by_dest: BTreeMap<String, MappedDest> = BTreeMap::new();
 
     let mut push_refs = |refs: &[FomodFileRef]| -> Result<()> {
         for r in refs {
@@ -579,17 +598,25 @@ pub fn build_file_map(
 
     Ok(by_dest
         .into_iter()
-        .map(|(dest, (source, _))| FomodMappedFile {
-            source,
-            dest_rel: PathBuf::from(dest),
+        .map(|(_, slot)| FomodMappedFile {
+            source: slot.source,
+            dest_rel: slot.dest,
         })
         .collect())
+}
+
+/// One deploy destination. The map key is lowercase so collisions ignore case;
+/// `dest` keeps the winning file's original casing.
+struct MappedDest {
+    source: PathBuf,
+    dest: PathBuf,
+    priority: i32,
 }
 
 fn expand_file_ref(
     content_root: &Path,
     r: &FomodFileRef,
-    by_dest: &mut BTreeMap<String, (PathBuf, i32)>,
+    by_dest: &mut BTreeMap<String, MappedDest>,
 ) -> Result<()> {
     let source = content_root.join(normalize_fomod_path(&r.source));
     if r.is_folder {
@@ -651,12 +678,13 @@ fn expand_file_ref(
 }
 
 fn insert_mapped(
-    by_dest: &mut BTreeMap<String, (PathBuf, i32)>,
+    by_dest: &mut BTreeMap<String, MappedDest>,
     source: PathBuf,
     dest: PathBuf,
     priority: i32,
 ) {
-    let key = normalize_relative(&dest)
+    let dest = normalize_relative(&dest);
+    let key = dest
         .to_string_lossy()
         .replace('\\', "/")
         .to_ascii_lowercase();
@@ -664,9 +692,16 @@ fn insert_mapped(
         return;
     }
     match by_dest.get(&key) {
-        Some((_, prev)) if *prev > priority => {}
+        Some(prev) if prev.priority > priority => {}
         _ => {
-            by_dest.insert(key, (source, priority));
+            by_dest.insert(
+                key,
+                MappedDest {
+                    source,
+                    dest,
+                    priority,
+                },
+            );
         }
     }
 }
@@ -787,10 +822,7 @@ fn attr_map(e: &quick_xml::events::BytesStart<'_>) -> HashMap<String, String> {
     map
 }
 
-fn read_text(
-    reader: &mut quick_xml::Reader<&[u8]>,
-    buf: &mut Vec<u8>,
-) -> Result<String> {
+fn read_text(reader: &mut quick_xml::Reader<&[u8]>, buf: &mut Vec<u8>) -> Result<String> {
     let mut out = String::new();
     loop {
         match reader.read_event_into(buf)? {
@@ -808,11 +840,7 @@ fn read_text(
     Ok(out)
 }
 
-fn skip_tag(
-    reader: &mut quick_xml::Reader<&[u8]>,
-    buf: &mut Vec<u8>,
-    tag: &str,
-) -> Result<()> {
+fn skip_tag(reader: &mut quick_xml::Reader<&[u8]>, buf: &mut Vec<u8>, tag: &str) -> Result<()> {
     let mut depth = 1i32;
     loop {
         match reader.read_event_into(buf)? {
@@ -905,7 +933,10 @@ fn read_install_steps(
                 let tag = local_name(&e.name());
                 if tag == "installstep" {
                     let attrs = attr_map(&e);
-                    let name = attrs.get("name").cloned().unwrap_or_else(|| format!("Step {}", *step_i + 1));
+                    let name = attrs
+                        .get("name")
+                        .cloned()
+                        .unwrap_or_else(|| format!("Step {}", *step_i + 1));
                     let id = option_id(*step_i, &name);
                     *step_i += 1;
                     let step = read_install_step(reader, buf, id, name)?;
@@ -949,8 +980,13 @@ fn read_install_step(
                     }
                     "group" => {
                         let attrs = attr_map(&e);
-                        let gname = attrs.get("name").cloned().unwrap_or_else(|| format!("Group {}", group_i + 1));
-                        let type_ = FomodGroupType::parse(attrs.get("type").map(|s| s.as_str()).unwrap_or("SelectAny"));
+                        let gname = attrs
+                            .get("name")
+                            .cloned()
+                            .unwrap_or_else(|| format!("Group {}", group_i + 1));
+                        let type_ = FomodGroupType::parse(
+                            attrs.get("type").map(|s| s.as_str()).unwrap_or("SelectAny"),
+                        );
                         let gid = format!("{id}.{}", option_id(group_i, &gname));
                         group_i += 1;
                         let group = read_group(reader, buf, gid, gname, type_)?;
@@ -995,7 +1031,10 @@ fn read_group(
                     "plugins" => {}
                     "plugin" => {
                         let attrs = attr_map(&e);
-                        let pname = attrs.get("name").cloned().unwrap_or_else(|| format!("Option {}", plugin_i + 1));
+                        let pname = attrs
+                            .get("name")
+                            .cloned()
+                            .unwrap_or_else(|| format!("Option {}", plugin_i + 1));
                         let pid = format!("{id}.{}", option_id(plugin_i, &pname));
                         plugin_i += 1;
                         plugins.push(read_plugin(reader, buf, pid, pname)?);
@@ -1242,7 +1281,9 @@ fn read_nested_type(
             quick_xml::events::Event::Start(e) | quick_xml::events::Event::Empty(e) => {
                 if local_name(&e.name()) == "type" {
                     let attrs = attr_map(&e);
-                    t = FomodPluginType::parse(attrs.get("name").map(|s| s.as_str()).unwrap_or("Optional"));
+                    t = FomodPluginType::parse(
+                        attrs.get("name").map(|s| s.as_str()).unwrap_or("Optional"),
+                    );
                 }
             }
             quick_xml::events::Event::End(e) => {
@@ -1366,7 +1407,10 @@ fn read_install_pattern(
         }
         buf.clear();
     }
-    Ok(dependencies.map(|dependencies| ConditionalPattern { dependencies, files }))
+    Ok(dependencies.map(|dependencies| ConditionalPattern {
+        dependencies,
+        files,
+    }))
 }
 
 fn read_dependency_block(
@@ -1403,11 +1447,15 @@ fn read_dependency_block(
                     "filedependency" => {
                         children.push(Dependency::File {
                             file: attrs.get("file").cloned().unwrap_or_default(),
-                            state: attrs.get("state").cloned().unwrap_or_else(|| "Active".into()),
+                            state: attrs
+                                .get("state")
+                                .cloned()
+                                .unwrap_or_else(|| "Active".into()),
                         });
                         skip_tag(reader, buf, &tag)?;
                     }
-                    "gamedependency" | "foseDependency" | "fosedependency" | "versiondependency" => {
+                    "gamedependency" | "foseDependency" | "fosedependency"
+                    | "versiondependency" => {
                         children.push(Dependency::GameVersion);
                         skip_tag(reader, buf, &tag)?;
                     }
@@ -1430,7 +1478,10 @@ fn read_dependency_block(
                     "filedependency" => {
                         children.push(Dependency::File {
                             file: attrs.get("file").cloned().unwrap_or_default(),
-                            state: attrs.get("state").cloned().unwrap_or_else(|| "Active".into()),
+                            state: attrs
+                                .get("state")
+                                .cloned()
+                                .unwrap_or_else(|| "Active".into()),
                         });
                     }
                     "gamedependency" | "fosedependency" | "versiondependency" => {
@@ -1487,7 +1538,11 @@ pub fn selection_is_valid(module: &FomodModule, selection: &FomodSelection) -> R
             continue;
         }
         for group in &step.groups {
-            let ids = selection.selected.get(&group.id).cloned().unwrap_or_default();
+            let ids = selection
+                .selected
+                .get(&group.id)
+                .cloned()
+                .unwrap_or_default();
             let usable: Vec<_> = group
                 .plugins
                 .iter()
@@ -1635,7 +1690,10 @@ mod tests {
         assert_eq!(module.module_name, "True Cyberpsychosis");
         assert_eq!(module.required.len(), 1);
         assert_eq!(module.steps.len(), 2);
-        assert_eq!(module.steps[0].groups[0].type_, FomodGroupType::SelectExactlyOne);
+        assert_eq!(
+            module.steps[0].groups[0].type_,
+            FomodGroupType::SelectExactlyOne
+        );
         assert_eq!(module.steps[0].groups[0].plugins.len(), 2);
         assert_eq!(
             module.steps[0].groups[0].plugins[0].plugin_type,
@@ -1663,7 +1721,13 @@ mod tests {
     fn file_map_includes_required_and_selected_folders() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        for dir in ["00 Core", "01 English", "02 Russian", "10 All Voices", "11 Jackie Only"] {
+        for dir in [
+            "00 Core",
+            "01 English",
+            "02 Russian",
+            "10 All Voices",
+            "11 Jackie Only",
+        ] {
             let p = root.join(dir).join("r6").join("scripts");
             fs::create_dir_all(&p).unwrap();
             fs::write(p.join("x.reds"), b"x").unwrap();
@@ -1717,9 +1781,78 @@ mod tests {
             &mut by_dest,
         )
         .unwrap();
-        let (source, pri) = by_dest.get("file.txt").unwrap();
-        assert_eq!(*pri, 5);
-        assert_eq!(fs::read(source).unwrap(), b"b");
+        let slot = by_dest.get("file.txt").unwrap();
+        assert_eq!(slot.priority, 5);
+        assert_eq!(fs::read(&slot.source).unwrap(), b"b");
+        assert_eq!(slot.dest, PathBuf::from("file.txt"));
+    }
+
+    #[test]
+    fn file_map_preserves_destination_case() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let voice = root
+            .join("red4ext")
+            .join("plugins")
+            .join("AudioXL")
+            .join("sounds")
+            .join("TrueCyberpsychosis");
+        fs::create_dir_all(&voice).unwrap();
+        fs::write(voice.join("tcp_heartbeat.ogg"), b"beat").unwrap();
+        // Same relative path, different case, lower priority — must not win.
+        let lower = root
+            .join("other")
+            .join("plugins")
+            .join("audioxl")
+            .join("sounds")
+            .join("truecyberpsychosis");
+        fs::create_dir_all(&lower).unwrap();
+        fs::write(lower.join("tcp_heartbeat.ogg"), b"nope").unwrap();
+
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<config>
+  <moduleName>Case</moduleName>
+  <requiredInstallFiles>
+    <folder source="red4ext" destination="red4ext" priority="1"/>
+  </requiredInstallFiles>
+  <installSteps order="Explicit">
+    <installStep name="Extra">
+      <optionalFileGroups>
+        <group name="Opt" type="SelectExactlyOne">
+          <plugins>
+            <plugin name="Lower">
+              <files>
+                <folder source="other" destination="red4ext" priority="0"/>
+              </files>
+              <typeDescriptor><type name="Optional"/></typeDescriptor>
+            </plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+  </installSteps>
+</config>"#;
+        fs::create_dir_all(root.join("fomod")).unwrap();
+        fs::write(root.join("fomod").join("ModuleConfig.xml"), xml).unwrap();
+
+        let module = load_module(root).unwrap().unwrap();
+        let sel = default_selection(&module);
+        let map = build_file_map(root, &module, &sel).unwrap();
+        let hit = map
+            .iter()
+            .find(|m| {
+                m.dest_rel
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .to_ascii_lowercase()
+                    .ends_with("tcp_heartbeat.ogg")
+            })
+            .expect("heartbeat mapped");
+        assert_eq!(
+            hit.dest_rel.to_string_lossy().replace('\\', "/"),
+            "red4ext/plugins/AudioXL/sounds/TrueCyberpsychosis/tcp_heartbeat.ogg"
+        );
+        assert_eq!(fs::read(&hit.source).unwrap(), b"beat");
     }
 
     #[test]
@@ -1754,7 +1887,11 @@ mod tests {
     fn detects_module_config_case_insensitively() {
         let tmp = tempfile::tempdir().unwrap();
         fs::create_dir_all(tmp.path().join("fomod")).unwrap();
-        fs::write(tmp.path().join("fomod").join("moduleconfig.xml"), SIMPLE_XML).unwrap();
+        fs::write(
+            tmp.path().join("fomod").join("moduleconfig.xml"),
+            SIMPLE_XML,
+        )
+        .unwrap();
         assert!(has_fomod(tmp.path()));
     }
 

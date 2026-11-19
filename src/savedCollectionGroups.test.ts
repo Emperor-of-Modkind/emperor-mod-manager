@@ -143,6 +143,38 @@ describe("groupSavedCollectionsByGame", () => {
     expect(groups[0]?.title).toBe("Detected Skyrim");
     expect(groups[0]?.coverPath).toBe("/det.jpg");
   });
+
+  it("uses a catalog poster when the detected game has no local file", () => {
+    const detected: DetectedGame[] = [
+      {
+        id: "det-1",
+        title: "Detected Skyrim",
+        install_path: "/g",
+        launcher: "steam",
+        supported: true,
+        plugin_id: "skyrimse",
+        nexus_domain: "skyrimspecialedition",
+        cover_path: null,
+        cover_url: "https://images.nexusmods.com/images/games/v2/1704/tile.jpg",
+        engine_hint: null,
+      },
+    ];
+    const groups = groupSavedCollectionsByGame(
+      [
+        entry({
+          id: "x",
+          name: "X",
+          game: { nexus_domain: "skyrimspecialedition" },
+        }),
+      ],
+      [],
+      detected,
+      [],
+    );
+    expect(groups[0]?.coverPath).toBe(
+      "https://images.nexusmods.com/images/games/v2/1704/tile.jpg",
+    );
+  });
 });
 
 describe("savedCollectionMatchesGame", () => {

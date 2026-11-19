@@ -80,9 +80,7 @@ impl GamePlugin for NoMansSkyPlugin {
 
     fn staging_deploy_warnings(&self, content_root: &Path, _mod_name: &str) -> Vec<String> {
         let mut out = Vec::new();
-        if content_root.join("Binaries").join("winmm.dll").is_file()
-            && cfg!(target_os = "linux")
-        {
+        if content_root.join("Binaries").join("winmm.dll").is_file() && cfg!(target_os = "linux") {
             out.push(
                 "This mod ships Binaries/winmm.dll. On Proton set \
                  WINEDLLOVERRIDES=\"winmm=n,b\" %command% (not winmm=n). Force Proton in Steam \
@@ -232,9 +230,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             dest,
-            PathBuf::from(
-                "/game/GAMEDATA/MODS/AbsoluteFlight/GCSPACESHIPGLOBALS.GLOBAL.EXML"
-            )
+            PathBuf::from("/game/GAMEDATA/MODS/AbsoluteFlight/GCSPACESHIPGLOBALS.GLOBAL.EXML")
         );
         let dest = NoMansSkyPlugin
             .resolve_deploy_root(Path::new("/game"), Path::new("Binaries/winmm.dll"))
@@ -288,7 +284,8 @@ mod tests {
         std::fs::create_dir_all(install.path().join("GAMEDATA")).unwrap();
         std::fs::create_dir_all(install.path().join("GAMEDATA/MODS/Binaries")).unwrap();
         let warnings = NoMansSkyPlugin.preflight_warnings(install.path());
-        assert!(warnings.iter().any(|w| w.contains("GAMEDATA/MODS/Binaries")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("GAMEDATA/MODS/Binaries")));
     }
-
 }

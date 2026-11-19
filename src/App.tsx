@@ -864,6 +864,95 @@ function mediaSrc(localPath?: string | null, remoteUrl?: string | null): string 
   return null;
 }
 
+function posterSrc(value?: string | null): string | null {
+  if (!value) return null;
+  if (/^https?:\/\//i.test(value)) return value;
+  return mediaSrc(value);
+}
+
+type GameArt = {
+  cover_path?: string | null;
+  cover_url?: string | null;
+  icon_path?: string | null;
+};
+
+/** Local poster, then a remote catalog/store poster, then a launcher icon. */
+function gameCoverSrc(game?: GameArt | null): string | null {
+  if (!game) return null;
+  const local = mediaSrc(game.cover_path);
+  if (local) return local;
+  if (game.cover_url) return game.cover_url;
+  return mediaSrc(game.icon_path);
+}
+
+function managedArt(game: DetectedGame): {
+  coverPath: string | null;
+  coverUrl: string | null;
+} {
+  return {
+    coverPath: game.cover_path ?? (game.cover_url ? null : game.icon_path ?? null),
+    coverUrl: game.cover_url ?? null,
+  };
+}
+
+function isDeferredIconPath(path: string): boolean {
+  const parts = path.replace(/\\/g, "/").split("/");
+  const file = parts[parts.length - 1]?.toLowerCase() ?? "";
+  const parent = parts[parts.length - 2]?.toLowerCase() ?? "";
+  return parent === "icons" || file.includes("_icon.");
+}
+
+function needsCatalogPoster(
+  coverPath?: string | null,
+  coverUrl?: string | null,
+  iconPath?: string | null,
+): boolean {
+  if (coverUrl) return false;
+  if (!coverPath) return true;
+  if (iconPath && coverPath === iconPath) return true;
+  return isDeferredIconPath(coverPath);
+}
+
+function catalogCoverRequests(detected: DetectedGame[], managed: ManagedGame[]) {
+  const requests: {
+    id: string;
+    nexus_domain: string | null;
+    modio_game_id: number | null;
+    icon_path: string | null;
+  }[] = [];
+  const seen = new Set<string>();
+  for (const game of detected) {
+    const managedMatch = managed.find((item) => item.id === game.id);
+    const domain = game.nexus_domain || managedMatch?.nexus_domain || null;
+    const modio = managedMatch?.modio_game_id ?? null;
+    const coverPath =
+      game.cover_path ||
+      (managedMatch && !game.cover_url ? managedMatch.cover_path : null);
+    const coverUrl = game.cover_url || managedMatch?.cover_url || null;
+    if (!needsCatalogPoster(coverPath, coverUrl, game.icon_path)) continue;
+    if (!domain && !modio) continue;
+    seen.add(game.id);
+    requests.push({
+      id: game.id,
+      nexus_domain: domain,
+      modio_game_id: modio,
+      icon_path: game.icon_path ?? null,
+    });
+  }
+  for (const game of managed) {
+    if (seen.has(game.id)) continue;
+    if (!needsCatalogPoster(game.cover_path, game.cover_url, null)) continue;
+    if (!game.nexus_domain && !game.modio_game_id) continue;
+    requests.push({
+      id: game.id,
+      nexus_domain: game.nexus_domain || null,
+      modio_game_id: game.modio_game_id ?? null,
+      icon_path: null,
+    });
+  }
+  return requests;
+}
+
 function shortLauncher(launcher: string): string {
   const l = launcher.toLowerCase();
   if (l.includes("steam")) return "Steam";
@@ -1147,6 +1236,8 @@ function MediaCard(props: {
   coverLabel?: string | null;
   hoverLabel?: string | null;
   unsupported?: boolean;
+  /** Library grids are small. Eager avoids WebView2 leaving lazy images blank until a click. */
+  loading?: "eager" | "lazy";
   onClick?: () => void;
   enterIndex?: number;
   /** Skip the motion wrapper. Browse virtualization mounts cards while scrolling. */
@@ -1166,10 +1257,12 @@ function MediaCard(props: {
     coverLabel,
     hoverLabel,
     unsupported,
+    loading = "lazy",
     onClick,
     enterIndex,
     plain,
   } = props;
+  const [failedSrc, setFailedSrc] = useState<string | null>(null);
   const classes = [
     "media-card",
     onClick ? "media-card-clickable" : "",
@@ -1190,15 +1283,13 @@ function MediaCard(props: {
       <div className="media-cover">
         {badge ? <span className="media-badge">{badge}</span> : null}
         {installed ? <span className="media-status">Installed</span> : null}
-        {imageSrc ? (
+        {imageSrc && failedSrc !== imageSrc ? (
           <img
             src={imageSrc}
             alt=""
-            loading="lazy"
+            loading={loading}
             decoding={plain ? "async" : undefined}
-            onError={(e) => {
-              (e.currentTarget as HTMLImageElement).style.display = "none";
-            }}
+            onError={() => setFailedSrc(imageSrc)}
           />
         ) : (
           <PlaceholderIcon />
@@ -1623,7 +1714,7 @@ export default function App() {
     () => managed.find((g) => g.id === activeId) ?? managed[0] ?? null,
     [managed, activeId],
   );
-  const activeGameCoverSrc = mediaSrc(activeGame?.cover_path ?? null);
+  const activeGameCoverSrc = gameCoverSrc(activeGame);
   const installedIds = useMemo(
     () => (activeGame ? installedCatalogIds(mods, activeGame) : new Set<string>()),
     [mods, activeGame],
@@ -2290,19 +2381,51 @@ export default function App() {
     setDownloads(list);
   }, []);
 
+  const fillCatalogCovers = useCallback(
+    async (found: DetectedGame[], managedList: ManagedGame[]) => {
+      const requests = catalogCoverRequests(found, managedList);
+      if (requests.length === 0) return;
+      try {
+        const hits = await api.resolveCatalogCovers(requests);
+        if (hits.length === 0) return;
+        const urls = new Map(hits.map((hit) => [hit.id, hit.cover_url]));
+        setDetected((prev) =>
+          prev.map((game) => {
+            const url = urls.get(game.id);
+            if (!url) return game;
+            const dropLocal =
+              !game.cover_path || game.cover_path === game.icon_path;
+            return {
+              ...game,
+              cover_url: url,
+              cover_path: dropLocal ? null : game.cover_path,
+            };
+          }),
+        );
+        await refreshManaged();
+      } catch (e) {
+        console.warn("resolve_catalog_covers failed", e);
+      }
+    },
+    [refreshManaged],
+  );
+
   const scan = useCallback(async () => {
     setBusy("Scanning installed games…");
     setError(null);
     setNotice(null);
     try {
-      setDetected(await api.scanGames());
+      const found = await api.scanGames();
+      setDetected(found);
+      const managedList = await refreshManaged();
+      await fillCatalogCovers(found, managedList);
       await refreshGameHealth();
     } catch (e) {
       setError(String(e));
     } finally {
       setBusy(null);
     }
-  }, [refreshGameHealth]);
+  }, [fillCatalogCovers, refreshGameHealth, refreshManaged]);
 
   useEffect(() => {
     let cancelled = false;
@@ -3880,7 +4003,7 @@ export default function App() {
         installPath: game.install_path!,
         launcher: game.launcher,
         pluginId: game.plugin_id!,
-        coverPath: game.cover_path,
+        ...managedArt(game),
         thunderstoreCommunity: suggestion?.thunderstore_community ?? null,
         modioGameId: suggestion?.modio_game_id ?? null,
       });
@@ -3979,7 +4102,7 @@ export default function App() {
         installPath: game.install_path!,
         launcher: game.launcher,
         pluginId: "unreal",
-        coverPath: game.cover_path,
+        ...managedArt(game),
         projectName,
         thunderstoreCommunity: suggestion!.thunderstore_community ?? null,
         modioGameId: suggestion!.modio_game_id ?? null,
@@ -4012,7 +4135,7 @@ export default function App() {
         installPath: game.install_path!,
         launcher: game.launcher,
         pluginId: "bepinex",
-        coverPath: game.cover_path,
+        ...managedArt(game),
         thunderstoreCommunity: suggestion!.thunderstore_community ?? null,
         modioGameId: suggestion!.modio_game_id ?? null,
       });
@@ -4050,7 +4173,7 @@ export default function App() {
         installPath: game.install_path!,
         launcher: game.launcher,
         pluginId: engine === "unreal" ? "unreal" : "bepinex",
-        coverPath: game.cover_path,
+        ...managedArt(game),
         projectName: engine === "unreal" ? values.projectName : null,
         thunderstoreCommunity: values.thunderstoreCommunity || null,
         modioGameId: values.modioGameId,
@@ -6641,8 +6764,8 @@ export default function App() {
 
                 <div className="detail-hero">
                   <div className="detail-cover">
-                    {mediaSrc(libraryDetail.game.cover_path) ? (
-                      <img src={mediaSrc(libraryDetail.game.cover_path)!} alt="" />
+                    {gameCoverSrc(libraryDetail.game) ? (
+                      <img src={gameCoverSrc(libraryDetail.game)!} alt="" />
                     ) : (
                       <PlaceholderIcon />
                     )}
@@ -7959,7 +8082,8 @@ export default function App() {
                               key={g.id}
                               enterIndex={index}
                               title={g.title}
-                              imageSrc={mediaSrc(g.cover_path)}
+                              imageSrc={gameCoverSrc(g)}
+                              loading="eager"
                               badge={badge}
                               overlay={
                                 health?.status === "missing"
@@ -8055,7 +8179,8 @@ export default function App() {
                             key={g.id}
                             enterIndex={index}
                             title={g.title}
-                            imageSrc={mediaSrc(g.cover_path)}
+                            imageSrc={gameCoverSrc(g)}
+                            loading="eager"
                             coverTags={hints}
                             hoverLabel="Manage"
                             onClick={() => manage(g)}
@@ -8070,7 +8195,8 @@ export default function App() {
                             key={g.id}
                             enterIndex={index}
                             title={g.title}
-                            imageSrc={mediaSrc(g.cover_path)}
+                            imageSrc={gameCoverSrc(g)}
+                            loading="eager"
                             badge={catalogMatchBadge(kind)}
                             coverTags={hints}
                             hoverLabel={catalogMatchHover(kind)}
@@ -8088,7 +8214,8 @@ export default function App() {
                             key={g.id}
                             enterIndex={index}
                             title={g.title}
-                            imageSrc={mediaSrc(g.cover_path)}
+                            imageSrc={gameCoverSrc(g)}
+                            loading="eager"
                             badge={catalogMatchBadge(kind)}
                             coverTags={hints}
                             hoverLabel={catalogMatchHover(kind)}
@@ -8105,7 +8232,8 @@ export default function App() {
                           key={g.id}
                           enterIndex={index}
                           title={g.title}
-                          imageSrc={mediaSrc(g.cover_path)}
+                          imageSrc={gameCoverSrc(g)}
+                          loading="eager"
                           coverTags={hints}
                           coverLabel="Unsupported"
                           unsupported
@@ -10018,7 +10146,7 @@ export default function App() {
                           role="button"
                           tabIndex={0}
                         >
-                          <ListPoster src={mediaSrc(group.coverPath)} />
+                          <ListPoster src={posterSrc(group.coverPath)} />
                           <div className="list-row-main">
                             <strong>{group.title}</strong>
                             <small>

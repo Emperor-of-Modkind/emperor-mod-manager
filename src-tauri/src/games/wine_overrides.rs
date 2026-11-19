@@ -239,7 +239,11 @@ pub fn launch_options_have_winmm_native(opts: &str) -> bool {
 fn winmm_has_native_and_builtin(opts: &str) -> bool {
     let lower = opts.to_lowercase();
     if let Some(rest) = lower.split("winmm=").nth(1) {
-        let token = rest.split_whitespace().next().unwrap_or("").trim_matches('"');
+        let token = rest
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_matches('"');
         return token.contains('n') && token.contains('b');
     }
     if let Some(idx) = lower.find("winedlloverrides") {
@@ -312,9 +316,8 @@ pub fn ensure_winmm_launch_options(install_path: &Path, success_hint: &str) -> V
         if winmm_proxy_at(install_path).is_none() {
             return Vec::new();
         }
-        let app_id = crate::tools::executables::steam_app_id_from_install(
-            &install_path.to_string_lossy(),
-        );
+        let app_id =
+            crate::tools::executables::steam_app_id_from_install(&install_path.to_string_lossy());
         let Some(app_id) = app_id else {
             return vec![
                 "A mod winmm.dll is deployed but this install has no Steam app id. \
@@ -365,9 +368,8 @@ pub fn winmm_launch_option_warnings(install_path: &Path, loader_label: &str) -> 
         if winmm_proxy_at(install_path).is_none() {
             return Vec::new();
         }
-        let app_id = crate::tools::executables::steam_app_id_from_install(
-            &install_path.to_string_lossy(),
-        );
+        let app_id =
+            crate::tools::executables::steam_app_id_from_install(&install_path.to_string_lossy());
         let Some(app_id) = app_id else {
             return vec![format!(
                 "Proton needs WINEDLLOVERRIDES=\"winmm=n,b\" in Steam launch options or \
