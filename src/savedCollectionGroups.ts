@@ -14,6 +14,42 @@ export type SavedCollectionGameGroup = {
   collections: SavedCollectionEntry[];
 };
 
+const GENERIC_ENGINE_PLUGINS = new Set(["bepinex", "unreal"]);
+
+function isGenericEnginePlugin(pluginId: string | null | undefined): boolean {
+  const id = pluginId?.trim().toLowerCase();
+  return Boolean(id && GENERIC_ENGINE_PLUGINS.has(id));
+}
+
+function titlesMatch(
+  left: string | null | undefined,
+  right: string | null | undefined,
+): boolean {
+  const a = left?.trim().toLowerCase();
+  const b = right?.trim().toLowerCase();
+  return Boolean(a && b && a === b);
+}
+
+function hintHasCatalog(hint: ShareGameHint): boolean {
+  return Boolean(
+    hint.nexus_domain?.trim() ||
+      hint.thunderstore_community?.trim() ||
+      (hint.modio_game_id != null && hint.modio_game_id > 0),
+  );
+}
+
+function genericEngineKey(hint: ShareGameHint): string | null {
+  if (!isGenericEnginePlugin(hint.plugin_id)) return null;
+  const title = hint.title?.trim().toLowerCase();
+  const project = hint.project_name?.trim().toLowerCase();
+  const plugin = hint.plugin_id!.trim().toLowerCase();
+  if (plugin === "unreal" && title && project) {
+    return `title:${title}:project:${project}`;
+  }
+  if (title) return `title:${title}`;
+  return null;
+}
+
 export function savedCollectionGameKey(entry: SavedCollectionEntry): string {
   const h = entry.game;
   if (h.nexus_domain?.trim()) {
@@ -25,6 +61,11 @@ export function savedCollectionGameKey(entry: SavedCollectionEntry): string {
   if (h.modio_game_id != null && h.modio_game_id > 0) {
     return `modio:${h.modio_game_id}`;
   }
+  if (h.plugin_id?.trim() && !isGenericEnginePlugin(h.plugin_id)) {
+    return `plugin:${h.plugin_id.trim()}`;
+  }
+  const generic = genericEngineKey(h);
+  if (generic) return generic;
   if (h.plugin_id?.trim()) {
     return `plugin:${h.plugin_id.trim()}`;
   }
@@ -38,6 +79,7 @@ export function savedCollectionGameKey(entry: SavedCollectionEntry): string {
 }
 
 export function fallbackGameTitle(hint: ShareGameHint, sourceGameId?: string | null): string {
+  if (hint.title?.trim()) return hint.title.trim();
   if (hint.nexus_domain?.trim()) return hint.nexus_domain.trim();
   if (hint.thunderstore_community?.trim()) return hint.thunderstore_community.trim();
   if (hint.modio_game_id != null && hint.modio_game_id > 0) {
@@ -78,6 +120,15 @@ export function savedCollectionMatchesGame(
   }
   if (entry.source_game_id && entry.source_game_id === game.id) return true;
   if (h.id && h.id === game.id) return true;
+  if (!hintHasCatalog(h) && titlesMatch(h.title, game.title)) {
+    if (
+      h.plugin_id?.trim().toLowerCase() === "unreal" &&
+      h.project_name?.trim()
+    ) {
+      return titlesMatch(h.project_name, game.project_name);
+    }
+    return true;
+  }
   return false;
 }
 
@@ -89,11 +140,10 @@ function detectedMatchesHint(game: DetectedGame, hint: ShareGameHint): boolean {
   ) {
     return true;
   }
-  if (
-    hint.plugin_id &&
-    game.plugin_id &&
-    hint.plugin_id === game.plugin_id
-  ) {
+  if (hint.plugin_id && game.plugin_id && hint.plugin_id === game.plugin_id) {
+    if (isGenericEnginePlugin(hint.plugin_id) && hint.title?.trim()) {
+      return titlesMatch(hint.title, game.title);
+    }
     return true;
   }
   return false;
@@ -103,7 +153,10 @@ function pluginMatchesHint(
   plugin: GamePluginInfo,
   hint: ShareGameHint,
 ): boolean {
-  if (hint.plugin_id && hint.plugin_id === plugin.id) return true;
+  if (hint.plugin_id && hint.plugin_id === plugin.id) {
+    if (isGenericEnginePlugin(hint.plugin_id) && hint.title?.trim()) return false;
+    return true;
+  }
   if (
     hint.nexus_domain &&
     plugin.nexus_domain &&

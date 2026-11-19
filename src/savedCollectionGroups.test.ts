@@ -178,4 +178,68 @@ describe("fallbackGameTitle", () => {
       "lethal-company",
     );
   });
+
+  it("prefers the stored game title", () => {
+    expect(
+      fallbackGameTitle({
+        title: "My Unity Game",
+        plugin_id: "bepinex",
+        nexus_domain: "some-domain",
+      }),
+    ).toBe("My Unity Game");
+  });
+});
+
+describe("generic engine titles", () => {
+  const genericPlugin: GamePluginInfo = {
+    id: "bepinex",
+    display_name: "Unity / BepInEx (generic)",
+    nexus_domain: "",
+  };
+
+  it("keeps two generic BepInEx shares in separate groups", () => {
+    const groups = groupSavedCollectionsByGame(
+      [
+        entry({
+          id: "a",
+          name: "Pack A",
+          game: { plugin_id: "bepinex", title: "Game One" },
+        }),
+        entry({
+          id: "b",
+          name: "Pack B",
+          game: { plugin_id: "bepinex", title: "Game Two" },
+        }),
+      ],
+      [],
+      [],
+      [genericPlugin],
+    );
+    expect(groups).toHaveLength(2);
+    expect(groups.map((g) => g.title).sort()).toEqual(["Game One", "Game Two"]);
+  });
+
+  it("matches a managed game by title when catalog ids are empty", () => {
+    const gameOne: ManagedGame = {
+      id: "u1",
+      title: "Game One",
+      nexus_domain: "",
+      install_path: "/games/one",
+      launcher: "steam",
+      plugin_id: "bepinex",
+    };
+    const gameTwo: ManagedGame = {
+      ...gameOne,
+      id: "u2",
+      title: "Game Two",
+      install_path: "/games/two",
+    };
+    const pack = entry({
+      id: "a",
+      name: "Pack",
+      game: { plugin_id: "bepinex", title: "game one" },
+    });
+    expect(savedCollectionMatchesGame(pack, gameOne)).toBe(true);
+    expect(savedCollectionMatchesGame(pack, gameTwo)).toBe(false);
+  });
 });

@@ -497,22 +497,6 @@ a {
   margin: 1rem 0;
 }
 
-.inline-version {
-  display: inline-flex;
-  flex-direction: column;
-  gap: 0.25rem;
-  font-size: 0.85rem;
-}
-
-.inline-version select {
-  border: 1px solid var(--line);
-  background: var(--input-bg);
-  color: var(--ink);
-  border-radius: 0.45rem;
-  padding: 0.35rem 0.5rem;
-  font: inherit;
-}
-
 .source-filter {
   margin-left: 0.5rem;
 }
@@ -1177,6 +1161,26 @@ button.mods-filters-toggle.active:hover:not(:disabled) {
   overflow-y: auto;
 }
 
+.modal-collection-import .modal-body label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.modal-collection-import .modal-body textarea {
+  width: 100%;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.8rem;
+  border: 1px solid var(--line);
+  background: var(--input-bg);
+  color: var(--ink);
+  border-radius: 0.45rem;
+  padding: 0.55rem 0.7rem;
+  resize: vertical;
+}
+
 .modal-foot {
   display: flex;
   justify-content: space-between;
@@ -1531,7 +1535,6 @@ input[type="search"],
 textarea,
 .row input,
 .panel label input,
-.inline-version select,
 .tag-picker-search,
 .share-panel textarea {
   transition:
@@ -1547,7 +1550,6 @@ textarea:focus-visible,
 select:focus-visible,
 .row input:focus-visible,
 .panel label input:focus-visible,
-.inline-version select:focus-visible,
 .tag-picker-search:focus-visible,
 .share-panel textarea:focus-visible,
 .filters select:focus-visible,
@@ -2038,7 +2040,34 @@ button.linkish:hover:not(:disabled):not(.nav) {
   gap: 0.4rem;
   flex-wrap: wrap;
   justify-content: flex-end;
+  align-items: center;
   margin-top: auto;
+}
+
+.detail-mod-actions .detail-version {
+  appearance: none;
+  -webkit-appearance: none;
+  border: 1px solid var(--line);
+  background-color: transparent;
+  background-image: var(--select-chevron);
+  background-repeat: no-repeat;
+  background-position: right 0.55rem center;
+  background-size: 0.7rem;
+  color: var(--ink);
+  border-radius: 0.45rem;
+  padding: 0.5rem 1.7rem 0.5rem 0.8rem;
+  font: inherit;
+  line-height: inherit;
+  cursor: pointer;
+  transition:
+    background-color var(--motion-fast) var(--ease-out),
+    border-color var(--motion-fast) var(--ease-out),
+    color var(--motion-fast) var(--ease-out),
+    box-shadow var(--motion-fast) var(--ease-out);
+}
+
+.detail-mod-actions .detail-version:hover {
+  background-color: color-mix(in srgb, var(--ink) 7%, transparent);
 }
 
 .detail-external-links {

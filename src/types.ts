@@ -470,6 +470,10 @@ export type ShareGameHint = {
   nexus_domain?: string | null;
   thunderstore_community?: string | null;
   modio_game_id?: number | null;
+  /** Display name of the game this share was exported from. */
+  title?: string | null;
+  /** Unreal project folder when the game uses the generic Unreal plugin. */
+  project_name?: string | null;
 };
 
 export type ShareModEntry = {

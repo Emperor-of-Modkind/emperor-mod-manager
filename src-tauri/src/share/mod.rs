@@ -46,6 +46,12 @@ pub struct ShareGameHint {
     pub thunderstore_community: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modio_game_id: Option<u32>,
+    /// Display name of the game this share was exported from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Unreal project folder when the game uses the generic Unreal plugin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -290,6 +296,8 @@ pub fn game_hint_from_managed(game: &ManagedGame) -> ShareGameHint {
             .as_ref()
             .and_then(|s| empty_opt(s)),
         modio_game_id: game.modio_game_id.filter(|id| *id > 0),
+        title: empty_opt(&game.title),
+        project_name: game.project_name.as_ref().and_then(|s| empty_opt(s)),
     }
 }
 
@@ -611,6 +619,8 @@ mod tests {
                 nexus_domain: Some("skyrimspecialedition".into()),
                 thunderstore_community: Some("lethal-company".into()),
                 modio_game_id: Some(42),
+                title: Some("Skyrim Special Edition".into()),
+                project_name: Some("Pal".into()),
             },
             game_versions: Some(vec!["1.6.1170".into()]),
             mods: vec![
@@ -666,6 +676,20 @@ mod tests {
         assert_eq!(back.mods[0].mod_id, Some(10));
         assert_eq!(back.mods[1].namespace.as_deref(), Some("Owner"));
         assert_eq!(back.mods[2].game_id, Some(42));
+        assert_eq!(back.game.title.as_deref(), Some("Skyrim Special Edition"));
+        assert_eq!(back.game.project_name.as_deref(), Some("Pal"));
+    }
+
+    #[test]
+    fn decode_share_without_game_title() {
+        let raw = r#"{"v":1,"name":"Old","game":{"plugin_id":"bepinex"},"mods":[]}"#;
+        let manifest: ShareManifest = serde_json::from_str(raw).unwrap();
+        assert_eq!(manifest.game.title, None);
+        assert_eq!(manifest.game.project_name, None);
+        let back = decode_share_code(&encode_share_manifest(&manifest).unwrap()).unwrap();
+        assert_eq!(back.game.plugin_id.as_deref(), Some("bepinex"));
+        assert_eq!(back.game.title, None);
+        assert_eq!(back.game.project_name, None);
     }
 
     #[test]
@@ -742,7 +766,7 @@ mod tests {
             launcher: "steam".into(),
             plugin_id: "p".into(),
             cover_path: None,
-            project_name: None,
+            project_name: Some("Phoenix".into()),
             thunderstore_community: None,
             modio_game_id: None,
             tool_overrides: None,
@@ -795,6 +819,8 @@ mod tests {
             ],
         };
         let (manifest, skipped, member_ids) = build_manifest_from_loadorder(&order, &game, None);
+        assert_eq!(manifest.game.title.as_deref(), Some("G"));
+        assert_eq!(manifest.game.project_name.as_deref(), Some("Phoenix"));
         assert_eq!(manifest.mods.len(), 1);
         assert_eq!(manifest.mods[0].mod_id, Some(1));
         assert_eq!(skipped.len(), 2);
@@ -845,6 +871,8 @@ mod tests {
             nexus_domain: Some("skyrimspecialedition".into()),
             thunderstore_community: None,
             modio_game_id: None,
+            title: None,
+            project_name: None,
         };
         assert!(catalogs_overlap(&hint, &game).is_err());
     }

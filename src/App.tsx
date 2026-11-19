@@ -20,6 +20,7 @@ import {
   faGear,
   faLink,
   faMagnifyingGlass,
+  faPlus,
   faTrashCan,
   faXmark,
 } from "@fortawesome/free-solid-svg-icons";
@@ -167,6 +168,14 @@ type BrowseListDensity = "compact" | "posters";
 type DetailTab = "info" | "files";
 type GameDetailTab = "info" | "mods" | "collections" | "tools";
 type BrowseTagMap = Record<string, TagFilterState>;
+
+type SaveImportPrompt = {
+  gameId: string;
+  code: string;
+  name?: string | null;
+  previewName?: string | null;
+  modCount?: number;
+};
 
 const EMPTY_IGNORED: IgnoredRequirement[] = [];
 
@@ -1416,6 +1425,11 @@ export default function App() {
   const [shareExportName, setShareExportName] = useState("");
   const [shareImportOpen, setShareImportOpen] = useState(false);
   const [shareImportCode, setShareImportCode] = useState("");
+  const [collectionImportOpen, setCollectionImportOpen] = useState(false);
+  const [collectionImportCode, setCollectionImportCode] = useState("");
+  const [saveImportPrompt, setSaveImportPrompt] = useState<SaveImportPrompt | null>(
+    null,
+  );
   const [lastShareCode, setLastShareCode] = useState<string | null>(null);
   const [savedCollections, setSavedCollections] = useState<SavedCollectionEntry[]>(
     [],
@@ -5257,7 +5271,7 @@ export default function App() {
       setError("Paste an Emperor share code or r2modman / Gale profile code.");
       return;
     }
-    await runUnifiedImport(activeGame.id, code);
+    await beginCodeImport(activeGame.id, code);
   }
 
   async function handleShareImportResult(
@@ -5353,6 +5367,65 @@ export default function App() {
     }
   }
 
+  function codeAlreadySaved(code: string): boolean {
+    const trimmed = code.trim();
+    return savedCollections.some((entry) => entry.code.trim() === trimmed);
+  }
+
+  async function beginCodeImport(
+    gameId: string,
+    code: string,
+    name?: string | null,
+  ) {
+    const trimmed = code.trim();
+    if (!trimmed) {
+      setError("Paste an Emperor share code or r2modman / Gale profile code.");
+      return;
+    }
+    if (codeAlreadySaved(trimmed)) {
+      await runUnifiedImport(gameId, trimmed, name);
+      return;
+    }
+    let detected;
+    try {
+      detected = await api.detectImportCode(trimmed);
+    } catch (e) {
+      setError(String(e));
+      return;
+    }
+    if (detected.kind !== "emperor") {
+      await runUnifiedImport(gameId, trimmed, name);
+      return;
+    }
+    setSaveImportPrompt({
+      gameId,
+      code: trimmed,
+      name: name ?? null,
+      previewName: detected.preview?.name ?? null,
+      modCount: detected.preview?.mods.length,
+    });
+  }
+
+  async function confirmSaveImport(save: boolean) {
+    if (!saveImportPrompt) return;
+    const prompt = saveImportPrompt;
+    setSaveImportPrompt(null);
+    if (save) {
+      try {
+        await api.saveCollectionCode({
+          code: prompt.code,
+          name: prompt.name ?? prompt.previewName ?? null,
+          sourceGameId: prompt.gameId,
+        });
+        await refreshSavedCollections();
+      } catch (e) {
+        setError(String(e));
+        return;
+      }
+    }
+    await runUnifiedImport(prompt.gameId, prompt.code, prompt.name);
+  }
+
   async function saveShareCodeToFile(code: string, suggestedName?: string) {
     const { save } = await import("@tauri-apps/plugin-dialog");
     const path = await save({
@@ -5387,7 +5460,7 @@ export default function App() {
         return;
       }
       setShareImportCode(code);
-      await runUnifiedImport(activeGame.id, code);
+      await beginCodeImport(activeGame.id, code);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -5434,6 +5507,59 @@ export default function App() {
       setSavedCollections(list);
     } catch (e) {
       setError(String(e));
+    }
+  }
+
+  function closeCollectionImport() {
+    setCollectionImportOpen(false);
+    setCollectionImportCode("");
+  }
+
+  async function saveImportedCollectionCode(raw: string) {
+    const code = raw.trim();
+    if (!code) {
+      setError("Paste an Emperor share code.");
+      return;
+    }
+    setError(null);
+    try {
+      await api.saveCollectionCode({ code });
+      setNotice({
+        kind: "ok",
+        message: "Saved to Collections.",
+      });
+      closeCollectionImport();
+      await refreshSavedCollections();
+    } catch (e) {
+      setCollectionImportCode(code);
+      setError(String(e));
+    }
+  }
+
+  async function openCollectionImportFile() {
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const selected = await open({
+      multiple: false,
+      filters: [
+        { name: "Emperor share", extensions: ["emperor-share", "txt"] },
+        { name: "Text", extensions: ["txt"] },
+      ],
+    });
+    if (!selected || Array.isArray(selected)) return;
+    setBusy("Reading share file…");
+    setError(null);
+    try {
+      const code = (await api.readShareFile(selected)).trim();
+      setCollectionImportCode(code);
+      if (!code) {
+        setError("Share file is empty.");
+        return;
+      }
+      await saveImportedCollectionCode(code);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(null);
     }
   }
 
@@ -6745,7 +6871,7 @@ export default function App() {
                                 onClick={() => {
                                   const code = shareImportCode.trim();
                                   if (!code || !activeGame) return;
-                                  void runUnifiedImport(activeGame.id, code);
+                                  void beginCodeImport(activeGame.id, code);
                                 }}
                               >
                                 Import
@@ -8322,22 +8448,21 @@ export default function App() {
                               >
                                 Open on Thunderstore
                               </button>
-                              <label className="inline-version">
-                                Version
-                                <select
-                                  value={tsVersion}
-                                  onChange={(e) => setTsVersion(e.target.value)}
-                                >
-                                  {(tsDetail?.versions ?? []).map((v) => (
-                                    <option key={v.uuid4} value={v.version_number}>
-                                      {v.version_number}
-                                      {v.downloads
-                                        ? ` · ${v.downloads.toLocaleString()} dl`
-                                        : ""}
-                                    </option>
-                                  ))}
-                                </select>
-                              </label>
+                              <select
+                                className="detail-version"
+                                aria-label="Version"
+                                value={tsVersion}
+                                onChange={(e) => setTsVersion(e.target.value)}
+                              >
+                                {(tsDetail?.versions ?? []).map((v) => (
+                                  <option key={v.uuid4} value={v.version_number}>
+                                    {v.version_number}
+                                    {v.downloads
+                                      ? ` · ${v.downloads.toLocaleString()} dl`
+                                      : ""}
+                                  </option>
+                                ))}
+                              </select>
                               <button
                                 type="button"
                                 onClick={() => void installThunderstorePackage()}
@@ -9847,10 +9972,24 @@ export default function App() {
               <div>
                 <div className="panel-head">
                   <h1>Saved Collections</h1>
+                  <div className="panel-head-actions">
+                    <button
+                      type="button"
+                      className="icon-btn"
+                      aria-label="Import collection"
+                      title="Import collection"
+                      onClick={() => {
+                        setError(null);
+                        setCollectionImportOpen(true);
+                      }}
+                    >
+                      <FontAwesomeIcon icon={faPlus} />
+                    </button>
+                  </div>
                 </div>
                 <p className="note">
                   Local Emperor share codes grouped by game. Create one from Library →
-                  game → Mods → Share loadout, or paste a code there and choose Save only.
+                  game → Mods → Share loadout, or import a code or file here.
                 </p>
                 <ul className="list collections-by-game">
                   {savedCollectionGameGroups.map((group) => {
@@ -10393,6 +10532,75 @@ export default function App() {
           gameTitle={activeGame?.title}
           onClose={() => setLoadDiagnosis(null)}
         />
+      )}
+      {saveImportPrompt && (
+        <Modal
+          title="Add to your collections?"
+          onClose={() => setSaveImportPrompt(null)}
+          footer={
+            <div className="modal-foot-actions">
+              <button
+                type="button"
+                className="linkish"
+                onClick={() => setSaveImportPrompt(null)}
+              >
+                Cancel
+              </button>
+              <button type="button" onClick={() => void confirmSaveImport(false)}>
+                Don't add
+              </button>
+              <button type="button" onClick={() => void confirmSaveImport(true)}>
+                Add to collections
+              </button>
+            </div>
+          }
+        >
+          <p className="note">
+            {(saveImportPrompt.previewName?.trim() || "This loadout") +
+              (saveImportPrompt.modCount != null
+                ? ` (${saveImportPrompt.modCount} mod${saveImportPrompt.modCount === 1 ? "" : "s"})`
+                : "")}
+            . Saving keeps the code in Collections so you can install it again later.
+          </p>
+        </Modal>
+      )}
+      {collectionImportOpen && (
+        <Modal
+          className="modal-collection-import"
+          title="Import collection"
+          onClose={closeCollectionImport}
+          footer={
+            <div className="modal-foot-actions">
+              <button
+                type="button"
+                className="linkish"
+                onClick={closeCollectionImport}
+              >
+                Cancel
+              </button>
+              <button type="button" onClick={() => void openCollectionImportFile()}>
+                Open file
+              </button>
+              <button
+                type="button"
+                onClick={() => void saveImportedCollectionCode(collectionImportCode)}
+              >
+                Save
+              </button>
+            </div>
+          }
+        >
+          <label>
+            Code
+            <textarea
+              rows={4}
+              value={collectionImportCode}
+              onChange={(e) => setCollectionImportCode(e.target.value)}
+              placeholder="Paste an Emperor share code"
+            />
+          </label>
+          {error ? <p className="error-banner">{error}</p> : null}
+        </Modal>
       )}
       {nexusLoginOpen && (
         <Modal
