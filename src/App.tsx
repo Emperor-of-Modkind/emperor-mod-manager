@@ -1,5 +1,4 @@
 import {
-  Fragment,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -9,7 +8,9 @@ import {
   type CSSProperties,
   type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
+  type RefObject,
 } from "react";
+import { createPortal } from "react-dom";
 import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
 import {
   faArrowDown,
@@ -24,14 +25,15 @@ import {
   faTrashCan,
   faXmark,
 } from "@fortawesome/free-solid-svg-icons";
-import { motion, useReducedMotion } from "motion/react";
+import { useReducedMotion } from "motion/react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import appLogo from "./assets/app-logo.png";
 import { AccountConnections } from "./AccountConnections";
 import { SettingsSection } from "./SettingsSection";
-import { UpdateToast } from "./UpdateToast";
+import { Throbber } from "./Throbber";
+import { CheckingUpdatesToast, UpdateToast } from "./UpdateToast";
 import { api } from "./api";
 import { setupCanFinish } from "./setupGate";
 import {
@@ -48,11 +50,10 @@ import {
   clampCatalogSourceFilter,
   type CatalogSourceFilter,
 } from "./catalogSources";
+import { SourceMark } from "./SourceMark";
 import { ImageCarousel } from "./ImageCarousel";
 import {
   FadeIn,
-  MOTION_EASE,
-  MOTION_FAST,
   MotionCard,
   NavTab,
   Collapse,
@@ -64,7 +65,8 @@ import {
 } from "./motion";
 import { RichText } from "./RichText";
 import { BrowseVirtualGrid, BrowseVirtualList } from "./BrowseResults";
-import { estimateListRowHeight } from "./browseVirtual";
+import { BrowseResultsSkeleton, StagedModsSkeleton } from "./Skeleton";
+import { estimateListRowHeight, estimateStagedModRowHeight } from "./browseVirtual";
 import { AppNavHistory, type NavEntry } from "./appNavHistory";
 import { attachMouseNavigationListeners } from "./mouseNavigation";
 import { browseGameVersionOptions } from "./gameVersion";
@@ -89,7 +91,16 @@ import {
   type CatalogMatchSubmit,
 } from "./CatalogMatchDialog";
 import { LoadLogDialog } from "./LoadLogDialog";
-import { FomodDialog } from "./FomodDialog";
+import { FomodConfigureBanner, FomodDialog } from "./FomodDialog";
+import {
+  cancelFomodPass,
+  finishFomodPass,
+  fomodModsForDeploy,
+  fomodPassCurrent,
+  fomodPassProgress,
+  startFomodPass,
+  type FomodPass,
+} from "./fomodQueue";
 import { ModOptionsDialog } from "./ModOptionsDialog";
 import { QuickInstallDialog } from "./QuickInstallDialog";
 import {
@@ -109,6 +120,8 @@ import {
   type StatusNotice,
 } from "./StatusBanner";
 import { WineOverrideNotice } from "./WineOverrideNotice";
+import { catalogCoverRequests, isDeferredIconPath } from "./catalogCovers";
+import { nexusModUnavailable, nexusUnavailableNotice } from "./nexusAvailability";
 import type {
   AuthorSuggestion,
   BrowseMeta,
@@ -147,6 +160,7 @@ import type {
   OrphanScan,
   CollectionVersionAdvice,
   GamePluginInfo,
+  CatalogSource,
   SavedCollectionEntry,
   SavedCollectionDetail,
   ShareImportResult,
@@ -161,6 +175,7 @@ import {
   savedCollectionMatchesGame,
 } from "./savedCollectionGroups";
 import "./App.css";
+import { accentInk, contentRoles } from "./contrast";
 
 type Tab = "setup" | "library" | "collections" | "browse" | "downloads" | "tools" | "settings";
 type ViewMode = "list" | "grid";
@@ -253,31 +268,32 @@ function catalogMatchHover(kind: CatalogMatchCardKind): string {
   return "Find catalog";
 }
 
-function catalogMatchActionLabel(kind: CatalogMatchCardKind): string {
-  if (kind === "ready") return "Manage";
-  if (kind === "review") return "Choose catalog";
-  return "Find catalog";
-}
-
-function catalogHintTags(s: CatalogSuggestion | null | undefined): string[] {
+function catalogHints(
+  s: CatalogSuggestion | null | undefined,
+): { source: CatalogSource; label: string }[] {
   if (!s) {
     return [];
   }
-  const tags: string[] = [];
+  const tags: { source: CatalogSource; label: string }[] = [];
   if (s.nexus_name || s.nexus_domain) {
-    tags.push(`Nexus: ${s.nexus_name ?? s.nexus_domain}`);
+    tags.push({
+      source: "nexus",
+      label: `Nexus: ${s.nexus_name ?? s.nexus_domain}`,
+    });
   }
   if (s.thunderstore_name || s.thunderstore_community) {
-    tags.push(`TS: ${s.thunderstore_name ?? s.thunderstore_community}`);
+    tags.push({
+      source: "thunderstore",
+      label: `Thunderstore: ${s.thunderstore_name ?? s.thunderstore_community}`,
+    });
   }
   if (s.modio_name || (s.modio_game_id != null && s.modio_game_id > 0)) {
-    tags.push(`mod.io: ${s.modio_name ?? String(s.modio_game_id)}`);
+    tags.push({
+      source: "modio",
+      label: `mod.io: ${s.modio_name ?? String(s.modio_game_id)}`,
+    });
   }
   return tags;
-}
-
-function catalogHintLine(s: CatalogSuggestion | null | undefined): string {
-  return catalogHintTags(s).join(" · ");
 }
 
 function blankCatalogHit(source: CatalogHit["source"], id: string, name: string): CatalogHit {
@@ -808,6 +824,51 @@ function applySystemPaletteVars(palette: SystemPalette) {
   root.style.setProperty("--input-bg", palette.input_bg);
 }
 
+function readToken(name: string): string {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
+/** Resolve a token that may itself be another variable, such as the system sidebar. */
+function usedColor(name: string, fallback: string): string {
+  const specified = readToken(name);
+  if (specified && !specified.includes("var(") && !specified.includes("color-mix")) {
+    return specified;
+  }
+  if (!document.body) return fallback;
+  const probe = document.createElement("span");
+  probe.style.color = `var(${name})`;
+  document.body.appendChild(probe);
+  const computed = getComputedStyle(probe).color;
+  probe.remove();
+  return computed || fallback;
+}
+
+/** On-accent, accent-as-text, and a muted floor from the tokens now on :root. */
+function applyContentRoles(osOnAccent?: string | null) {
+  const accent = readToken("--accent");
+  const bg = readToken("--bg");
+  const panel = readToken("--panel");
+  const ink = readToken("--ink");
+  const muted = readToken("--muted");
+  if (!accent || !bg || !panel || !ink || !muted) return;
+  const roles = contentRoles({
+    accent,
+    bg,
+    panel,
+    ink,
+    muted,
+    osOnAccent,
+  });
+  const root = document.documentElement;
+  root.style.setProperty("--on-accent", roles.onAccent);
+  root.style.setProperty("--accent-ink", roles.accentInk);
+  root.style.setProperty("--accent-hover", roles.accentHover);
+  root.style.setProperty("--logo", accentInk(accent, [usedColor("--sidebar-bg", bg)]));
+  if (roles.muted.toLowerCase() !== muted.toLowerCase()) {
+    root.style.setProperty("--muted", roles.muted);
+  }
+}
+
 async function applyAppearance(
   pref: ThemePreference,
   style: ThemeStyle,
@@ -824,6 +885,7 @@ async function applyAppearance(
         pref === "system" ? (palette.dark ? "dark" : "light") : resolveTheme(pref);
       root.dataset.theme = resolved;
       applySystemPaletteVars(palette);
+      applyContentRoles(palette.on_accent);
       return;
     } catch {
       /* fall through to app monochrome */
@@ -839,6 +901,7 @@ async function applyAppearance(
       `color-mix(in srgb, ${accent} 72%, #ff8c00)`,
     );
   }
+  applyContentRoles(null);
 }
 
 // Match config defaults before settings load to avoid a Brand-palette flash.
@@ -850,6 +913,7 @@ if (typeof document !== "undefined") {
     "--accent-2",
     `color-mix(in srgb, ${DEFAULT_ACCENT} 72%, #ff8c00)`,
   );
+  applyContentRoles(null);
 }
 
 function mediaSrc(localPath?: string | null, remoteUrl?: string | null): string | null {
@@ -895,68 +959,11 @@ function managedArt(game: DetectedGame): {
   };
 }
 
-function isDeferredIconPath(path: string): boolean {
-  const parts = path.replace(/\\/g, "/").split("/");
-  const file = parts[parts.length - 1]?.toLowerCase() ?? "";
-  const parent = parts[parts.length - 2]?.toLowerCase() ?? "";
-  return parent === "icons" || file.includes("_icon.");
-}
-
-function needsCatalogPoster(
-  coverPath?: string | null,
-  coverUrl?: string | null,
-  iconPath?: string | null,
-): boolean {
-  if (coverUrl) return false;
-  if (!coverPath) return true;
-  if (iconPath && coverPath === iconPath) return true;
-  return isDeferredIconPath(coverPath);
-}
-
-function catalogCoverRequests(detected: DetectedGame[], managed: ManagedGame[]) {
-  const requests: {
-    id: string;
-    nexus_domain: string | null;
-    modio_game_id: number | null;
-    icon_path: string | null;
-  }[] = [];
-  const seen = new Set<string>();
-  for (const game of detected) {
-    const managedMatch = managed.find((item) => item.id === game.id);
-    const domain = game.nexus_domain || managedMatch?.nexus_domain || null;
-    const modio = managedMatch?.modio_game_id ?? null;
-    const coverPath =
-      game.cover_path ||
-      (managedMatch && !game.cover_url ? managedMatch.cover_path : null);
-    const coverUrl = game.cover_url || managedMatch?.cover_url || null;
-    if (!needsCatalogPoster(coverPath, coverUrl, game.icon_path)) continue;
-    if (!domain && !modio) continue;
-    seen.add(game.id);
-    requests.push({
-      id: game.id,
-      nexus_domain: domain,
-      modio_game_id: modio,
-      icon_path: game.icon_path ?? null,
-    });
-  }
-  for (const game of managed) {
-    if (seen.has(game.id)) continue;
-    if (!needsCatalogPoster(game.cover_path, game.cover_url, null)) continue;
-    if (!game.nexus_domain && !game.modio_game_id) continue;
-    requests.push({
-      id: game.id,
-      nexus_domain: game.nexus_domain || null,
-      modio_game_id: game.modio_game_id ?? null,
-      icon_path: null,
-    });
-  }
-  return requests;
-}
-
 function shortLauncher(launcher: string): string {
   const l = launcher.toLowerCase();
   if (l.includes("steam")) return "Steam";
   if (l.includes("heroic")) return "Heroic";
+  if (l.includes("epic")) return "Epic";
   if (l.includes("lutris")) return "Lutris";
   if (l.includes("bottles")) return "Bottles";
   return launcher.split("(")[0]?.trim() || launcher;
@@ -1208,6 +1215,30 @@ export function NexusModFileList(props: {
   );
 }
 
+function presentName(value: string | null | undefined): string | null {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : null;
+}
+
+function NexusUnavailableCallout({
+  detail,
+  files = false,
+}: {
+  detail: ModDetail | null;
+  files?: boolean;
+}) {
+  const notice = nexusUnavailableNotice(detail, { files });
+  if (!notice) return null;
+  return (
+    <div className="mod-unavailable">
+      <strong>{notice.title}</strong>
+      {notice.reason ? <p>{notice.reason}</p> : null}
+      <p>{notice.body}</p>
+      {notice.files ? <p>{notice.files}</p> : null}
+    </div>
+  );
+}
+
 function normalizeGameKey(title: string, launcher: string): string {
   return `${title.trim().toLowerCase()}|${launcher.trim().toLowerCase()}`;
 }
@@ -1228,14 +1259,16 @@ function MediaCard(props: {
   badge?: string | null;
   overlay?: string | null;
   tags?: string[];
-  coverTags?: string[];
-  meta?: string | null;
+  coverMarks?: { source: CatalogSource; label: string }[];
+  meta?: ReactNode;
   installed?: boolean;
   actions?: ReactNode;
   coverActions?: ReactNode;
   coverLabel?: string | null;
   hoverLabel?: string | null;
   unsupported?: boolean;
+  /** The game currently open in the app. Library grids keep this title at full strength. */
+  active?: boolean;
   /** Library grids are small. Eager avoids WebView2 leaving lazy images blank until a click. */
   loading?: "eager" | "lazy";
   onClick?: () => void;
@@ -1249,7 +1282,7 @@ function MediaCard(props: {
     badge,
     overlay,
     tags,
-    coverTags,
+    coverMarks,
     meta,
     installed,
     actions,
@@ -1257,16 +1290,19 @@ function MediaCard(props: {
     coverLabel,
     hoverLabel,
     unsupported,
+    active,
     loading = "lazy",
     onClick,
     enterIndex,
     plain,
   } = props;
   const [failedSrc, setFailedSrc] = useState<string | null>(null);
+  const coverSrc = imageSrc && failedSrc !== imageSrc ? imageSrc : null;
   const classes = [
     "media-card",
     onClick ? "media-card-clickable" : "",
     unsupported ? "media-card-unsupported" : "",
+    active ? "is-active" : "",
   ]
     .filter(Boolean)
     .join(" ");
@@ -1280,45 +1316,55 @@ function MediaCard(props: {
     : undefined;
   const body = (
     <>
-      <div className="media-cover">
-        {badge ? <span className="media-badge">{badge}</span> : null}
-        {installed ? <span className="media-status">Installed</span> : null}
-        {imageSrc && failedSrc !== imageSrc ? (
+      <div className="media-cover-stack">
+        {coverSrc ? (
           <img
-            src={imageSrc}
+            className="media-cover-glow"
+            src={coverSrc}
             alt=""
+            aria-hidden="true"
             loading={loading}
             decoding={plain ? "async" : undefined}
-            onError={() => setFailedSrc(imageSrc)}
           />
-        ) : (
-          <PlaceholderIcon />
-        )}
-        {overlay ? <span className="media-overlay">{overlay}</span> : null}
-        {coverTags && coverTags.length > 0 ? (
-          <div className="media-cover-tags">
-            {coverTags.map((t) => (
-              <span key={t} className="media-cover-tag">
-                {t}
-              </span>
-            ))}
-          </div>
         ) : null}
-        {coverLabel ? (
-          <span className="media-cover-label">{coverLabel}</span>
-        ) : null}
-        {hoverLabel ? (
-          <span className="media-cover-label media-cover-hover">{hoverLabel}</span>
-        ) : null}
-        {coverActions ? (
-          <div
-            className="media-cover-actions"
-            onClick={(e) => e.stopPropagation()}
-            onKeyDown={(e) => e.stopPropagation()}
-          >
-            {coverActions}
-          </div>
-        ) : null}
+        <div className="media-cover">
+          {badge ? <span className="media-badge">{badge}</span> : null}
+          {installed ? <span className="media-status">Installed</span> : null}
+          {coverSrc ? (
+            <img
+              src={coverSrc}
+              alt=""
+              loading={loading}
+              decoding={plain ? "async" : undefined}
+              onError={() => setFailedSrc(coverSrc)}
+            />
+          ) : (
+            <PlaceholderIcon />
+          )}
+          {overlay ? <span className="media-overlay">{overlay}</span> : null}
+          {coverMarks && coverMarks.length > 0 ? (
+            <div className="media-cover-tags">
+              {coverMarks.map((mark) => (
+                <SourceMark key={mark.source} source={mark.source} label={mark.label} />
+              ))}
+            </div>
+          ) : null}
+          {coverLabel ? (
+            <span className="media-cover-label">{coverLabel}</span>
+          ) : null}
+          {hoverLabel ? (
+            <span className="media-cover-label media-cover-hover">{hoverLabel}</span>
+          ) : null}
+          {coverActions ? (
+            <div
+              className="media-cover-actions"
+              onClick={(e) => e.stopPropagation()}
+              onKeyDown={(e) => e.stopPropagation()}
+            >
+              {coverActions}
+            </div>
+          ) : null}
+        </div>
       </div>
       <div className="media-card-title">{title}</div>
       {meta ? <div className="media-card-meta">{meta}</div> : null}
@@ -1447,12 +1493,81 @@ function installViaLabel(via: AppInstallVia): string {
   }
 }
 
+/** Short checks finish before this, so a small staged list never flashes the toast. */
+const MOD_UPDATE_CHECK_TOAST_DELAY_MS = 400;
+
+/** Re-scan installed games while the Library tab stays open. */
+const LIBRARY_SCAN_INTERVAL_MS = 60_000;
+
+function sameSnapshot(a: unknown, b: unknown): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+function shareModLabel(m: ShareModEntry): string {
+  return (
+    m.display_name ||
+    m.name ||
+    (m.s === "nexus"
+      ? `Nexus ${m.mod_id}/${m.file_id}`
+      : m.s === "thunderstore"
+        ? `${m.namespace}-${m.name}`
+        : `mod.io ${m.mod_id}`) ||
+    "Mod"
+  );
+}
+
+function ShareModList({
+  mods,
+  scrollRef,
+}: {
+  mods: ShareModEntry[];
+  scrollRef: RefObject<HTMLElement | null>;
+}) {
+  if (mods.length === 0) {
+    return (
+      <ul className="list">
+        <li className="empty">No mods in this share.</li>
+      </ul>
+    );
+  }
+  const rows = mods.map((mod, index) => ({ mod, index }));
+  return (
+    <BrowseVirtualList
+      items={rows}
+      scrollRef={scrollRef}
+      estimateSize={estimateListRowHeight(false)}
+      getKey={(row) => `${row.mod.s}-${row.index}`}
+      rowClassName=""
+      renderItem={(row) => {
+        const m = row.mod;
+        return (
+          <div>
+            <strong>{shareModLabel(m)}</strong>
+            <small>
+              {m.s}
+              {m.version ? ` · v${m.version}` : ""}
+              {m.s === "nexus" && m.mod_id != null
+                ? ` · ${m.domain} ${m.mod_id}/${m.file_id}`
+                : ""}
+              {m.s === "thunderstore"
+                ? ` · ${m.community}/${m.namespace}-${m.name}`
+                : ""}
+              {m.s === "modio" ? ` · game ${m.game_id} mod ${m.mod_id}` : ""}
+            </small>
+          </div>
+        );
+      }}
+    />
+  );
+}
+
 export default function App() {
   const [tab, setTabState] = useState<Tab | null>(null);
   const [settings, setSettings] = useState<Settings | null>(null);
   const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
   const [appUpdate, setAppUpdate] = useState<AppUpdateStatus | null>(null);
   const [checkingAppUpdate, setCheckingAppUpdate] = useState(false);
+  const [checkingModUpdates, setCheckingModUpdates] = useState(false);
   const [installingAppUpdate, setInstallingAppUpdate] = useState(false);
   const [appUpdateMessage, setAppUpdateMessage] = useState<string | null>(null);
   const [dismissedUpdateVersion, setDismissedUpdateVersion] = useState<string | null>(null);
@@ -1474,6 +1589,7 @@ export default function App() {
   } | null>(null);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [mods, setMods] = useState<StagedMod[]>([]);
+  const [modsReadyGameId, setModsReadyGameId] = useState<string | null>(null);
   const [wineAdvice, setWineAdvice] = useState<WineOverrideAdvice | null>(null);
   const [wineApplyBusy, setWineApplyBusy] = useState(false);
   const [missingRequirements, setMissingRequirements] =
@@ -1485,6 +1601,9 @@ export default function App() {
   const [gameVersionReport, setGameVersionReport] =
     useState<GameVersionReport | null>(null);
   const [gameVersionDraft, setGameVersionDraft] = useState("");
+  const [requirementScopeGameId, setRequirementScopeGameId] = useState<
+    string | null
+  >(null);
   const [quickInstall, setQuickInstall] = useState<{
     hit: CatalogHit;
     mains: ModFileInfo[];
@@ -1495,8 +1614,12 @@ export default function App() {
   );
   const [modsWithOptions, setModsWithOptions] = useState<Set<string>>(new Set());
   const [modOptionsFor, setModOptionsFor] = useState<StagedMod | null>(null);
-  const [fomodFor, setFomodFor] = useState<StagedMod | null>(null);
-  const fomodPromptedRef = useRef<Set<string>>(new Set());
+  const [fomodNeedingIds, setFomodNeedingIds] = useState<string[]>([]);
+  const [fomodDialog, setFomodDialog] = useState<{
+    mod: StagedMod;
+    pass: FomodPass<StagedMod> | null;
+  } | null>(null);
+  const fomodDialogRef = useRef(fomodDialog);
   const [loadDiagnosis, setLoadDiagnosis] = useState<LoadDiagnosis | null>(null);
   const [modsQuery, setModsQuery] = useState("");
   const [modsStatusFilter, setModsStatusFilter] =
@@ -1536,9 +1659,6 @@ export default function App() {
   const [installedEmperorShareIds, setInstalledEmperorShareIds] = useState(
     () => new Set<string>(),
   );
-  const [savedEntryShareIds, setSavedEntryShareIds] = useState<
-    Record<string, string>
-  >({});
   const [savedCollectionAdvice, setSavedCollectionAdvice] = useState<
     Record<string, CollectionVersionAdvice>
   >({});
@@ -1554,11 +1674,10 @@ export default function App() {
   const [collectionHits, setCollectionHits] = useState<CollectionHit[]>([]);
   const [browseMode, setBrowseMode] = useState<"mods" | "collections">("mods");
   const [sourceFilter, setSourceFilter] = useState<CatalogSourceFilter>("all");
-  const [libraryView, setLibraryView] = useState<ViewMode>("grid");
   const [browseView, setBrowseView] = useState<ViewMode>("grid");
   const [browseGridMin, setBrowseGridMin] = useState(160);
   const [browseListDensity, setBrowseListDensity] =
-    useState<BrowseListDensity>("compact");
+    useState<BrowseListDensity>("posters");
   const [browseSort, setBrowseSort] = useState("endorsements");
   const [browseCategory, setBrowseCategory] = useState("");
   const [browseVersion, setBrowseVersion] = useState("");
@@ -1578,6 +1697,8 @@ export default function App() {
   const [browsePageCount, setBrowsePageCount] = useState(24);
   const [browseSearched, setBrowseSearched] = useState(false);
   const [browseLoading, setBrowseLoading] = useState(false);
+  const [browseResultsPending, setBrowseResultsPending] = useState(false);
+  const [browseLoadingMore, setBrowseLoadingMore] = useState(false);
   const [browseMeta, setBrowseMeta] = useState<BrowseMeta | null>(null);
   const [browseDetail, setBrowseDetail] = useState<BrowseDetail | null>(null);
   const [browseReturnTab, setBrowseReturnTab] = useState<Tab | null>(null);
@@ -1688,6 +1809,7 @@ export default function App() {
   const browseNextOffsetRef = useRef(0);
   const browseAppendFailedRef = useRef(false);
   const browseRequestIdRef = useRef(0);
+  const browseResultsRequestRef = useRef(0);
   const browseModeRef = useRef(browseMode);
   browseModeRef.current = browseMode;
   const searchQueryRef = useRef(searchQuery);
@@ -1733,6 +1855,7 @@ export default function App() {
   const openEmperorModLinkRef = useRef<(payload: EmperorOpenMod) => void>(() => {});
   const lastEmperorOpenRef = useRef<{ key: string; at: number } | null>(null);
   const modUpdatesReqRef = useRef(0);
+  const checkingModUpdatesTimerRef = useRef<number | null>(null);
   const modFilesReqRef = useRef(0);
   const modFilesModIdRef = useRef<number | null>(null);
   const wineAdviceReqRef = useRef(0);
@@ -1742,6 +1865,25 @@ export default function App() {
   const pictureFillInFlightRef = useRef(false);
   const pictureFillSkippedRef = useRef(new Set<string>());
   const [pictureFillTick, setPictureFillTick] = useState(0);
+  const activeRequirementsGameId = activeGame?.id ?? null;
+  // Clear these caches while rendering so the mods page paints without the
+  // previous game's requirements or version check.
+  const fomodScopeCleared = requirementScopeGameId !== activeRequirementsGameId;
+  if (fomodScopeCleared) {
+    setRequirementScopeGameId(activeRequirementsGameId);
+    setMissingRequirements(null);
+    setGameVersionReport(null);
+    setGameVersionDraft("");
+    setRequirementsModal(null);
+    setIgnoredRequirementsOpen(false);
+    setFomodNeedingIds([]);
+    setFomodDialog(null);
+    missingReqRef.current += 1;
+    gameVersionReqRef.current += 1;
+  }
+  const openFomod = fomodScopeCleared ? null : fomodDialog;
+  fomodDialogRef.current = openFomod;
+  const shownFomodNeedingIds = fomodScopeCleared ? [] : fomodNeedingIds;
 
   const clearModFiles = useCallback(() => {
     modFilesReqRef.current += 1;
@@ -1773,6 +1915,7 @@ export default function App() {
 
   const resetBrowseState = useCallback(() => {
     browseRequestIdRef.current += 1;
+    browseResultsRequestRef.current = browseRequestIdRef.current;
     browseNextOffsetRef.current = 0;
     browseLoadingMoreRef.current = false;
     browseAppendFailedRef.current = false;
@@ -1781,6 +1924,8 @@ export default function App() {
     browseResultsVisibleRef.current = false;
     browsePrefetchErrorRef.current = null;
     setBrowseLoading(false);
+    setBrowseResultsPending(false);
+    setBrowseLoadingMore(false);
     closeBrowseDetail();
     setSearchQuery("");
     setModHits([]);
@@ -1924,8 +2069,8 @@ export default function App() {
       setQuickInstall(null);
       return true;
     }
-    if (fomodFor) {
-      setFomodFor(null);
+    if (openFomod) {
+      closeFomodDialog("cancel");
       return true;
     }
     if (modOptionsFor) {
@@ -2066,6 +2211,16 @@ export default function App() {
 
   const modsInLoadOrder = useMemo(() => stagedModsInLoadOrder(mods), [mods]);
 
+  const fomodNeeding = useMemo(() => {
+    const byId = new Map(mods.map((mod) => [mod.id, mod]));
+    return shownFomodNeedingIds.flatMap((id) => {
+      const mod = byId.get(id);
+      // A refresh that started before Finish can still list a mod whose choice is already stored.
+      if (!mod || mod.fomod_selection) return [];
+      return [mod];
+    });
+  }, [mods, shownFomodNeedingIds]);
+
   const modIndexById = useMemo(() => {
     const map = new Map<string, number>();
     modsInLoadOrder.forEach((m, i) => map.set(m.id, i));
@@ -2099,13 +2254,20 @@ export default function App() {
     [mods, modUpdates],
   );
 
+  const unmanagedSuggestKey = unmanaged
+    .map((game) => `${game.id}\0${game.title}`)
+    .join("\n");
+  const unmanagedForSuggestRef = useRef(unmanaged);
+  unmanagedForSuggestRef.current = unmanaged;
+
   useEffect(() => {
-    if (unmanaged.length === 0) {
+    const games = unmanagedForSuggestRef.current;
+    if (games.length === 0) {
       setCatalogSuggestions({});
       setCatalogLookupBusy(false);
       return;
     }
-    const requests = unmanaged.map((g) => ({ id: g.id, title: g.title }));
+    const requests = games.map((g) => ({ id: g.id, title: g.title }));
     const gen = ++catalogEnrichGen.current;
     setCatalogLookupBusy(true);
     void (async () => {
@@ -2126,7 +2288,7 @@ export default function App() {
         }
       }
     })();
-  }, [unmanaged]);
+  }, [unmanagedSuggestKey]);
 
   const themePref: ThemePreference = settings?.theme ?? "system";
   const themeStyle: ThemeStyle = settings?.theme_style ?? "app";
@@ -2214,17 +2376,17 @@ export default function App() {
   const refreshGameHealth = useCallback(async () => {
     try {
       const health = await api.getGameHealth();
-      setGameHealth(health);
+      setGameHealth((prev) => (sameSnapshot(prev, health) ? prev : health));
       return health;
     } catch {
-      setGameHealth([]);
+      setGameHealth((prev) => (prev.length === 0 ? prev : []));
       return [];
     }
   }, []);
 
   const refreshManaged = useCallback(async () => {
     const list = await api.listManaged();
-    setManaged(list);
+    setManaged((prev) => (sameSnapshot(prev, list) ? prev : list));
     void refreshGameHealth();
     return list;
   }, [refreshGameHealth]);
@@ -2242,34 +2404,35 @@ export default function App() {
   }, []);
 
   const refreshMods = useCallback(async (gameId: string) => {
-    const list = await api.listMods(gameId);
-    if (activeGameRef.current?.id !== gameId) return;
-    setMods(list);
-    // Reading a manifest per mod is a disk walk, so ask once per refresh
-    // instead of on every row render.
+    let revealed = false;
     try {
-      const withOptions = await api.listModsWithOptions(gameId);
+      const list = await api.listMods(gameId);
       if (activeGameRef.current?.id !== gameId) return;
-      setModsWithOptions(new Set(withOptions));
-    } catch (e) {
-      console.warn("list_mods_with_options failed", e);
+      setMods(list);
+      setModsReadyGameId(gameId);
+      revealed = true;
+      // Reading a manifest per mod is a disk walk, so ask once per refresh
+      // instead of on every row render. The list is already visible.
+      try {
+        const withOptions = await api.listModsWithOptions(gameId);
+        if (activeGameRef.current?.id !== gameId) return;
+        setModsWithOptions(new Set(withOptions));
+      } catch (e) {
+        console.warn("list_mods_with_options failed", e);
+      }
+      try {
+        const needing = await api.listModsNeedingFomod(gameId);
+        if (activeGameRef.current?.id !== gameId) return;
+        setFomodNeedingIds(needing);
+      } catch (e) {
+        console.warn("list_mods_needing_fomod failed", e);
+      }
+      void refreshWineAdvice(gameId);
+    } finally {
+      if (!revealed && activeGameRef.current?.id === gameId) {
+        setModsReadyGameId(gameId);
+      }
     }
-    try {
-      const needing = await api.listModsNeedingFomod(gameId);
-      if (activeGameRef.current?.id !== gameId) return;
-      setFomodFor((open) => {
-        if (open) return open;
-        const nextId = needing.find((id) => !fomodPromptedRef.current.has(id));
-        if (!nextId) return null;
-        const staged = list.find((m) => m.id === nextId);
-        if (!staged) return null;
-        fomodPromptedRef.current.add(nextId);
-        return staged;
-      });
-    } catch (e) {
-      console.warn("list_mods_needing_fomod failed", e);
-    }
-    void refreshWineAdvice(gameId);
   }, [refreshWineAdvice]);
 
   const openModInstaller = useCallback(async (m: StagedMod) => {
@@ -2278,7 +2441,9 @@ export default function App() {
     try {
       const fomod = await api.getFomodInstaller(gameId, m.id);
       if (fomod) {
-        setFomodFor(m);
+        const next = { mod: m, pass: null };
+        fomodDialogRef.current = next;
+        setFomodDialog(next);
         return;
       }
     } catch (e) {
@@ -2289,6 +2454,15 @@ export default function App() {
 
   const refreshModUpdates = useCallback(async (gameId: string) => {
     const req = ++modUpdatesReqRef.current;
+    if (checkingModUpdatesTimerRef.current != null) {
+      window.clearTimeout(checkingModUpdatesTimerRef.current);
+      checkingModUpdatesTimerRef.current = null;
+    }
+    checkingModUpdatesTimerRef.current = window.setTimeout(() => {
+      if (req !== modUpdatesReqRef.current) return;
+      checkingModUpdatesTimerRef.current = null;
+      setCheckingModUpdates(true);
+    }, MOD_UPDATE_CHECK_TOAST_DELAY_MS);
     try {
       const updates = await api.checkStagedModUpdates(gameId);
       if (req !== modUpdatesReqRef.current) return null;
@@ -2318,6 +2492,14 @@ export default function App() {
     } catch (e) {
       console.warn("check_staged_mod_updates failed", e);
       return null;
+    } finally {
+      if (req === modUpdatesReqRef.current) {
+        if (checkingModUpdatesTimerRef.current != null) {
+          window.clearTimeout(checkingModUpdatesTimerRef.current);
+          checkingModUpdatesTimerRef.current = null;
+        }
+        setCheckingModUpdates(false);
+      }
     }
   }, []);
 
@@ -2382,26 +2564,39 @@ export default function App() {
   }, []);
 
   const fillCatalogCovers = useCallback(
-    async (found: DetectedGame[], managedList: ManagedGame[]) => {
-      const requests = catalogCoverRequests(found, managedList);
+    async (
+      found: DetectedGame[],
+      managedList: ManagedGame[],
+      suggestions?: Record<string, CatalogSuggestion | null | undefined>,
+    ) => {
+      const requests = catalogCoverRequests(found, managedList, suggestions);
       if (requests.length === 0) return;
       try {
         const hits = await api.resolveCatalogCovers(requests);
         if (hits.length === 0) return;
         const urls = new Map(hits.map((hit) => [hit.id, hit.cover_url]));
-        setDetected((prev) =>
-          prev.map((game) => {
+        setDetected((prev) => {
+          let changed = false;
+          const next = prev.map((game) => {
             const url = urls.get(game.id);
             if (!url) return game;
             const dropLocal =
-              !game.cover_path || game.cover_path === game.icon_path;
+              !game.cover_path ||
+              game.cover_path === game.icon_path ||
+              isDeferredIconPath(game.cover_path);
+            const cover_path = dropLocal ? null : game.cover_path ?? null;
+            if (game.cover_url === url && (game.cover_path ?? null) === cover_path) {
+              return game;
+            }
+            changed = true;
             return {
               ...game,
               cover_url: url,
-              cover_path: dropLocal ? null : game.cover_path,
+              cover_path,
             };
-          }),
-        );
+          });
+          return changed ? next : prev;
+        });
         await refreshManaged();
       } catch (e) {
         console.warn("resolve_catalog_covers failed", e);
@@ -2410,22 +2605,86 @@ export default function App() {
     [refreshManaged],
   );
 
+  useEffect(() => {
+    if (Object.keys(catalogSuggestions).length === 0) return;
+    void fillCatalogCovers(detected, managed, catalogSuggestions);
+  }, [catalogSuggestions, detected, managed, fillCatalogCovers]);
+
+  const scanInFlightRef = useRef<Promise<void> | null>(null);
+
+  const performScan = useCallback(
+    async (quiet: boolean) => {
+      if (!quiet) {
+        setBusy("Scanning installed games…");
+        setError(null);
+        setNotice(null);
+      }
+      try {
+        const found = await api.scanGames();
+        setDetected((prev) => (sameSnapshot(prev, found) ? prev : found));
+        const managedList = await refreshManaged();
+        await fillCatalogCovers(found, managedList);
+        await refreshGameHealth();
+      } catch (e) {
+        if (quiet) {
+          console.warn("scan_games failed", e);
+        } else {
+          setError(String(e));
+        }
+      } finally {
+        if (!quiet) setBusy(null);
+      }
+    },
+    [fillCatalogCovers, refreshGameHealth, refreshManaged, setError],
+  );
+
   const scan = useCallback(async () => {
-    setBusy("Scanning installed games…");
-    setError(null);
-    setNotice(null);
-    try {
-      const found = await api.scanGames();
-      setDetected(found);
-      const managedList = await refreshManaged();
-      await fillCatalogCovers(found, managedList);
-      await refreshGameHealth();
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setBusy(null);
+    for (;;) {
+      const pending = scanInFlightRef.current;
+      if (!pending) break;
+      setBusy("Scanning installed games…");
+      try {
+        await pending;
+      } catch {
+        /* the in-flight scan reports its own failure */
+      }
     }
-  }, [fillCatalogCovers, refreshGameHealth, refreshManaged]);
+    const job = performScan(false);
+    scanInFlightRef.current = job;
+    try {
+      await job;
+    } finally {
+      if (scanInFlightRef.current === job) scanInFlightRef.current = null;
+    }
+  }, [performScan]);
+
+  const scanQuiet = useCallback(() => {
+    if (scanInFlightRef.current) return;
+    const job = performScan(true);
+    scanInFlightRef.current = job;
+    void job.finally(() => {
+      if (scanInFlightRef.current === job) scanInFlightRef.current = null;
+    });
+  }, [performScan]);
+
+  useEffect(() => {
+    if (tab !== "library") return;
+    const tick = () => {
+      if (document.hidden) return;
+      scanQuiet();
+    };
+    tick();
+    const id = window.setInterval(tick, LIBRARY_SCAN_INTERVAL_MS);
+    const onVisible = () => {
+      if (document.hidden || tabRef.current !== "library") return;
+      scanQuiet();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      window.clearInterval(id);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [tab, scanQuiet]);
 
   useEffect(() => {
     let cancelled = false;
@@ -2437,9 +2696,12 @@ export default function App() {
           setTab(s.initial_setup_complete ? "library" : "setup");
           choseTab = true;
         }
+        // Start before the next await so the Library tab effect sees this
+        // scan in flight and does not run a second one.
+        const initialScan = scan();
         await refreshManaged();
         await refreshOrphanScan();
-        await scan();
+        await initialScan;
         if (s.has_api_key) {
           try {
             await api.validateUser();
@@ -2524,6 +2786,11 @@ export default function App() {
     if (gameChanged) {
       prevActiveGameIdRef.current = nextId;
       modUpdatesReqRef.current += 1;
+      if (checkingModUpdatesTimerRef.current != null) {
+        window.clearTimeout(checkingModUpdatesTimerRef.current);
+        checkingModUpdatesTimerRef.current = null;
+      }
+      setCheckingModUpdates(false);
       wineAdviceReqRef.current += 1;
       setWineAdvice(null);
       if (prevId !== null) {
@@ -2534,6 +2801,8 @@ export default function App() {
       setSavedRename("");
       setSavedInstallGameId(nextId ?? "");
       setGameSavedDetail(null);
+      setMods([]);
+      setModsReadyGameId(null);
     }
 
     if (activeGame) {
@@ -4381,6 +4650,7 @@ export default function App() {
         return;
       }
       browseLoadingMoreRef.current = true;
+      setBrowseLoadingMore(true);
     }
 
     const requestId = ++browseRequestIdRef.current;
@@ -4455,6 +4725,9 @@ export default function App() {
       if (!append) {
         browseNextOffsetRef.current = 0;
         browseAppendFailedRef.current = false;
+        browseResultsRequestRef.current = requestId;
+        setBrowseResultsPending(true);
+        setBrowseLoadingMore(false);
         const perform = async () => {
           if (mode === "mods") {
             const page = await api.searchCatalog(activeGame.id, query, {
@@ -4541,11 +4814,17 @@ export default function App() {
         }
       }
     } finally {
+      if (!append && browseResultsRequestRef.current === requestId) {
+        setBrowseResultsPending(false);
+      }
       if (silent && !append && requestId === browseRequestIdRef.current) {
         setBrowseLoading(false);
       }
       if (append) {
         browseLoadingMoreRef.current = false;
+        if (requestId === browseRequestIdRef.current) {
+          setBrowseLoadingMore(false);
+        }
         if (
           appendOk &&
           requestId === browseRequestIdRef.current &&
@@ -4793,7 +5072,7 @@ export default function App() {
         const detail = await api.getMod(domain, modId);
         setModDetail(detail);
         patchBrowseHit((current) => enrichCatalogHitFromNexus(current, detail));
-        if (detailTab === "files") {
+        if (detailTab === "files" && !nexusModUnavailable(detail)) {
           await loadModFiles(domain, modId);
         }
       },
@@ -4998,12 +5277,20 @@ export default function App() {
         next.hit.mod_id &&
         modFilesModIdRef.current !== next.hit.mod_id
       ) {
-        await withBusy("Loading files…", async () => {
-          await loadModFiles(
-            next.hit.domain_name || activeGame.nexus_domain,
-            next.hit.mod_id!,
-          );
-        });
+        if (!nexusModUnavailable(modDetail)) {
+          const domain = next.hit.domain_name || activeGame.nexus_domain;
+          const modId = next.hit.mod_id;
+          await withBusy(modDetail ? "Loading files…" : "Loading mod…", async () => {
+            let detail = modDetail;
+            if (!detail) {
+              detail = await api.getMod(domain, modId);
+              setModDetail(detail);
+            }
+            if (!nexusModUnavailable(detail)) {
+              await loadModFiles(domain, modId);
+            }
+          });
+        }
       } else if (detailTab === "info" && !modDetail && next.hit.mod_id) {
         await withBusy("Loading mod…", async () => {
           setModDetail(
@@ -5822,19 +6109,7 @@ export default function App() {
       }),
     );
 
-    const shareIdByEntry: Record<string, string> = {};
-    await Promise.all(
-      savedCollections.map(async (entry) => {
-        try {
-          shareIdByEntry[entry.id] = await api.emperorShareId(entry.code);
-        } catch {
-          /* ignore */
-        }
-      }),
-    );
-
     setInstalledEmperorShareIds(installedIds);
-    setSavedEntryShareIds(shareIdByEntry);
     setSavedCollectionAdvice(adviceEntries);
   }, [gamePlugins.length, managed, savedCollections]);
 
@@ -5846,24 +6121,10 @@ export default function App() {
   const isSavedCollectionInstalled = useCallback(
     (entry: SavedCollectionEntry) => {
       if (installedEmperorShareIds.has(entry.code.trim())) return true;
-      const shareId = savedEntryShareIds[entry.id];
-      return Boolean(shareId && installedEmperorShareIds.has(shareId));
+      return Boolean(entry.share_id && installedEmperorShareIds.has(entry.share_id));
     },
-    [installedEmperorShareIds, savedEntryShareIds],
+    [installedEmperorShareIds],
   );
-
-  function shareModLabel(m: ShareModEntry): string {
-    return (
-      m.display_name ||
-      m.name ||
-      (m.s === "nexus"
-        ? `Nexus ${m.mod_id}/${m.file_id}`
-        : m.s === "thunderstore"
-          ? `${m.namespace}-${m.name}`
-          : `mod.io ${m.mod_id}`) ||
-      "Mod"
-    );
-  }
 
   async function installSavedCollection() {
     if (!savedDetail) return;
@@ -5899,7 +6160,7 @@ export default function App() {
   }
 
   async function deleteSavedCollectionEntry(entry: SavedCollectionEntry) {
-    let shareId: string | null = savedEntryShareIds[entry.id] ?? null;
+    let shareId: string | null = entry.share_id ?? null;
     if (!shareId) {
       try {
         shareId = await api.emperorShareId(entry.code);
@@ -5971,17 +6232,15 @@ export default function App() {
   async function checkStagedModUpdatesNow() {
     if (!activeGame) return;
     const gameId = activeGame.id;
-    await withBusy("Checking for updates…", async () => {
-      const updates = await refreshModUpdates(gameId);
-      if (updates == null) return;
-      const count = updates.length;
-      setNotice({
-        kind: "ok",
-        message:
-          count === 0
-            ? "No updates available."
-            : `${count} update${count === 1 ? "" : "s"} available.`,
-      });
+    const updates = await refreshModUpdates(gameId);
+    if (updates == null) return;
+    const count = updates.length;
+    setNotice({
+      kind: "ok",
+      message:
+        count === 0
+          ? "No updates available."
+          : `${count} update${count === 1 ? "" : "s"} available.`,
     });
   }
 
@@ -6333,19 +6592,71 @@ export default function App() {
     }
   }
 
-  async function deploy() {
-    if (!activeGame) return;
+  function openFomodPass(modsToConfigure: StagedMod[], deployAfter: boolean) {
+    const step = startFomodPass(modsToConfigure, deployAfter);
+    if (step.action === "open") {
+      const next = { mod: fomodPassCurrent(step.pass), pass: step.pass };
+      fomodDialogRef.current = next;
+      setFomodDialog(next);
+      return;
+    }
+    if (step.action === "deploy") void runDeploy();
+  }
+
+  function configureFomods() {
+    openFomodPass(fomodNeeding, false);
+  }
+
+  function closeFomodDialog(reason?: "saved" | "cancel") {
+    const current = fomodDialogRef.current;
+    if (reason === "saved" && current?.pass) {
+      const step = finishFomodPass(current.pass);
+      if (step.action === "open") {
+        const next = { mod: fomodPassCurrent(step.pass), pass: step.pass };
+        fomodDialogRef.current = next;
+        setFomodDialog(next);
+        return;
+      }
+      fomodDialogRef.current = null;
+      setFomodDialog(null);
+      if (step.action === "deploy") {
+        void runDeploy();
+        return;
+      }
+      setNotice({
+        kind: "ok",
+        message:
+          current.pass.mods.length > 1
+            ? "Saved installer choices. Deploy to apply them."
+            : `Saved installer choices for ${current.mod.name}. Deploy to apply them.`,
+      });
+      return;
+    }
+    if (current?.pass) cancelFomodPass(current.pass);
+    if (reason === "saved" && current) {
+      setNotice({
+        kind: "ok",
+        message: `Saved installer choices for ${current.mod.name}. Deploy to apply them.`,
+      });
+    }
+    fomodDialogRef.current = null;
+    setFomodDialog(null);
+  }
+
+  async function runDeploy() {
+    const game = activeGameRef.current;
+    if (!game) return;
     await withBusy("Deploying mods…", async () => {
-      const result = await api.deployMods(activeGame.id);
-      void refreshMissingRequirements(activeGame.id);
-      void refreshWineAdvice(activeGame.id);
+      const result = await api.deployMods(game.id);
+      void refreshMissingRequirements(game.id);
+      void refreshWineAdvice(game.id);
       const full = result.missing_requirements;
       setNotice(
         deployStatusNotice(
           {
             ...result,
             missing_requirements: full
-              ? withoutIgnoredRequirements(full, activeGame.ignored_requirements ?? [])
+              ? withoutIgnoredRequirements(full, game.ignored_requirements ?? [])
               : full,
           },
           (requirements) => {
@@ -6354,6 +6665,16 @@ export default function App() {
         ),
       );
     });
+  }
+
+  async function deploy() {
+    if (!activeGame) return;
+    const pending = fomodModsForDeploy(fomodNeeding);
+    if (pending.length > 0) {
+      openFomodPass(pending, true);
+      return;
+    }
+    await runDeploy();
   }
 
   async function applyWineOverrides() {
@@ -6545,7 +6866,10 @@ export default function App() {
       ) : null}
       <aside className="sidebar">
         <div className="sidebar-top">
-          <div className="brand">
+          <div
+            className="brand"
+            style={{ "--brand-mask": `url("${appLogo}")` } as CSSProperties}
+          >
             <img className="brand-mark" src={appLogo} alt="Emperor Mod Manager" />
           </div>
           <Collapse show={navCanBack} className="sidebar-history">
@@ -6569,7 +6893,6 @@ export default function App() {
               onClick={() => {
                 setTab(id);
                 if (id === "downloads") refreshDownloads();
-                if (id === "library" && detected.length === 0) scan();
                 if (id === "collections") {
                   void refreshSavedCollections();
                   setSavedDetail(null);
@@ -6593,10 +6916,13 @@ export default function App() {
                     onClick={openDownloadsTab}
                     title="Open Downloads"
                   >
-                    <span className="status-primary">{downloadStatus.primary}</span>
-                    {downloadStatus.secondary ? (
-                      <span className="status-secondary">{downloadStatus.secondary}</span>
-                    ) : null}
+                    <Throbber />
+                    <span className="status-copy">
+                      <span className="status-primary">{downloadStatus.primary}</span>
+                      {downloadStatus.secondary ? (
+                        <span className="status-secondary">{downloadStatus.secondary}</span>
+                      ) : null}
+                    </span>
                   </button>
                 ) : null}
                 {showSidebarAssist ? (
@@ -6619,10 +6945,13 @@ export default function App() {
                   onClick={openDownloadsTab}
                   title="Open Downloads"
                 >
-                  <span className="status-primary">{downloadStatus.primary}</span>
-                  {downloadStatus.secondary ? (
-                    <span className="status-secondary">{downloadStatus.secondary}</span>
-                  ) : null}
+                  <Throbber />
+                  <span className="status-copy">
+                    <span className="status-primary">{downloadStatus.primary}</span>
+                    {downloadStatus.secondary ? (
+                      <span className="status-secondary">{downloadStatus.secondary}</span>
+                    ) : null}
+                  </span>
                 </button>
               ) : null}
               {showSidebarAssist ? (
@@ -6706,7 +7035,7 @@ export default function App() {
         )}
 
         {tab === "library" && (
-          <section className="panel">
+          <section className={libraryDetail ? "panel" : "panel library-home"}>
             <ViewSwitch
               viewKey={libraryDetail ? `game:${libraryDetail.game.id}` : "library-home"}
               initial={false}
@@ -7373,9 +7702,15 @@ export default function App() {
                                 key={id}
                                 layoutId="mods-source"
                                 active={modsSourceFilter === id}
+                                aria-label={label}
+                                title={label}
                                 onClick={() => setModsSourceFilter(id)}
                               >
-                                {label}
+                                {id === "all" ? (
+                                  label
+                                ) : (
+                                  <SourceMark source={id} decorative />
+                                )}
                               </SegmentTab>
                             ))}
                           </Segment>
@@ -7456,13 +7791,45 @@ export default function App() {
                         />
                       ) : null}
                     </Reveal>
-                    <ul
-                      className={
-                        modDrag.isDragging ? "list mods mod-list-dragging" : "list mods"
+                    <FomodConfigureBanner
+                      mods={fomodNeeding}
+                      onConfigure={configureFomods}
+                    />
+                    {activeGame && modsReadyGameId !== activeGame.id ? (
+                      <StagedModsSkeleton />
+                    ) : mods.length === 0 ? (
+                      <ul className="list mods">
+                        <li className="empty">No staged mods. Browse mods to install some.</li>
+                      </ul>
+                    ) : visibleMods.length === 0 ? (
+                      <ul className="list mods">
+                        <li className="empty">No mods match your search/filters.</li>
+                      </ul>
+                    ) : (
+                    <BrowseVirtualList
+                      items={modDrag.displayMods}
+                      scrollRef={mainScrollRef}
+                      listRef={modDrag.listRef}
+                      listClassName={
+                        modDrag.isDragging ? "mods mod-list-dragging" : "mods"
                       }
-                      ref={modDrag.listRef}
-                    >
-                      {modDrag.displayMods.map((m) => {
+                      estimateSize={estimateStagedModRowHeight()}
+                      getKey={(m) => m.id}
+                      onRowPointerDown={(m, event) =>
+                        modDrag.onDragPointerDown(m.id, event)
+                      }
+                      rowClassName={(m) =>
+                        [
+                          m.enabled
+                            ? "list-row-poster"
+                            : "mod-disabled list-row-poster",
+                          canReorderMods ? "mod-drag-ready" : "",
+                          modDrag.draggingId === m.id ? "mod-drag-placeholder" : "",
+                        ]
+                          .filter(Boolean)
+                          .join(" ")
+                      }
+                      renderItem={(m) => {
                         const idx = modIndexById.get(m.id) ?? -1;
                         const canMoveUp =
                           canReorderMods &&
@@ -7521,15 +7888,6 @@ export default function App() {
                             </div>
                           </>
                         );
-                        const rowClass = [
-                          m.enabled
-                            ? "list-row-poster"
-                            : "mod-disabled list-row-poster",
-                          canReorderMods ? "mod-drag-ready" : "",
-                          isDragged ? "mod-dragging" : "",
-                        ]
-                          .filter(Boolean)
-                          .join(" ");
                         const rowBody = (
                           <>
                             <label className="check">
@@ -7545,6 +7903,11 @@ export default function App() {
                                 className="mod-identity staged-mod-page"
                                 role="button"
                                 tabIndex={0}
+                                title={
+                                  canReorderMods
+                                    ? "Click and hold to drag in load order"
+                                    : undefined
+                                }
                                 onClick={() => {
                                   if (modDrag.suppressClick) return;
                                   void openStagedMod(m);
@@ -7559,7 +7922,14 @@ export default function App() {
                                 {identity}
                               </div>
                             ) : (
-                              <div className="mod-identity">{identity}</div>
+                              <div
+                                className="mod-identity"
+                                title={
+                                  canReorderMods
+                                    ? "Click and hold to drag in load order"
+                                    : undefined
+                                }
+                              >{identity}</div>
                             )}
                             <div className="actions">
                               {modUpdates[m.id] && (
@@ -7642,73 +8012,39 @@ export default function App() {
                           </>
                         );
                         if (isDragged && modDrag.lift) {
+                          const lift = modDrag.lift;
                           return (
-                            <Fragment key={m.id}>
-                              <li
-                                className="mod-drag-placeholder"
-                                style={{ height: modDrag.lift.height }}
-                                aria-hidden="true"
-                              />
-                              <li
-                                className={rowClass}
-                                style={{
-                                  position: "fixed",
-                                  left: modDrag.lift.x,
-                                  top: modDrag.lift.y,
-                                  width: modDrag.lift.width,
-                                  height: modDrag.lift.height,
-                                  zIndex: 40,
-                                  margin: 0,
-                                  pointerEvents: "none",
-                                  transform: reduceMotion
-                                    ? undefined
-                                    : "scale(1.02)",
-                                }}
-                              >
+                            <>
+                              <div style={{ visibility: "hidden" }} aria-hidden="true">
                                 {rowBody}
-                              </li>
-                            </Fragment>
+                              </div>
+                              {createPortal(
+                                <div
+                                  className="mod-drag-clone"
+                                  style={{
+                                    position: "fixed",
+                                    left: lift.x,
+                                    top: lift.y,
+                                    width: lift.width,
+                                    height: lift.height,
+                                    zIndex: 40,
+                                    pointerEvents: "none",
+                                    transform: reduceMotion
+                                      ? undefined
+                                      : "scale(1.02)",
+                                  }}
+                                >
+                                  {rowBody}
+                                </div>,
+                                document.body,
+                              )}
+                            </>
                           );
                         }
-                        return (
-                          <motion.li
-                            key={m.id}
-                            layout={
-                              !reduceMotion &&
-                              modDrag.isDragging &&
-                              !isDragged
-                            }
-                            transition={{
-                              layout: {
-                                duration:
-                                  reduceMotion || !modDrag.isDragging
-                                    ? 0
-                                    : MOTION_FAST,
-                                ease: MOTION_EASE,
-                              },
-                            }}
-                            className={rowClass}
-                            ref={(el) => modDrag.setRowRef(m.id, el)}
-                            onPointerDown={(e) =>
-                              modDrag.onDragPointerDown(m.id, e)
-                            }
-                            title={
-                              canReorderMods
-                                ? "Click and hold to drag in load order"
-                                : undefined
-                            }
-                          >
-                            {rowBody}
-                          </motion.li>
-                        );
-                      })}
-                      {mods.length === 0 && (
-                        <li className="empty">No staged mods. Browse mods to install some.</li>
-                      )}
-                      {mods.length > 0 && visibleMods.length === 0 && (
-                        <li className="empty">No mods match your search/filters.</li>
-                      )}
-                    </ul>
+                        return rowBody;
+                      }}
+                    />
+                    )}
                   </div>
                 )}
                 {libraryDetail.tab === "collections" && (
@@ -7820,31 +8156,7 @@ export default function App() {
                           </button>
                         </div>
                         <h2>Contained mods</h2>
-                        <ul className="list">
-                          {gameSavedDetail.mods.map((m, i) => (
-                            <li key={`${m.s}-${i}`}>
-                              <div>
-                                <strong>{shareModLabel(m)}</strong>
-                                <small>
-                                  {m.s}
-                                  {m.version ? ` · v${m.version}` : ""}
-                                  {m.s === "nexus" && m.mod_id != null
-                                    ? ` · ${m.domain} ${m.mod_id}/${m.file_id}`
-                                    : ""}
-                                  {m.s === "thunderstore"
-                                    ? ` · ${m.community}/${m.namespace}-${m.name}`
-                                    : ""}
-                                  {m.s === "modio"
-                                    ? ` · game ${m.game_id} mod ${m.mod_id}`
-                                    : ""}
-                                </small>
-                              </div>
-                            </li>
-                          ))}
-                          {gameSavedDetail.mods.length === 0 && (
-                            <li className="empty">No mods in this share.</li>
-                          )}
-                        </ul>
+                        <ShareModList mods={gameSavedDetail.mods} scrollRef={mainScrollRef} />
                         <h2>Code</h2>
                         <textarea
                           rows={4}
@@ -7996,22 +8308,6 @@ export default function App() {
                 <div className="panel-head">
                   <h1>Library</h1>
                   <div className="panel-head-actions">
-                    <Segment>
-                      <SegmentTab
-                        layoutId="library-view"
-                        active={libraryView === "list"}
-                        onClick={() => setLibraryView("list")}
-                      >
-                        List
-                      </SegmentTab>
-                      <SegmentTab
-                        layoutId="library-view"
-                        active={libraryView === "grid"}
-                        onClick={() => setLibraryView("grid")}
-                      >
-                        Grid
-                      </SegmentTab>
-                    </Segment>
                     <button onClick={scan}>Scan games</button>
                   </div>
                 </div>
@@ -8041,8 +8337,7 @@ export default function App() {
                 {managed.length > 0 && (
                   <>
                     <h2>Managed</h2>
-                    {libraryView === "grid" ? (
-                      <FadeIn className="media-grid">
+                    <FadeIn className="media-grid library-posters">
                         {managed.map((g, index) => {
                           const health = gameHealthById.get(g.id);
                           const badge = managedHealthBadge(health);
@@ -8084,6 +8379,7 @@ export default function App() {
                               title={g.title}
                               imageSrc={gameCoverSrc(g)}
                               loading="eager"
+                              active={g.id === activeGame?.id}
                               badge={badge}
                               overlay={
                                 health?.status === "missing"
@@ -8096,83 +8392,16 @@ export default function App() {
                           );
                         })}
                       </FadeIn>
-                    ) : (
-                      <ul className="list">
-                        {managed.map((g) => {
-                          const health = gameHealthById.get(g.id);
-                          const badge = managedHealthBadge(health);
-                          return (
-                            <li
-                              key={g.id}
-                              className="list-row-clickable"
-                              onClick={() => openGame(g, "mods")}
-                              onKeyDown={(e) => {
-                                if (e.key === "Enter" || e.key === " ") {
-                                  e.preventDefault();
-                                  openGame(g, "mods");
-                                }
-                              }}
-                              role="button"
-                              tabIndex={0}
-                            >
-                              <div>
-                                <strong>{g.title}</strong>
-                                {badge ? (
-                                  <span className="pill warn">{badge}</span>
-                                ) : null}
-                                <small>
-                                  {g.launcher} · {g.nexus_domain || g.thunderstore_community || g.plugin_id}
-                                  {health?.status === "missing"
-                                    ? ` · ${g.install_path}`
-                                    : health?.new_install_path
-                                      ? ` → ${health.new_install_path}`
-                                      : ""}
-                                </small>
-                              </div>
-                              {(health?.status === "relocate_candidate" ||
-                                health?.status === "missing") && (
-                                <div
-                                  className="actions"
-                                  onClick={(e) => e.stopPropagation()}
-                                >
-                                  {health.status === "relocate_candidate" ? (
-                                    <button
-                                      type="button"
-                                      onClick={() =>
-                                        setRelinkPrompt({
-                                          game: g,
-                                          health,
-                                        })
-                                      }
-                                    >
-                                      Relink
-                                    </button>
-                                  ) : null}
-                                  <button
-                                    type="button"
-                                    className="danger"
-                                    onClick={() => void unmanageFromLibrary(g)}
-                                  >
-                                    Unmanage
-                                  </button>
-                                </div>
-                              )}
-                            </li>
-                          );
-                        })}
-                      </ul>
-                    )}
                   </>
                 )}
                 <h2>Unmanaged</h2>
                 {catalogLookupBusy && unmanaged.length > 0 && (
                   <p className="note">Looking up Nexus / Thunderstore / mod.io…</p>
                 )}
-                {libraryView === "grid" ? (
-                  <FadeIn className="media-grid">
+                <FadeIn className="media-grid library-posters">
                     {unmanaged.map((g, index) => {
                       const suggestion = catalogSuggestions[g.id];
-                      const hints = catalogHintTags(suggestion);
+                      const hints = catalogHints(suggestion);
                       if (g.supported) {
                         return (
                           <MediaCard
@@ -8181,7 +8410,7 @@ export default function App() {
                             title={g.title}
                             imageSrc={gameCoverSrc(g)}
                             loading="eager"
-                            coverTags={hints}
+                            coverMarks={hints}
                             hoverLabel="Manage"
                             onClick={() => manage(g)}
                           />
@@ -8198,7 +8427,7 @@ export default function App() {
                             imageSrc={gameCoverSrc(g)}
                             loading="eager"
                             badge={catalogMatchBadge(kind)}
-                            coverTags={hints}
+                            coverMarks={hints}
                             hoverLabel={catalogMatchHover(kind)}
                             onClick={() =>
                               ready ? manageUnrealQuick(g) : beginUnrealManage(g)
@@ -8217,7 +8446,7 @@ export default function App() {
                             imageSrc={gameCoverSrc(g)}
                             loading="eager"
                             badge={catalogMatchBadge(kind)}
-                            coverTags={hints}
+                            coverMarks={hints}
                             hoverLabel={catalogMatchHover(kind)}
                             onClick={() =>
                               ready
@@ -8234,7 +8463,7 @@ export default function App() {
                           title={g.title}
                           imageSrc={gameCoverSrc(g)}
                           loading="eager"
-                          coverTags={hints}
+                          coverMarks={hints}
                           coverLabel="Unsupported"
                           unsupported
                         />
@@ -8246,81 +8475,7 @@ export default function App() {
                         while the app was open.
                       </p>
                     )}
-                  </FadeIn>
-                ) : (
-                  <ul className="list">
-                    {unmanaged.map((g) => {
-                      const suggestion = catalogSuggestions[g.id];
-                      const hintLine = catalogHintLine(suggestion);
-                      const kind =
-                        !g.supported &&
-                        (g.engine_hint === "unreal" || g.engine_hint === "bepinex") &&
-                        g.install_path
-                          ? catalogMatchCardKind(suggestion)
-                          : null;
-                      return (
-                        <li key={g.id}>
-                          <div>
-                            <strong>{g.title}</strong>
-                            <small>
-                              {g.launcher}
-                              {g.install_path ? ` · ${g.install_path}` : ""}
-                              {!g.supported &&
-                              g.engine_hint !== "unreal" &&
-                              g.engine_hint !== "bepinex"
-                                ? " · unsupported"
-                                : ""}
-                              {g.engine_hint === "unreal" && !g.supported
-                                ? " · Unreal Engine"
-                                : ""}
-                              {g.engine_hint === "bepinex" && !g.supported
-                                ? " · Unity / BepInEx"
-                                : ""}
-                              {kind === "needs" ? " · needs catalog" : ""}
-                              {kind === "review" ? " · review match" : ""}
-                              {hintLine ? ` · ${hintLine}` : ""}
-                            </small>
-                          </div>
-                          <div className="actions">
-                            {g.supported ? (
-                              <button type="button" onClick={() => manage(g)}>
-                                Manage
-                              </button>
-                            ) : g.engine_hint === "unreal" && g.install_path ? (
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  kind === "ready"
-                                    ? manageUnrealQuick(g)
-                                    : beginUnrealManage(g)
-                                }
-                              >
-                                {catalogMatchActionLabel(kind ?? "needs")}
-                              </button>
-                            ) : g.engine_hint === "bepinex" && g.install_path ? (
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  kind === "ready"
-                                    ? manageBepinexQuick(g)
-                                    : beginBepinexManage(g)
-                                }
-                              >
-                                {catalogMatchActionLabel(kind ?? "needs")}
-                              </button>
-                            ) : null}
-                          </div>
-                        </li>
-                      );
-                    })}
-                    {unmanaged.length === 0 && (
-                      <li className="empty">
-                        No unmanaged games found. Scan again if you installed something
-                        while the app was open.
-                      </li>
-                    )}
-                  </ul>
-                )}
+                </FadeIn>
               </div>
             )}
             </ViewSwitch>
@@ -8348,9 +8503,9 @@ export default function App() {
                     </button>
                     <h1>
                       {browseDetail.kind === "mod"
-                        ? (modDetail?.name ??
-                          tsDetail?.name ??
-                          modioDetail?.name ??
+                        ? (presentName(modDetail?.name) ??
+                          presentName(tsDetail?.name) ??
+                          presentName(modioDetail?.name) ??
                           browseDetail.hit.name)
                         : browseDetail.hit.name}
                     </h1>
@@ -8677,24 +8832,41 @@ export default function App() {
                       <div className="detail-body">
                         {browseDetail.hit.source !== "thunderstore" &&
                           browseDetail.hit.source !== "modio" && (
+                            <NexusUnavailableCallout detail={modDetail} />
+                          )}
+                        {browseDetail.hit.source !== "thunderstore" &&
+                          browseDetail.hit.source !== "modio" && (
                             <ImageCarousel slides={modDetail?.image_urls ?? []} />
                           )}
-                        <h2>About</h2>
-                        <RichText
-                          className="detail-description detail-description-html"
-                          text={
-                            browseDetail.hit.source === "thunderstore"
-                              ? (tsDetail?.description ??
-                                browseDetail.hit.summary)
-                              : browseDetail.hit.source === "modio"
-                                ? (modioDetail?.description ??
-                                  modioDetail?.summary ??
-                                  browseDetail.hit.summary)
-                                : (modDetail?.description ??
-                                  modDetail?.summary ??
-                                  browseDetail.hit.summary)
-                          }
-                        />
+                        {(browseDetail.hit.source === "thunderstore" ||
+                          browseDetail.hit.source === "modio" ||
+                          !nexusModUnavailable(modDetail) ||
+                          Boolean(
+                            (
+                              modDetail?.description ??
+                              modDetail?.summary ??
+                              browseDetail.hit.summary
+                            )?.trim(),
+                          )) && (
+                          <>
+                            <h2>About</h2>
+                            <RichText
+                              className="detail-description detail-description-html"
+                              text={
+                                browseDetail.hit.source === "thunderstore"
+                                  ? (tsDetail?.description ??
+                                    browseDetail.hit.summary)
+                                  : browseDetail.hit.source === "modio"
+                                    ? (modioDetail?.description ??
+                                      modioDetail?.summary ??
+                                      browseDetail.hit.summary)
+                                    : (modDetail?.description ??
+                                      modDetail?.summary ??
+                                      browseDetail.hit.summary)
+                              }
+                            />
+                          </>
+                        )}
                         {browseDetail.hit.source === "modio" &&
                           modioDetail?.has_dependencies && (
                           <p className="note">
@@ -8759,6 +8931,8 @@ export default function App() {
                               <li className="empty">No files found for this mod.</li>
                             )}
                           </ul>
+                        ) : nexusModUnavailable(modDetail) ? (
+                          <NexusUnavailableCallout detail={modDetail} files />
                         ) : (
                           <NexusModFileList
                             files={modFiles}
@@ -9077,9 +9251,15 @@ export default function App() {
                               key={id}
                               layoutId="browse-source"
                               active={sourceFilter === id}
+                              aria-label={label}
+                              title={label}
                               onClick={() => setSourceFilter(id)}
                             >
-                              {label}
+                              {id === "all" ? (
+                                label
+                              ) : (
+                                <SourceMark source={id} decorative />
+                              )}
                             </SegmentTab>
                           ))}
                         </Segment>
@@ -9110,17 +9290,17 @@ export default function App() {
                       <Segment>
                         <SegmentTab
                           layoutId="browse-density"
-                          active={browseListDensity === "compact"}
-                          onClick={() => setBrowseListDensity("compact")}
-                        >
-                          Compact
-                        </SegmentTab>
-                        <SegmentTab
-                          layoutId="browse-density"
                           active={browseListDensity === "posters"}
                           onClick={() => setBrowseListDensity("posters")}
                         >
                           Posters
+                        </SegmentTab>
+                        <SegmentTab
+                          layoutId="browse-density"
+                          active={browseListDensity === "compact"}
+                          onClick={() => setBrowseListDensity("compact")}
+                        >
+                          Compact
                         </SegmentTab>
                       </Segment>
                     )}
@@ -9234,9 +9414,7 @@ export default function App() {
                                   @{hit.name}
                                 </span>
                                 <span className="browse-author-suggest-meta">
-                                  {hit.source === "thunderstore"
-                                    ? "Thunderstore"
-                                    : "Nexus"}
+                                  <SourceMark source={hit.source} />
                                   {hit.mod_count != null
                                     ? ` · ${hit.mod_count.toLocaleString()} mods`
                                     : ""}
@@ -9505,6 +9683,15 @@ export default function App() {
                         </button>
                       </div>
                     ) : null}
+                    {browseResultsPending ? (
+                      <BrowseResultsSkeleton
+                        view={browseView}
+                        posters={browseListDensity === "posters"}
+                        count={browsePageCount}
+                        minCardPx={browseGridMin}
+                      />
+                    ) : (
+                    <>
                     {browseMode === "mods" ? (
                       browseView === "grid" ? (
                         <FadeIn key={modHits[0]?.id ?? `mods:${searchQuery}`}>
@@ -9518,15 +9705,12 @@ export default function App() {
                               onPageSize={onBrowsePageSize}
                               getKey={(m) => m.id}
                               renderItem={(m) => {
-                                const sourceLabel =
-                                  m.source === "thunderstore"
-                                    ? "Thunderstore"
-                                    : m.source === "modio"
-                                      ? "mod.io"
-                                      : "Nexus";
-                                const meta = [sourceLabel, m.category]
-                                  .filter(Boolean)
-                                  .join(" · ");
+                                const meta = (
+                                  <>
+                                    <SourceMark source={m.source} />
+                                    {m.category ? ` · ${m.category}` : ""}
+                                  </>
+                                );
                                 return (
                                   <MediaCard
                                     plain
@@ -9681,11 +9865,7 @@ export default function App() {
                                     ) : null}
                                   </strong>
                                   <small>
-                                    {m.source === "thunderstore"
-                                      ? "Thunderstore"
-                                      : m.source === "modio"
-                                        ? "mod.io"
-                                        : "Nexus"}
+                                    <SourceMark source={m.source} />
                                     {" · "}
                                     {m.author ? (
                                       <button
@@ -9796,19 +9976,17 @@ export default function App() {
                             onPageSize={onBrowsePageSize}
                             getKey={collectionHitKey}
                             renderItem={(c) => {
-                              const meta = [
-                                collectionHitSource(c) === "thunderstore"
-                                  ? "Thunderstore"
-                                  : "Nexus",
-                                c.mod_count != null
-                                  ? `${c.mod_count.toLocaleString()} mods`
-                                  : null,
-                                c.file_size != null && c.file_size > 0
-                                  ? formatBytes(c.file_size)
-                                  : null,
-                              ]
-                                .filter(Boolean)
-                                .join(" · ");
+                              const meta = (
+                                <>
+                                  <SourceMark source={collectionHitSource(c)} />
+                                  {c.mod_count != null
+                                    ? ` · ${c.mod_count.toLocaleString()} mods`
+                                    : ""}
+                                  {c.file_size != null && c.file_size > 0
+                                    ? ` · ${formatBytes(c.file_size)}`
+                                    : ""}
+                                </>
+                              );
                               return (
                                 <MediaCard
                                   plain
@@ -9885,9 +10063,7 @@ export default function App() {
                               >
                                 <strong>{c.name}</strong>
                                 <small>
-                                  {collectionHitSource(c) === "thunderstore"
-                                    ? "Thunderstore"
-                                    : "Nexus"}
+                                  <SourceMark source={collectionHitSource(c)} />
                                   {" · "}
                                   {c.author ?? c.slug}
                                   {c.mod_count != null
@@ -9913,6 +10089,14 @@ export default function App() {
                       className="browse-scroll-sentinel"
                       aria-hidden="true"
                     />
+                    {browseLoadingMore ? (
+                      <BrowseResultsSkeleton
+                        view={browseView}
+                        posters={browseListDensity === "posters"}
+                        rows={2}
+                        minCardPx={browseGridMin}
+                      />
+                    ) : null}
                     {(modHits.length > 0 || collectionHits.length > 0) && (
                       <p className="browse-page-status note">
                         {browseMode === "mods"
@@ -9926,6 +10110,8 @@ export default function App() {
                             } collections`}
                         {browseHasMore ? " · scroll for more" : ""}
                       </p>
+                    )}
+                    </>
                     )}
                   </div>
                 ) : null}
@@ -10067,31 +10253,7 @@ export default function App() {
                     </button>
                   </div>
                   <h2>Contained mods</h2>
-                  <ul className="list">
-                    {savedDetail.mods.map((m, i) => (
-                      <li key={`${m.s}-${i}`}>
-                        <div>
-                          <strong>{shareModLabel(m)}</strong>
-                          <small>
-                            {m.s}
-                            {m.version ? ` · v${m.version}` : ""}
-                            {m.s === "nexus" && m.mod_id != null
-                              ? ` · ${m.domain} ${m.mod_id}/${m.file_id}`
-                              : ""}
-                            {m.s === "thunderstore"
-                              ? ` · ${m.community}/${m.namespace}-${m.name}`
-                              : ""}
-                            {m.s === "modio"
-                              ? ` · game ${m.game_id} mod ${m.mod_id}`
-                              : ""}
-                          </small>
-                        </div>
-                      </li>
-                    ))}
-                    {savedDetail.mods.length === 0 && (
-                      <li className="empty">No mods in this share.</li>
-                    )}
-                  </ul>
+                  <ShareModList mods={savedDetail.mods} scrollRef={mainScrollRef} />
                   <h2>Code</h2>
                   <textarea rows={4} readOnly value={savedDetail.entry.code} />
                 </div>
@@ -10303,7 +10465,7 @@ export default function App() {
         {tab === "settings" && (
           <section className="panel">
             <h1>Settings</h1>
-            <SettingsSection title="App updates">
+            <SettingsSection title="App updates" defaultOpen>
               <p className="note">
                 Current version:{" "}
                 <strong>v{appInfo?.version ?? appUpdate?.current_version ?? "…"}</strong>
@@ -10807,42 +10969,49 @@ export default function App() {
           onUnignore={unignoreRequirement}
         />
       )}
-      <UpdateToast
-        show={
-          Boolean(appUpdate?.update_available && appUpdate.latest_version) &&
-          dismissedUpdateVersion !== appUpdate?.latest_version &&
-          tab != null &&
-          tab !== "settings" &&
-          tab !== "setup"
-        }
-        version={appUpdate?.latest_version ?? ""}
-        progress={installingAppUpdate ? appUpdateMessage : null}
-        canInstall={Boolean(appUpdate?.asset_name)}
-        checking={checkingAppUpdate}
-        installing={installingAppUpdate}
-        onUpdate={() => void installAppUpdate()}
-        onOpenRelease={() => {
-          if (appUpdate?.release_url) void openUrl(appUpdate.release_url);
-        }}
-        onLater={() => {
-          if (appUpdate?.latest_version) setDismissedUpdateVersion(appUpdate.latest_version);
-        }}
-      />
-      {fomodFor && activeGame && (
+      <div className="toast-stack">
+        <UpdateToast
+          show={
+            Boolean(appUpdate?.update_available && appUpdate.latest_version) &&
+            dismissedUpdateVersion !== appUpdate?.latest_version &&
+            tab != null &&
+            tab !== "settings" &&
+            tab !== "setup"
+          }
+          version={appUpdate?.latest_version ?? ""}
+          progress={installingAppUpdate ? appUpdateMessage : null}
+          canInstall={Boolean(appUpdate?.asset_name)}
+          checking={checkingAppUpdate}
+          installing={installingAppUpdate}
+          onUpdate={() => void installAppUpdate()}
+          onOpenRelease={() => {
+            if (appUpdate?.release_url) void openUrl(appUpdate.release_url);
+          }}
+          onLater={() => {
+            if (appUpdate?.latest_version) setDismissedUpdateVersion(appUpdate.latest_version);
+          }}
+        />
+        <CheckingUpdatesToast
+          show={checkingModUpdates}
+          stagedCount={checkingModUpdates && mods.length > 0 ? mods.length : null}
+        />
+      </div>
+      {openFomod && activeGame && (
         <FomodDialog
+          key={openFomod.mod.id}
           gameId={activeGame.id}
-          mod={fomodFor}
-          onClose={() => setFomodFor(null)}
+          mod={openFomod.mod}
+          progress={openFomod.pass ? fomodPassProgress(openFomod.pass) : null}
+          onClose={closeFomodDialog}
           onSaved={(selection) => {
+            const savedId = fomodDialogRef.current?.mod.id;
+            if (!savedId) return;
             setMods((prev) =>
               prev.map((m) =>
-                m.id === fomodFor.id ? { ...m, fomod_selection: selection } : m,
+                m.id === savedId ? { ...m, fomod_selection: selection } : m,
               ),
             );
-            setNotice({
-              kind: "ok",
-              message: `Saved installer choices for ${fomodFor.name}. Deploy to apply them.`,
-            });
+            setFomodNeedingIds((ids) => ids.filter((id) => id !== savedId));
           }}
         />
       )}

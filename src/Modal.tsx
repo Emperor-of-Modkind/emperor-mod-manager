@@ -11,13 +11,23 @@ const FOCUSABLE =
 type ModalProps = {
   title: string;
   subtitle?: string;
+  /** Short line above the title, such as an installer-list counter. */
+  kicker?: string;
   className?: string;
   onClose: () => void;
   children: React.ReactNode;
   footer?: React.ReactNode;
 };
 
-export function Modal({ title, subtitle, className, onClose, children, footer }: ModalProps) {
+export function Modal({
+  title,
+  subtitle,
+  kicker,
+  className,
+  onClose,
+  children,
+  footer,
+}: ModalProps) {
   const dialogRef = useRef<HTMLDivElement>(null);
   // Closing must not steal focus from wherever the user was before opening.
   const opener = useRef<HTMLElement | null>(null);
@@ -107,6 +117,7 @@ export function Modal({ title, subtitle, className, onClose, children, footer }:
           >
             <div className="modal-head">
               <div>
+                {kicker ? <p className="modal-kicker">{kicker}</p> : null}
                 <h2>{title}</h2>
                 {subtitle ? <small>{subtitle}</small> : null}
               </div>

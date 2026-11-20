@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 
 import { Modal } from "./Modal";
+import { SourceMark } from "./SourceMark";
 import type { CatalogCandidate, CatalogSuggestion, DetectedGame } from "./types";
 
 export type CatalogMatchEngine = "unreal" | "bepinex";
@@ -45,12 +46,6 @@ function flattenCandidates(s: CatalogSuggestion | null): FlatCandidate[] {
   }
   rows.sort((a, b) => b.score - a.score || a.name.length - b.name.length);
   return rows;
-}
-
-function sourceLabel(source: SourceKey): string {
-  if (source === "nexus") return "Nexus";
-  if (source === "thunderstore") return "Thunderstore";
-  return "mod.io";
 }
 
 function confidenceLabel(score: number): string {
@@ -176,7 +171,8 @@ export function CatalogMatchDialog({
                     <span className="catalog-match-row-main">
                       <strong>{row.name}</strong>
                       <small>
-                        {sourceLabel(row.source)} · {row.id}
+                        <SourceMark source={row.source} />
+                        {` · ${row.id}`}
                       </small>
                     </span>
                     <span className="catalog-match-score">

@@ -192,7 +192,11 @@ impl ModioClient {
             .context("mod.io get_mods body")?;
 
         let total = list.total;
-        let hits = list.data.into_iter().map(hit_from_mod).collect();
+        let hits = list
+            .data
+            .into_iter()
+            .map(|m| hit_from_mod(m, true))
+            .collect();
         Ok((hits, total))
     }
 
@@ -316,7 +320,7 @@ impl ModioClient {
     }
 }
 
-fn hit_from_mod(m: modio::types::mods::Mod) -> ModioModHit {
+fn hit_from_mod(m: modio::types::mods::Mod, browse_thumb: bool) -> ModioModHit {
     let primary = m.modfile.as_ref().map(|f| f.id.get());
     ModioModHit {
         game_id: m.game_id.get() as u32,
@@ -325,7 +329,11 @@ fn hit_from_mod(m: modio::types::mods::Mod) -> ModioModHit {
         name_id: m.name_id,
         summary: m.summary,
         description: m.description_plaintext.or(m.description),
-        picture_url: Some(m.logo.thumb_640x360.to_string()),
+        picture_url: Some(if browse_thumb {
+            m.logo.thumb_320x180.to_string()
+        } else {
+            m.logo.thumb_640x360.to_string()
+        }),
         author: Some(m.submitted_by.username),
         downloads: m.stats.downloads_total as u64,
         profile_url: m.profile_url.to_string(),
@@ -336,7 +344,7 @@ fn hit_from_mod(m: modio::types::mods::Mod) -> ModioModHit {
 }
 
 fn detail_from_mod(m: modio::types::mods::Mod) -> ModioModDetail {
-    let hit = hit_from_mod(m);
+    let hit = hit_from_mod(m, false);
     ModioModDetail {
         game_id: hit.game_id,
         mod_id: hit.mod_id,

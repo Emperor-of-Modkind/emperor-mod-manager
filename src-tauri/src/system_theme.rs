@@ -15,6 +15,9 @@ pub struct SystemPalette {
     pub muted: String,
     pub line: String,
     pub accent: String,
+    /// Toolkit selection foreground, when the theme defines one.
+    /// The UI keeps it only if it contrasts with `accent`.
+    pub on_accent: Option<String>,
     pub input_bg: String,
 }
 
@@ -32,6 +35,7 @@ impl SystemPalette {
                 muted: "#b3b3b3".into(),
                 line: "#3d3d3d".into(),
                 accent,
+                on_accent: None,
                 input_bg: "#1f1f1f".into(),
             }
         } else {
@@ -45,6 +49,7 @@ impl SystemPalette {
                 muted: "#5c5c5c".into(),
                 line: "#e0e0e0".into(),
                 accent,
+                on_accent: None,
                 input_bg: "#ffffff".into(),
             }
         }
@@ -163,6 +168,7 @@ fn build_palette(
     line: (u8, u8, u8),
     accent: (u8, u8, u8),
     input_bg: (u8, u8, u8),
+    on_accent: Option<(u8, u8, u8)>,
 ) -> SystemPalette {
     let dark = is_dark_bg(bg.0, bg.1, bg.2);
     let bg_2 = if dark {
@@ -181,6 +187,7 @@ fn build_palette(
         muted: hex(muted.0, muted.1, muted.2),
         line: hex(line.0, line.1, line.2),
         accent: hex(accent.0, accent.1, accent.2),
+        on_accent: on_accent.map(|c| hex(c.0, c.1, c.2)),
         input_bg: hex(input_bg.0, input_bg.1, input_bg.2),
     }
 }
@@ -221,7 +228,8 @@ fn windows_accent() -> Option<(u8, u8, u8)> {
 #[cfg(target_os = "windows")]
 fn windows_palette(prefer_dark: bool, accent_fallback: &str) -> Option<SystemPalette> {
     use windows_sys::Win32::Graphics::Gdi::{
-        GetSysColor, COLOR_3DFACE, COLOR_3DSHADOW, COLOR_BTNFACE, COLOR_WINDOW, COLOR_WINDOWTEXT,
+        GetSysColor, COLOR_3DFACE, COLOR_3DSHADOW, COLOR_BTNFACE, COLOR_HIGHLIGHT,
+        COLOR_HIGHLIGHTTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT,
     };
 
     let sys = |idx: i32| -> (u8, u8, u8) {
@@ -239,6 +247,14 @@ fn windows_palette(prefer_dark: bool, accent_fallback: &str) -> Option<SystemPal
     let face3d = sys(COLOR_3DFACE as i32);
     let shadow = sys(COLOR_3DSHADOW as i32);
     let accent = accent_or_fallback(windows_accent(), accent_fallback);
+    // Highlight text is paired with COLOR_HIGHLIGHT, so only keep it when that
+    // color is the accent fill. A DWM accent would make the pairing meaningless.
+    let highlight = sys(COLOR_HIGHLIGHT as i32);
+    let on_accent = if accent == highlight {
+        Some(sys(COLOR_HIGHLIGHTTEXT as i32))
+    } else {
+        None
+    };
 
     // Classic GetSysColor stays "light window" even in dark mode on modern Windows.
     // Prefer AppsUseLightTheme for luminance; still use sys colors for borders when light.
@@ -248,6 +264,7 @@ fn windows_palette(prefer_dark: bool, accent_fallback: &str) -> Option<SystemPal
             source: "windows".into(),
             accent: hex(accent.0, accent.1, accent.2),
             line: hex(shadow.0, shadow.1, shadow.2),
+            on_accent: on_accent.map(|c| hex(c.0, c.1, c.2)),
             ..dark
         });
     }
@@ -258,7 +275,7 @@ fn windows_palette(prefer_dark: bool, accent_fallback: &str) -> Option<SystemPal
         face
     };
     Some(build_palette(
-        "windows", face3d, panel, text, shadow, accent, window,
+        "windows", face3d, panel, text, shadow, accent, window, on_accent,
     ))
 }
 
@@ -460,6 +477,12 @@ fn qt_scheme_accent(map: &ColorIniMap) -> Option<(u8, u8, u8)> {
         .or_else(|| kde_section_color_cfg(map, "General", "AccentColor"))
 }
 
+/// Selection label from a Plasma/qtct `.colors` map.
+#[cfg(any(target_os = "linux", test))]
+fn qt_scheme_on_accent(map: &ColorIniMap) -> Option<(u8, u8, u8)> {
+    kde_section_color_cfg(map, "Colors:Selection", "ForegroundNormal")
+}
+
 #[cfg(any(target_os = "linux", test))]
 fn kde_section_color_cfg(map: &ColorIniMap, section: &str, key: &str) -> Option<(u8, u8, u8)> {
     let v = map.get(section)?.get(key)?;
@@ -591,7 +614,10 @@ fn kde_palette(prefer_dark: bool, accent_fallback: &str) -> Option<SystemPalette
     let input_bg = kde_section_color(&map, "Colors:View", "BackgroundNormal").unwrap_or(panel);
     // Qt/Plasma scheme only — do not use GNOME portal/gsettings accents.
     let accent = accent_or_fallback(qt_scheme_accent(&map), accent_fallback);
-    Some(build_palette("qt", bg, panel, ink, line, accent, input_bg))
+    let on_accent = qt_scheme_on_accent(&map);
+    Some(build_palette(
+        "qt", bg, panel, ink, line, accent, input_bg, on_accent,
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -634,7 +660,16 @@ fn gtk_palette(prefer_dark: bool, accent_fallback: &str) -> Option<SystemPalette
         selected.or_else(portal_accent).or_else(gnome_named_accent),
         accent_fallback,
     );
-    Some(build_palette("gtk", bg, panel, ink, line, accent, input_bg))
+    // Only the GTK selection color is paired with theme_selected_fg_color.
+    // A portal or named accent has no matching foreground.
+    let on_accent = if selected.is_some() {
+        gtk_lookup_color("theme_selected_fg_color")
+    } else {
+        None
+    };
+    Some(build_palette(
+        "gtk", bg, panel, ink, line, accent, input_bg, on_accent,
+    ))
 }
 
 #[cfg(test)]
@@ -680,6 +715,18 @@ ForegroundNormal=0,56,42
             Some((10, 22, 17))
         );
         assert_eq!(qt_scheme_accent(&map), Some((0, 224, 177)));
+        assert_eq!(qt_scheme_on_accent(&map), Some((0, 56, 42)));
+        let palette = build_palette(
+            "qt",
+            (10, 22, 17),
+            (10, 22, 17),
+            (216, 230, 222),
+            (80, 90, 85),
+            (0, 224, 177),
+            (10, 22, 17),
+            qt_scheme_on_accent(&map),
+        );
+        assert_eq!(palette.on_accent.as_deref(), Some("#00382a"));
     }
 
     #[test]

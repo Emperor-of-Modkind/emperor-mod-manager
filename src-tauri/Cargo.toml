@@ -1,6 +1,6 @@
 [package]
 name = "emperor-mod-manager"
-version = "0.7.5"
+version = "0.8.0"
 description = "Mod manager for Linux and Windows"
 authors = ["emperor-mod-manager contributors"]
 edition = "2021"
@@ -21,7 +21,7 @@ tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "gzip"] }
 wreq = "0.16"
 wreq-util = "0.2"
 directories = "5"

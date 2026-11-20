@@ -273,6 +273,7 @@ pub struct IgnoredRequirement {
     pub name: String,
 }
 
+#[derive(Clone)]
 pub struct Paths {
     pub config_dir: PathBuf,
     pub data_dir: PathBuf,

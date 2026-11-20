@@ -24,6 +24,7 @@ mod firstlight;
 mod fromsoft_loaders;
 mod fromsoftware;
 mod helldivers2;
+mod id_tech;
 mod kingdomcome;
 mod log_sources;
 mod melonloader;
@@ -68,6 +69,10 @@ pub use fromsoftware::{
     DarkSouls2Plugin, DarkSouls3Plugin, DarkSoulsPlugin, DarkSoulsRemasteredPlugin, EldenRingPlugin,
 };
 pub use helldivers2::Helldivers2Plugin;
+pub use id_tech::{
+    Doom2016Plugin, DoomEternalPlugin, DoomTheDarkAgesPlugin, Wolfenstein2Plugin,
+    WolfensteinNewOrderPlugin, WolfensteinOldBloodPlugin, WolfensteinYoungbloodPlugin,
+};
 pub use kingdomcome::{KingdomComeDeliverance2Plugin, KingdomComeDeliverancePlugin};
 pub use melonloader::{BonelabPlugin, BoneworksPlugin};
 pub use monsterhunterworld::MonsterHunterWorldPlugin;
@@ -385,6 +390,13 @@ pub fn all_plugins() -> Vec<&'static dyn GamePlugin> {
     // More specific match_names first (FromSoft + RE Engine remakes + UE + BepInEx titles).
     // Generic UnrealEnginePlugin / BepInExPlugin have empty match_names (detection via engine_hint).
     vec![
+        &DoomTheDarkAgesPlugin,
+        &DoomEternalPlugin,
+        &Doom2016Plugin,
+        &Wolfenstein2Plugin,
+        &WolfensteinYoungbloodPlugin,
+        &WolfensteinOldBloodPlugin,
+        &WolfensteinNewOrderPlugin,
         &StardewValleyPlugin,
         &BaldursGate3Plugin,
         &Cyberpunk2077Plugin,
@@ -481,10 +493,13 @@ pub(crate) fn hd2_test_gate() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|e| e.into_inner())
 }
 
-/// Lowercase a store title and drop trademark marks.
+/// Lowercase a store title and drop trademark marks and spaced separators.
 ///
 /// Steam and `lib_game_detector` report names like `The Sims™ 4`, which would
-/// otherwise never match a `sims 4` entry in `match_names`.
+/// otherwise never match a `sims 4` entry in `match_names`. A shortcut named
+/// `Doom - The Dark Ages` is the same phrase as `DOOM: The Dark Ages` once the
+/// spaced hyphen and the colon are word breaks. A hyphen inside a word
+/// (`spider-man`) stays put.
 pub fn normalize_title(title: &str) -> String {
     let stripped: String = title
         .chars()
@@ -498,12 +513,21 @@ pub fn normalize_title(title: &str) -> String {
         .collect();
     let mut out = String::with_capacity(stripped.len());
     for word in stripped.split_whitespace() {
+        let word = word.trim_matches(is_title_separator);
+        if word.is_empty() {
+            continue;
+        }
         if !out.is_empty() {
             out.push(' ');
         }
         out.push_str(&word.to_lowercase());
     }
     out
+}
+
+/// Spaced punctuation that splits a title, not a hyphen inside one word.
+fn is_title_separator(c: char) -> bool {
+    matches!(c, '-' | '–' | '—' | ':')
 }
 
 pub fn match_plugin(title: &str, install_path: Option<&str>) -> Option<GamePluginInfo> {
@@ -516,6 +540,15 @@ pub fn match_plugin(title: &str, install_path: Option<&str>) -> Option<GamePlugi
         for name in info.match_names {
             if lower.contains(&name.to_lowercase()) {
                 return Some(info);
+            }
+        }
+    }
+
+    // Steam lists DOOM (2016) as "DOOM". Only an id Tech 6 install is that game.
+    if lower == "doom" {
+        if let Some(path) = install_path {
+            if id_tech::is_doom_2016_install(Path::new(path)) {
+                return Some(Doom2016Plugin.info());
             }
         }
     }
@@ -658,6 +691,41 @@ mod tests {
         assert_eq!(normalize_title("HELLDIVERS™ 2"), "helldivers 2");
         assert_eq!(match_plugin("The Sims™ 4", None).unwrap().id, "sims4");
         assert_eq!(match_plugin("The Sims™ 3", None).unwrap().id, "sims3");
+        assert_eq!(match_plugin("R.E.P.O.", None).unwrap().id, "repo");
+    }
+
+    #[test]
+    fn match_treats_spaced_hyphens_as_word_breaks() {
+        assert_eq!(
+            normalize_title("Doom - The Dark Ages"),
+            "doom the dark ages"
+        );
+        assert_eq!(normalize_title("spider-man"), "spider-man");
+        assert_eq!(
+            match_plugin("Doom - The Dark Ages", None).unwrap().id,
+            "doomthedarkages"
+        );
+        assert_eq!(
+            match_plugin("DOOM – The Dark Ages", None).unwrap().id,
+            "doomthedarkages"
+        );
+        assert_eq!(
+            match_plugin("DOOM: The Dark Ages", None).unwrap().id,
+            "doomthedarkages"
+        );
+        assert_eq!(
+            match_plugin("Wolfenstein - The New Order", None)
+                .unwrap()
+                .id,
+            "wolfensteintheneworder"
+        );
+        assert_eq!(
+            match_plugin("Subnautica - Below Zero", None).unwrap().id,
+            "subnauticabelowzero"
+        );
+        assert!(match_plugin("Return to Castle Wolfenstein", None).is_none());
+        assert!(match_plugin("Doom 3", None).is_none());
+        assert!(match_plugin("Control", None).is_none());
     }
 
     #[test]
@@ -859,6 +927,84 @@ mod tests {
                 .unwrap()
                 .id,
             "oblivionremastered"
+        );
+    }
+
+    #[test]
+    fn match_id_tech_titles() {
+        assert_eq!(
+            match_plugin("DOOM: The Dark Ages", None).unwrap().id,
+            "doomthedarkages"
+        );
+        assert_eq!(
+            match_plugin("DOOM The Dark Ages", None).unwrap().id,
+            "doomthedarkages"
+        );
+        assert_eq!(
+            match_plugin("DOOM Eternal", None).unwrap().id,
+            "doometernal"
+        );
+        assert_eq!(match_plugin("DOOM (2016)", None).unwrap().id, "doom2016");
+        assert_eq!(match_plugin("DOOM 2016", None).unwrap().id, "doom2016");
+        assert!(match_plugin("DOOM", None).is_none());
+        assert!(match_plugin("Doom 3", None).is_none());
+        assert!(match_plugin("DOOM 64", None).is_none());
+        assert!(match_plugin("Ultimate Doom", None).is_none());
+        assert!(match_plugin("Return to Castle Wolfenstein", None).is_none());
+        assert!(match_plugin("Wolfenstein", None).is_none());
+
+        let doom = tempfile::tempdir().unwrap();
+        std::fs::write(doom.path().join("DOOMx64.exe"), b"x").unwrap();
+        assert_eq!(
+            match_plugin("DOOM", Some(doom.path().to_str().unwrap()))
+                .unwrap()
+                .id,
+            "doom2016"
+        );
+        let vk = tempfile::tempdir().unwrap();
+        std::fs::write(vk.path().join("DOOMx64vk.exe"), b"x").unwrap();
+        assert_eq!(
+            match_plugin("DOOM®", Some(vk.path().to_str().unwrap()))
+                .unwrap()
+                .id,
+            "doom2016"
+        );
+        let eternal = tempfile::tempdir().unwrap();
+        std::fs::write(eternal.path().join("DOOMx64.exe"), b"x").unwrap();
+        std::fs::write(eternal.path().join("DOOMEternal.exe"), b"x").unwrap();
+        assert!(match_plugin("DOOM", Some(eternal.path().to_str().unwrap())).is_none());
+
+        assert_eq!(
+            match_plugin("Wolfenstein II: The New Colossus", None)
+                .unwrap()
+                .id,
+            "wolfenstein2thenewcolossus"
+        );
+        assert_eq!(
+            match_plugin("Wolfenstein 2: The New Colossus", None)
+                .unwrap()
+                .id,
+            "wolfenstein2thenewcolossus"
+        );
+        assert_eq!(
+            match_plugin("Wolfenstein: Youngblood", None).unwrap().id,
+            "wolfensteinyoungblood"
+        );
+        assert_eq!(
+            match_plugin("Wolfenstein Youngblood", None).unwrap().id,
+            "wolfensteinyoungblood"
+        );
+        assert_eq!(
+            match_plugin("Wolfenstein: The Old Blood", None).unwrap().id,
+            "wolfensteintheoldblood"
+        );
+        assert_eq!(
+            match_plugin("Wolfenstein: The New Order", None).unwrap().id,
+            "wolfensteintheneworder"
+        );
+        assert_eq!(
+            match_plugin("Wolfenstein The New Order", None).unwrap().id,
+            "wolfensteintheneworder"
         );
     }
 }

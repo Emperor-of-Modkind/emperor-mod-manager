@@ -154,6 +154,10 @@ pub struct SavedCollectionEntry {
     pub nexus_count: usize,
     pub thunderstore_count: usize,
     pub modio_count: usize,
+    /// `emperor-share:{hash}`. Filled when the list is sent to the UI so each
+    /// code is not hashed over its own command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -492,14 +496,15 @@ pub fn entry_from_code(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "Shared loadout".into());
     let now = now_rfc3339();
+    let stored_code = if code.trim().starts_with("#emperor1") {
+        code.trim().to_string()
+    } else {
+        encode_share_manifest(&manifest)?
+    };
     Ok(SavedCollectionEntry {
         id: uuid::Uuid::new_v4().to_string(),
         name,
-        code: if code.trim().starts_with("#emperor1") {
-            code.trim().to_string()
-        } else {
-            encode_share_manifest(&manifest)?
-        },
+        code: stored_code.clone(),
         created_at: now.clone(),
         updated_at: now,
         source_game_id,
@@ -509,6 +514,7 @@ pub fn entry_from_code(
         nexus_count: preview.nexus_count,
         thunderstore_count: preview.thunderstore_count,
         modio_count: preview.modio_count,
+        share_id: Some(emperor_share_id(&stored_code)),
     })
 }
 

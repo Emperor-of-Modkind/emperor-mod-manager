@@ -1,4 +1,4 @@
-//! Installed-game detection (Linux via lib_game_detector; Windows via Steam/Heroic).
+//! Installed-game detection (Linux via lib_game_detector; Windows via Steam, the Epic Games Launcher, and Heroic).
 
 use std::path::Path;
 
@@ -15,7 +15,9 @@ pub(crate) use catalog_art::{catalog_cover_url, is_deferred_icon_path};
 
 #[cfg(target_os = "linux")]
 mod linux;
-// Compile under `test` on non-Windows so pure Steam path/cover helpers are covered in CI.
+// Compile under `test` on non-Windows so pure Steam and Epic helpers are covered in CI.
+#[cfg(any(target_os = "windows", test))]
+mod epic;
 #[cfg(any(target_os = "windows", test))]
 mod windows;
 

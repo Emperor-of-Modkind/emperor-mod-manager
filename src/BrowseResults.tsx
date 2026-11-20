@@ -1,4 +1,4 @@
-import { useCallback, useLayoutEffect, useRef, useState, type ReactNode, type RefObject } from "react";
+import { useCallback, useLayoutEffect, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   BROWSE_GRID_COLUMN_GAP_REM,
@@ -14,7 +14,7 @@ import {
 
 const OVERSCAN = 2;
 
-type ScrollRef = RefObject<HTMLDivElement | null>;
+type ScrollRef = RefObject<HTMLElement | null>;
 
 function readRootRem(): number {
   if (typeof document === "undefined") return 16;
@@ -176,9 +176,13 @@ type BrowseVirtualListProps<T> = {
   scrollRef: ScrollRef;
   getKey: (item: T) => string;
   renderItem: (item: T, index: number) => ReactNode;
-  rowClassName: string;
+  rowClassName: string | ((item: T, index: number) => string);
   estimateSize: number;
   onPageSize?: (count: number) => void;
+  /** Extra classes on the list, after `list browse-virtual`. */
+  listClassName?: string;
+  listRef?: RefObject<HTMLUListElement | null>;
+  onRowPointerDown?: (item: T, event: ReactPointerEvent<HTMLLIElement>) => void;
 };
 
 export function BrowseVirtualList<T,>({
@@ -189,10 +193,39 @@ export function BrowseVirtualList<T,>({
   rowClassName,
   estimateSize,
   onPageSize,
+  listClassName,
+  listRef,
+  onRowPointerDown,
 }: BrowseVirtualListProps<T>) {
   const width = useScrollWidth(scrollRef);
   const rem = useRootRem();
   const rowGap = BROWSE_LIST_GAP_REM * rem;
+  const innerListRef = useRef<HTMLUListElement | null>(null);
+  const [scrollMargin, setScrollMargin] = useState(0);
+  const setList = useCallback(
+    (el: HTMLUListElement | null) => {
+      innerListRef.current = el;
+      if (listRef) listRef.current = el;
+    },
+    [listRef],
+  );
+  useLayoutEffect(() => {
+    const scroll = scrollRef.current;
+    const list = innerListRef.current;
+    if (!scroll || !list) return;
+    const publish = () => {
+      const next =
+        list.getBoundingClientRect().top -
+        scroll.getBoundingClientRect().top +
+        scroll.scrollTop;
+      setScrollMargin((prev) => (Math.abs(prev - next) < 0.5 ? prev : next));
+    };
+    publish();
+    const observer = new ResizeObserver(publish);
+    observer.observe(scroll);
+    if (list.parentElement) observer.observe(list.parentElement);
+    return () => observer.disconnect();
+  }, [items.length, scrollRef]);
   useLayoutEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
@@ -221,22 +254,33 @@ export function BrowseVirtualList<T,>({
     estimateSize: () => estimateSize,
     overscan: OVERSCAN,
     gap: rowGap,
+    scrollMargin,
     initialOffset: () => scrollRef.current?.scrollTop ?? 0,
     getItemKey: getRowKey,
   });
+  const margin = virtualizer.options.scrollMargin;
 
   return (
-    <ul className="list browse-virtual" style={{ height: virtualizer.getTotalSize() }}>
+    <ul
+      ref={setList}
+      className={["list browse-virtual", listClassName].filter(Boolean).join(" ")}
+      style={{ height: virtualizer.getTotalSize() }}
+    >
       {virtualizer.getVirtualItems().map((row) => {
         const item = items[row.index];
         if (!item) return null;
+        const extra =
+          typeof rowClassName === "function" ? rowClassName(item, row.index) : rowClassName;
         return (
           <li
             key={row.key}
             data-index={row.index}
             ref={virtualizer.measureElement}
-            className={`browse-virtual-row ${rowClassName}`}
-            style={{ transform: `translateY(${row.start}px)` }}
+            className={`browse-virtual-row ${extra}`}
+            style={{ transform: `translateY(${row.start - margin}px)` }}
+            onPointerDown={
+              onRowPointerDown ? (event) => onRowPointerDown(item, event) : undefined
+            }
           >
             {renderItem(item, row.index)}
           </li>

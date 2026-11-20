@@ -2,14 +2,16 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::StreamExt;
-use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
+use reqwest::header::{
+    HeaderMap, HeaderValue, IF_MODIFIED_SINCE, LAST_MODIFIED, LOCATION, USER_AGENT,
+};
 use serde::{Deserialize, Serialize};
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
@@ -19,10 +21,13 @@ use crate::nexus::{TransferControl, CANCELLED_MSG, PAUSED_MSG};
 use walkdir::WalkDir;
 
 const TS_BASE: &str = "https://thunderstore.io";
+const TS_CHUNK_CONCURRENCY: usize = 4;
 
 #[derive(Clone)]
 pub struct ThunderstoreClient {
     http: reqwest::Client,
+    /// Does not follow redirects, so a listing-index 302 keeps its Last-Modified.
+    http_noredir: reqwest::Client,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +63,50 @@ pub struct TsPackage {
     pub has_nsfw_content: bool,
     pub categories: Vec<String>,
     pub versions: Vec<TsPackageVersion>,
+}
+
+/// Latest-version fields needed for browse cards. Version history stays on `TsPackage`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TsBrowsePackage {
+    pub name: String,
+    pub full_name: String,
+    pub owner: String,
+    pub package_url: String,
+    pub uuid4: String,
+    pub rating_score: i64,
+    pub is_pinned: bool,
+    pub is_deprecated: bool,
+    pub has_nsfw_content: bool,
+    pub categories: Vec<String>,
+    pub description: String,
+    pub icon: String,
+    pub downloads: u64,
+    pub latest_version: String,
+    pub dependency_count: u64,
+    pub file_size: u64,
+}
+
+/// Compact browse snapshot plus the chunk URLs that produced the full package list.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TsBrowseDiskCache {
+    pub last_modified: Option<String>,
+    pub chunk_urls: Vec<String>,
+    pub packages: Vec<TsBrowsePackage>,
+}
+
+/// Community package list fetched from the listing index or the v1 fallback.
+#[derive(Debug, Clone)]
+pub struct TsCommunityListing {
+    pub last_modified: Option<String>,
+    pub chunk_urls: Vec<String>,
+    pub packages: Vec<TsPackage>,
+}
+
+#[derive(Debug, Clone)]
+pub enum TsListingFetch {
+    /// Index replied 304. The caller already has this community's snapshot.
+    NotModified,
+    Fresh(TsCommunityListing),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,17 +199,25 @@ impl TsDependency {
     }
 }
 
+fn build_http(follow_redirects: bool) -> Result<reqwest::Client> {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        USER_AGENT,
+        HeaderValue::from_str(&format!("{APP_NAME}/{APP_VERSION}"))?,
+    );
+    let mut builder = reqwest::Client::builder().default_headers(headers);
+    if !follow_redirects {
+        builder = builder.redirect(reqwest::redirect::Policy::none());
+    }
+    Ok(builder.build()?)
+}
+
 impl ThunderstoreClient {
     pub fn new() -> Result<Self> {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            USER_AGENT,
-            HeaderValue::from_str(&format!("{APP_NAME}/{APP_VERSION}"))?,
-        );
-        let http = reqwest::Client::builder()
-            .default_headers(headers)
-            .build()?;
-        Ok(Self { http })
+        Ok(Self {
+            http: build_http(true)?,
+            http_noredir: build_http(false)?,
+        })
     }
 
     pub async fn list_communities(&self) -> Result<Vec<TsCommunity>> {
@@ -187,6 +244,124 @@ impl ThunderstoreClient {
     }
 
     pub async fn list_packages(&self, community: &str) -> Result<Vec<TsPackage>> {
+        match self.fetch_community_listing(community, None).await? {
+            TsListingFetch::NotModified => Ok(Vec::new()),
+            TsListingFetch::Fresh(listing) => Ok(listing.packages),
+        }
+    }
+
+    /// Load a community's packages from the chunked listing index.
+    ///
+    /// `if_modified_since` is the previous index `Last-Modified` value. A 304
+    /// returns [`TsListingFetch::NotModified`] and does not download chunks.
+    /// A missing index (404/503) or a bad chunk falls back to `/api/v1/package/`.
+    pub async fn fetch_community_listing(
+        &self,
+        community: &str,
+        if_modified_since: Option<&str>,
+    ) -> Result<TsListingFetch> {
+        match self.fetch_listing_index(community, if_modified_since).await {
+            Ok(fetch) => Ok(fetch),
+            Err(err) => {
+                log::warn!(
+                    "Thunderstore listing index unavailable for {community}, using package dump: {err:#}"
+                );
+                let packages = self.list_packages_v1(community).await?;
+                Ok(TsListingFetch::Fresh(TsCommunityListing {
+                    last_modified: None,
+                    chunk_urls: Vec::new(),
+                    packages,
+                }))
+            }
+        }
+    }
+
+    async fn fetch_listing_index(
+        &self,
+        community: &str,
+        if_modified_since: Option<&str>,
+    ) -> Result<TsListingFetch> {
+        let index_url = format!("{TS_BASE}/c/{community}/api/v1/package-listing-index/");
+        let mut req = self.http_noredir.get(&index_url);
+        if let Some(since) = if_modified_since.map(str::trim).filter(|s| !s.is_empty()) {
+            req = req.header(IF_MODIFIED_SINCE, since);
+        }
+        let resp = req
+            .send()
+            .await
+            .with_context(|| format!("GET {index_url}"))?;
+        if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
+            return Ok(TsListingFetch::NotModified);
+        }
+        if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE
+            || resp.status() == reqwest::StatusCode::NOT_FOUND
+        {
+            bail!("Thunderstore listing index unavailable: {}", resp.status());
+        }
+
+        let last_modified = header_string(resp.headers(), LAST_MODIFIED);
+        let chunk_urls = if resp.status().is_redirection() {
+            let loc = header_string(resp.headers(), LOCATION)
+                .context("listing index redirect missing Location")?;
+            let base = reqwest::Url::parse(&index_url)?;
+            let next = base
+                .join(&loc)
+                .with_context(|| format!("join listing index redirect {loc}"))?;
+            let next = next.to_string();
+            if !trusted_thunderstore_url(&next) {
+                bail!("untrusted listing index url: {next}");
+            }
+            self.read_chunk_urls(&next).await?
+        } else if resp.status().is_success() {
+            resp.json().await.context("decode listing index")?
+        } else {
+            bail!("Thunderstore listing index failed: {}", resp.status());
+        };
+        for url in &chunk_urls {
+            if !trusted_thunderstore_url(url) {
+                bail!("untrusted package chunk url: {url}");
+            }
+        }
+        let packages = self.download_package_chunks(&chunk_urls).await?;
+        Ok(TsListingFetch::Fresh(TsCommunityListing {
+            last_modified,
+            chunk_urls,
+            packages,
+        }))
+    }
+
+    async fn read_chunk_urls(&self, url: &str) -> Result<Vec<String>> {
+        let resp = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?;
+        if !resp.status().is_success() {
+            bail!("Thunderstore listing index blob failed: {}", resp.status());
+        }
+        resp.json().await.context("decode listing index")
+    }
+
+    pub async fn download_package_chunks(&self, urls: &[String]) -> Result<Vec<TsPackage>> {
+        if urls.is_empty() {
+            return Ok(Vec::new());
+        }
+        let http = self.http.clone();
+        let mut stream = futures_util::stream::iter(urls.iter().cloned())
+            .map(|url| {
+                let http = http.clone();
+                async move { fetch_package_chunk(http, url).await }
+            })
+            .buffer_unordered(TS_CHUNK_CONCURRENCY);
+        let mut packages = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            packages.extend(chunk?);
+        }
+        Ok(packages)
+    }
+
+    async fn list_packages_v1(&self, community: &str) -> Result<Vec<TsPackage>> {
         let url = format!("{TS_BASE}/c/{community}/api/v1/package/");
         let resp = self
             .http
@@ -270,6 +445,7 @@ impl ThunderstoreClient {
     /// satisfies every required floor. When two packages require the same
     /// dependency, the higher floor wins. An explicit `version` for the root
     /// package is treated as an exact pin (profile / modpack entries).
+    #[allow(dead_code)]
     pub async fn resolve_install_order(
         &self,
         community: &str,
@@ -278,33 +454,7 @@ impl ThunderstoreClient {
         version: Option<&str>,
     ) -> Result<Vec<TsPackageDetail>> {
         let packages = self.list_packages(community).await?;
-        let by_key: HashMap<String, TsPackage> = packages
-            .into_iter()
-            .map(|p| (format!("{}-{}", p.owner, p.name).to_lowercase(), p))
-            .collect();
-
-        let root_key = format!("{namespace}-{name}").to_lowercase();
-        if !by_key.contains_key(&root_key) {
-            bail!("Package {namespace}-{name} not found");
-        }
-
-        let pins = resolve_dependency_pins(&root_key, version, &by_key)?;
-
-        let mut ordered: Vec<TsPackageDetail> = Vec::new();
-        let mut visiting: HashSet<String> = HashSet::new();
-        let mut visited: HashSet<String> = HashSet::new();
-        collect_install_order(
-            &root_key,
-            &root_key,
-            version,
-            &pins,
-            &by_key,
-            community,
-            &mut visiting,
-            &mut visited,
-            &mut ordered,
-        )?;
-        Ok(ordered)
+        resolve_install_order_from(&packages, community, namespace, name, version)
     }
 
     pub async fn download_version(
@@ -556,6 +706,190 @@ fn select_latest_satisfying<'a>(
         return Ok(found);
     }
     bail!("No version of {} satisfies minimum {min}", pkg.full_name)
+}
+
+pub fn resolve_install_order_from(
+    packages: &[TsPackage],
+    community: &str,
+    namespace: &str,
+    name: &str,
+    version: Option<&str>,
+) -> Result<Vec<TsPackageDetail>> {
+    let by_key: HashMap<String, TsPackage> = packages
+        .iter()
+        .cloned()
+        .map(|p| (format!("{}-{}", p.owner, p.name).to_lowercase(), p))
+        .collect();
+
+    let root_key = format!("{namespace}-{name}").to_lowercase();
+    if !by_key.contains_key(&root_key) {
+        bail!("Package {namespace}-{name} not found");
+    }
+
+    let pins = resolve_dependency_pins(&root_key, version, &by_key)?;
+
+    let mut ordered: Vec<TsPackageDetail> = Vec::new();
+    let mut visiting: HashSet<String> = HashSet::new();
+    let mut visited: HashSet<String> = HashSet::new();
+    collect_install_order(
+        &root_key,
+        &root_key,
+        version,
+        &pins,
+        &by_key,
+        community,
+        &mut visiting,
+        &mut visited,
+        &mut ordered,
+    )?;
+    Ok(ordered)
+}
+
+pub fn packages_to_browse(packages: &[TsPackage]) -> Vec<TsBrowsePackage> {
+    packages.iter().map(browse_from_package).collect()
+}
+
+pub fn browse_from_package(pkg: &TsPackage) -> TsBrowsePackage {
+    let latest = pkg.versions.first();
+    TsBrowsePackage {
+        name: pkg.name.clone(),
+        full_name: pkg.full_name.clone(),
+        owner: pkg.owner.clone(),
+        package_url: pkg.package_url.clone(),
+        uuid4: pkg.uuid4.clone(),
+        rating_score: pkg.rating_score,
+        is_pinned: pkg.is_pinned,
+        is_deprecated: pkg.is_deprecated,
+        has_nsfw_content: pkg.has_nsfw_content,
+        categories: pkg.categories.clone(),
+        description: latest.map(|v| v.description.clone()).unwrap_or_default(),
+        icon: latest.map(|v| v.icon.clone()).unwrap_or_default(),
+        downloads: latest.map(|v| v.downloads).unwrap_or(0),
+        latest_version: latest.map(|v| v.version_number.clone()).unwrap_or_default(),
+        dependency_count: latest.map(|v| v.dependencies.len() as u64).unwrap_or(0),
+        file_size: latest.map(|v| v.file_size).unwrap_or(0),
+    }
+}
+
+/// Page a browse snapshot without cloning the packages that are not returned.
+pub fn page_browse_packages<'a>(
+    packages: &'a [TsBrowsePackage],
+    query: &str,
+    author: Option<&str>,
+    include_nsfw: bool,
+    modpacks_only: bool,
+    offset: usize,
+    count: usize,
+) -> (Vec<&'a TsBrowsePackage>, usize) {
+    let author = author.map(str::trim).filter(|s| !s.is_empty());
+    let q = query.trim().to_lowercase();
+    let mut idxs: Vec<usize> = packages
+        .iter()
+        .enumerate()
+        .filter(|(_, pkg)| {
+            if pkg.is_deprecated {
+                return false;
+            }
+            if !include_nsfw && pkg.has_nsfw_content {
+                return false;
+            }
+            if modpacks_only && !is_modpack_category(&pkg.categories) {
+                return false;
+            }
+            if let Some(author) = author {
+                if !pkg.owner.eq_ignore_ascii_case(author) {
+                    return false;
+                }
+            }
+            if q.is_empty() {
+                return true;
+            }
+            pkg.name.to_lowercase().contains(&q)
+                || pkg.full_name.to_lowercase().contains(&q)
+                || pkg.owner.to_lowercase().contains(&q)
+                || pkg.description.to_lowercase().contains(&q)
+                || pkg.categories.iter().any(|c| c.to_lowercase().contains(&q))
+        })
+        .map(|(idx, _)| idx)
+        .collect();
+    idxs.sort_by(|&ia, &ib| {
+        let a = &packages[ia];
+        let b = &packages[ib];
+        b.is_pinned
+            .cmp(&a.is_pinned)
+            .then_with(|| b.downloads.cmp(&a.downloads))
+    });
+    let total = idxs.len();
+    let page = idxs
+        .into_iter()
+        .skip(offset)
+        .take(count)
+        .map(|idx| &packages[idx])
+        .collect();
+    (page, total)
+}
+
+pub fn browse_cache_path(cache_dir: &Path, community: &str) -> Option<PathBuf> {
+    if !community_cache_slug(community) {
+        return None;
+    }
+    Some(
+        cache_dir
+            .join("thunderstore")
+            .join(format!("{community}.browse.json")),
+    )
+}
+
+pub fn encode_browse_disk(cache: &TsBrowseDiskCache) -> Result<Vec<u8>> {
+    serde_json::to_vec(cache).context("encode thunderstore browse cache")
+}
+
+pub fn decode_browse_disk(bytes: &[u8]) -> Result<TsBrowseDiskCache> {
+    serde_json::from_slice(bytes).context("decode thunderstore browse cache")
+}
+
+fn community_cache_slug(community: &str) -> bool {
+    !community.is_empty()
+        && community.len() <= 128
+        && community
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+pub fn trusted_thunderstore_url(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    if parsed.scheme() != "https" {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    host.eq_ignore_ascii_case("thunderstore.io")
+        || host.to_ascii_lowercase().ends_with(".thunderstore.io")
+}
+
+fn header_string(headers: &HeaderMap, name: reqwest::header::HeaderName) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+}
+
+async fn fetch_package_chunk(http: reqwest::Client, url: String) -> Result<Vec<TsPackage>> {
+    if !trusted_thunderstore_url(&url) {
+        bail!("untrusted package chunk url: {url}");
+    }
+    let resp = http
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
+    if !resp.status().is_success() {
+        bail!("Thunderstore package chunk failed: {}", resp.status());
+    }
+    resp.json().await.context("decode package chunk")
 }
 
 pub fn detail_from_package(community: &str, pkg: TsPackage) -> TsPackageDetail {
@@ -968,5 +1302,115 @@ mod tests {
             .expect("RoR2BepInExPack in order");
         assert_eq!(ror2.latest_version.as_deref(), Some("1.50.0"));
         assert_eq!(ror2.versions[0].version_number, "1.50.0");
+    }
+
+    #[test]
+    fn browse_snapshot_keeps_latest_version_only() {
+        let pkg = package(
+            "Owner",
+            "Mod",
+            vec![
+                version("2.0.0", &["Dep-A-1.0.0"]),
+                version("1.0.0", &["Dep-A-0.1.0", "Dep-B-1.0.0"]),
+            ],
+        );
+        let mut latest = version("2.0.0", &["Dep-A-1.0.0"]);
+        latest.downloads = 12;
+        latest.description = "hello".into();
+        latest.icon = "https://thunderstore.io/icon.png".into();
+        latest.file_size = 40;
+        let mut pkg = pkg;
+        pkg.versions[0] = latest;
+        let snap = packages_to_browse(&[pkg]);
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].latest_version, "2.0.0");
+        assert_eq!(snap[0].dependency_count, 1);
+        assert_eq!(snap[0].downloads, 12);
+        assert_eq!(snap[0].description, "hello");
+        assert_eq!(snap[0].file_size, 40);
+    }
+
+    fn browse_pkg(name: &str, downloads: u64, pinned: bool) -> TsBrowsePackage {
+        TsBrowsePackage {
+            name: name.into(),
+            full_name: format!("Owner-{name}"),
+            owner: "Owner".into(),
+            package_url: String::new(),
+            uuid4: String::new(),
+            rating_score: 0,
+            is_pinned: pinned,
+            is_deprecated: false,
+            has_nsfw_content: false,
+            categories: vec!["Mods".into()],
+            description: format!("{name} description"),
+            icon: String::new(),
+            downloads,
+            latest_version: "1.0.0".into(),
+            dependency_count: 0,
+            file_size: 1,
+        }
+    }
+
+    #[test]
+    fn page_browse_orders_pinned_then_downloads() {
+        let mut deprecated = browse_pkg("Old", 1000, false);
+        deprecated.is_deprecated = true;
+        let mut nsfw = browse_pkg("Spicy", 500, false);
+        nsfw.has_nsfw_content = true;
+        let packages = vec![
+            browse_pkg("Alpha", 10, false),
+            browse_pkg("Beta", 50, false),
+            browse_pkg("Pinned", 1, true),
+            deprecated,
+            nsfw,
+        ];
+        let (page, total) = page_browse_packages(&packages, "", None, false, false, 0, 10);
+        let names: Vec<_> = page.iter().map(|pkg| pkg.name.as_str()).collect();
+        assert_eq!(names, vec!["Pinned", "Beta", "Alpha"]);
+        assert_eq!(total, 3);
+
+        let (matched, _) = page_browse_packages(&packages, "alp", None, true, false, 0, 10);
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].name, "Alpha");
+    }
+
+    #[test]
+    fn trusted_chunk_urls_stay_on_thunderstore() {
+        assert!(trusted_thunderstore_url(
+            "https://thunderstore.io/c/valheim/api/v1/package-listing-index/"
+        ));
+        assert!(trusted_thunderstore_url(
+            "https://gcdn.thunderstore.io/live/chunk.json"
+        ));
+        assert!(!trusted_thunderstore_url(
+            "http://thunderstore.io/chunk.json"
+        ));
+        assert!(!trusted_thunderstore_url("https://evil.example/chunk.json"));
+        assert!(!trusted_thunderstore_url(
+            "https://thunderstore.io.evil.example/chunk.json"
+        ));
+    }
+
+    #[test]
+    fn browse_cache_path_rejects_traversal() {
+        let root = Path::new("/tmp/emperor-cache");
+        assert!(browse_cache_path(root, "../secret").is_none());
+        assert!(browse_cache_path(root, "lethal/company").is_none());
+        assert_eq!(
+            browse_cache_path(root, "lethal-company"),
+            Some(root.join("thunderstore").join("lethal-company.browse.json"))
+        );
+    }
+
+    #[test]
+    fn browse_disk_cache_roundtrip() {
+        let cache = TsBrowseDiskCache {
+            last_modified: Some("Wed, 21 Oct 2015 07:28:00 GMT".into()),
+            chunk_urls: vec!["https://gcdn.thunderstore.io/chunk.json".into()],
+            packages: vec![browse_pkg("Alpha", 3, false)],
+        };
+        let bytes = encode_browse_disk(&cache).unwrap();
+        let decoded = decode_browse_disk(&bytes).unwrap();
+        assert_eq!(decoded, cache);
     }
 }

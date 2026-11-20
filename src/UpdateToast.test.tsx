@@ -2,7 +2,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { act, type ReactElement } from "react";
 import { describe, expect, it } from "vitest";
 
-import { UpdateToast } from "./UpdateToast";
+import { CheckingUpdatesToast, UpdateToast } from "./UpdateToast";
 
 async function render(ui: ReactElement) {
   const host = document.createElement("div");
@@ -47,6 +47,7 @@ describe("UpdateToast", () => {
     );
     expect(view.host.textContent).toContain("Update available");
     expect(view.host.textContent).toContain("v1.2.3");
+    expect(view.host.querySelector(".throbber")).toBeNull();
     expect(buttonNamed(view.host, "Open release")).toBeUndefined();
 
     await act(async () => {
@@ -78,6 +79,7 @@ describe("UpdateToast", () => {
       />,
     );
     expect(buttonNamed(view.host, "Update")).toBeUndefined();
+    expect(view.host.querySelector(".throbber")).toBeNull();
     await act(async () => {
       buttonNamed(view.host, "Open release")?.click();
     });
@@ -100,8 +102,36 @@ describe("UpdateToast", () => {
       />,
     );
     expect(view.host.textContent).toContain("Downloading…");
+    expect(view.host.querySelector(".throbber")).not.toBeNull();
     expect(buttonNamed(view.host, "Updating…")?.disabled).toBe(true);
     expect(buttonNamed(view.host, "Later")?.disabled).toBe(true);
+    await view.unmount();
+  });
+});
+
+describe("CheckingUpdatesToast", () => {
+  it("says it is checking and includes the staged count", async () => {
+    const view = await render(<CheckingUpdatesToast show stagedCount={84} />);
+    expect(view.host.querySelector("[role='status']")?.textContent).toContain(
+      "Checking for mod updates…",
+    );
+    expect(view.host.querySelector(".throbber")).not.toBeNull();
+    expect(view.host.textContent).toContain("84 staged mods");
+    expect(view.host.querySelector("button")).toBeNull();
+    await view.unmount();
+  });
+
+  it("uses the singular when one mod is staged", async () => {
+    const view = await render(<CheckingUpdatesToast show stagedCount={1} />);
+    expect(view.host.textContent).toContain("1 staged mod");
+    expect(view.host.textContent).not.toContain("mods");
+    await view.unmount();
+  });
+
+  it("omits the count until the staged list is loaded", async () => {
+    const view = await render(<CheckingUpdatesToast show stagedCount={null} />);
+    expect(view.host.textContent).toContain("Checking for mod updates…");
+    expect(view.host.textContent).not.toContain("staged");
     await view.unmount();
   });
 });

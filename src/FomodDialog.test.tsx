@@ -126,11 +126,18 @@ describe("FomodDialog", () => {
 
     await act(async () => {
       root.render(
-        <FomodDialog gameId="cyberpunk2077" mod={mod} onClose={onClose} onSaved={onSaved} />,
+        <FomodDialog
+          gameId="cyberpunk2077"
+          mod={mod}
+          progress={{ current: 2, total: 5 }}
+          onClose={onClose}
+          onSaved={onSaved}
+        />,
       );
     });
     await flush();
 
+    expect(document.body.textContent).toContain("2 of 5");
     expect(document.body.textContent).toContain("English");
     expect(document.body.textContent).toContain("Voice Language");
 

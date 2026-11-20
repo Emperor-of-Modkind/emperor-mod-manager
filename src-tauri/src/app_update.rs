@@ -647,14 +647,104 @@ fn running_exe() -> Result<PathBuf, String> {
     std::env::current_exe().map_err(|e| format!("Could not resolve the running binary: {e}"))
 }
 
+/// 600 × 50ms. After this the helper starts the new binary anyway.
+#[cfg(any(target_os = "linux", test))]
+const RELAUNCH_WAIT_TICKS: u32 = 600;
+
+#[cfg(any(target_os = "linux", test))]
+struct RelaunchHelper {
+    program: &'static str,
+    args: Vec<String>,
+}
+
+/// `/bin/sh` argv that execs `binary` once `pid` has exited.
+///
+/// The new process has to start after this one drops the single-instance D-Bus
+/// name. The pid and binary stay separate arguments so the script never
+/// interpolates them.
+#[cfg(any(target_os = "linux", test))]
+fn relaunch_helper(pid: u32, binary: &Path) -> RelaunchHelper {
+    let script = format!(
+        "i=0; while kill -0 \"$1\" 2>/dev/null && [ \"$i\" -lt {RELAUNCH_WAIT_TICKS} ]; do sleep 0.05; i=$((i+1)); done; shift; exec \"$@\""
+    );
+    RelaunchHelper {
+        program: "/bin/sh",
+        args: vec![
+            "-c".into(),
+            script,
+            "emm-relaunch".into(),
+            pid.to_string(),
+            binary.display().to_string(),
+        ],
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn relaunch(app: &AppHandle, binary: &Path) -> Result<(), String> {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+
     emit_progress(app, "Relaunching…");
-    Command::new(binary)
-        .spawn()
+    let helper = relaunch_helper(std::process::id(), binary);
+    let fds = inherited_fds();
+    let mut cmd = Command::new(helper.program);
+    cmd.args(&helper.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    unsafe {
+        cmd.pre_exec(move || {
+            detach_session_and_close_fds(&fds);
+            Ok(())
+        });
+    }
+    cmd.spawn()
         .map_err(|e| format!("Failed to relaunch {}: {e}", binary.display()))?;
     schedule_exit(app);
     Ok(())
+}
+
+/// Fds this process has open above stderr. The `/proc/self/fd` directory fd is
+/// left out: it closes when the listing is dropped, and the child must not
+/// close whatever reuses that number (the spawn error pipe).
+#[cfg(target_os = "linux")]
+fn inherited_fds() -> Vec<i32> {
+    let Ok(dir) = std::fs::read_dir("/proc/self/fd") else {
+        return Vec::new();
+    };
+    let proc_fd = PathBuf::from(format!("/proc/{}/fd", std::process::id()));
+    let mut fds = Vec::new();
+    for entry in dir.flatten() {
+        let name = entry.file_name();
+        let Some(fd) = name.to_str().and_then(|s| s.parse::<i32>().ok()) else {
+            continue;
+        };
+        if fd <= 2 {
+            continue;
+        }
+        let listing = std::fs::read_link(entry.path()).ok();
+        let is_proc_fd = listing
+            .as_ref()
+            .is_some_and(|path| path == &proc_fd || path == Path::new("/proc/self/fd"));
+        if !is_proc_fd {
+            fds.push(fd);
+        }
+    }
+    fds
+}
+
+#[cfg(target_os = "linux")]
+fn detach_session_and_close_fds(fds: &[i32]) {
+    extern "C" {
+        fn setsid() -> i32;
+        fn close(fd: i32) -> i32;
+    }
+    unsafe {
+        let _ = setsid();
+        for fd in fds {
+            let _ = close(*fd);
+        }
+    }
 }
 
 /// Root can read this even when the cache directory is mode 0700.
@@ -1003,6 +1093,24 @@ source=("https://evil.example/emperor-mod-manager.tar.gz")
         assert!(status.update_available);
         assert_eq!(status.asset_name.as_deref(), Some("PKGBUILD"));
         assert_eq!(status.install_via, Some(UpdateChannel::Pacman));
+    }
+
+    #[test]
+    fn relaunch_helper_waits_for_pid_then_execs_binary() {
+        let binary = Path::new("/home/user/My Apps/emperor-mod-manager");
+        let helper = relaunch_helper(4321, binary);
+        assert_eq!(helper.program, "/bin/sh");
+        assert_eq!(helper.args[0], "-c");
+        assert_eq!(helper.args[2], "emm-relaunch");
+        assert_eq!(helper.args[3], "4321");
+        assert_eq!(helper.args[4], binary.display().to_string());
+        let script = &helper.args[1];
+        assert!(script.contains("kill -0 \"$1\""));
+        assert!(script.contains("[ \"$i\" -lt 600 ]"));
+        assert!(script.contains("shift"));
+        assert!(script.contains("exec \"$@\""));
+        assert!(!script.contains("4321"));
+        assert!(!script.contains("My Apps"));
     }
 
     #[test]

@@ -15,9 +15,45 @@ import type {
 type Props = {
   gameId: string;
   mod: StagedMod;
-  onClose: () => void;
+  /** Installer-list position for a Configure or Deploy pass. Omitted for one mod opened from its row. */
+  progress?: { current: number; total: number } | null;
+  onClose: (reason?: "saved" | "cancel") => void;
   onSaved: (selection: FomodSelection) => void;
 };
+
+const FOMOD_BANNER_PREVIEW = 4;
+
+export function FomodConfigureBanner({
+  mods,
+  onConfigure,
+}: {
+  mods: StagedMod[];
+  onConfigure: () => void;
+}) {
+  if (mods.length === 0) return null;
+  const preview = mods.slice(0, FOMOD_BANNER_PREVIEW);
+  const extra = mods.length - preview.length;
+  const label =
+    mods.length === 1
+      ? "1 mod needs installer choices"
+      : `${mods.length} mods need installer choices`;
+  return (
+    <div className="fomod-configure">
+      <div>
+        <strong>{label}</strong>
+        <ul>
+          {preview.map((mod) => (
+            <li key={mod.id}>{mod.name}</li>
+          ))}
+          {extra > 0 ? <li>and {extra} more</li> : null}
+        </ul>
+      </div>
+      <button type="button" onClick={onConfigure}>
+        Configure
+      </button>
+    </div>
+  );
+}
 
 function OptionImage({ path, alt }: { path: string | null; alt: string }) {
   if (!path) return null;
@@ -36,7 +72,7 @@ function pluginDisabled(plugin: FomodPluginView) {
   return plugin.plugin_type === "NotUsable";
 }
 
-export function FomodDialog({ gameId, mod, onClose, onSaved }: Props) {
+export function FomodDialog({ gameId, mod, progress, onClose, onSaved }: Props) {
   const [view, setView] = useState<FomodInstallerView | null>(null);
   const [selection, setSelection] = useState<FomodSelection | null>(null);
   const [stepIndex, setStepIndex] = useState(0);
@@ -134,7 +170,7 @@ export function FomodDialog({ gameId, mod, onClose, onSaved }: Props) {
     try {
       const saved = await api.setFomodSelection(gameId, mod.id, selection);
       onSaved(saved);
-      onClose();
+      onClose("saved");
     } catch (e) {
       setError(String(e));
     } finally {
@@ -150,7 +186,12 @@ export function FomodDialog({ gameId, mod, onClose, onSaved }: Props) {
           : "Deploy again to apply these choices."}
       </small>
       <div className="modal-foot-actions">
-        <button type="button" className="linkish" onClick={onClose} disabled={saving}>
+        <button
+          type="button"
+          className="linkish"
+          onClick={() => onClose("cancel")}
+          disabled={saving}
+        >
           Cancel
         </button>
         {stepIndex > 0 ? (
@@ -184,7 +225,8 @@ export function FomodDialog({ gameId, mod, onClose, onSaved }: Props) {
     <Modal
       title={view?.module_name || mod.name}
       subtitle={current?.name ?? "FOMOD installer"}
-      onClose={onClose}
+      kicker={progress ? `${progress.current} of ${progress.total}` : undefined}
+      onClose={() => onClose("cancel")}
       footer={view && selection && !view.unsupported_scripted ? footer : undefined}
     >
       {error ? <p className="error">{error}</p> : null}

@@ -721,6 +721,8 @@ checksum = "ce2548391e9c1929c21bf6aa2680af86fe4c1b33e6cea9ac1cfeec0bd11218cf"
 dependencies = [
  "brotli",
  "compression-core",
+ "flate2",
+ "memchr",
 ]
 
 [[package]]
@@ -1253,7 +1255,7 @@ checksum = "4ef6b89e5b37196644d8796de5268852ff179b44e96276cf4290264843743bb7"
 
 [[package]]
 name = "emperor-mod-manager"
-version = "0.7.5"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

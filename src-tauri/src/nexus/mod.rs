@@ -146,6 +146,19 @@ pub struct ModDetail {
     pub contains_adult_content: bool,
     #[serde(default)]
     pub uploaded_users_profile_url: Option<String>,
+    /// `false` when Nexus has hidden, removed, or otherwise unpublished the mod.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available: Option<bool>,
+    /// Hidden/removed notice from the public mod page, when that page says why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub availability_note: Option<String>,
+}
+
+/// Author gallery and any hidden/removed notice from one public mod page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModPageRead {
+    pub images: Vec<ModGalleryImage>,
+    pub availability_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -611,78 +624,14 @@ impl NexusClient {
         let url = format!("{REST_BASE}/games/{domain}/mods/{mod_id}.json");
         let resp = self.http.get(&url).send().await?;
         self.check_rate_limit(&resp);
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("get mod failed ({status}): {body}");
-        }
-        let n: Value = resp.json().await?;
-        let mod_id = n.get("mod_id").and_then(|v| v.as_u64()).unwrap_or(mod_id);
-        let name = n
-            .get("name")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("mod response missing name"))?
-            .to_string();
-        let domain_name = n
-            .get("domain_name")
-            .and_then(|v| v.as_str())
-            .unwrap_or(domain)
-            .to_string();
-        let category_id = n.get("category_id").and_then(|v| v.as_u64());
-        Ok(ModDetail {
-            mod_id,
-            name,
-            summary: n
-                .get("summary")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-            description: n
-                .get("description")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-            picture_url: n
-                .get("picture_url")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-            image_urls: Vec::new(),
-            author: n.get("author").and_then(|v| v.as_str()).map(str::to_string),
-            version: n
-                .get("version")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-            downloads: n
-                .get("mod_downloads")
-                .and_then(|v| v.as_u64())
-                .or_else(|| n.get("downloads").and_then(|v| v.as_u64())),
-            endorsements: n.get("endorsement_count").and_then(|v| v.as_u64()),
-            created_timestamp: n.get("created_timestamp").and_then(|v| v.as_u64()),
-            updated_timestamp: n.get("updated_timestamp").and_then(|v| v.as_u64()),
-            domain_name,
-            category_id,
-            category: None,
-            uploaded_by: n
-                .get("uploaded_by")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-            status: n.get("status").and_then(|v| v.as_str()).map(str::to_string),
-            contains_adult_content: n
-                .get("contains_adult_content")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-            uploaded_users_profile_url: n
-                .get("uploaded_users_profile_url")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-        })
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        detail_from_mod_response(status, &body, domain, mod_id)
     }
 
-    /// Author image carousel from the public mod page. The REST mod payload
-    /// only includes the primary `picture_url`.
-    pub async fn mod_page_gallery(
-        &self,
-        domain: &str,
-        mod_id: u64,
-    ) -> Result<Vec<ModGalleryImage>> {
+    /// Author image carousel and hidden/removed notice from the public mod
+    /// page. The REST mod payload only includes the primary `picture_url`.
+    pub async fn mod_page_gallery(&self, domain: &str, mod_id: u64) -> Result<ModPageRead> {
         let domain = domain.trim();
         if domain.is_empty() || !domain.bytes().all(|b| b.is_ascii_alphanumeric()) {
             bail!("invalid nexus domain");
@@ -693,7 +642,7 @@ impl NexusClient {
             bail!("mod page gallery failed ({})", resp.status());
         }
         let body = resp.text().await?;
-        Ok(parse_mod_gallery(&body))
+        Ok(read_mod_page(&body))
     }
 
     pub async fn list_mod_files(&self, domain: &str, mod_id: u64) -> Result<Vec<ModFileInfo>> {
@@ -1691,6 +1640,231 @@ impl NexusClient {
     }
 }
 
+fn detail_from_mod_response(
+    status: StatusCode,
+    body: &str,
+    domain: &str,
+    mod_id: u64,
+) -> Result<ModDetail> {
+    if status == StatusCode::NOT_FOUND {
+        return Ok(unavailable_mod_detail(domain, mod_id));
+    }
+    if !status.is_success() {
+        bail!("get mod failed ({status}): {body}");
+    }
+    let n: Value = serde_json::from_str(body).context("Nexus did not return this mod")?;
+    mod_detail_from_json(&n, domain, mod_id)
+}
+
+fn unavailable_mod_detail(domain: &str, mod_id: u64) -> ModDetail {
+    ModDetail {
+        mod_id,
+        name: String::new(),
+        summary: None,
+        description: None,
+        picture_url: None,
+        image_urls: Vec::new(),
+        author: None,
+        version: None,
+        downloads: None,
+        endorsements: None,
+        created_timestamp: None,
+        updated_timestamp: None,
+        domain_name: domain.to_string(),
+        category_id: None,
+        category: None,
+        uploaded_by: None,
+        status: None,
+        contains_adult_content: false,
+        uploaded_users_profile_url: None,
+        available: Some(false),
+        availability_note: None,
+    }
+}
+
+fn mod_detail_from_json(n: &Value, domain: &str, fallback_mod_id: u64) -> Result<ModDetail> {
+    let mod_id = n
+        .get("mod_id")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(fallback_mod_id);
+    let name = json_text(n, "name");
+    let status = json_text(n, "status");
+    let mut available = n.get("available").and_then(|v| v.as_bool());
+    let unavailable = available == Some(false)
+        || status.as_deref().is_some_and(is_non_public_status)
+        || (name.is_none() && status.is_some());
+    if name.is_none() && !unavailable {
+        bail!("Nexus did not return this mod");
+    }
+    if unavailable {
+        available = Some(false);
+    }
+    let domain_name = json_text(n, "domain_name").unwrap_or_else(|| domain.to_string());
+    Ok(ModDetail {
+        mod_id,
+        name: name.unwrap_or_default(),
+        summary: json_text(n, "summary"),
+        description: json_text(n, "description"),
+        picture_url: json_text(n, "picture_url"),
+        image_urls: Vec::new(),
+        author: json_text(n, "author"),
+        version: json_text(n, "version"),
+        downloads: n
+            .get("mod_downloads")
+            .and_then(|v| v.as_u64())
+            .or_else(|| n.get("downloads").and_then(|v| v.as_u64())),
+        endorsements: n.get("endorsement_count").and_then(|v| v.as_u64()),
+        created_timestamp: n.get("created_timestamp").and_then(|v| v.as_u64()),
+        updated_timestamp: n.get("updated_timestamp").and_then(|v| v.as_u64()),
+        domain_name,
+        category_id: n.get("category_id").and_then(|v| v.as_u64()),
+        category: None,
+        uploaded_by: json_text(n, "uploaded_by"),
+        status,
+        contains_adult_content: n
+            .get("contains_adult_content")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        uploaded_users_profile_url: json_text(n, "uploaded_users_profile_url"),
+        available,
+        availability_note: None,
+    })
+}
+
+fn json_text(n: &Value, key: &str) -> Option<String> {
+    n.get(key)
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn is_non_public_status(status: &str) -> bool {
+    let normalized = status
+        .trim()
+        .chars()
+        .map(|c| {
+            if c == '_' {
+                ' '
+            } else {
+                c.to_ascii_lowercase()
+            }
+        })
+        .collect::<String>();
+    let normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    const MARKERS: &[&str] = &[
+        "hidden",
+        "removed",
+        "deleted",
+        "under moderation",
+        "not published",
+        "wastebinned",
+    ];
+    MARKERS
+        .iter()
+        .any(|marker| normalized == *marker || normalized.contains(marker))
+}
+
+fn read_mod_page(html: &str) -> ModPageRead {
+    ModPageRead {
+        images: parse_mod_gallery(html),
+        availability_note: parse_availability_note(html),
+    }
+}
+
+/// Hidden, removed, or deleted banner on the public mod page.
+fn parse_availability_note(html: &str) -> Option<String> {
+    let at = find_ignore_ascii_case(html, "has been set to")?;
+    let start = rfind_ignore_ascii_case(&html[..at], "this mod")
+        .filter(|index| at.saturating_sub(*index) < 200)
+        .unwrap_or(at);
+    let tail = &html[at..];
+    let end_rel = find_ignore_ascii_case(tail, "</div>").unwrap_or_else(|| tail.len().min(1200));
+    let text = notice_text(&html[start..at + end_rel])?;
+    let lower = text.to_ascii_lowercase();
+    if !lower.contains("has been set to") || !is_non_public_status(&lower) {
+        return None;
+    }
+    Some(text)
+}
+
+fn notice_text(chunk: &str) -> Option<String> {
+    let flattened = chunk.replace(['\n', '\r'], " ");
+    let broken = break_tags_to_newlines(&flattened);
+    let decoded = decode_entities(&broken);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut in_tag = false;
+    for c in decoded.chars() {
+        if c == '<' {
+            in_tag = true;
+            continue;
+        }
+        if c == '>' {
+            in_tag = false;
+            continue;
+        }
+        if in_tag {
+            continue;
+        }
+        if c == '\n' {
+            push_notice_line(&mut lines, &mut current);
+        } else {
+            current.push(c);
+        }
+    }
+    push_notice_line(&mut lines, &mut current);
+    if lines.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    for line in lines {
+        if !out.is_empty() {
+            let last = out.chars().last()?;
+            if !matches!(last, '.' | ':' | '!' | '?') {
+                out.push('.');
+            }
+            out.push(' ');
+        }
+        out.push_str(&line);
+    }
+    Some(out)
+}
+
+fn push_notice_line(lines: &mut Vec<String>, current: &mut String) {
+    let trimmed = current.split_whitespace().collect::<Vec<_>>().join(" ");
+    current.clear();
+    if !trimmed.is_empty() {
+        lines.push(trimmed);
+    }
+}
+
+fn break_tags_to_newlines(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(at) = find_ignore_ascii_case(rest, "<br") {
+        out.push_str(&rest[..at]);
+        let after = &rest[at..];
+        let Some(end) = after.find('>') else {
+            out.push_str(after);
+            return out;
+        };
+        let tag = &after[1..end];
+        let name_end = tag
+            .find(|c: char| c.is_ascii_whitespace() || c == '/')
+            .unwrap_or(tag.len());
+        if tag[..name_end].eq_ignore_ascii_case("br") {
+            out.push('\n');
+            rest = &after[end + 1..];
+        } else {
+            out.push('<');
+            rest = &rest[at + 1..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Images from the author carousel (`ul.thumbgallery`) on a Nexus mod page.
 fn parse_mod_gallery(html: &str) -> Vec<ModGalleryImage> {
     let Some(open) = thumbgallery_ul(html) else {
@@ -1918,6 +2092,24 @@ fn decode_one(entity: &str) -> Option<char> {
                 .or_else(|| entity.strip_prefix('#').and_then(|num| num.parse().ok()))?;
             char::from_u32(num)
         }
+    }
+}
+
+fn rfind_ignore_ascii_case(haystack: &str, needle: &str) -> Option<usize> {
+    let haystack = haystack.as_bytes();
+    let needle = needle.as_bytes();
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    let mut i = haystack.len() - needle.len();
+    loop {
+        if haystack[i..i + needle.len()].eq_ignore_ascii_case(needle) {
+            return Some(i);
+        }
+        if i == 0 {
+            return None;
+        }
+        i -= 1;
     }
 }
 
@@ -2413,6 +2605,91 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn hidden_mod_without_a_name_is_unavailable() {
+        let body = r#"{"mod_id":5188,"name":null,"status":"hidden","available":false,"domain_name":"starfield"}"#;
+        let detail = detail_from_mod_response(StatusCode::OK, body, "starfield", 5188).unwrap();
+        assert_eq!(detail.name, "");
+        assert_eq!(detail.status.as_deref(), Some("hidden"));
+        assert_eq!(detail.available, Some(false));
+        assert_eq!(detail.mod_id, 5188);
+        assert_eq!(detail.domain_name, "starfield");
+        assert!(detail.availability_note.is_none());
+    }
+
+    #[test]
+    fn a_named_hidden_mod_keeps_its_name() {
+        let body =
+            r#"{"mod_id":9,"name":"Show Star Names","status":"under_moderation","available":true}"#;
+        let detail = detail_from_mod_response(StatusCode::OK, body, "starfield", 9).unwrap();
+        assert_eq!(detail.name, "Show Star Names");
+        assert_eq!(detail.status.as_deref(), Some("under_moderation"));
+        assert_eq!(detail.available, Some(false));
+    }
+
+    #[test]
+    fn a_missing_mod_is_unavailable() {
+        let detail =
+            detail_from_mod_response(StatusCode::NOT_FOUND, "missing", "starfield", 5188).unwrap();
+        assert_eq!(detail.name, "");
+        assert_eq!(detail.available, Some(false));
+        assert_eq!(detail.mod_id, 5188);
+        assert_eq!(detail.domain_name, "starfield");
+        assert!(detail.status.is_none());
+    }
+
+    #[test]
+    fn a_nameless_payload_without_status_is_an_error() {
+        let err = detail_from_mod_response(StatusCode::OK, r#"{"mod_id":1}"#, "starfield", 1)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Nexus did not return this mod"), "{msg}");
+        assert!(!msg.contains("mod response missing name"), "{msg}");
+    }
+
+    #[test]
+    fn a_published_mod_keeps_its_name() {
+        let body = r#"{"mod_id":8,"name":"Darktide Mod Framework","status":"published","available":true,"summary":"Framework","author":"Author","version":"1.0","domain_name":"warhammer40kdarktide"}"#;
+        let detail = detail_from_mod_response(StatusCode::OK, body, "starfield", 8).unwrap();
+        assert_eq!(detail.name, "Darktide Mod Framework");
+        assert_eq!(detail.summary.as_deref(), Some("Framework"));
+        assert_eq!(detail.author.as_deref(), Some("Author"));
+        assert_eq!(detail.version.as_deref(), Some("1.0"));
+        assert_eq!(detail.available, Some(true));
+        assert_eq!(detail.status.as_deref(), Some("published"));
+        assert!(detail.availability_note.is_none());
+    }
+
+    #[test]
+    fn hidden_page_notice_includes_the_reason() {
+        let html = r#"
+            <div class="info warning clearfix site-notice">
+              <div class="info-content">
+                <h3>Hidden mod</h3>
+                <p>This mod has been set to hidden<br><br>
+                  <p><b>Hidden at 06 Nov 2026, 7:57PM by <a href="/users/191643000">FSNovask</a></b>
+                  for the following reason: <br/ >
+                  <i>This mod is currently not supported by the author(s) and/or has issue(s) they are unable to fix yet.</i></p>
+                </p>
+              </div>
+            </div>
+        "#;
+        let note = parse_availability_note(html).unwrap();
+        assert_eq!(
+            note,
+            "This mod has been set to hidden. Hidden at 06 Nov 2026, 7:57PM by FSNovask for the following reason: This mod is currently not supported by the author(s) and/or has issue(s) they are unable to fix yet."
+        );
+    }
+
+    #[test]
+    fn an_unrelated_page_has_no_availability_note() {
+        assert!(parse_availability_note("<p>Just a moment...</p>").is_none());
+        assert!(parse_availability_note(
+            r#"<p>This mod has been set to published and is ready.</p>"#
+        )
+        .is_none());
     }
 
     #[test]

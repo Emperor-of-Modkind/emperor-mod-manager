@@ -201,7 +201,7 @@ pub struct FomodMappedFile {
 
 /// Look for ModuleConfig under the staged content root.
 pub fn module_config_path(content_root: &Path) -> Option<PathBuf> {
-    let dir = content_root.join("fomod");
+    let dir = fomod_config_dir(content_root)?;
     for name in ["ModuleConfig.xml", "moduleconfig.xml", "ModuleConfig.XML"] {
         let p = dir.join(name);
         if p.is_file() {
@@ -217,6 +217,27 @@ pub fn module_config_path(content_root: &Path) -> Option<PathBuf> {
         let lower = name.to_string_lossy().to_ascii_lowercase();
         if lower == "moduleconfig.xml" {
             return Some(entry.path());
+        }
+    }
+    None
+}
+
+/// `fomod/` as stored in the archive. Windows installers often use `Fomod`.
+fn fomod_config_dir(content_root: &Path) -> Option<PathBuf> {
+    let exact = content_root.join("fomod");
+    if exact.is_dir() {
+        return Some(exact);
+    }
+    let entries = fs::read_dir(content_root).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir()
+            && entry
+                .file_name()
+                .to_string_lossy()
+                .eq_ignore_ascii_case("fomod")
+        {
+            return Some(path);
         }
     }
     None
@@ -293,9 +314,10 @@ pub fn installer_view(
                                     id: p.id.clone(),
                                     name: p.name.clone(),
                                     description: p.description.clone(),
-                                    image: p.image.as_ref().map(|rel| {
-                                        content_root.join(rel).to_string_lossy().to_string()
-                                    }),
+                                    image: p
+                                        .image
+                                        .as_deref()
+                                        .and_then(|rel| resolve_fomod_image(content_root, rel)),
                                     plugin_type,
                                 }
                             })
@@ -709,6 +731,61 @@ fn insert_mapped(
 fn normalize_fomod_path(raw: &str) -> PathBuf {
     let cleaned = raw.replace('\\', "/").trim_matches('/').to_string();
     normalize_relative(Path::new(&cleaned))
+}
+
+/// Absolute path of a plugin thumbnail, or `None` when the file is not in the package.
+///
+/// ModuleConfig paths use Windows separators (`fomod\logo.png`). On Linux that is one
+/// filename, so the webview requests a missing file and shows a broken-image icon.
+fn resolve_fomod_image(content_root: &Path, rel: &str) -> Option<String> {
+    let relative = normalize_fomod_path(rel);
+    if relative.as_os_str().is_empty() {
+        return None;
+    }
+    let direct = content_root.join(&relative);
+    if direct.is_file() {
+        return Some(direct.to_string_lossy().to_string());
+    }
+    let resolved = resolve_image_case_insensitive(content_root, &relative)?;
+    resolved
+        .is_file()
+        .then(|| resolved.to_string_lossy().to_string())
+}
+
+/// Walk `relative` from `root`, using the on-disk spelling when only the case differs.
+fn resolve_image_case_insensitive(root: &Path, relative: &Path) -> Option<PathBuf> {
+    let mut current = root.to_path_buf();
+    let mut matched = false;
+    for component in relative.components() {
+        let name = match component {
+            std::path::Component::Normal(name) => name,
+            std::path::Component::CurDir => continue,
+            _ => return None,
+        };
+        matched = true;
+        let exact = current.join(name);
+        if exact.exists() {
+            current = exact;
+            continue;
+        }
+        let wanted = name.to_str()?;
+        let mut found = None;
+        for entry in fs::read_dir(&current).ok()?.flatten() {
+            let file_name = entry.file_name();
+            let Some(candidate) = file_name.to_str() else {
+                continue;
+            };
+            if !candidate.eq_ignore_ascii_case(wanted) {
+                continue;
+            }
+            if found.is_some() {
+                return None;
+            }
+            found = Some(entry.path());
+        }
+        current = found?;
+    }
+    matched.then_some(current)
 }
 
 // --- XML parsing -----------------------------------------------------------
@@ -1575,6 +1652,29 @@ pub fn selection_is_valid(module: &FomodModule, selection: &FomodSelection) -> R
 mod tests {
     use super::*;
 
+    const IMAGE_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<config>
+  <moduleName>Images</moduleName>
+  <installSteps order="Explicit">
+    <installStep name="Main">
+      <optionalFileGroups>
+        <group name="Main File" type="SelectAny">
+          <plugins>
+            <plugin name="With image">
+              <image path="fomod\logo.png" />
+              <typeDescriptor><type name="Optional"/></typeDescriptor>
+            </plugin>
+            <plugin name="Missing image">
+              <image path="fomod\missing.png" />
+              <typeDescriptor><type name="Optional"/></typeDescriptor>
+            </plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+  </installSteps>
+</config>"#;
+
     const SIMPLE_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
     xsi:noNamespaceSchemaLocation="http://qconsulting.ca/fo3/ModConfig5.0.xsd">
@@ -1893,6 +1993,45 @@ mod tests {
         )
         .unwrap();
         assert!(has_fomod(tmp.path()));
+    }
+
+    #[test]
+    fn installer_view_resolves_windows_image_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let logo = root.join("fomod").join("logo.png");
+        fs::create_dir_all(logo.parent().unwrap()).unwrap();
+        fs::write(&logo, b"png").unwrap();
+        fs::write(root.join("fomod").join("ModuleConfig.xml"), IMAGE_XML).unwrap();
+
+        let view = installer_view(root, None).unwrap().unwrap();
+        let plugins = &view.steps[0].groups[0].plugins;
+        assert_eq!(PathBuf::from(plugins[0].image.clone().unwrap()), logo);
+        assert!(plugins[1].image.is_none());
+    }
+
+    #[test]
+    fn installer_view_resolves_case_mismatched_image_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let logo = root.join("Fomod").join("Logo.PNG");
+        fs::create_dir_all(logo.parent().unwrap()).unwrap();
+        fs::write(&logo, b"png").unwrap();
+        fs::write(logo.parent().unwrap().join("ModuleConfig.xml"), IMAGE_XML).unwrap();
+
+        let view = installer_view(root, None).unwrap().unwrap();
+        let image = PathBuf::from(
+            view.steps[0].groups[0].plugins[0]
+                .image
+                .clone()
+                .expect("thumbnail path"),
+        );
+        assert_eq!(
+            fs::canonicalize(&image).unwrap(),
+            fs::canonicalize(&logo).unwrap()
+        );
+        #[cfg(unix)]
+        assert_eq!(image, logo);
     }
 
     #[test]

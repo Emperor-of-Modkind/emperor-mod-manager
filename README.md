@@ -2,7 +2,7 @@
 
 Desktop mod manager for [Nexus Mods](https://www.nexusmods.com/), Thunderstore, and mod.io — on **Linux** and **Windows**.
 
-Browse, download, and deploy mods for dozens of games across Unity/BepInEx, Unreal, RE Engine, FromSoftware, Bethesda/Creation Engine, and many more titles. Detects installs from Steam, Heroic, Lutris, and Bottles on Linux, and Steam (plus optional Heroic) on Windows.
+Browse, download, and deploy mods for dozens of games across Unity/BepInEx, Unreal, RE Engine, FromSoftware, Bethesda/Creation Engine, id Tech, and many more titles. Detects installs from Steam, Heroic, Lutris, and Bottles on Linux, and Steam, the Epic Games Launcher, and optional Heroic on Windows.
 
 ## Highlights
 

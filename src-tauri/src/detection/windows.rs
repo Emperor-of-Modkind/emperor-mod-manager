@@ -1,15 +1,14 @@
-//! Windows game detection via Steam libraryfolders + optional Heroic.
+//! Windows game detection via Steam libraryfolders, the Epic Games Launcher,
+//! and optional Heroic.
 //!
 //! Pure path/cover helpers also compile under `cfg(test)` on other hosts so CI
 //! can cover Steam librarycache resolution without a Windows linker.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use regex::Regex;
-
-#[cfg(target_os = "windows")]
-use std::collections::HashSet;
 #[cfg(target_os = "windows")]
 use winreg::enums::HKEY_CURRENT_USER;
 #[cfg(target_os = "windows")]
@@ -26,6 +25,7 @@ pub fn scan_games() -> Vec<DetectedGame> {
     let mut out = Vec::new();
     out.extend(scan_steam());
     out.extend(scan_heroic());
+    extend_new_installs(&mut out, super::epic::scan_installed());
 
     out.sort_by(|a, b| {
         b.supported
@@ -34,6 +34,27 @@ pub fn scan_games() -> Vec<DetectedGame> {
             .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
     });
     out
+}
+
+/// Append `games` whose install folder is not already in `out`.
+///
+/// Identity matches [`normalize_windows_path_key`], so `C:\Games\Control` and
+/// `c:/games/control` are the same folder. A game with no install path is kept.
+fn extend_new_installs(out: &mut Vec<DetectedGame>, games: impl IntoIterator<Item = DetectedGame>) {
+    let mut seen = HashSet::new();
+    for game in out.iter() {
+        if let Some(install) = game.install_path.as_deref() {
+            seen.insert(normalize_windows_path_key(Path::new(install)));
+        }
+    }
+    for game in games {
+        if let Some(install) = game.install_path.as_deref() {
+            if !seen.insert(normalize_windows_path_key(Path::new(install))) {
+                continue;
+            }
+        }
+        out.push(game);
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -128,7 +149,7 @@ fn same_windows_path(a: &Path, b: &Path) -> bool {
     normalize_windows_path_key(a) == normalize_windows_path_key(b)
 }
 
-fn normalize_windows_path_key(path: &Path) -> String {
+pub(super) fn normalize_windows_path_key(path: &Path) -> String {
     let s = path.to_string_lossy();
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -738,6 +759,37 @@ mod tests {
             resolve_steam_box_art(root.path(), "731").as_deref(),
             Some(plain_only.as_path())
         );
+    }
+
+    fn sample_game(launcher: &str, install_path: &str) -> DetectedGame {
+        DetectedGame {
+            id: install_path.to_string(),
+            title: install_path.to_string(),
+            install_path: Some(install_path.to_string()),
+            launcher: launcher.to_string(),
+            supported: false,
+            plugin_id: None,
+            nexus_domain: None,
+            cover_path: None,
+            cover_url: None,
+            icon_path: None,
+            engine_hint: None,
+        }
+    }
+
+    #[test]
+    fn extend_new_installs_skips_a_folder_already_found() {
+        let mut out = vec![sample_game("Steam", r"C:\Games\Control")];
+        extend_new_installs(
+            &mut out,
+            vec![
+                sample_game("Epic Games Launcher", r"c:/games/control"),
+                sample_game("Epic Games Launcher", r"D:\Games\Hades"),
+            ],
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].launcher, "Steam");
+        assert_eq!(out[1].install_path.as_deref(), Some(r"D:\Games\Hades"));
     }
 
     #[test]

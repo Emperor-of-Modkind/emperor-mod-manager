@@ -47,6 +47,12 @@ export function estimateListRowHeight(posters: boolean, rootPx = 16): number {
   return Math.round((posters ? 14 : 7) * rem);
 }
 
+/** Staged-mod row: 4.5rem poster plus the list's vertical padding. */
+export function estimateStagedModRowHeight(rootPx = 16): number {
+  const rem = rootPx > 0 ? rootPx : 16;
+  return Math.round(5.9 * rem);
+}
+
 /** Used before the results pane has a size. Matches the catalog default. */
 export const BROWSE_PAGE_FALLBACK = 24;
 /** Keeps a very tall window from asking for an unbounded page. */

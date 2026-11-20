@@ -31,6 +31,36 @@ type DragSession = {
   activated: boolean;
 };
 
+/**
+ * Where to insert `modId` inside its enabled group, based on the list's box.
+ * `display` is the on-screen order. The result is an index among the other
+ * rows in that group, or that group's length when the pointer is past the end.
+ * Unmounted rows still count: each slot is an equal share of the list height.
+ */
+export function stagedDropGroupIndex(
+  display: readonly { id: string; enabled: boolean }[],
+  modId: string,
+  enabled: boolean,
+  pointerY: number,
+  listTop: number,
+  listHeight: number,
+): number {
+  const others = display.filter((m) => m.enabled === enabled && m.id !== modId);
+  if (others.length === 0 || !(listHeight > 0) || display.length === 0) {
+    return others.length;
+  }
+  const stride = listHeight / display.length;
+  const y = pointerY - listTop;
+  let insertAt = 0;
+  for (let i = 0; i < display.length; i++) {
+    const item = display[i];
+    if (item.enabled !== enabled || item.id === modId) continue;
+    if (y < i * stride + stride / 2) return insertAt;
+    insertAt += 1;
+  }
+  return insertAt;
+}
+
 function groupIndexOf(mods: StagedMod[], modId: string): number {
   const mod = mods.find((m) => m.id === modId);
   if (!mod) return -1;
@@ -166,16 +196,24 @@ export function useStagedModDrag({
 
   const indexFromPointerY = useCallback(
     (pointerY: number, modId: string, enabled: boolean) => {
-      const mods = visibleModsRef.current;
-      const group = mods.filter((m) => m.enabled === enabled);
-      const others = group.filter((m) => m.id !== modId);
-      for (let i = 0; i < others.length; i++) {
-        const el = rowRefs.current.get(others[i].id);
-        if (!el) continue;
-        const rect = el.getBoundingClientRect();
-        if (pointerY < rect.top + rect.height / 2) return i;
+      const list = listRef.current;
+      const display = previewVisibleMods(
+        visibleModsRef.current,
+        modId,
+        previewRef.current,
+      );
+      if (!list) {
+        return display.filter((m) => m.enabled === enabled && m.id !== modId).length;
       }
-      return others.length;
+      const rect = list.getBoundingClientRect();
+      return stagedDropGroupIndex(
+        display,
+        modId,
+        enabled,
+        pointerY,
+        rect.top,
+        rect.height,
+      );
     },
     [],
   );

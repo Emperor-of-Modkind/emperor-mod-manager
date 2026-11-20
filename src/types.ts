@@ -13,6 +13,8 @@ export type SystemPalette = {
   muted: string;
   line: string;
   accent: string;
+  /** Toolkit selection foreground. Used only when it contrasts with `accent`. */
+  on_accent?: string | null;
   input_bg: string;
 };
 
@@ -357,6 +359,10 @@ export type ModDetail = {
   status?: string | null;
   contains_adult_content?: boolean;
   uploaded_users_profile_url?: string | null;
+  /** False when Nexus has hidden, removed, or otherwise unpublished the mod. */
+  available?: boolean | null;
+  /** Hidden or removed notice from the public mod page, when Nexus says why. */
+  availability_note?: string | null;
 };
 
 export type ModFileInfo = {
@@ -521,6 +527,8 @@ export type SavedCollectionEntry = {
   nexus_count: number;
   thunderstore_count: number;
   modio_count: number;
+  /** emperor-share:{hash}. Filled by the list command. */
+  share_id?: string | null;
 };
 
 export type SavedCollectionDetail = {
