@@ -1,11 +1,15 @@
 import {
+  animate,
   useReducedMotion,
   motion,
   AnimatePresence,
-  type HTMLMotionProps,
 } from "motion/react";
 import {
+  createContext,
+  useContext,
   useEffect,
+  useLayoutEffect,
+  useMemo,
   useRef,
   type ButtonHTMLAttributes,
   type CSSProperties,
@@ -253,19 +257,64 @@ export function FadeIn({
   );
 }
 
-function layoutTransition(reduced: boolean): HTMLMotionProps<"span">["transition"] {
-  return { layout: { duration: reduced ? 0 : MOTION_FAST, ease: MOTION_EASE } };
+type LocalRect = {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+};
+
+type LastActive = {
+  el: HTMLButtonElement;
+  rect: LocalRect | null;
+};
+
+type HighlightGroupApi = {
+  getLastActive: () => LastActive | null;
+  setLastActive: (entry: LastActive) => void;
+};
+
+const HighlightGroupContext = createContext<HighlightGroupApi | null>(null);
+
+function HighlightGroup({ children }: { children: ReactNode }) {
+  const lastActiveRef = useRef<LastActive | null>(null);
+  const api = useMemo<HighlightGroupApi>(
+    () => ({
+      getLastActive: () => lastActiveRef.current,
+      setLastActive: (entry) => {
+        lastActiveRef.current = entry;
+      },
+    }),
+    [],
+  );
+  return (
+    <HighlightGroupContext.Provider value={api}>
+      {children}
+    </HighlightGroupContext.Provider>
+  );
+}
+
+function readLocalRect(el: HTMLButtonElement): LocalRect | null {
+  const width = el.offsetWidth;
+  const height = el.offsetHeight;
+  if (width <= 0 || height <= 0) return null;
+  return {
+    left: el.offsetLeft,
+    top: el.offsetTop,
+    width,
+    height,
+  };
 }
 
 type HighlightProps = ButtonHTMLAttributes<HTMLButtonElement> & {
-  layoutId: string;
+  layoutId?: string;
   active: boolean;
   indicatorClass: string;
   labelClass: string;
 };
 
 function HighlightButton({
-  layoutId,
+  layoutId: _layoutId,
   active,
   indicatorClass,
   labelClass,
@@ -275,22 +324,79 @@ function HighlightButton({
   ...rest
 }: HighlightProps) {
   const reduced = useReduced();
+  const group = useContext(HighlightGroupContext);
+  const buttonRef = useRef<HTMLButtonElement>(null);
+  const indicatorRef = useRef<HTMLSpanElement>(null);
+  const wasActiveRef = useRef(active);
+
+  useLayoutEffect(() => {
+    const prevActive = wasActiveRef.current;
+    wasActiveRef.current = active;
+
+    const btn = buttonRef.current;
+    if (!active || !btn || !group) return;
+
+    const curr = readLocalRect(btn);
+    const prev = group.getLastActive();
+    group.setLastActive({ el: btn, rect: curr });
+
+    const indicator = indicatorRef.current;
+    if (reduced || prevActive || !indicator || !curr || !prev || prev.el === btn) {
+      return;
+    }
+
+    const prevRect = prev.el.isConnected
+      ? (readLocalRect(prev.el) ?? prev.rect)
+      : prev.rect;
+    if (!prevRect) return;
+
+    const dx = prevRect.left - curr.left;
+    const dy = prevRect.top - curr.top;
+    const sx = prevRect.width / curr.width;
+    const sy = prevRect.height / curr.height;
+    if (dx === 0 && dy === 0 && sx === 1 && sy === 1) return;
+
+    indicator.style.transformOrigin = "top left";
+    const controls = animate(
+      indicator,
+      {
+        x: [dx, 0],
+        y: [dy, 0],
+        scaleX: [sx, 1],
+        scaleY: [sy, 1],
+      },
+      { duration: MOTION_FAST, ease: MOTION_EASE },
+    );
+    return () => {
+      controls.stop();
+      indicator.style.transform = "";
+    };
+  }, [active, group, reduced]);
+
+  useLayoutEffect(() => {
+    const btn = buttonRef.current;
+    if (!active || !btn || !group) return;
+    const curr = readLocalRect(btn);
+    if (curr) {
+      group.setLastActive({ el: btn, rect: curr });
+    }
+  });
+
   return (
-    <button type={type} className={className} {...rest}>
+    <button ref={buttonRef} type={type} className={className} {...rest}>
       {active ? (
-        reduced ? (
-          <span className={indicatorClass} aria-hidden="true" />
-        ) : (
-          <motion.span
-            layoutId={layoutId}
-            className={indicatorClass}
-            aria-hidden="true"
-            transition={layoutTransition(reduced)}
-          />
-        )
+        <span ref={indicatorRef} className={indicatorClass} aria-hidden="true" />
       ) : null}
       <span className={labelClass}>{children}</span>
     </button>
+  );
+}
+
+export function NavGroup({ children }: { children: ReactNode }) {
+  return (
+    <HighlightGroup>
+      <nav>{children}</nav>
+    </HighlightGroup>
   );
 }
 
@@ -300,7 +406,7 @@ export function NavTab({
   className,
   children,
   ...rest
-}: ButtonHTMLAttributes<HTMLButtonElement> & { layoutId: string; active: boolean }) {
+}: ButtonHTMLAttributes<HTMLButtonElement> & { layoutId?: string; active: boolean }) {
   return (
     <HighlightButton
       layoutId={layoutId}
@@ -322,7 +428,11 @@ export function Segment({
   children: ReactNode;
   className?: string;
 }) {
-  return <div className={className ? `segment ${className}` : "segment"}>{children}</div>;
+  return (
+    <HighlightGroup>
+      <div className={className ? `segment ${className}` : "segment"}>{children}</div>
+    </HighlightGroup>
+  );
 }
 
 export function SegmentTab({
@@ -331,7 +441,7 @@ export function SegmentTab({
   className,
   children,
   ...rest
-}: ButtonHTMLAttributes<HTMLButtonElement> & { layoutId: string; active: boolean }) {
+}: ButtonHTMLAttributes<HTMLButtonElement> & { layoutId?: string; active: boolean }) {
   return (
     <HighlightButton
       layoutId={layoutId}

@@ -36,8 +36,9 @@ describe("imageLoadQueue", () => {
 
     releases[0]();
     expect(granted).toHaveLength(MAX_CONCURRENT_IMAGE_LOADS + 1);
+    // LIFO: most recently enqueued entry is granted next
     expect(granted[MAX_CONCURRENT_IMAGE_LOADS]).toBe(
-      `https://example.com/img-${MAX_CONCURRENT_IMAGE_LOADS}.jpg`,
+      `https://example.com/img-${MAX_CONCURRENT_IMAGE_LOADS + 3}.jpg`,
     );
 
     // Calling release twice is a no-op
@@ -54,17 +55,17 @@ describe("imageLoadQueue", () => {
       releases.push(enqueueImageLoad(url, () => granted.push(url)));
     }
 
-    // Cancel the first queued entry (index MAX_CONCURRENT_IMAGE_LOADS)
-    releases[MAX_CONCURRENT_IMAGE_LOADS]();
+    // Cancel the newest queued entry (index MAX_CONCURRENT_IMAGE_LOADS + 1)
+    releases[MAX_CONCURRENT_IMAGE_LOADS + 1]();
     expect(getImageQueueStats().pending).toBe(1);
 
-    // Release an active slot; the cancelled one is skipped
+    // Release an active slot; the cancelled one is skipped and the remaining queued one runs
     releases[0]();
     expect(granted).toContain(
-      `https://example.com/img-${MAX_CONCURRENT_IMAGE_LOADS + 1}.jpg`,
+      `https://example.com/img-${MAX_CONCURRENT_IMAGE_LOADS}.jpg`,
     );
     expect(granted).not.toContain(
-      `https://example.com/img-${MAX_CONCURRENT_IMAGE_LOADS}.jpg`,
+      `https://example.com/img-${MAX_CONCURRENT_IMAGE_LOADS + 1}.jpg`,
     );
   });
 
@@ -115,23 +116,23 @@ describe("imageLoadQueue", () => {
       cachedPending: 3,
     });
 
-    // Cancel a queued cached entry before it starts
-    releases[MAX_CONCURRENT_CACHED_DECODES + 1]();
+    // Cancel the newest queued cached entry before it starts
+    releases[MAX_CONCURRENT_CACHED_DECODES + 2]();
     expect(getImageQueueStats().cachedPending).toBe(2);
 
-    // Releasing an active slot pumps the next non-cancelled cached entry
+    // Releasing active slots pumps newest non-cancelled cached entries (LIFO)
     releases[0]();
     expect(granted).toHaveLength(MAX_CONCURRENT_CACHED_DECODES + 1);
     expect(granted).toContain(
-      `https://example.com/cached-${MAX_CONCURRENT_CACHED_DECODES}.jpg`,
+      `https://example.com/cached-${MAX_CONCURRENT_CACHED_DECODES + 1}.jpg`,
     );
 
     releases[1]();
     expect(granted).toContain(
-      `https://example.com/cached-${MAX_CONCURRENT_CACHED_DECODES + 2}.jpg`,
+      `https://example.com/cached-${MAX_CONCURRENT_CACHED_DECODES}.jpg`,
     );
     expect(granted).not.toContain(
-      `https://example.com/cached-${MAX_CONCURRENT_CACHED_DECODES + 1}.jpg`,
+      `https://example.com/cached-${MAX_CONCURRENT_CACHED_DECODES + 2}.jpg`,
     );
   });
 });

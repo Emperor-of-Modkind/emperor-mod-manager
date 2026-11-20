@@ -125,6 +125,9 @@ pub struct AppConfig {
     /// How many finished downloads to keep in the Recent list.
     #[serde(default = "default_recent_downloads_limit")]
     pub recent_downloads_limit: u32,
+    /// Auto-dismiss timeouts (seconds) for status banners; `0` means never.
+    #[serde(default)]
+    pub banner_timeouts: BannerTimeouts,
     /// Set after the first import of managed games from legacy nexus-manager config.
     #[serde(default)]
     pub legacy_games_merged: bool,
@@ -199,6 +202,43 @@ pub fn clamp_recent_downloads_limit(limit: u32) -> u32 {
     limit.clamp(MIN_RECENT_DOWNLOADS_LIMIT, MAX_RECENT_DOWNLOADS_LIMIT)
 }
 
+pub const MAX_BANNER_TIMEOUT_SECONDS: u32 = 86_400;
+
+/// Per-color auto-dismiss timeouts in seconds (`0` means never auto-dismiss).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct BannerTimeouts {
+    pub info: u32,
+    pub warn: u32,
+    pub error: u32,
+}
+
+impl Default for BannerTimeouts {
+    fn default() -> Self {
+        Self {
+            info: 10,
+            warn: 300,
+            error: 0,
+        }
+    }
+}
+
+pub fn clamp_banner_timeout_seconds(seconds: u32) -> u32 {
+    if seconds == 0 {
+        0
+    } else {
+        seconds.min(MAX_BANNER_TIMEOUT_SECONDS)
+    }
+}
+
+pub fn clamp_banner_timeouts(timeouts: BannerTimeouts) -> BannerTimeouts {
+    BannerTimeouts {
+        info: clamp_banner_timeout_seconds(timeouts.info),
+        warn: clamp_banner_timeout_seconds(timeouts.warn),
+        error: clamp_banner_timeout_seconds(timeouts.error),
+    }
+}
+
 /// Resolves a missing first-run flag. `None` means the field was never saved:
 /// existing installs with an API key are complete, and everyone else stays in setup.
 /// A saved `false` is left false even when an API key exists later.
@@ -223,12 +263,27 @@ impl Default for AppConfig {
             linux_system_backend: default_linux_system_backend(),
             install_click_behavior: InstallClickBehavior::Downloads,
             recent_downloads_limit: default_recent_downloads_limit(),
+            banner_timeouts: BannerTimeouts::default(),
             legacy_games_merged: false,
             tools: ToolsConfig::default(),
             initial_setup_complete: None,
             nexus_website_signed_in: false,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LaunchEnvVar {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchCommandSource {
+    #[default]
+    Emperor,
+    Launcher,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -264,6 +319,21 @@ pub struct ManagedGame {
     /// Requirements hidden from the review until the user unignores them.
     #[serde(default)]
     pub ignored_requirements: Vec<IgnoredRequirement>,
+    /// Optional relative or absolute executable override for launching non-Steam games.
+    #[serde(default)]
+    pub launch_executable: Option<String>,
+    /// Whether Emperor applies its own launch commands (WINEDLLOVERRIDES, tool env) or defers to the launcher.
+    #[serde(default)]
+    pub launch_command_source: LaunchCommandSource,
+    /// User-defined custom environment variables for launching modded.
+    #[serde(default)]
+    pub custom_env_vars: Vec<LaunchEnvVar>,
+    /// Optional wrapper command (e.g. "gamemoderun").
+    #[serde(default)]
+    pub custom_wrapper: Option<String>,
+    /// Optional extra launch arguments (e.g. "--launcher-skip").
+    #[serde(default)]
+    pub custom_launch_args: Option<String>,
 }
 
 /// A requirement the user chose to hide for one managed game.
@@ -333,6 +403,10 @@ impl Paths {
 
     pub fn deploy_manifest(&self, game_id: &str) -> PathBuf {
         self.game_data_dir(game_id).join("deployed.json")
+    }
+
+    pub fn last_launch_manifest(&self, game_id: &str) -> PathBuf {
+        self.game_data_dir(game_id).join("last-launch-deployed.json")
     }
 
     pub fn logs_dir(&self) -> PathBuf {
@@ -480,5 +554,37 @@ mod tests {
         assert_eq!(normalize_accent_color("#AABBCC"), "#aabbcc");
         assert_eq!(normalize_accent_color("112233"), "#112233");
         assert_eq!(normalize_accent_color("nope"), DEFAULT_ACCENT_COLOR);
+    }
+
+    #[test]
+    fn banner_timeouts_defaults_and_roundtrip_zero_as_never() {
+        let cfg: AppConfig = toml::from_str("").unwrap();
+        assert_eq!(
+            cfg.banner_timeouts,
+            BannerTimeouts {
+                info: 10,
+                warn: 300,
+                error: 0,
+            }
+        );
+
+        let mut custom = cfg.clone();
+        custom.banner_timeouts = clamp_banner_timeouts(BannerTimeouts {
+            info: 0,
+            warn: 100_000,
+            error: 15,
+        });
+        assert_eq!(
+            custom.banner_timeouts,
+            BannerTimeouts {
+                info: 0,
+                warn: MAX_BANNER_TIMEOUT_SECONDS,
+                error: 15,
+            }
+        );
+
+        let raw = toml::to_string_pretty(&custom).unwrap();
+        let reloaded: AppConfig = toml::from_str(&raw).unwrap();
+        assert_eq!(reloaded.banner_timeouts, custom.banner_timeouts);
     }
 }

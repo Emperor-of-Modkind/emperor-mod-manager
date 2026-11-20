@@ -475,6 +475,16 @@ fn install_scan_dirs(install_path: &Path, project_name: Option<&str>) -> Vec<Pat
             dirs.push(binaries);
         }
     }
+    if let Some(bin) = child_dir_ci(install_path, "bin") {
+        if bin.is_dir() && !dirs.iter().any(|dir| dir == &bin) {
+            dirs.push(bin.clone());
+        }
+        if let Some(x64) = child_dir_ci(&bin, "x64") {
+            if x64.is_dir() && !dirs.iter().any(|dir| dir == &x64) {
+                dirs.push(x64);
+            }
+        }
+    }
     dirs
 }
 
@@ -542,13 +552,28 @@ fn staging_scan_dirs(content_root: &Path) -> Vec<PathBuf> {
                 }
             }
         }
+        push_bin_subdirs(&mut dirs, wrapper);
     }
     if let Some(binaries) = child_dir_ci(content_root, "Binaries") {
         if !dirs.iter().any(|dir| dir == &binaries) {
             dirs.push(binaries);
         }
     }
+    push_bin_subdirs(&mut dirs, content_root);
     dirs
+}
+
+fn push_bin_subdirs(dirs: &mut Vec<PathBuf>, root: &Path) {
+    if let Some(bin) = child_dir_ci(root, "bin") {
+        if bin.is_dir() && !dirs.iter().any(|dir| dir == &bin) {
+            dirs.push(bin.clone());
+        }
+        if let Some(x64) = child_dir_ci(&bin, "x64") {
+            if x64.is_dir() && !dirs.iter().any(|dir| dir == &x64) {
+                dirs.push(x64);
+            }
+        }
+    }
 }
 
 fn direct_proxy_dlls(dir: &Path) -> Vec<String> {
@@ -842,5 +867,26 @@ mod tests {
         assert_eq!(advice.needs[0].dll, "dwmapi");
         assert!(!advice.can_apply);
         assert!(advice.summary.contains("no Steam app id"));
+    }
+
+    #[test]
+    fn staged_bin_x64_proxy_dlls_are_detected() {
+        let install = tempfile::tempdir().unwrap();
+        let staged_mod = tempfile::tempdir().unwrap();
+        let x64 = staged_mod.path().join("bin").join("x64");
+        std::fs::create_dir_all(&x64).unwrap();
+        std::fs::write(x64.join("winmm.dll"), b"x").unwrap();
+        std::fs::write(x64.join("version.dll"), b"x").unwrap();
+
+        let staged = [StagedProxySource {
+            name: "RED4ext",
+            path: staged_mod.path(),
+            enabled: true,
+        }];
+        let advice = advise_wine_overrides(install.path(), None, &staged, "", false, None)
+            .expect("staged bin/x64 proxy DLLs should produce advice before deployment");
+        let dlls: Vec<&str> = advice.needs.iter().map(|n| n.dll.as_str()).collect();
+        assert!(dlls.contains(&"winmm"));
+        assert!(dlls.contains(&"version"));
     }
 }

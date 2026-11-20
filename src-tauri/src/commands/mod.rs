@@ -168,6 +168,12 @@ pub struct AppState {
     /// downloads at once, and saturating the connection is what makes CDN
     /// streams stall and end short in the first place.
     pub download_slots: tokio::sync::Semaphore,
+    /// Per-game launch & process-monitoring state.
+    pub launch_states: Arc<Mutex<HashMap<String, crate::launch::GameLaunchState>>>,
+    /// Per-game close signal flags for active launch watchers.
+    pub close_flags: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    /// Serverless P2P social service (iroh).
+    pub p2p: Arc<crate::p2p::P2pService>,
 }
 
 /// Enough to keep a fast link busy without starving any single transfer.
@@ -303,6 +309,7 @@ impl AppState {
         if recent.len() != recent_before {
             save_recent_downloads(&paths, &recent);
         }
+        let p2p = crate::p2p::P2pService::new(paths.clone());
         Ok(Self {
             paths,
             config: Mutex::new(config),
@@ -335,6 +342,9 @@ impl AppState {
             detected_games: Mutex::new(None),
             ts_communities_cache: Mutex::new(None),
             download_slots: tokio::sync::Semaphore::new(MAX_CONCURRENT_DOWNLOADS),
+            launch_states: Arc::new(Mutex::new(HashMap::new())),
+            close_flags: Arc::new(Mutex::new(HashMap::new())),
+            p2p,
         })
     }
 
@@ -1270,7 +1280,11 @@ pub fn manage_game(
     let modio_id = modio_game_id
         .filter(|&id| id > 0)
         .or_else(|| modio_api::seed_modio_game_id(&plugin_id));
-    if domain.is_empty() && ts_community.is_none() && modio_id.is_none() {
+    if domain.is_empty()
+        && ts_community.is_none()
+        && modio_id.is_none()
+        && matches!(plugin_id.as_str(), "unreal" | "bepinex")
+    {
         return Err(
             "Enter a Nexus Mods domain, Thunderstore community, and/or mod.io game ID.".into(),
         );
@@ -1318,6 +1332,11 @@ pub fn manage_game(
         tool_overrides: None,
         game_version: None,
         ignored_requirements: Vec::new(),
+        launch_executable: None,
+        launch_command_source: config::LaunchCommandSource::default(),
+        custom_env_vars: Vec::new(),
+        custom_wrapper: None,
+        custom_launch_args: None,
     };
     let install_exists = Path::new(&install_path).is_dir();
     let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
@@ -1923,14 +1942,97 @@ pub async fn relink_managed_game(
         .map_err(|e| e.to_string())
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct UnmanageCollectionStatus {
+    pub has_portable_mods: bool,
+    pub mod_count: usize,
+    pub skipped_count: usize,
+    pub already_saved: bool,
+    pub default_name: String,
+}
+
+#[tauri::command]
+pub fn get_unmanage_collection_status(
+    state: State<'_, AppState>,
+    game_id: String,
+) -> Result<UnmanageCollectionStatus, String> {
+    let game = managed_game(&state, &game_id)?;
+    let order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
+    let (mut manifest, skipped, _) = share::build_manifest_from_loadorder(&order, &game, None);
+    let mod_count = manifest.mods.len();
+    let skipped_count = skipped.len();
+    if mod_count == 0 {
+        return Ok(UnmanageCollectionStatus {
+            has_portable_mods: false,
+            mod_count: 0,
+            skipped_count,
+            already_saved: false,
+            default_name: game.title,
+        });
+    }
+    let override_version = game
+        .game_version
+        .clone()
+        .filter(|version| !version.trim().is_empty());
+    let detected = games::detect_install_version(Path::new(&game.install_path));
+    manifest.game_versions = override_version.or(detected).map(|version| vec![version]);
+    let code = share::encode_share_manifest(&manifest).map_err(|e| e.to_string())?;
+    let already_saved =
+        share::is_loadout_saved_in_personal_collections(&state.paths, &game, &manifest, &code)
+            .map_err(|e| e.to_string())?;
+    Ok(UnmanageCollectionStatus {
+        has_portable_mods: true,
+        mod_count,
+        skipped_count,
+        already_saved,
+        default_name: game.title,
+    })
+}
+
+fn cleanup_unmanaged_game_files(
+    paths: &Paths,
+    id: &str,
+    install_path: Option<&str>,
+    plugin_id: Option<&str>,
+) -> Result<(), String> {
+    mods::remove_all_mods(paths, id, install_path.map(Path::new)).map_err(|e| e.to_string())?;
+    if let (Some(install), Some(pid)) = (install_path, plugin_id) {
+        if let Some(plugin) = games::plugin_by_id(pid) {
+            mods::prune_empty_loader_dirs(plugin, Path::new(install));
+        }
+    }
+    let game_dir = paths.game_data_dir(id);
+    if game_dir.exists() {
+        std::fs::remove_dir_all(&game_dir).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn unmanage_game(state: State<'_, AppState>, id: String) -> Result<(), String> {
     let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
+    let game_meta = cfg
+        .managed_games
+        .iter()
+        .find(|g| g.id == id)
+        .map(|g| (g.install_path.clone(), g.plugin_id.clone()));
     cfg.managed_games.retain(|g| g.id != id);
     if cfg.last_active_game_id.as_deref() == Some(&id) {
         cfg.last_active_game_id = cfg.managed_games.first().map(|g| g.id.clone());
     }
     config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())?;
+    drop(cfg);
+
+    let (install_path, plugin_id) = match game_meta {
+        Some((install, pid)) => (Some(install), Some(pid)),
+        None => (None, None),
+    };
+    cleanup_unmanaged_game_files(
+        &state.paths,
+        &id,
+        install_path.as_deref(),
+        plugin_id.as_deref(),
+    )?;
     migration::remove_game_from_legacy_config(&id).map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -1950,6 +2052,7 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<serde_json::Value, Str
         cfg.initial_setup_complete = Some(initial_setup_complete);
         config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())?;
     }
+    let banner_timeouts = config::clamp_banner_timeouts(cfg.banner_timeouts);
     Ok(serde_json::json!({
         "adult_content": cfg.adult_content,
         "game_version_warnings": cfg.game_version_warnings,
@@ -1961,6 +2064,11 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<serde_json::Value, Str
         "linux_system_backend": cfg.linux_system_backend,
         "install_click_behavior": cfg.install_click_behavior,
         "recent_downloads_limit": config::clamp_recent_downloads_limit(cfg.recent_downloads_limit),
+        "banner_timeouts": {
+            "info": (banner_timeouts.info > 0).then_some(banner_timeouts.info),
+            "warn": (banner_timeouts.warn > 0).then_some(banner_timeouts.warn),
+            "error": (banner_timeouts.error > 0).then_some(banner_timeouts.error),
+        },
         "has_api_key": has_key,
         "has_modio_api_key": has_modio_api_key,
         "initial_setup_complete": initial_setup_complete,
@@ -2117,6 +2225,28 @@ pub fn set_recent_downloads_limit(state: State<'_, AppState>, limit: u32) -> Res
     }
     commit_recent_downloads(&state);
     Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BannerTimeoutsInput {
+    pub info: Option<u32>,
+    pub warn: Option<u32>,
+    pub error: Option<u32>,
+}
+
+#[tauri::command]
+pub fn set_banner_timeouts(
+    state: State<'_, AppState>,
+    timeouts: BannerTimeoutsInput,
+) -> Result<(), String> {
+    let next = config::clamp_banner_timeouts(config::BannerTimeouts {
+        info: timeouts.info.unwrap_or(0),
+        warn: timeouts.warn.unwrap_or(0),
+        error: timeouts.error.unwrap_or(0),
+    });
+    let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
+    cfg.banner_timeouts = next;
+    config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -3553,6 +3683,7 @@ pub async fn download_thunderstore_mod(
             mod_ids: member_ids,
             installed_at: String::new(),
             game_versions: None,
+            friend_sync: None,
         };
         mods::record_installed_collection(&state.paths, &game_id, collection, &new_ids)
             .map_err(|e| e.to_string())?;
@@ -3712,6 +3843,7 @@ pub async fn import_thunderstore_profile(
         mod_ids: member_ids,
         installed_at: String::new(),
         game_versions: None,
+        friend_sync: None,
     };
     let collection =
         mods::record_installed_collection(&state.paths, &game_id, collection, &new_ids)
@@ -5330,6 +5462,7 @@ pub async fn install_collection(
             mod_ids: member_ids,
             installed_at: String::new(),
             game_versions: None,
+            friend_sync: None,
         };
         mods::record_installed_collection(&state.paths, &game_id, collection, &new_ids)
             .map_err(|e| e.to_string())?;
@@ -7124,6 +7257,7 @@ pub fn record_nexus_collection(
         mod_ids: member_ids,
         installed_at: String::new(),
         game_versions: None,
+        friend_sync: None,
     };
     mods::record_installed_collection(&state.paths, &game_id, collection, &new_ids)
         .map_err(|e| e.to_string())
@@ -7203,6 +7337,7 @@ pub fn export_share_code(
         mod_ids: member_ids,
         installed_at: String::new(),
         game_versions,
+        friend_sync: None,
     };
     // Empty new_mod_ids: mods were already staged; keep independent so uninstall
     // of this share collection does not delete the user's loadout.
@@ -7598,6 +7733,7 @@ pub async fn import_share_code(
             mod_ids: member_ids.clone(),
             installed_at: String::new(),
             game_versions: manifest.game_versions.clone(),
+            friend_sync: None,
         };
         Some(
             mods::record_installed_collection(&state.paths, &game_id, col, &new_ids)
@@ -7680,6 +7816,7 @@ pub fn record_emperor_share(
         mod_ids: ids,
         installed_at: String::new(),
         game_versions,
+        friend_sync: None,
     };
     mods::record_installed_collection(&state.paths, &game_id, collection, &new_ids)
         .map_err(|e| e.to_string())
@@ -7858,14 +7995,28 @@ pub fn diagnose_load(
         .map(|staged| staged.name.clone())
         .collect();
     let manifest_path = state.paths.deploy_manifest(&game_id);
-    let deployed_paths = std::fs::read_to_string(&manifest_path)
+    let mut deployed_paths = std::fs::read_to_string(&manifest_path)
         .ok()
         .and_then(|raw| serde_json::from_str::<mods::DeployManifest>(&raw).ok())
         .map(|manifest| manifest.paths)
         .unwrap_or_default();
-    let deployed_at = std::fs::metadata(&manifest_path)
+    let mut deployed_at = std::fs::metadata(&manifest_path)
         .and_then(|meta| meta.modified())
         .ok();
+    if deployed_paths.is_empty() {
+        let last_path = state.paths.last_launch_manifest(&game_id);
+        if let Some(last_paths) = std::fs::read_to_string(&last_path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<mods::DeployManifest>(&raw).ok())
+            .map(|manifest| manifest.paths)
+            .filter(|p| !p.is_empty())
+        {
+            deployed_paths = last_paths;
+            deployed_at = std::fs::metadata(&last_path)
+                .and_then(|meta| meta.modified())
+                .ok();
+        }
+    }
     let manager_log = crate::app_log::recent_warn_lines(&state.paths.log_file());
     Ok(crate::diagnostics::diagnose(
         &crate::diagnostics::DiagnoseInput {
@@ -8168,13 +8319,12 @@ async fn repair_damaged_staging(
     warnings
 }
 
-#[tauri::command]
-pub async fn deploy_mods(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-    game_id: String,
-) -> Result<mods::DeployResult, String> {
-    let game = {
+async fn deploy_game_inner(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    game_id: &str,
+) -> Result<(mods::DeployResult, ManagedGame), String> {
+    let mut game = {
         let cfg = state.config.lock().map_err(|e| e.to_string())?;
         cfg.managed_games
             .iter()
@@ -8182,7 +8332,7 @@ pub async fn deploy_mods(
             .cloned()
             .ok_or_else(|| "Managed game not found".to_string())?
     };
-    let repair_warnings = repair_damaged_staging(&app, &state, &game_id).await;
+    let repair_warnings = repair_damaged_staging(app, state, game_id).await;
     let install = PathBuf::from(&game.install_path);
     let Some(saved_plugin) = games::plugin_by_id(&game.plugin_id) else {
         return Err(format!("Unknown game plugin: {}", game.plugin_id));
@@ -8196,6 +8346,7 @@ pub async fn deploy_mods(
         if let Some(next) = games::plugin_by_id(preferred) {
             let display = next.info().display_name;
             plugin_id = preferred.to_string();
+            game.plugin_id = plugin_id.clone();
             match state.config.lock() {
                 Ok(mut cfg) => {
                     if let Some(saved) = cfg.managed_games.iter_mut().find(|g| g.id == game_id) {
@@ -8236,7 +8387,7 @@ pub async fn deploy_mods(
         Ok(games::RuntimePrepOutcome::NeedsAssist { warnings, request }) => {
             let mut warnings = warnings;
             if let Err(e) =
-                wait_for_loader_assist(&app, &state, &game_id, plugin, &prep, &request).await
+                wait_for_loader_assist(app, state, game_id, plugin, &prep, &request).await
             {
                 warnings.push(e);
             } else if let Ok(extra) = plugin.finish_runtime_prep(&prep) {
@@ -8248,7 +8399,7 @@ pub async fn deploy_mods(
     };
     let mut result = mods::deploy(
         &state.paths,
-        &game_id,
+        game_id,
         &plugin_id,
         &install,
         game.project_name.as_deref(),
@@ -8260,7 +8411,7 @@ pub async fn deploy_mods(
     result.warnings.splice(0..0, loader_warnings.drain(..));
     result.warnings.splice(0..0, repair_warnings);
     if !result.plugin_skips.is_empty() {
-        if let Ok(order) = mods::load_loadorder(&state.paths, &game_id) {
+        if let Ok(order) = mods::load_loadorder(&state.paths, game_id) {
             let mut owners: Vec<StagedMod> = Vec::new();
             let mut seen: HashSet<String> = HashSet::new();
             for skip in &result.plugin_skips {
@@ -8280,10 +8431,10 @@ pub async fn deploy_mods(
             }
             let seeds = owners.iter().filter_map(seed_from_staged).collect();
             result.missing_requirements =
-                collect_requirement_seeds(&state, seeds, staged_nexus_mods(&order.mods)).await;
+                collect_requirement_seeds(state, seeds, staged_nexus_mods(&order.mods)).await;
         }
     }
-    Ok(result)
+    Ok((result, game))
 }
 
 async fn wait_for_loader_assist(
@@ -8326,8 +8477,289 @@ async fn wait_for_loader_assist(
     ))
 }
 
+fn ensure_launch_idle(state: &AppState, game_id: &str) -> Result<(), String> {
+    let map = state.launch_states.lock().map_err(|e| e.to_string())?;
+    if let Some(cur) = map.get(game_id) {
+        if cur.is_busy() {
+            return Err("Game launch or session is already in progress.".to_string());
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
-pub fn purge_mods(state: State<'_, AppState>, game_id: String) -> Result<(), String> {
+pub async fn launch_modded(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    game_id: String,
+) -> Result<crate::launch::LaunchResult, String> {
+    ensure_launch_idle(&state, &game_id)?;
+    let started_at = crate::launch::now_unix_secs();
+    crate::launch::set_and_emit_state(
+        &app,
+        &state.launch_states,
+        crate::launch::GameLaunchState {
+            game_id: game_id.clone(),
+            mode: crate::launch::LaunchMode::Modded,
+            phase: crate::launch::LaunchPhase::Deploying,
+            pids: Vec::new(),
+            started_at,
+            error: None,
+        },
+    );
+
+    let (deploy_result, game) = match deploy_game_inner(&app, &state, &game_id).await {
+        Ok(res) => res,
+        Err(e) => {
+            crate::launch::set_and_emit_state(
+                &app,
+                &state.launch_states,
+                crate::launch::GameLaunchState::idle(game_id),
+            );
+            return Err(e);
+        }
+    };
+
+    let target = match crate::launch::resolve_launch_target(&game) {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = crate::launch::revert_game_deployment(
+                &state.paths,
+                &game_id,
+                &game.install_path,
+                &game.plugin_id,
+            );
+            crate::launch::set_and_emit_state(
+                &app,
+                &state.launch_states,
+                crate::launch::GameLaunchState::idle(game_id),
+            );
+            return Err(format!("{e:#}"));
+        }
+    };
+
+    let steam_app_id = match &target {
+        crate::launch::LaunchTarget::Steam { app_id } => Some(app_id.clone()),
+        _ => None,
+    };
+
+    let mut env_vars = HashMap::new();
+    let mut wrapper: Option<String> = None;
+    let mut launch_args: Option<String> = None;
+    if game.launch_command_source == config::LaunchCommandSource::Emperor {
+        let preview = build_launch_preview(&state, &game);
+        let mut merged: Vec<config::LaunchEnvVar> = preview.auto_env_vars;
+        for cv in preview.custom_env_vars {
+            if let Some(pos) = merged.iter().position(|v| v.name == cv.name) {
+                merged[pos].value = cv.value;
+            } else {
+                merged.push(cv);
+            }
+        }
+        for v in &merged {
+            env_vars.insert(v.name.clone(), v.value.clone());
+        }
+        wrapper = game
+            .custom_wrapper
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        launch_args = game
+            .custom_launch_args
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
+        match &target {
+            crate::launch::LaunchTarget::Steam { app_id } => {
+                #[cfg(target_os = "linux")]
+                {
+                    let existing = crate::tools::steam_launch::read_launch_options(app_id)
+                        .unwrap_or(None)
+                        .unwrap_or_default();
+                    let mut parts: Vec<String> = merged
+                        .iter()
+                        .map(|v| {
+                            if v.value.contains(' ') || v.value.contains(';') {
+                                format!("{}=\"{}\"", v.name, v.value)
+                            } else {
+                                format!("{}={}", v.name, v.value)
+                            }
+                        })
+                        .collect();
+                    if let Some(w) = &wrapper {
+                        parts.push(w.clone());
+                    }
+                    let prefix = parts.join(" ");
+                    let base = if existing.trim().is_empty() {
+                        "%command%".to_string()
+                    } else if existing.contains("%command%") {
+                        existing
+                    } else {
+                        format!("{existing} %command%")
+                    };
+                    let mut final_opts = if prefix.is_empty() {
+                        base
+                    } else {
+                        format!("{prefix} {base}")
+                    };
+                    if let Some(a) = &launch_args {
+                        final_opts = format!("{final_opts} {a}");
+                    }
+                    let _ = crate::tools::steam_launch::write_launch_options(app_id, &final_opts);
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = app_id;
+                }
+            }
+            crate::launch::LaunchTarget::Heroic { app_name, .. } => {
+                if let Some(heroic) = crate::tools::heroic_launch::resolve_heroic_app(&game.install_path) {
+                    let _ = crate::tools::heroic_launch::write_heroic_launch_options(
+                        &heroic.config_dir,
+                        app_name,
+                        &merged,
+                        wrapper.as_deref(),
+                        launch_args.as_deref(),
+                    );
+                }
+            }
+            crate::launch::LaunchTarget::Executable { .. } => {}
+        }
+    }
+
+    let direct_pid = match crate::launch::launch_target(
+        &app,
+        &target,
+        &env_vars,
+        wrapper.as_deref(),
+        launch_args.as_deref(),
+    ) {
+        Ok(pid) => pid,
+        Err(e) => {
+            let _ = crate::launch::revert_game_deployment(
+                &state.paths,
+                &game_id,
+                &game.install_path,
+                &game.plugin_id,
+            );
+            crate::launch::set_and_emit_state(
+                &app,
+                &state.launch_states,
+                crate::launch::GameLaunchState::idle(game_id),
+            );
+            return Err(format!("{e:#}"));
+        }
+    };
+
+    let starting_state = crate::launch::GameLaunchState {
+        game_id: game_id.clone(),
+        mode: crate::launch::LaunchMode::Modded,
+        phase: crate::launch::LaunchPhase::Starting,
+        pids: direct_pid.into_iter().collect(),
+        started_at,
+        error: None,
+    };
+    crate::launch::set_and_emit_state(&app, &state.launch_states, starting_state.clone());
+
+    let close_flag = Arc::new(AtomicBool::new(false));
+    if let Ok(mut flags) = state.close_flags.lock() {
+        flags.insert(game_id.clone(), close_flag.clone());
+    }
+
+    crate::launch::spawn_game_watcher(
+        app,
+        state.paths.clone(),
+        state.launch_states.clone(),
+        close_flag,
+        game,
+        crate::launch::LaunchMode::Modded,
+        steam_app_id,
+        direct_pid,
+        false,
+    );
+
+    Ok(crate::launch::LaunchResult {
+        state: starting_state,
+        deploy_result: Some(deploy_result),
+    })
+}
+
+#[tauri::command]
+pub async fn launch_unmodded(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    game_id: String,
+) -> Result<crate::launch::GameLaunchState, String> {
+    ensure_launch_idle(&state, &game_id)?;
+    let game = {
+        let cfg = state.config.lock().map_err(|e| e.to_string())?;
+        cfg.managed_games
+            .iter()
+            .find(|g| g.id == game_id)
+            .cloned()
+            .ok_or_else(|| "Managed game not found".to_string())?
+    };
+
+    if mods::has_active_deployment(&state.paths, &game_id) {
+        crate::launch::revert_game_deployment(
+            &state.paths,
+            &game_id,
+            &game.install_path,
+            &game.plugin_id,
+        )
+        .map_err(|e| format!("{e:#}"))?;
+    }
+
+    let target = crate::launch::resolve_launch_target(&game).map_err(|e| format!("{e:#}"))?;
+    let steam_app_id = match &target {
+        crate::launch::LaunchTarget::Steam { app_id } => Some(app_id.clone()),
+        _ => None,
+    };
+    let empty_env = HashMap::new();
+    let direct_pid =
+        crate::launch::launch_target(&app, &target, &empty_env, None, None)
+            .map_err(|e| format!("{e:#}"))?;
+
+    let starting_state = crate::launch::GameLaunchState {
+        game_id: game_id.clone(),
+        mode: crate::launch::LaunchMode::Unmodded,
+        phase: crate::launch::LaunchPhase::Starting,
+        pids: direct_pid.into_iter().collect(),
+        started_at: crate::launch::now_unix_secs(),
+        error: None,
+    };
+    crate::launch::set_and_emit_state(&app, &state.launch_states, starting_state.clone());
+
+    let close_flag = Arc::new(AtomicBool::new(false));
+    if let Ok(mut flags) = state.close_flags.lock() {
+        flags.insert(game_id.clone(), close_flag.clone());
+    }
+
+    crate::launch::spawn_game_watcher(
+        app,
+        state.paths.clone(),
+        state.launch_states.clone(),
+        close_flag,
+        game,
+        crate::launch::LaunchMode::Unmodded,
+        steam_app_id,
+        direct_pid,
+        false,
+    );
+
+    Ok(starting_state)
+}
+
+#[tauri::command]
+pub fn revert_deployment(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    game_id: String,
+) -> Result<(), String> {
+    ensure_launch_idle(&state, &game_id)?;
     let cfg = state.config.lock().map_err(|e| e.to_string())?;
     let game = cfg
         .managed_games
@@ -8335,19 +8767,305 @@ pub fn purge_mods(state: State<'_, AppState>, game_id: String) -> Result<(), Str
         .find(|g| g.id == game_id)
         .map(|g| (g.install_path.clone(), g.plugin_id.clone()));
     drop(cfg);
-    let install_path = game.as_ref().map(|(path, _)| path.clone());
-    mods::purge_deploy(
-        &state.paths,
-        &game_id,
-        install_path.as_deref().map(Path::new),
-    )
-    .map_err(|e| e.to_string())?;
     if let Some((install_path, plugin_id)) = game {
-        if let Some(plugin) = games::plugin_by_id(&plugin_id) {
-            mods::prune_empty_loader_dirs(plugin, Path::new(&install_path));
+        crate::launch::revert_game_deployment(&state.paths, &game_id, &install_path, &plugin_id)
+            .map_err(|e| format!("{e:#}"))?;
+    } else {
+        mods::purge_deploy(&state.paths, &game_id, None).map_err(|e| e.to_string())?;
+    }
+    crate::launch::set_and_emit_state(
+        &app,
+        &state.launch_states,
+        crate::launch::GameLaunchState::idle(game_id),
+    );
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_launch_state(
+    state: State<'_, AppState>,
+    game_id: String,
+) -> Result<crate::launch::GameLaunchState, String> {
+    let map = state.launch_states.lock().map_err(|e| e.to_string())?;
+    Ok(map
+        .get(&game_id)
+        .cloned()
+        .unwrap_or_else(|| crate::launch::GameLaunchState::idle(game_id)))
+}
+
+#[tauri::command]
+pub fn has_active_deployment(
+    state: State<'_, AppState>,
+    game_id: String,
+) -> Result<bool, String> {
+    Ok(mods::has_active_deployment(&state.paths, &game_id))
+}
+
+#[tauri::command]
+pub async fn close_game(
+    state: State<'_, AppState>,
+    game_id: String,
+) -> Result<(), String> {
+    let (install_path, is_heroic) = {
+        let cfg = state.config.lock().map_err(|e| e.to_string())?;
+        cfg.managed_games
+            .iter()
+            .find(|g| g.id == game_id)
+            .map(|g| {
+                (
+                    g.install_path.clone(),
+                    g.launcher.to_ascii_lowercase().contains("heroic"),
+                )
+            })
+            .ok_or_else(|| "Managed game not found".to_string())?
+    };
+    let heroic_prefix = if is_heroic {
+        crate::tools::heroic_launch::resolve_heroic_app(&install_path).and_then(|h| {
+            crate::tools::heroic_launch::read_heroic_wine_prefix(&h.config_dir, &h.app_name)
+        })
+    } else {
+        None
+    };
+    let tracked_pids = {
+        let map = state.launch_states.lock().map_err(|e| e.to_string())?;
+        map.get(&game_id).map(|s| s.pids.clone()).unwrap_or_default()
+    };
+    let steam_app_id = crate::tools::executables::steam_app_id_from_install(&install_path);
+    crate::launch::close_running_game(
+        &install_path,
+        steam_app_id.as_deref(),
+        &tracked_pids,
+        heroic_prefix.as_deref(),
+    )
+    .await
+    .map_err(|e| format!("{e:#}"))?;
+    if let Ok(flags) = state.close_flags.lock() {
+        if let Some(flag) = flags.get(&game_id) {
+            flag.store(true, Ordering::Relaxed);
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LaunchPreview {
+    pub source: config::LaunchCommandSource,
+    pub launcher_name: String,
+    pub auto_env_vars: Vec<config::LaunchEnvVar>,
+    pub custom_env_vars: Vec<config::LaunchEnvVar>,
+    pub custom_wrapper: String,
+    pub custom_launch_args: String,
+    pub launcher_options: Option<String>,
+    pub effective_command: String,
+}
+
+fn build_launch_preview(state: &AppState, game: &ManagedGame) -> LaunchPreview {
+    let mut auto_env_vars: Vec<config::LaunchEnvVar> = Vec::new();
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(order) = mods::load_loadorder(&state.paths, &game.id) {
+            let staged: Vec<games::StagedProxySource<'_>> = order
+                .mods
+                .iter()
+                .map(|staged| games::StagedProxySource {
+                    name: staged.name.as_str(),
+                    path: Path::new(&staged.staging_path),
+                    enabled: staged.enabled,
+                })
+                .collect();
+            if let Some(advice) = games::advise_wine_overrides(
+                Path::new(&game.install_path),
+                game.project_name.as_deref(),
+                &staged,
+                "",
+                false,
+                None,
+            ) {
+                let dlls: Vec<&str> = advice.needs.iter().map(|n| n.dll.as_str()).collect();
+                if !dlls.is_empty() {
+                    auto_env_vars.push(config::LaunchEnvVar {
+                        name: "WINEDLLOVERRIDES".to_string(),
+                        value: format!("{}=n,b", dlls.join(",")),
+                    });
+                }
+            }
+        }
+        if let Some(overrides) = &game.tool_overrides {
+            if overrides.lsfg_vk.enabled {
+                auto_env_vars.push(config::LaunchEnvVar {
+                    name: "LSFGVK_CONFIG".to_string(),
+                    value: state.paths.lsfg_vk_config_file().display().to_string(),
+                });
+                auto_env_vars.push(config::LaunchEnvVar {
+                    name: "LSFGVK_PROFILE".to_string(),
+                    value: crate::tools::executables::profile_name_for_game(&game.id),
+                });
+            }
+            if overrides.autohdr_vk.enabled {
+                auto_env_vars.push(config::LaunchEnvVar {
+                    name: "ENABLE_AUTOHDR".to_string(),
+                    value: "1".to_string(),
+                });
+            }
+        }
+    }
+
+    let custom_env_vars = game.custom_env_vars.clone();
+    let custom_wrapper = game.custom_wrapper.clone().unwrap_or_default();
+    let custom_launch_args = game.custom_launch_args.clone().unwrap_or_default();
+
+    let launcher_options = if let Some(app_id) =
+        crate::tools::executables::steam_app_id_from_install(&game.install_path)
+    {
+        #[cfg(target_os = "linux")]
+        {
+            crate::tools::steam_launch::read_launch_options(&app_id)
+                .ok()
+                .flatten()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = app_id;
+            None
+        }
+    } else if game.launcher.to_ascii_lowercase().contains("heroic") {
+        crate::tools::heroic_launch::resolve_heroic_app(&game.install_path).and_then(|h| {
+            crate::tools::heroic_launch::read_heroic_launch_options(&h.config_dir, &h.app_name)
+                .ok()
+                .map(|cfg| {
+                    let mut parts: Vec<String> = cfg
+                        .env_vars
+                        .iter()
+                        .map(|v| format!("{}={}", v.name, v.value))
+                        .collect();
+                    if !cfg.wrapper.trim().is_empty() {
+                        parts.push(cfg.wrapper);
+                    }
+                    if !cfg.args.trim().is_empty() {
+                        parts.push(cfg.args);
+                    }
+                    parts.join(" ")
+                })
+        })
+    } else {
+        None
+    };
+
+    let effective_command = if game.launch_command_source == config::LaunchCommandSource::Launcher {
+        launcher_options
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "%command%".to_string())
+    } else {
+        let mut merged = auto_env_vars.clone();
+        for cv in &custom_env_vars {
+            if let Some(pos) = merged.iter().position(|v| v.name == cv.name) {
+                merged[pos].value = cv.value.clone();
+            } else {
+                merged.push(cv.clone());
+            }
+        }
+        let mut parts: Vec<String> = merged
+            .iter()
+            .map(|v| {
+                if v.value.contains(' ') || v.value.contains(';') {
+                    format!("{}=\"{}\"", v.name, v.value)
+                } else {
+                    format!("{}={}", v.name, v.value)
+                }
+            })
+            .collect();
+        if !custom_wrapper.trim().is_empty() {
+            parts.push(custom_wrapper.trim().to_string());
+        }
+        parts.push("%command%".to_string());
+        if !custom_launch_args.trim().is_empty() {
+            parts.push(custom_launch_args.trim().to_string());
+        }
+        parts.join(" ")
+    };
+
+    LaunchPreview {
+        source: game.launch_command_source,
+        launcher_name: game.launcher.clone(),
+        auto_env_vars,
+        custom_env_vars,
+        custom_wrapper,
+        custom_launch_args,
+        launcher_options,
+        effective_command,
+    }
+}
+
+#[tauri::command]
+pub fn get_launch_preview(
+    state: State<'_, AppState>,
+    game_id: String,
+) -> Result<LaunchPreview, String> {
+    let game = {
+        let cfg = state.config.lock().map_err(|e| e.to_string())?;
+        cfg.managed_games
+            .iter()
+            .find(|g| g.id == game_id)
+            .cloned()
+            .ok_or_else(|| "Managed game not found".to_string())?
+    };
+    Ok(build_launch_preview(&state, &game))
+}
+
+#[tauri::command]
+pub fn set_game_launch_options(
+    state: State<'_, AppState>,
+    game_id: String,
+    source: config::LaunchCommandSource,
+    custom_env_vars: Vec<config::LaunchEnvVar>,
+    custom_wrapper: Option<String>,
+    custom_launch_args: Option<String>,
+) -> Result<LaunchPreview, String> {
+    let updated_game = {
+        let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
+        let game = cfg
+            .managed_games
+            .iter_mut()
+            .find(|g| g.id == game_id)
+            .ok_or_else(|| "Managed game not found".to_string())?;
+        game.launch_command_source = source;
+        game.custom_env_vars = custom_env_vars
+            .into_iter()
+            .filter(|v| !v.name.trim().is_empty())
+            .map(|v| config::LaunchEnvVar {
+                name: v.name.trim().to_string(),
+                value: v.value,
+            })
+            .collect();
+        game.custom_wrapper = custom_wrapper
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        game.custom_launch_args = custom_launch_args
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let cloned = game.clone();
+        config::save_config(&state.paths, &cfg).map_err(|e| format!("{e:#}"))?;
+        cloned
+    };
+    Ok(build_launch_preview(&state, &updated_game))
+}
+
+#[tauri::command]
+pub fn set_launch_command_source(
+    state: State<'_, AppState>,
+    game_id: String,
+    source: config::LaunchCommandSource,
+) -> Result<(), String> {
+    let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
+    let game = cfg
+        .managed_games
+        .iter_mut()
+        .find(|g| g.id == game_id)
+        .ok_or_else(|| "Managed game not found".to_string())?;
+    game.launch_command_source = source;
+    config::save_config(&state.paths, &cfg).map_err(|e| format!("{e:#}"))
 }
 
 #[tauri::command]
@@ -9274,6 +9992,366 @@ mod catalog_filter_tests {
         assert!(msg.contains("Thunderstore filter"), "{msg}");
         assert!(msg.contains("Nexus"), "{msg}");
     }
+}
+
+#[cfg(test)]
+mod unmanage_tests {
+    use super::cleanup_unmanaged_game_files;
+    use crate::config::Paths;
+
+    #[test]
+    fn cleanup_unmanaged_game_files_purges_and_deletes_data_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_dir: dir.path().join("cfg"),
+            data_dir: dir.path().join("data"),
+            cache_dir: dir.path().join("cache"),
+        };
+        let game_id = "test-game";
+        let install_dir = dir.path().join("game-install");
+        std::fs::create_dir_all(&install_dir).unwrap();
+
+        let staging = paths.mods_dir(game_id).join("mod-1");
+        std::fs::create_dir_all(&staging).unwrap();
+        let staged_file = staging.join("plugin.dll");
+        std::fs::write(&staged_file, b"mod").unwrap();
+
+        let deployed_file = install_dir.join("plugin.dll");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&staged_file, &deployed_file).unwrap();
+        #[cfg(not(unix))]
+        std::fs::copy(&staged_file, &deployed_file).unwrap();
+
+        std::fs::create_dir_all(paths.game_data_dir(game_id)).unwrap();
+        std::fs::write(
+            paths.deploy_manifest(game_id),
+            serde_json::json!({ "paths": [deployed_file] }).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            paths.loadorder_file(game_id),
+            serde_json::json!({
+                "mods": [{
+                    "id": "mod-1",
+                    "name": "Mod 1",
+                    "domain": "test",
+                    "staging_path": staging,
+                    "enabled": true,
+                    "order": 0
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        cleanup_unmanaged_game_files(
+            &paths,
+            game_id,
+            Some(install_dir.to_str().unwrap()),
+            None,
+        )
+        .unwrap();
+
+        assert!(!deployed_file.exists());
+        assert!(!paths.game_data_dir(game_id).exists());
+    }
+
+    #[test]
+    fn cleanup_unmanaged_game_files_handles_missing_install_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_dir: dir.path().join("cfg"),
+            data_dir: dir.path().join("data"),
+            cache_dir: dir.path().join("cache"),
+        };
+        let game_id = "missing-game";
+        let staging = paths.mods_dir(game_id).join("mod-1");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("file.txt"), b"data").unwrap();
+
+        let missing_install = dir.path().join("does-not-exist");
+        cleanup_unmanaged_game_files(
+            &paths,
+            game_id,
+            Some(missing_install.to_str().unwrap()),
+            None,
+        )
+        .unwrap();
+
+        assert!(!paths.game_data_dir(game_id).exists());
+    }
+}
+
+// --- P2P Social & Friend Collection Sync ---
+
+fn friend_collection_local_id(peer_id: &str, collection_id: &str) -> String {
+    format!("friend:{peer_id}:{collection_id}")
+}
+
+fn match_manifest_entry_to_staged<'a>(
+    order: &'a mods::LoadOrder,
+    entry: &share::ShareModEntry,
+) -> Option<&'a mods::StagedMod> {
+    match entry.s {
+        ShareModSource::Nexus => {
+            let mid = entry.mod_id.unwrap_or(0);
+            let fid = entry.file_id.unwrap_or(0);
+            mods::find_nexus_file(order, mid, fid).or_else(|| {
+                order
+                    .mods
+                    .iter()
+                    .find(|m| m.source == ModSource::Nexus && m.nexus_mod_id == mid)
+            })
+        }
+        ShareModSource::Thunderstore => order.mods.iter().find(|m| {
+            m.source == ModSource::Thunderstore
+                && m.ts_namespace.as_deref() == entry.namespace.as_deref()
+                && m.ts_name.as_deref() == entry.name.as_deref()
+        }),
+        ShareModSource::Modio => {
+            let gid = entry.game_id.unwrap_or(0);
+            let mid = entry.mod_id.unwrap_or(0);
+            mods::find_modio_mod(order, gid, mid)
+        }
+    }
+}
+
+fn apply_friend_manifest_order_and_selections(
+    paths: &Paths,
+    game_id: &str,
+    manifest: &share::ShareManifest,
+) -> Result<Vec<String>, String> {
+    let order = mods::load_loadorder(paths, game_id).map_err(|e| e.to_string())?;
+    let mut selections = Vec::new();
+    let mut member_ids = Vec::new();
+    let mut seen = HashSet::new();
+    for entry in &manifest.mods {
+        if let Some(staged) = match_manifest_entry_to_staged(&order, entry) {
+            if seen.insert(staged.id.clone()) {
+                member_ids.push(staged.id.clone());
+                selections.push(mods::SyncedModSelection {
+                    mod_id: staged.id.clone(),
+                    fomod_selection: entry.fomod.clone(),
+                    option_selection: entry.options.clone(),
+                });
+            }
+        }
+    }
+    if !selections.is_empty() {
+        mods::apply_collection_order_and_selections(paths, game_id, &selections)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(member_ids)
+}
+
+#[tauri::command]
+pub fn get_friends_state(state: State<'_, AppState>) -> Result<crate::p2p::FriendsState, String> {
+    state.p2p.get_state().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn set_p2p_display_name(
+    state: State<'_, AppState>,
+    name: String,
+) -> Result<crate::p2p::FriendsState, String> {
+    state.p2p.set_display_name(name).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn set_collection_visibility(
+    state: State<'_, AppState>,
+    collection_id: String,
+    hidden: bool,
+) -> Result<crate::p2p::FriendsState, String> {
+    state
+        .p2p
+        .set_collection_visibility(collection_id, hidden)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn add_friend_by_code(
+    state: State<'_, AppState>,
+    code: String,
+) -> Result<crate::p2p::FriendsState, String> {
+    state
+        .p2p
+        .add_friend_by_code(code)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn respond_friend_request(
+    state: State<'_, AppState>,
+    peer_id: String,
+    accept: bool,
+) -> Result<crate::p2p::FriendsState, String> {
+    state
+        .p2p
+        .respond_friend_request(peer_id, accept)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn remove_friend(
+    state: State<'_, AppState>,
+    peer_id: String,
+) -> Result<crate::p2p::FriendsState, String> {
+    state.p2p.remove_friend(peer_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn refresh_friends(
+    state: State<'_, AppState>,
+) -> Result<crate::p2p::FriendsState, String> {
+    state
+        .p2p
+        .refresh_all_friends()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn decode_friend_share_code(code: String) -> Result<ShareDecodePreview, String> {
+    let manifest = crate::p2p::decode_friend_share(&code).map_err(|e| e.to_string())?;
+    Ok(share::preview_from_manifest(&manifest, code.len()))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FriendSyncResult {
+    pub collection_id: String,
+    pub name: String,
+    pub share_code: String,
+    pub share_hash: String,
+    pub member_ids: Vec<String>,
+    pub needs_assist: Vec<ShareAssistFile>,
+    pub warnings: Vec<String>,
+    pub collection: Option<InstalledCollection>,
+}
+
+#[tauri::command]
+pub async fn join_or_sync_friend_collection(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    game_id: String,
+    peer_id: String,
+    friend_collection_id: String,
+) -> Result<FriendSyncResult, String> {
+    let share_code = state
+        .p2p
+        .get_friend_share_code(&peer_id, &friend_collection_id)
+        .map_err(|e| e.to_string())?;
+    let share_hash = share::share_hash(&share_code);
+    let manifest = share::decode_share_code(&share_code).map_err(|e| e.to_string())?;
+
+    let mut result = import_share_code(
+        app,
+        state.clone(),
+        game_id.clone(),
+        share_code.clone(),
+        manifest.name.clone(),
+    )
+    .await?;
+
+    let local_col_id = friend_collection_local_id(&peer_id, &friend_collection_id);
+    if result.needs_assist.is_empty() {
+        let ordered_ids =
+            apply_friend_manifest_order_and_selections(&state.paths, &game_id, &manifest)?;
+        let col = InstalledCollection {
+            id: local_col_id.clone(),
+            source: CollectionSource::Emperor,
+            kind: CollectionKind::Share,
+            name: result.name.clone(),
+            slug: Some(friend_collection_id.clone()),
+            namespace: None,
+            package_name: None,
+            community: None,
+            revision: None,
+            version: None,
+            profile_code: Some(share_code.clone()),
+            mod_ids: ordered_ids.clone(),
+            installed_at: String::new(),
+            game_versions: manifest.game_versions.clone(),
+            friend_sync: Some(mods::FriendSyncMetadata {
+                friend_peer_id: peer_id,
+                friend_collection_id,
+                last_synced_hash: share_hash.clone(),
+                last_synced_at: chrono::Utc::now().to_rfc3339(),
+                auto_sync: false,
+            }),
+        };
+        let recorded = mods::record_installed_collection(&state.paths, &game_id, col, &[])
+            .map_err(|e| e.to_string())?;
+        result.collection = Some(recorded);
+        result.member_ids = ordered_ids;
+    }
+
+    Ok(FriendSyncResult {
+        collection_id: local_col_id,
+        name: result.name,
+        share_code,
+        share_hash,
+        member_ids: result.member_ids,
+        needs_assist: result.needs_assist,
+        warnings: result.warnings,
+        collection: result.collection,
+    })
+}
+
+#[tauri::command]
+pub fn finalize_friend_collection_sync(
+    state: State<'_, AppState>,
+    game_id: String,
+    peer_id: String,
+    friend_collection_id: String,
+    share_code: String,
+) -> Result<InstalledCollection, String> {
+    let manifest = share::decode_share_code(&share_code).map_err(|e| e.to_string())?;
+    let share_hash = share::share_hash(&share_code);
+    let ordered_ids =
+        apply_friend_manifest_order_and_selections(&state.paths, &game_id, &manifest)?;
+    let local_col_id = friend_collection_local_id(&peer_id, &friend_collection_id);
+    let col = InstalledCollection {
+        id: local_col_id,
+        source: CollectionSource::Emperor,
+        kind: CollectionKind::Share,
+        name: manifest
+            .name
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "Friend Collection".into()),
+        slug: Some(friend_collection_id.clone()),
+        namespace: None,
+        package_name: None,
+        community: None,
+        revision: None,
+        version: None,
+        profile_code: Some(share_code),
+        mod_ids: ordered_ids,
+        installed_at: String::new(),
+        game_versions: manifest.game_versions,
+        friend_sync: Some(mods::FriendSyncMetadata {
+            friend_peer_id: peer_id,
+            friend_collection_id,
+            last_synced_hash: share_hash,
+            last_synced_at: chrono::Utc::now().to_rfc3339(),
+            auto_sync: false,
+        }),
+    };
+    mods::record_installed_collection(&state.paths, &game_id, col, &[]).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn set_friend_collection_auto_sync(
+    state: State<'_, AppState>,
+    game_id: String,
+    collection_id: String,
+    auto_sync: bool,
+) -> Result<(), String> {
+    mods::set_friend_collection_auto_sync(&state.paths, &game_id, &collection_id, auto_sync)
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

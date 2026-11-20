@@ -52,7 +52,7 @@ describe("AppNavHistory", () => {
 
   it("reset collapses history", () => {
     const journal = new AppNavHistory(entry("browse"));
-    journal.push(entry("library", { libraryDetail: { gameId: "g1", tab: "mods" } }));
+    journal.push(entry("library", { libraryDetail: { gameId: "g1" } }));
     journal.reset(entry("downloads"));
     expect(journal.length).toBe(1);
     expect(journal.current().tab).toBe("downloads");
@@ -62,7 +62,7 @@ describe("AppNavHistory", () => {
   it("back works after push from library home (openGame must push, not reset)", () => {
     const journal = new AppNavHistory(entry("library"));
     journal.push(
-      entry("library", { libraryDetail: { gameId: "g1", tab: "mods" } }),
+      entry("library", { libraryDetail: { gameId: "g1" } }),
     );
     expect(journal.currentIndex).toBe(1);
     const previous = journal.back();

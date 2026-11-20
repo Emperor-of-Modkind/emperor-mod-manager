@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { EmperorOpenMod } from "./modDeepLink";
 import type {
   AuthorSuggestion,
+  BannerTimeouts,
   BrowseMeta,
   BrowseSearchOpts,
   CatalogSearchPage,
@@ -13,7 +14,11 @@ import type {
   CollectionModFile,
   CollectionSearchPage,
   CollectionVersionAdvice,
-  DeployResult,
+  GameLaunchState,
+  LaunchCommandSource,
+  LaunchEnvVar,
+  LaunchPreview,
+  LaunchResult,
   LoadDiagnosis,
   DetectedGame,
   DownloadItem,
@@ -67,6 +72,8 @@ import type {
   AppInfo,
   AppUpdateStatus,
   AppInstallResult,
+  FriendsState,
+  FriendSyncResult,
 } from "./types";
 
 export const api = {
@@ -96,6 +103,8 @@ export const api = {
     invoke<void>("set_install_click_behavior", { behavior }),
   setRecentDownloadsLimit: (limit: number) =>
     invoke<void>("set_recent_downloads_limit", { limit }),
+  setBannerTimeouts: (timeouts: BannerTimeouts) =>
+    invoke<void>("set_banner_timeouts", { timeouts }),
   scanModOrphans: () => invoke<OrphanScan>("scan_mod_orphans"),
   clearDownloadCache: () =>
     invoke<ClearDownloadCacheResult>("clear_download_cache"),
@@ -158,6 +167,14 @@ export const api = {
       requests,
     }),
   unmanageGame: (id: string) => invoke<void>("unmanage_game", { id }),
+  getUnmanageCollectionStatus: (gameId: string) =>
+    invoke<{
+      has_portable_mods: boolean;
+      mod_count: number;
+      skipped_count: number;
+      already_saved: boolean;
+      default_name: string;
+    }>("get_unmanage_collection_status", { gameId }),
   setActiveGame: (id: string) => invoke<void>("set_active_game", { id }),
   searchMods: (domain: string, query: string, opts: BrowseSearchOpts = {}) =>
     invoke<ModSearchPage>("search_mods", {
@@ -501,10 +518,36 @@ export const api = {
     invoke<void>("remove_mod", { gameId, modId }),
   removeAllMods: (gameId: string) =>
     invoke<void>("remove_all_mods", { gameId }),
-  deployMods: (gameId: string) => invoke<DeployResult>("deploy_mods", { gameId }),
+  launchModded: (gameId: string) => invoke<LaunchResult>("launch_modded", { gameId }),
+  launchUnmodded: (gameId: string) =>
+    invoke<GameLaunchState>("launch_unmodded", { gameId }),
+  revertDeployment: (gameId: string) =>
+    invoke<void>("revert_deployment", { gameId }),
+  getLaunchState: (gameId: string) =>
+    invoke<GameLaunchState>("get_launch_state", { gameId }),
+  hasActiveDeployment: (gameId: string) =>
+    invoke<boolean>("has_active_deployment", { gameId }),
+  closeGame: (gameId: string) => invoke<void>("close_game", { gameId }),
+  setLaunchCommandSource: (gameId: string, source: LaunchCommandSource) =>
+    invoke<void>("set_launch_command_source", { gameId, source }),
+  getLaunchPreview: (gameId: string) =>
+    invoke<LaunchPreview>("get_launch_preview", { gameId }),
+  setGameLaunchOptions: (
+    gameId: string,
+    source: LaunchCommandSource,
+    customEnvVars: LaunchEnvVar[],
+    customWrapper: string | null,
+    customLaunchArgs: string | null,
+  ) =>
+    invoke<LaunchPreview>("set_game_launch_options", {
+      gameId,
+      source,
+      customEnvVars,
+      customWrapper,
+      customLaunchArgs,
+    }),
   diagnoseLoad: (gameId: string) =>
     invoke<LoadDiagnosis>("diagnose_load", { gameId }),
-  purgeMods: (gameId: string) => invoke<void>("purge_mods", { gameId }),
   listDownloads: () => invoke<DownloadItem[]>("list_downloads"),
   clearRecentDownloads: (ids: string[]) =>
     invoke<void>("clear_recent_downloads", { ids }),
@@ -534,4 +577,50 @@ export const api = {
       request: { game_id: gameId, overrides },
     }),
   syncGameTools: (gameId: string) => invoke<GameToolsResponse>("sync_game_tools", { gameId }),
+  getFriendsState: () => invoke<FriendsState>("get_friends_state"),
+  setP2pDisplayName: (name: string) =>
+    invoke<FriendsState>("set_p2p_display_name", { name }),
+  setCollectionVisibility: (collectionId: string, hidden: boolean) =>
+    invoke<FriendsState>("set_collection_visibility", { collectionId, hidden }),
+  addFriendByCode: (code: string) =>
+    invoke<FriendsState>("add_friend_by_code", { code }),
+  respondFriendRequest: (peerId: string, accept: boolean) =>
+    invoke<FriendsState>("respond_friend_request", { peerId, accept }),
+  removeFriend: (peerId: string) =>
+    invoke<FriendsState>("remove_friend", { peerId }),
+  refreshFriends: () => invoke<FriendsState>("refresh_friends"),
+  decodeFriendShareCode: (code: string) =>
+    invoke<ShareDecodePreview>("decode_friend_share_code", { code }),
+  joinOrSyncFriendCollection: (args: {
+    gameId: string;
+    peerId: string;
+    friendCollectionId: string;
+  }) =>
+    invoke<FriendSyncResult>("join_or_sync_friend_collection", {
+      gameId: args.gameId,
+      peerId: args.peerId,
+      friendCollectionId: args.friendCollectionId,
+    }),
+  finalizeFriendCollectionSync: (args: {
+    gameId: string;
+    peerId: string;
+    friendCollectionId: string;
+    shareCode: string;
+  }) =>
+    invoke<InstalledCollection>("finalize_friend_collection_sync", {
+      gameId: args.gameId,
+      peerId: args.peerId,
+      friendCollectionId: args.friendCollectionId,
+      shareCode: args.shareCode,
+    }),
+  setFriendCollectionAutoSync: (
+    gameId: string,
+    collectionId: string,
+    autoSync: boolean,
+  ) =>
+    invoke<void>("set_friend_collection_auto_sync", {
+      gameId,
+      collectionId,
+      autoSync,
+    }),
 };

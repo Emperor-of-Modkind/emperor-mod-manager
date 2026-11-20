@@ -25,7 +25,8 @@ import {
 import { STAGGER_CAP, STAGGER_STEP, staggerStyle } from "./motion";
 
 const OVERSCAN = 2;
-const HYDRATE_ROWS_PER_FRAME = 2;
+const HYDRATE_CARDS_PER_FRAME = 8;
+const FAST_SCROLL_SETTLE_MS = 60;
 
 /**
  * Enables staggered entrance only for the initial visible batch after mount
@@ -226,6 +227,8 @@ type BrowseVirtualGridProps<T> = {
   renderItem: (item: T, index: number) => ReactNode;
   renderSkeletonItem?: (index: number) => ReactNode;
   fixedRowHeight?: boolean;
+  fillTrailingSkeletons?: boolean;
+  initialScrollTop?: number;
   onPageSize?: (count: number) => void;
   /** Parked pages leave the scroll flow. Keep the last measurements until shown again. */
   active?: boolean;
@@ -249,6 +252,8 @@ function BrowseVirtualGridInner<T,>({
   renderItem,
   renderSkeletonItem,
   fixedRowHeight = false,
+  fillTrailingSkeletons = false,
+  initialScrollTop,
   onPageSize,
   active = true,
   trackScrollMargin = false,
@@ -325,10 +330,11 @@ function BrowseVirtualGridInner<T,>({
     [columns, items],
   );
 
+  const rowHeight = estimateGridRowHeight(cardWidth, rem);
   const virtualizer = useVirtualizer({
     count: rowCount,
     getScrollElement: () => scrollRef.current,
-    estimateSize: () => estimateGridRowHeight(cardWidth, rem),
+    estimateSize: () => rowHeight,
     overscan: columns >= 6 ? 1 : OVERSCAN,
     gap: rowGap,
     paddingStart: BROWSE_GRID_PAD_START_REM * rem,
@@ -336,9 +342,18 @@ function BrowseVirtualGridInner<T,>({
     scrollMargin,
     observeElementRect,
     measureElement: fixedRowHeight ? undefined : measureNonZeroRow,
-    initialOffset: () => scrollRef.current?.scrollTop ?? 0,
+    initialOffset: () => initialScrollTop ?? scrollRef.current?.scrollTop ?? 0,
     getItemKey: getRowKey,
   });
+
+  const restoredScrollRef = useRef(false);
+  useLayoutEffect(() => {
+    if (restoredScrollRef.current || !active || width <= 0 || rowCount === 0) return;
+    restoredScrollRef.current = true;
+    if (initialScrollTop != null && initialScrollTop > 0 && scrollRef.current) {
+      scrollRef.current.scrollTop = initialScrollTop;
+    }
+  }, [active, initialScrollTop, rowCount, scrollRef, width]);
 
   const prevLayoutRef = useRef<{ width: number; columns: number; rem: number } | null>(null);
   useLayoutEffect(() => {
@@ -352,9 +367,46 @@ function BrowseVirtualGridInner<T,>({
   const margin = virtualizer.options.scrollMargin;
   const virtualRows = virtualizer.getVirtualItems();
   const [hydratedKeys, setHydratedKeys] = useState<Set<string>>(() => new Set());
+  const [scrollSettleTick, setScrollSettleTick] = useState(0);
+  const scrollDirectionRef = useRef<"down" | "up">("down");
+  const prevScrollTopRef = useRef<number>(initialScrollTop ?? 0);
+  const fastScrollingRef = useRef(false);
+  const rowHeightRef = useRef(rowHeight);
+  rowHeightRef.current = rowHeight;
+
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!active || !el || !renderSkeletonItem) return;
+    prevScrollTopRef.current = el.scrollTop;
+    let settleTimer: ReturnType<typeof setTimeout> | null = null;
+    const onScroll = () => {
+      const nextTop = el.scrollTop;
+      const delta = nextTop - prevScrollTopRef.current;
+      prevScrollTopRef.current = nextTop;
+      if (delta < -1) scrollDirectionRef.current = "up";
+      else if (delta > 1) scrollDirectionRef.current = "down";
+      if (Math.abs(delta) > Math.max(40, rowHeightRef.current * 0.5)) {
+        fastScrollingRef.current = true;
+        if (settleTimer !== null) clearTimeout(settleTimer);
+        settleTimer = setTimeout(() => {
+          settleTimer = null;
+          fastScrollingRef.current = false;
+          setScrollSettleTick((t) => t + 1);
+        }, FAST_SCROLL_SETTLE_MS);
+      }
+    };
+    el.addEventListener("scroll", onScroll, { passive: true });
+    return () => {
+      el.removeEventListener("scroll", onScroll);
+      if (settleTimer !== null) clearTimeout(settleTimer);
+      fastScrollingRef.current = false;
+    };
+  }, [active, renderSkeletonItem, scrollRef]);
+
   const activeWindowSignature = renderSkeletonItem
     ? virtualRows.map((row) => String(row.key)).join("|")
     : "";
+  const rowsPerFrame = Math.max(1, Math.floor(HYDRATE_CARDS_PER_FRAME / columns));
 
   useEffect(() => {
     if (!renderSkeletonItem || !active || width <= 0) return;
@@ -373,11 +425,29 @@ function BrowseVirtualGridInner<T,>({
 
     if (!needsPrune && missing.length === 0) return;
 
+    // During fast scrollbar/wheel sweeps, prune offscreen keys but defer mounting new cards until settled.
+    if (fastScrollingRef.current) {
+      if (needsPrune) {
+        setHydratedKeys((prev) => {
+          const next = new Set<string>();
+          for (const k of prev) {
+            if (windowSet.has(k)) next.add(k);
+          }
+          return next.size === prev.size ? prev : next;
+        });
+      }
+      return;
+    }
+
+    const orderedKeys =
+      scrollDirectionRef.current === "up" ? [...windowKeys].reverse() : windowKeys;
+    const orderedMissing = orderedKeys.filter((k) => !hydratedKeys.has(k));
+
     // On initial mount (nothing in current window hydrated yet), hydrate the first batch immediately.
     const activeHydratedCount = windowKeys.length - missing.length;
-    if (activeHydratedCount === 0 && missing.length > 0) {
+    if (activeHydratedCount === 0 && orderedMissing.length > 0) {
       const next = new Set<string>();
-      for (const k of missing.slice(0, HYDRATE_ROWS_PER_FRAME)) {
+      for (const k of orderedMissing.slice(0, rowsPerFrame)) {
         next.add(k);
       }
       setHydratedKeys(next);
@@ -393,11 +463,11 @@ function BrowseVirtualGridInner<T,>({
           if (windowSet.has(k)) next.add(k);
         }
         let added = 0;
-        for (const k of windowKeys) {
+        for (const k of orderedKeys) {
           if (!next.has(k)) {
             next.add(k);
             added += 1;
-            if (added >= HYDRATE_ROWS_PER_FRAME) break;
+            if (added >= rowsPerFrame) break;
           }
         }
         if (next.size === prev.size && added === 0) return prev;
@@ -408,7 +478,15 @@ function BrowseVirtualGridInner<T,>({
       cancelled = true;
       window.cancelAnimationFrame(id);
     };
-  }, [active, activeWindowSignature, hydratedKeys, renderSkeletonItem, width]);
+  }, [
+    active,
+    activeWindowSignature,
+    hydratedKeys,
+    renderSkeletonItem,
+    rowsPerFrame,
+    scrollSettleTick,
+    width,
+  ]);
 
   return (
     <div
@@ -448,6 +526,13 @@ function BrowseVirtualGridInner<T,>({
                 </div>
               );
             })}
+            {fillTrailingSkeletons && renderSkeletonItem && slice.length < columns
+              ? Array.from({ length: columns - slice.length }, (_, extra) => (
+                  <div key={`trailing-skeleton-${extra}`} className="browse-virtual-cell">
+                    {renderSkeletonItem(start + slice.length + extra)}
+                  </div>
+                ))
+              : null}
           </div>
         );
       })}

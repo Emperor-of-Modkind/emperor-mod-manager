@@ -1,6 +1,6 @@
 [package]
 name = "emperor-mod-manager"
-version = "0.8.1"
+version = "0.8.2"
 description = "Mod manager for Linux and Windows"
 authors = ["emperor-mod-manager contributors"]
 edition = "2021"
@@ -51,6 +51,8 @@ xz2 = "0.1"
 quick-xml = { version = "0.42.0", features = ["encoding", "serialize"] }
 encoding_rs = "0.8.44"
 steam_shortcuts_util = "1.1.8"
+iroh = "1.5"
+sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 lib_game_detector = { version = "0.0.35", features = ["bundled_sqlite"] }

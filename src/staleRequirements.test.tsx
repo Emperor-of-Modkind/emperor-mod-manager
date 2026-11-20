@@ -399,10 +399,10 @@ describe("stale requirements on game switch", () => {
 
     const callsBeforeRefresh = requirementCalls.length;
     await act(async () => {
-      clickButton("Info");
+      clickButton("Home");
     });
     await act(async () => {
-      clickButton("Mods");
+      clickCard("Game A");
     });
     await waitFor(
       () => requirementCalls.length > callsBeforeRefresh,

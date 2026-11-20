@@ -107,3 +107,75 @@ fn parse_appmanifest_appid(acf_path: &Path) -> Option<String> {
 pub fn profile_name_for_game(game_id: &str) -> String {
     format!("emm-{game_id}")
 }
+
+/// Find relative paths to candidate game executables inside `install_path`.
+/// Prefers `.exe` files (Windows/Proton) and falls back to native executable
+/// binaries on Unix when no `.exe` is present.
+pub fn find_launch_executables(install_path: &str, max: usize) -> Vec<PathBuf> {
+    let root = Path::new(install_path);
+    if !root.is_dir() {
+        return Vec::new();
+    }
+    let mut exe_candidates: Vec<PathBuf> = Vec::new();
+    #[cfg(unix)]
+    let mut unix_candidates: Vec<PathBuf> = Vec::new();
+
+    for entry in WalkDir::new(root)
+        .max_depth(3)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy();
+        let lower = name.to_lowercase();
+        if lower.contains("unins")
+            || lower.contains("setup")
+            || lower.contains("redist")
+            || lower.contains("crash")
+            || lower.contains("updater")
+            || (lower.contains("launcher") && !lower.contains("shipping"))
+        {
+            continue;
+        }
+        let Ok(rel) = path.strip_prefix(root) else {
+            continue;
+        };
+        if lower.ends_with(".exe") {
+            exe_candidates.push(rel.to_path_buf());
+            if exe_candidates.len() >= max {
+                break;
+            }
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let is_exec = entry
+                .metadata()
+                .map(|m| m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false);
+            let ext_skip = lower.ends_with(".so")
+                || lower.ends_with(".dll")
+                || lower.ends_with(".sh")
+                || lower.ends_with(".py");
+            if is_exec && !ext_skip && unix_candidates.len() < max {
+                unix_candidates.push(rel.to_path_buf());
+            }
+        }
+    }
+
+    if !exe_candidates.is_empty() {
+        exe_candidates.sort_by_key(|p| (p.components().count(), p.to_string_lossy().to_lowercase()));
+        return exe_candidates;
+    }
+    #[cfg(unix)]
+    {
+        unix_candidates.sort_by_key(|p| (p.components().count(), p.to_string_lossy().to_lowercase()));
+        return unix_candidates;
+    }
+    #[cfg(not(unix))]
+    Vec::new()
+}

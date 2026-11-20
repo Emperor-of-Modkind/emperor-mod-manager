@@ -191,6 +191,16 @@ pub enum CollectionKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FriendSyncMetadata {
+    pub friend_peer_id: String,
+    pub friend_collection_id: String,
+    pub last_synced_hash: String,
+    pub last_synced_at: String,
+    #[serde(default)]
+    pub auto_sync: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstalledCollection {
     pub id: String,
     pub source: CollectionSource,
@@ -217,6 +227,9 @@ pub struct InstalledCollection {
     /// Game versions this collection revision was built for. `None` has not been looked up.
     #[serde(default)]
     pub game_versions: Option<Vec<String>>,
+    /// Synced friend collection metadata when joined from a P2P friend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub friend_sync: Option<FriendSyncMetadata>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -2248,6 +2261,107 @@ pub fn set_load_order(paths: &Paths, game_id: &str, ordered_ids: &[String]) -> R
     })
 }
 
+pub struct SyncedModSelection {
+    pub mod_id: String,
+    pub fomod_selection: Option<FomodSelection>,
+    pub option_selection: Option<ModOptionSelection>,
+}
+
+/// Reorders the specified collection mods to match `selections` in relative order
+/// (preserving unrelated mods' positions) and applies FOMOD / option selections.
+pub fn apply_collection_order_and_selections(
+    paths: &Paths,
+    game_id: &str,
+    selections: &[SyncedModSelection],
+) -> Result<()> {
+    mutate_load_order(paths, game_id, |order| {
+        let selection_map: HashMap<&str, &SyncedModSelection> = selections
+            .iter()
+            .map(|s| (s.mod_id.as_str(), s))
+            .collect();
+        let member_set: HashSet<&str> = selection_map.keys().copied().collect();
+
+        let mut by_id: HashMap<String, StagedMod> = HashMap::new();
+        let mut slots: Vec<Option<StagedMod>> = Vec::with_capacity(order.mods.len());
+        let mut first_slot: Option<usize> = None;
+
+        for mut m in order.mods.drain(..) {
+            if member_set.contains(m.id.as_str()) {
+                if first_slot.is_none() {
+                    first_slot = Some(slots.len());
+                }
+                if let Some(sel) = selection_map.get(m.id.as_str()) {
+                    if let Some(fomod) = &sel.fomod_selection {
+                        m.fomod_selection = Some(fomod.clone());
+                    }
+                    if let Some(opts) = &sel.option_selection {
+                        m.option_selection = Some(opts.clone());
+                    }
+                    m.enabled = true;
+                }
+                by_id.insert(m.id.clone(), m);
+                slots.push(None);
+            } else {
+                slots.push(Some(m));
+            }
+        }
+
+        let mut ordered_members: Vec<StagedMod> = Vec::with_capacity(selections.len());
+        for sel in selections {
+            if let Some(m) = by_id.remove(&sel.mod_id) {
+                ordered_members.push(m);
+            }
+        }
+        for (_, m) in by_id {
+            ordered_members.push(m);
+        }
+
+        let mut member_iter = ordered_members.into_iter();
+        let mut new_mods = Vec::with_capacity(slots.len() + member_iter.len());
+        let insert_at = first_slot.unwrap_or(slots.len());
+        for (idx, slot) in slots.into_iter().enumerate() {
+            if idx == insert_at {
+                // Fill the first member slot; subsequent None slots will be skipped
+                // and remaining members are placed at the first slot to keep them contiguous
+                // in exact friend load order.
+                for m in member_iter.by_ref() {
+                    new_mods.push(m);
+                }
+            }
+            if let Some(m) = slot {
+                new_mods.push(m);
+            }
+        }
+        for m in member_iter {
+            new_mods.push(m);
+        }
+        for (i, m) in new_mods.iter_mut().enumerate() {
+            m.order = (i as u32) + 1;
+        }
+        order.mods = new_mods;
+        Ok(())
+    })
+}
+
+pub fn set_friend_collection_auto_sync(
+    paths: &Paths,
+    game_id: &str,
+    collection_id: &str,
+    auto_sync: bool,
+) -> Result<()> {
+    let mut store = load_collections(paths, game_id)?;
+    let col = store
+        .collections
+        .iter_mut()
+        .find(|c| c.id == collection_id)
+        .ok_or_else(|| anyhow::anyhow!("Collection not found: {collection_id}"))?;
+    let Some(sync) = col.friend_sync.as_mut() else {
+        bail!("Collection is not linked to a friend");
+    };
+    sync.auto_sync = auto_sync;
+    save_collections(paths, game_id, &store)
+}
+
 pub fn remove_mod(paths: &Paths, game_id: &str, mod_uid: &str) -> Result<()> {
     with_game_order(game_id, || {
         let mut order = read_loadorder(paths, game_id)?;
@@ -2494,6 +2608,14 @@ fn link_or_copy(src: &Path, dest: &Path) -> Result<LinkKind> {
     }
 }
 
+pub fn has_active_deployment(paths: &Paths, game_id: &str) -> bool {
+    let manifest_path = paths.deploy_manifest(game_id);
+    fs::read_to_string(&manifest_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<DeployManifest>(&raw).ok())
+        .is_some_and(|m| !m.paths.is_empty())
+}
+
 pub fn purge_deploy(paths: &Paths, game_id: &str, install_path: Option<&Path>) -> Result<()> {
     let manifest_path = paths.deploy_manifest(game_id);
     if manifest_path.exists() {
@@ -2705,10 +2827,9 @@ pub fn deploy(
     }
 
     crate::config::ensure_game_dirs(paths, game_id)?;
-    fs::write(
-        paths.deploy_manifest(game_id),
-        serde_json::to_string_pretty(&deployed)?,
-    )?;
+    let manifest_json = serde_json::to_string_pretty(&deployed)?;
+    fs::write(paths.deploy_manifest(game_id), &manifest_json)?;
+    let _ = fs::write(paths.last_launch_manifest(game_id), &manifest_json);
     Ok(DeployResult {
         file_count: count,
         enabled_mods,
@@ -5039,6 +5160,7 @@ mod tests {
                     mod_ids: vec!["1_10".into(), "1_20".into()],
                     installed_at: "t".into(),
                     game_versions: None,
+                    friend_sync: None,
                 }],
             },
         )
@@ -5232,6 +5354,7 @@ mod tests {
                         mod_ids: vec!["A".into(), "Z".into()],
                         installed_at: "t".into(),
                         game_versions: None,
+                        friend_sync: None,
                     },
                     InstalledCollection {
                         id: "col-b".into(),
@@ -5248,6 +5371,7 @@ mod tests {
                         mod_ids: vec!["B".into()],
                         installed_at: "t".into(),
                         game_versions: None,
+                        friend_sync: None,
                     },
                 ],
             },
@@ -5311,6 +5435,7 @@ mod tests {
                     mod_ids: vec!["A".into(), "Z".into()],
                     installed_at: "t".into(),
                     game_versions: None,
+                    friend_sync: None,
                 }],
             },
         )
@@ -5526,5 +5651,60 @@ mod tests {
             "expected RoR2BepInExPack 1.50+ (got {} bytes)",
             meta.len()
         );
+    }
+
+    #[test]
+    fn apply_collection_order_and_selections_preserves_other_mods() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_dir: dir.path().join("cfg"),
+            data_dir: dir.path().join("data"),
+            cache_dir: dir.path().join("cache"),
+        };
+        let game_id = "skyrim_sync_test";
+        let staged = |id: &str, ord: u32| StagedMod {
+            id: id.into(),
+            name: id.into(),
+            domain: "skyrim".into(),
+            staging_path: paths.mods_dir(game_id).join(id).to_string_lossy().into(),
+            enabled: true,
+            order: ord,
+            ..Default::default()
+        };
+        save_loadorder(
+            &paths,
+            game_id,
+            &LoadOrder {
+                mods: vec![staged("local_top", 1), staged("a", 2), staged("b", 3), staged("local_bottom", 4)],
+            },
+        )
+        .unwrap();
+
+        let mut selected = std::collections::BTreeMap::new();
+        selected.insert("g1".into(), vec!["p2".into()]);
+        let fomod = FomodSelection { selected };
+
+        apply_collection_order_and_selections(
+            &paths,
+            game_id,
+            &[
+                SyncedModSelection {
+                    mod_id: "b".into(),
+                    fomod_selection: Some(fomod.clone()),
+                    option_selection: None,
+                },
+                SyncedModSelection {
+                    mod_id: "a".into(),
+                    fomod_selection: None,
+                    option_selection: None,
+                },
+            ],
+        )
+        .unwrap();
+
+        let after = load_loadorder(&paths, game_id).unwrap();
+        let ids: Vec<_> = after.mods.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["local_top", "b", "a", "local_bottom"]);
+        assert_eq!(after.mods[1].fomod_selection, Some(fomod));
     }
 }

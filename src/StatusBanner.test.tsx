@@ -1,9 +1,18 @@
 import { createRoot, type Root } from "react-dom/client";
 import { act, type ReactElement } from "react";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { StatusBanner, deployStatusNotice, hiddenBannerDetails } from "./StatusBanner";
-import type { DeployResult, MissingRequirements } from "./types";
+import {
+  DEFAULT_BANNER_TIMEOUTS,
+  StatusBanner,
+  bannerTimeoutFor,
+  deployStatusNotice,
+  dismissBanner,
+  hiddenBannerDetails,
+  pushBanner,
+  type StackedBanner,
+} from "./StatusBanner";
+import type { DeployResult, MissingRequirements, Settings } from "./types";
 
 const requirements: MissingRequirements = {
   nexus: [
@@ -61,7 +70,7 @@ describe("deployStatusNotice", () => {
       (payload) => opened.push(payload),
     );
     expect(notice.kind).toBe("warn");
-    expect(notice.message).toBe("Deployed 4 files from 2 mods.");
+    expect(notice.message).toBe("Launched with 4 files from 2 mods.");
     expect(notice.message).not.toContain("Skipped");
     expect(notice.details).toEqual([
       "Skipped A: missing master B.",
@@ -105,7 +114,7 @@ describe("deployStatusNotice", () => {
     const notice = deployStatusNotice(deployResult(), () => {});
     expect(notice).toEqual({
       kind: "ok",
-      message: "Deployed 4 files from 2 enabled mods.",
+      message: "Deployed 4 files from 2 enabled mods and launched game.",
     });
   });
 });
@@ -183,5 +192,170 @@ describe("StatusBanner", () => {
     expect(view.host.textContent).not.toContain("Show more");
     expect(view.host.querySelector('button[aria-label="Dismiss"]')).not.toBeNull();
     await view.unmount();
+  });
+});
+
+describe("banner timeouts", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  async function renderMount(ui: ReactElement) {
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const root: Root = createRoot(host);
+    await act(async () => {
+      root.render(ui);
+    });
+    return {
+      async rerender(next: ReactElement) {
+        await act(async () => {
+          root.render(next);
+        });
+      },
+      async unmount() {
+        await act(async () => root.unmount());
+        host.remove();
+      },
+    };
+  }
+
+  it("uses sensible defaults and respects explicit null or custom values", () => {
+    expect(DEFAULT_BANNER_TIMEOUTS).toEqual({ info: 10, warn: 300, error: null });
+    expect(bannerTimeoutFor("info", null)).toBe(10);
+    expect(bannerTimeoutFor("warn", null)).toBe(300);
+    expect(bannerTimeoutFor("error", null)).toBeNull();
+
+    const custom = {
+      banner_timeouts: { info: null, warn: 45, error: 15 },
+    } as Settings;
+    expect(bannerTimeoutFor("info", custom)).toBeNull();
+    expect(bannerTimeoutFor("warn", custom)).toBe(45);
+    expect(bannerTimeoutFor("error", custom)).toBe(15);
+  });
+
+  it("auto-dismisses after timeoutSeconds and does not reset on onDismiss identity change", async () => {
+    vi.useFakeTimers();
+    const onDismiss1 = vi.fn();
+    const onDismiss2 = vi.fn();
+    const view = await renderMount(
+      <StatusBanner
+        kind="info"
+        message="Closing Cyberpunk 2077…"
+        timeoutSeconds={10}
+        onDismiss={onDismiss1}
+      />,
+    );
+
+    await act(async () => {
+      vi.advanceTimersByTime(6000);
+    });
+    expect(onDismiss1).not.toHaveBeenCalled();
+
+    await view.rerender(
+      <StatusBanner
+        kind="info"
+        message="Closing Cyberpunk 2077…"
+        timeoutSeconds={10}
+        onDismiss={onDismiss2}
+      />,
+    );
+
+    await act(async () => {
+      vi.advanceTimersByTime(4000);
+    });
+    expect(onDismiss1).not.toHaveBeenCalled();
+    expect(onDismiss2).toHaveBeenCalledTimes(1);
+    await view.unmount();
+  });
+
+  it("resets timer when message changes and never auto-dismisses when null", async () => {
+    vi.useFakeTimers();
+    const onDismiss = vi.fn();
+    const view = await renderMount(
+      <StatusBanner
+        kind="info"
+        message="First"
+        timeoutSeconds={10}
+        onDismiss={onDismiss}
+      />,
+    );
+
+    await act(async () => {
+      vi.advanceTimersByTime(7000);
+    });
+    await view.rerender(
+      <StatusBanner
+        kind="info"
+        message="Second"
+        timeoutSeconds={10}
+        onDismiss={onDismiss}
+      />,
+    );
+
+    await act(async () => {
+      vi.advanceTimersByTime(5000);
+    });
+    expect(onDismiss).not.toHaveBeenCalled();
+
+    await act(async () => {
+      vi.advanceTimersByTime(5000);
+    });
+    expect(onDismiss).toHaveBeenCalledTimes(1);
+
+    await view.rerender(
+      <StatusBanner
+        kind="error"
+        message="Persistent error"
+        timeoutSeconds={null}
+        onDismiss={onDismiss}
+      />,
+    );
+    await act(async () => {
+      vi.advanceTimersByTime(600_000);
+    });
+    expect(onDismiss).toHaveBeenCalledTimes(1);
+    await view.unmount();
+  });
+});
+
+describe("banner stack", () => {
+  it("stacks amber and red banners newest-first while replacing green banners", () => {
+    let stack: StackedBanner[] = [];
+    stack = pushBanner(stack, { kind: "info", message: "Deployed." }, 1);
+    stack = pushBanner(stack, { kind: "warn", message: "Warning 1" }, 2);
+    stack = pushBanner(stack, { kind: "error", message: "Error 1" }, 3);
+    stack = pushBanner(stack, { kind: "warn", message: "Warning 2" }, 4);
+    expect(stack.map((b) => [b.id, b.kind, b.message])).toEqual([
+      [4, "warn", "Warning 2"],
+      [3, "error", "Error 1"],
+      [2, "warn", "Warning 1"],
+      [1, "info", "Deployed."],
+    ]);
+
+    // A new green banner replaces the old green banner, keeping amber/red stacked.
+    stack = pushBanner(stack, { kind: "info", message: "Saved." }, 5);
+    expect(stack.map((b) => [b.id, b.kind, b.message])).toEqual([
+      [5, "info", "Saved."],
+      [4, "warn", "Warning 2"],
+      [3, "error", "Error 1"],
+      [2, "warn", "Warning 1"],
+    ]);
+  });
+
+  it("deduplicates identical amber/red banners, caps stack size, and dismisses by id", () => {
+    let stack: StackedBanner[] = [];
+    stack = pushBanner(stack, { kind: "error", message: "Same error", details: ["A"] }, 1, 2);
+    stack = pushBanner(stack, { kind: "warn", message: "Warn 1" }, 2, 2);
+    // Identical error refreshes to top without duplicating
+    stack = pushBanner(stack, { kind: "error", message: "Same error", details: ["A"] }, 3, 2);
+    expect(stack.map((b) => b.id)).toEqual([3, 2]);
+
+    // Adding a 3rd warn/error drops the oldest stacked item (maxStacked = 2)
+    stack = pushBanner(stack, { kind: "error", message: "Error 2" }, 4, 2);
+    expect(stack.map((b) => b.id)).toEqual([4, 3]);
+
+    stack = dismissBanner(stack, 4);
+    expect(stack.map((b) => b.id)).toEqual([3]);
   });
 });

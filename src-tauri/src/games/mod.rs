@@ -48,6 +48,7 @@ mod theforest;
 mod unity_bepinex;
 mod unreal_engine;
 mod user_data;
+mod valve;
 mod warhammer40kdarktide;
 mod wine_overrides;
 mod witcher3;
@@ -107,6 +108,15 @@ pub use unreal_engine::{
     detect_ue_layout, layout_info, DeepRockGalacticPlugin, DeployContext, HogwartsLegacyPlugin,
     MarvelRivalsPlugin, PalworldPlugin, PavlovPlugin, ReadyOrNotPlugin,
     Stalker2HeartOfChornobylPlugin, Subnautica2Plugin, UeLayoutInfo, UnrealEnginePlugin,
+};
+pub use valve::{
+    AlienSwarmPlugin, ApertureDeskJobPlugin, CounterStrike2Plugin,
+    CounterStrikeConditionZeroPlugin, CounterStrikePlugin, CounterStrikeSourcePlugin,
+    DayOfDefeatPlugin, DayOfDefeatSourcePlugin, DeadlockPlugin, DeathmatchClassicPlugin,
+    Dota2Plugin, GarrysModPlugin, HalfLife2DeathmatchPlugin, HalfLife2Plugin, HalfLifeAlyxPlugin,
+    HalfLifeBlueShiftPlugin, HalfLifeDeathmatchSourcePlugin, HalfLifeOpposingForcePlugin,
+    HalfLifePlugin, HalfLifeSourcePlugin, Left4Dead2Plugin, Left4DeadPlugin, Portal2Plugin,
+    PortalPlugin, RicochetPlugin, TeamFortress2Plugin, TeamFortressClassicPlugin,
 };
 pub use warhammer40kdarktide::Warhammer40kDarktidePlugin;
 pub use wine_overrides::WineOverrideAdvice;
@@ -338,6 +348,12 @@ pub trait GamePlugin: Send + Sync {
         Ok(vec![])
     }
 
+    /// Restore any native game config files patched during `after_deploy`
+    /// (e.g. `gameinfo.gi` or `addonlist.txt` backups).
+    fn on_revert(&self, _install_path: &Path) -> Result<()> {
+        Ok(())
+    }
+
     /// Plugins left out of the load order because a master file is missing.
     fn plugin_skips(&self, _install_path: &Path) -> Vec<PluginSkip> {
         Vec::new()
@@ -477,6 +493,34 @@ pub fn all_plugins() -> Vec<&'static dyn GamePlugin> {
         &ResidentEvil32020Plugin,
         &ResidentEvil22019Plugin,
         &ResidentEvil7Plugin,
+        // Valve (more specific titles first)
+        &HalfLife2DeathmatchPlugin,
+        &HalfLife2Plugin,
+        &HalfLifeAlyxPlugin,
+        &HalfLifeDeathmatchSourcePlugin,
+        &HalfLifeSourcePlugin,
+        &HalfLifeOpposingForcePlugin,
+        &HalfLifeBlueShiftPlugin,
+        &HalfLifePlugin,
+        &CounterStrike2Plugin,
+        &CounterStrikeSourcePlugin,
+        &CounterStrikeConditionZeroPlugin,
+        &CounterStrikePlugin,
+        &Left4Dead2Plugin,
+        &Left4DeadPlugin,
+        &Portal2Plugin,
+        &PortalPlugin,
+        &TeamFortress2Plugin,
+        &TeamFortressClassicPlugin,
+        &DayOfDefeatSourcePlugin,
+        &DayOfDefeatPlugin,
+        &DeathmatchClassicPlugin,
+        &RicochetPlugin,
+        &AlienSwarmPlugin,
+        &GarrysModPlugin,
+        &Dota2Plugin,
+        &DeadlockPlugin,
+        &ApertureDeskJobPlugin,
     ]
 }
 
@@ -1006,5 +1050,47 @@ mod tests {
             match_plugin("Wolfenstein The New Order", None).unwrap().id,
             "wolfensteintheneworder"
         );
+    }
+
+    #[test]
+    fn match_valve_titles() {
+        let cases = [
+            ("Half-Life 2: Deathmatch", "halflife2deathmatch"),
+            ("Half-Life 2", "halflife2"),
+            ("Half-Life: Alyx", "halflifealyx"),
+            ("Half-Life Deathmatch: Source", "hldms"),
+            ("Half-Life: Source", "halflifesource"),
+            ("Half-Life: Opposing Force", "halflifeopposingforce"),
+            ("Half-Life: Blue Shift", "halflifeblueshift"),
+            ("Half-Life", "halflife"),
+            ("Counter-Strike 2", "counterstrike2"),
+            ("Counter-Strike: Source", "counterstrikesource"),
+            ("Counter-Strike: Condition Zero", "cscz"),
+            ("Counter-Strike", "counterstrike"),
+            ("Left 4 Dead 2", "left4dead2"),
+            ("Left 4 Dead", "left4dead"),
+            ("Portal 2", "portal2"),
+            ("Portal", "portal"),
+            ("Team Fortress 2", "teamfortress2"),
+            ("Team Fortress Classic", "teamfortressclassic"),
+            ("Day of Defeat: Source", "dayofdefeatsource"),
+            ("Day of Defeat", "dayofdefeat"),
+            ("Deathmatch Classic", "deathmatchclassic"),
+            ("Ricochet", "ricochet"),
+            ("Alien Swarm", "alienswarm"),
+            ("Garry's Mod", "garrysmod"),
+            ("Dota 2", "dota2"),
+            ("Deadlock", "deadlock"),
+            ("Aperture Desk Job", "aperturedeskjob"),
+        ];
+        for (title, expected_id) in cases {
+            assert_eq!(
+                match_plugin(title, None)
+                    .unwrap_or_else(|| panic!("expected match for {title}"))
+                    .id,
+                expected_id,
+                "title: {title}"
+            );
+        }
     }
 }

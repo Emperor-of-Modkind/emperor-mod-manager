@@ -86,8 +86,23 @@ refresh_desktop_caches() {
   if command -v update-desktop-database >/dev/null 2>&1 && [ -d "$APPS_DIR" ]; then
     update-desktop-database "$APPS_DIR" >/dev/null 2>&1 || true
   fi
-  if command -v gtk-update-icon-cache >/dev/null 2>&1 && [ -f "$ICONS_DIR/index.theme" ]; then
-    gtk-update-icon-cache -f -t "$ICONS_DIR" >/dev/null 2>&1 || true
+  if [ -d "$ICONS_DIR" ]; then
+    touch "$ICONS_DIR" >/dev/null 2>&1 || true
+    if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+      gtk-update-icon-cache -f -t "$ICONS_DIR" >/dev/null 2>&1 || true
+    fi
+  fi
+  rm -f "${XDG_CACHE_HOME:-$HOME/.cache}/icon-cache.kcache" >/dev/null 2>&1 || true
+  if command -v kbuildsycoca6 >/dev/null 2>&1; then
+    kbuildsycoca6 >/dev/null 2>&1 || true
+  elif command -v kbuildsycoca5 >/dev/null 2>&1; then
+    kbuildsycoca5 >/dev/null 2>&1 || true
+  fi
+}
+
+remove_installed_icons() {
+  if [ -d "$ICONS_DIR" ]; then
+    find "$ICONS_DIR" -maxdepth 3 \( -path "*/apps/$APP_ID.png" -o -path "*/apps/$APP_ID.svg" \) -delete
   fi
 }
 
@@ -95,9 +110,7 @@ if [ "$UNINSTALL" -eq 1 ]; then
   info "Uninstalling local $APP_ID"
   rm -f "$BIN_DIR/$APP_ID"
   rm -f "$APPS_DIR/$DESKTOP_FILE"
-  for size in 32x32 64x64 128x128 256x256; do
-    rm -f "$ICONS_DIR/$size/apps/$APP_ID.png"
-  done
+  remove_installed_icons
   refresh_desktop_caches
   info "Removed binary, desktop entry, and icons from $BIN_DIR and $DATA_HOME"
   exit 0
@@ -152,6 +165,7 @@ mv -f "$TMP_BIN" "$BIN_DIR/$APP_ID"
 TMP_BIN=""
 
 info "Installing icons to $ICONS_DIR"
+remove_installed_icons
 install_icon() {
   local src="$REPO_ROOT/src-tauri/icons/$1"
   local size="$2"
@@ -165,6 +179,7 @@ install_icon "32x32.png" "32x32"
 install_icon "64x64.png" "64x64"
 install_icon "128x128.png" "128x128"
 install_icon "128x128@2x.png" "256x256"
+install_icon "icon.png" "512x512"
 
 info "Installing desktop entry to $APPS_DIR/$DESKTOP_FILE"
 mkdir -p "$APPS_DIR"

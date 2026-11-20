@@ -272,4 +272,34 @@ describe("BrowseResults virtualizers", () => {
     await view.unmount();
     scrollEl.remove();
   });
+
+  it("fills remaining columns of a partial final row with skeletons when fillTrailingSkeletons is true", async () => {
+    const scrollEl = document.createElement("div");
+    setClientSize(scrollEl, 800, 600);
+    document.body.appendChild(scrollEl);
+    const scrollRef = createRef<HTMLElement | null>();
+    scrollRef.current = scrollEl;
+
+    // Width 800, minCardPx 160 -> 4 columns; 6 items leaves 2 trailing slots in row 2
+    const items = Array.from({ length: 6 }, (_, i) => ({ id: `mod-${i}` }));
+    const view = await mount(
+      <BrowseVirtualGrid
+        items={items}
+        scrollRef={scrollRef}
+        minCardPx={160}
+        fixedRowHeight
+        fillTrailingSkeletons
+        getKey={(item) => item.id}
+        renderItem={(item) => <div className="real-card">{item.id}</div>}
+        renderSkeletonItem={(index) => <div className="skeleton-card">{index}</div>}
+      />,
+      scrollEl,
+    );
+
+    expect(scrollEl.querySelectorAll(".real-card")).toHaveLength(6);
+    expect(scrollEl.querySelectorAll(".skeleton-card")).toHaveLength(2);
+
+    await view.unmount();
+    scrollEl.remove();
+  });
 });

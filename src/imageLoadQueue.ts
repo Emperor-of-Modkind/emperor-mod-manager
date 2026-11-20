@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-export const MAX_CONCURRENT_IMAGE_LOADS = 6;
-export const MAX_CONCURRENT_CACHED_DECODES = 8;
+export const MAX_CONCURRENT_IMAGE_LOADS = 4;
+export const MAX_CONCURRENT_CACHED_DECODES = 4;
 export const IMAGE_LOAD_TIMEOUT_MS = 15_000;
 const MAX_CACHED_IMAGE_URLS = 1000;
 
@@ -96,7 +96,7 @@ function activateInPool(pool: QueuePool, entry: QueueEntry) {
 
 function pumpPool(pool: QueuePool) {
   while (pool.activeCount < pool.maxConcurrent && pool.pending.length > 0) {
-    const next = pool.pending.shift();
+    const next = pool.pending.pop();
     if (!next || next.cancelled || next.released) continue;
     activateInPool(pool, next);
   }

@@ -4,14 +4,13 @@ export type AppTab =
   | "setup"
   | "library"
   | "collections"
+  | "friends"
   | "browse"
   | "downloads"
   | "tools"
   | "settings";
 
 export type DetailTab = "info" | "files";
-
-export type GameDetailTab = "info" | "mods" | "collections" | "tools";
 
 export type BrowseDetailRef =
   | { kind: "mod"; hit: CatalogHit; tab: DetailTab }
@@ -21,9 +20,11 @@ export type NavEntry = {
   tab: AppTab;
   browseReturnTab: AppTab | null;
   browseDetail: BrowseDetailRef | null;
-  libraryDetail: { gameId: string; tab: GameDetailTab } | null;
+  libraryDetail: { gameId: string } | null;
   gameSavedDetailId: string | null;
   savedDetailId: string | null;
+  friendPeerId?: string | null;
+  friendCollectionId?: string | null;
 };
 
 export class AppNavHistory {

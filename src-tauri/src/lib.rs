@@ -8,6 +8,7 @@ mod detection;
 mod diagnostics;
 mod games;
 mod github_release;
+mod launch;
 #[cfg(any(
     target_os = "linux",
     target_os = "dragonfly",
@@ -22,6 +23,7 @@ mod migration;
 mod modio_api;
 mod mods;
 mod nexus;
+mod p2p;
 mod share;
 mod system_theme;
 mod thunderstore;
@@ -93,6 +95,7 @@ pub fn run() {
             commands::suggest_catalog_ids,
             commands::suggest_catalog_ids_batch,
             commands::unmanage_game,
+            commands::get_unmanage_collection_status,
             commands::get_game_health,
             commands::relink_managed_game,
             commands::get_settings,
@@ -107,6 +110,7 @@ pub fn run() {
             commands::set_autoclick_free_download,
             commands::set_install_click_behavior,
             commands::set_recent_downloads_limit,
+            commands::set_banner_timeouts,
             commands::set_active_game,
             commands::set_api_key,
             commands::validate_user,
@@ -178,9 +182,16 @@ pub fn run() {
             commands::list_mods_needing_fomod,
             commands::remove_mod,
             commands::remove_all_mods,
-            commands::deploy_mods,
+            commands::launch_modded,
+            commands::launch_unmodded,
+            commands::revert_deployment,
+            commands::get_launch_state,
+            commands::has_active_deployment,
+            commands::close_game,
+            commands::set_launch_command_source,
+            commands::get_launch_preview,
+            commands::set_game_launch_options,
             commands::diagnose_load,
-            commands::purge_mods,
             commands::list_downloads,
             commands::clear_recent_downloads,
             commands::remove_download,
@@ -211,8 +222,35 @@ pub fn run() {
             tools::get_game_tools,
             tools::set_game_tools,
             tools::sync_game_tools,
+            commands::get_friends_state,
+            commands::set_p2p_display_name,
+            commands::set_collection_visibility,
+            commands::add_friend_by_code,
+            commands::respond_friend_request,
+            commands::remove_friend,
+            commands::refresh_friends,
+            commands::decode_friend_share_code,
+            commands::join_or_sync_friend_collection,
+            commands::finalize_friend_collection_sync,
+            commands::set_friend_collection_auto_sync,
         ])
         .setup(|app| {
+            {
+                use tauri::Manager;
+                let st = app.state::<AppState>();
+                st.p2p.start(app.handle().clone());
+                let games = st
+                    .config
+                    .lock()
+                    .map(|c| c.managed_games.clone())
+                    .unwrap_or_default();
+                launch::reconcile_orphaned_deployments(
+                    app.handle(),
+                    &st.paths,
+                    &games,
+                    &st.launch_states,
+                );
+            }
             // Register nxm:// and emperor:// with the OS when supported (Windows installer / Linux desktop).
             if let Err(e) = app.deep_link().register_all() {
                 log::warn!("deep-link register_all failed: {e}");

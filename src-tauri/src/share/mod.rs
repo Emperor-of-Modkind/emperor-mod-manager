@@ -75,6 +75,10 @@ pub struct ShareModEntry {
     pub display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fomod: Option<crate::mods::fomod::FomodSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<crate::mods::options::ModOptionSelection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,6 +187,10 @@ fn content_hash(code: &str) -> String {
 
 pub fn emperor_share_id(code: &str) -> String {
     format!("emperor-share:{}", content_hash(code))
+}
+
+pub fn share_hash(code: &str) -> String {
+    content_hash(code)
 }
 
 pub fn encode_share_manifest(manifest: &ShareManifest) -> Result<String> {
@@ -397,6 +405,15 @@ pub fn build_manifest_from_loadorder(
     game: &ManagedGame,
     name: Option<String>,
 ) -> (ShareManifest, Vec<String>, Vec<String>) {
+    build_manifest_from_loadorder_with_selections(order, game, name, false)
+}
+
+pub fn build_manifest_from_loadorder_with_selections(
+    order: &LoadOrder,
+    game: &ManagedGame,
+    name: Option<String>,
+    include_selections: bool,
+) -> (ShareManifest, Vec<String>, Vec<String>) {
     let mut mods = Vec::new();
     let mut skipped = Vec::new();
     let mut member_ids = Vec::new();
@@ -429,6 +446,8 @@ pub fn build_manifest_from_loadorder(
                     game_id: None,
                     display_name: Some(display_name(m)),
                     version: m.version.clone(),
+                    fomod: include_selections.then(|| m.fomod_selection.clone()).flatten(),
+                    options: include_selections.then(|| m.option_selection.clone()).flatten(),
                 });
                 member_ids.push(m.id.clone());
             }
@@ -449,6 +468,8 @@ pub fn build_manifest_from_loadorder(
                     game_id: None,
                     display_name: Some(display_name(m)),
                     version: m.version.clone(),
+                    fomod: include_selections.then(|| m.fomod_selection.clone()).flatten(),
+                    options: include_selections.then(|| m.option_selection.clone()).flatten(),
                 });
                 member_ids.push(m.id.clone());
             }
@@ -468,6 +489,8 @@ pub fn build_manifest_from_loadorder(
                     game_id: Some(gid),
                     display_name: Some(display_name(m)),
                     version: m.version.clone(),
+                    fomod: include_selections.then(|| m.fomod_selection.clone()).flatten(),
+                    options: include_selections.then(|| m.option_selection.clone()).flatten(),
                 });
                 member_ids.push(m.id.clone());
             }
@@ -590,6 +613,68 @@ pub fn get_saved_collection(paths: &Paths, id: &str) -> Result<SavedCollectionDe
     })
 }
 
+fn share_mod_identity(
+    m: &ShareModEntry,
+) -> (
+    &ShareModSource,
+    Option<&str>,
+    Option<u64>,
+    Option<u64>,
+    Option<&str>,
+    Option<&str>,
+    Option<&str>,
+    Option<u32>,
+    Option<&str>,
+) {
+    (
+        &m.s,
+        m.domain.as_deref(),
+        m.mod_id,
+        m.file_id,
+        m.community.as_deref(),
+        m.namespace.as_deref(),
+        m.name.as_deref(),
+        m.game_id,
+        m.version.as_deref(),
+    )
+}
+
+pub fn manifest_mods_match(a: &[ShareModEntry], b: &[ShareModEntry]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut keys_a: Vec<_> = a.iter().map(share_mod_identity).collect();
+    let mut keys_b: Vec<_> = b.iter().map(share_mod_identity).collect();
+    keys_a.sort_by_key(|k| format!("{k:?}"));
+    keys_b.sort_by_key(|k| format!("{k:?}"));
+    keys_a == keys_b
+}
+
+pub fn is_loadout_saved_in_personal_collections(
+    paths: &Paths,
+    game: &ManagedGame,
+    manifest: &ShareManifest,
+    code: &str,
+) -> Result<bool> {
+    let store = load_saved_collections(paths)?;
+    let trimmed = code.trim();
+    let target_share_id = emperor_share_id(trimmed);
+    for entry in &store.collections {
+        let entry_trimmed = entry.code.trim();
+        if entry_trimmed == trimmed || emperor_share_id(entry_trimmed) == target_share_id {
+            return Ok(true);
+        }
+        if let Ok(saved_manifest) = decode_share_code(entry_trimmed) {
+            let same_game = entry.source_game_id.as_deref() == Some(game.id.as_str())
+                || catalogs_overlap(&saved_manifest.game, game).is_ok();
+            if same_game && manifest_mods_match(&manifest.mods, &saved_manifest.mods) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 pub fn mod_label(entry: &ShareModEntry) -> String {
     entry
         .display_name
@@ -641,6 +726,8 @@ mod tests {
                     game_id: None,
                     display_name: Some("Cool Mod".into()),
                     version: Some("1.0".into()),
+                    fomod: None,
+                    options: None,
                 },
                 ShareModEntry {
                     s: ShareModSource::Thunderstore,
@@ -653,6 +740,8 @@ mod tests {
                     game_id: None,
                     display_name: Some("Pkg".into()),
                     version: Some("2.0.0".into()),
+                    fomod: None,
+                    options: None,
                 },
                 ShareModEntry {
                     s: ShareModSource::Modio,
@@ -665,6 +754,8 @@ mod tests {
                     game_id: Some(42),
                     display_name: Some("Mio".into()),
                     version: None,
+                    fomod: None,
+                    options: None,
                 },
             ],
         }
@@ -779,6 +870,11 @@ mod tests {
             tool_overrides: None,
             game_version: None,
             ignored_requirements: Vec::new(),
+            launch_executable: None,
+            launch_command_source: Default::default(),
+            custom_env_vars: Vec::new(),
+            custom_wrapper: None,
+            custom_launch_args: None,
         };
         let order = LoadOrder {
             mods: vec![
@@ -851,6 +947,11 @@ mod tests {
             tool_overrides: None,
             game_version: None,
             ignored_requirements: Vec::new(),
+            launch_executable: None,
+            launch_command_source: Default::default(),
+            custom_env_vars: Vec::new(),
+            custom_wrapper: None,
+            custom_launch_args: None,
         };
         let hint = sample_manifest().game;
         assert!(catalogs_overlap(&hint, &game).is_ok());
@@ -873,6 +974,11 @@ mod tests {
             tool_overrides: None,
             game_version: None,
             ignored_requirements: Vec::new(),
+            launch_executable: None,
+            launch_command_source: Default::default(),
+            custom_env_vars: Vec::new(),
+            custom_wrapper: None,
+            custom_launch_args: None,
         };
         let hint = ShareGameHint {
             id: None,
@@ -884,5 +990,68 @@ mod tests {
             project_name: None,
         };
         assert!(catalogs_overlap(&hint, &game).is_err());
+    }
+
+    #[test]
+    fn loadout_saved_in_personal_collections_matches_code_and_renamed_mods() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_dir: dir.path().join("cfg"),
+            data_dir: dir.path().join("data"),
+            cache_dir: dir.path().join("cache"),
+        };
+        let game = ManagedGame {
+            id: "skyrim-1".into(),
+            title: "Skyrim SE".into(),
+            nexus_domain: "skyrimspecialedition".into(),
+            install_path: "/tmp".into(),
+            launcher: "steam".into(),
+            plugin_id: "skyrim".into(),
+            cover_path: None,
+            cover_url: None,
+            project_name: None,
+            thunderstore_community: None,
+            modio_game_id: None,
+            tool_overrides: None,
+            game_version: None,
+            ignored_requirements: Vec::new(),
+            launch_executable: None,
+            launch_command_source: Default::default(),
+            custom_env_vars: Vec::new(),
+            custom_wrapper: None,
+            custom_launch_args: None,
+        };
+        let manifest = sample_manifest();
+        let code = encode_share_manifest(&manifest).unwrap();
+        assert!(!is_loadout_saved_in_personal_collections(&paths, &game, &manifest, &code).unwrap());
+
+        // Save with a custom name (different encoded code because manifest.name differs).
+        let mut named_manifest = manifest.clone();
+        named_manifest.name = Some("My Renamed Loadout".into());
+        let named_code = encode_share_manifest(&named_manifest).unwrap();
+        let entry = entry_from_code(&named_code, Some("My Renamed Loadout".into()), Some(game.id.clone())).unwrap();
+        add_saved_collection(&paths, entry).unwrap();
+
+        assert!(is_loadout_saved_in_personal_collections(&paths, &game, &manifest, &code).unwrap());
+
+        // Different mod list should not match.
+        let mut other_manifest = manifest.clone();
+        other_manifest.mods.pop();
+        let other_code = encode_share_manifest(&other_manifest).unwrap();
+        assert!(!is_loadout_saved_in_personal_collections(&paths, &game, &other_manifest, &other_code).unwrap());
+    }
+
+    #[test]
+    fn share_manifest_round_trips_fomod_selection() {
+        let mut selected = std::collections::BTreeMap::new();
+        selected.insert("group_1".to_string(), vec!["plugin_a".to_string()]);
+        let fomod = crate::mods::fomod::FomodSelection { selected };
+
+        let mut manifest = sample_manifest();
+        manifest.mods[0].fomod = Some(fomod.clone());
+        let code = encode_share_manifest(&manifest).unwrap();
+        let decoded = decode_share_code(&code).unwrap();
+        assert_eq!(decoded.mods[0].fomod, Some(fomod));
+        assert!(decoded.mods[1].fomod.is_none());
     }
 }

@@ -251,6 +251,11 @@ mod tests {
             tool_overrides: None,
             game_version: None,
             ignored_requirements: Vec::new(),
+            launch_executable: None,
+            launch_command_source: Default::default(),
+            custom_env_vars: Vec::new(),
+            custom_wrapper: None,
+            custom_launch_args: None,
         }
     }
 

@@ -2,6 +2,7 @@
 
 mod autohdr_vk;
 pub(crate) mod executables;
+pub(crate) mod heroic_launch;
 mod lsfg_vk;
 mod manifest;
 

@@ -76,6 +76,13 @@ export type ManagedGame = {
   game_version?: string | null;
   /** Requirements hidden from the review until the user unignores them. */
   ignored_requirements?: IgnoredRequirement[];
+  /** Optional relative or absolute executable override for launching non-Steam games. */
+  launch_executable?: string | null;
+  /** Whether Emperor applies its own launch commands (WINEDLLOVERRIDES, tool env) or defers to the launcher. */
+  launch_command_source?: LaunchCommandSource;
+  custom_env_vars?: LaunchEnvVar[];
+  custom_wrapper?: string | null;
+  custom_launch_args?: string | null;
 };
 
 export type IgnoredRequirement = {
@@ -471,6 +478,14 @@ export type CollectionSearchPage = {
   thunderstore_available?: boolean;
 };
 
+export type FriendSyncMetadata = {
+  friend_peer_id: string;
+  friend_collection_id: string;
+  last_synced_hash: string;
+  last_synced_at: string;
+  auto_sync: boolean;
+};
+
 export type InstalledCollection = {
   id: string;
   source: "nexus" | "thunderstore" | "emperor";
@@ -487,6 +502,7 @@ export type InstalledCollection = {
   installed_at: string;
   /** Game versions this collection revision was built for. */
   game_versions?: string[] | null;
+  friend_sync?: FriendSyncMetadata | null;
 };
 
 export type ShareGameHint = {
@@ -512,6 +528,8 @@ export type ShareModEntry = {
   game_id?: number | null;
   display_name?: string | null;
   version?: string | null;
+  fomod?: FomodSelection | null;
+  options?: ModOptionSelection | null;
 };
 
 export type SavedCollectionEntry = {
@@ -764,6 +782,71 @@ export type StagedModUpdate = {
   file_name?: string | null;
 };
 
+export type FriendCollectionKind = "active_loadout" | "saved_collection";
+
+export type FriendShareRef = {
+  id: string;
+  kind: FriendCollectionKind;
+  name: string;
+  share_code: string;
+  share_hash: string;
+  updated_at: string;
+};
+
+export type PeerProfileSummary = {
+  peer_id: string;
+  display_name: string;
+  updated_at: string;
+  collections: FriendShareRef[];
+};
+
+export type FriendStatus = "connected" | "pending_outgoing";
+
+export type FriendRecord = {
+  peer_id: string;
+  display_name: string;
+  status: FriendStatus;
+  online: boolean;
+  last_seen_at?: string | null;
+  cached_profile?: PeerProfileSummary | null;
+};
+
+export type PendingFriendRequest = {
+  peer_id: string;
+  display_name: string;
+  received_at: string;
+};
+
+export type LocalShareableCollection = {
+  id: string;
+  kind: FriendCollectionKind;
+  name: string;
+  game_title: string;
+  mod_count: number;
+  hidden: boolean;
+};
+
+export type FriendsState = {
+  endpoint_ready: boolean;
+  peer_id?: string | null;
+  join_code?: string | null;
+  display_name: string;
+  friends: FriendRecord[];
+  pending_requests: PendingFriendRequest[];
+  local_collections: LocalShareableCollection[];
+};
+
+export type FriendSyncResult = {
+  collection_id: string;
+  name: string;
+  share_code: string;
+  share_hash: string;
+  member_ids: string[];
+  needs_assist: ShareAssistFile[];
+  warnings: string[];
+  collection?: InstalledCollection | null;
+};
+
 export type ModioModDetail = {
   game_id: number;
   mod_id: number;
@@ -848,6 +931,47 @@ export type DeployResult = {
   missing_requirements?: MissingRequirements;
 };
 
+export type LaunchMode = "modded" | "unmodded";
+
+export type LaunchCommandSource = "emperor" | "launcher";
+
+export type LaunchEnvVar = {
+  name: string;
+  value: string;
+};
+
+export type LaunchPreview = {
+  source: LaunchCommandSource;
+  launcher_name: string;
+  auto_env_vars: LaunchEnvVar[];
+  custom_env_vars: LaunchEnvVar[];
+  custom_wrapper: string;
+  custom_launch_args: string;
+  launcher_options?: string | null;
+  effective_command: string;
+};
+
+export type LaunchPhase =
+  | "idle"
+  | "deploying"
+  | "starting"
+  | "running"
+  | "reverting";
+
+export type GameLaunchState = {
+  game_id: string;
+  mode: LaunchMode;
+  phase: LaunchPhase;
+  pids: number[];
+  started_at: number;
+  error?: string | null;
+};
+
+export type LaunchResult = {
+  state: GameLaunchState;
+  deploy_result?: DeployResult | null;
+};
+
 export type LoadFinding = {
   severity: string;
   title: string;
@@ -917,6 +1041,12 @@ export type DownloadItem = {
   page?: DownloadPageTarget | null;
 };
 
+export type BannerTimeouts = {
+  info: number | null;
+  warn: number | null;
+  error: number | null;
+};
+
 export type Settings = {
   adult_content: boolean;
   game_version_warnings: boolean;
@@ -928,6 +1058,7 @@ export type Settings = {
   linux_system_backend?: LinuxSystemBackend;
   install_click_behavior?: InstallClickBehavior;
   recent_downloads_limit?: number;
+  banner_timeouts?: BannerTimeouts;
   has_api_key: boolean;
   has_modio_api_key?: boolean;
   initial_setup_complete: boolean;
