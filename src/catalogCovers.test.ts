@@ -1,6 +1,17 @@
 import { describe, expect, it } from "vitest";
-import { catalogCoverRequests } from "./catalogCovers";
-import type { CatalogSuggestion, DetectedGame } from "./types";
+import {
+  COLLECTION_COVER_PREFIX,
+  applyCatalogCovers,
+  catalogCoverRequests,
+  collectionCatalogCoverRequests,
+} from "./catalogCovers";
+import type { SavedCollectionGameGroup } from "./savedCollectionGroups";
+import type {
+  CatalogSuggestion,
+  DetectedGame,
+  GamePluginInfo,
+  SavedCollectionEntry,
+} from "./types";
 
 function detected(partial: Partial<DetectedGame> & Pick<DetectedGame, "id">): DetectedGame {
   return {
@@ -115,5 +126,189 @@ describe("catalogCoverRequests", () => {
       { game: suggestion({ nexus_domain: "suggested" }) },
     );
     expect(requests[0]?.nexus_domain).toBe("stored");
+  });
+});
+
+function collectionGroup(
+  partial: Partial<SavedCollectionGameGroup> & Pick<SavedCollectionGameGroup, "key">,
+): SavedCollectionGameGroup {
+  const entry: SavedCollectionEntry = {
+    id: "c1",
+    name: "Pack",
+    code: "code",
+    created_at: "2026-01-01T00:00:00Z",
+    updated_at: "2026-01-01T00:00:00Z",
+    game: {},
+    mod_count: 1,
+    nexus_count: 1,
+    thunderstore_count: 0,
+    modio_count: 0,
+  };
+  return {
+    title: "Game",
+    coverPath: null,
+    managed: null,
+    collections: [entry],
+    ...partial,
+  };
+}
+
+describe("collectionCatalogCoverRequests", () => {
+  it("requests posters for unmanaged/uninstalled collection groups with nexus_domain or modio_game_id", () => {
+    const groups = [
+      collectionGroup({
+        key: "nexus:cyberpunk2077",
+        collections: [
+          {
+            ...collectionGroup({ key: "nexus:cyberpunk2077" }).collections[0]!,
+            game: { nexus_domain: "cyberpunk2077" },
+          },
+        ],
+      }),
+      collectionGroup({
+        key: "modio:42",
+        collections: [
+          {
+            ...collectionGroup({ key: "modio:42" }).collections[0]!,
+            game: { modio_game_id: 42 },
+          },
+        ],
+      }),
+    ];
+    expect(collectionCatalogCoverRequests(groups, [])).toEqual([
+      {
+        id: `${COLLECTION_COVER_PREFIX}nexus:cyberpunk2077`,
+        nexus_domain: "cyberpunk2077",
+        modio_game_id: null,
+        icon_path: null,
+      },
+      {
+        id: `${COLLECTION_COVER_PREFIX}modio:42`,
+        nexus_domain: null,
+        modio_game_id: 42,
+        icon_path: null,
+      },
+    ]);
+  });
+
+  it("falls back to plugin nexus_domain when hint only has plugin_id", () => {
+    const plugins: GamePluginInfo[] = [
+      { id: "skyrimse", display_name: "Skyrim SE", nexus_domain: "skyrimspecialedition" },
+    ];
+    const groups = [
+      collectionGroup({
+        key: "plugin:skyrimse",
+        collections: [
+          {
+            ...collectionGroup({ key: "plugin:skyrimse" }).collections[0]!,
+            game: { plugin_id: "skyrimse" },
+          },
+        ],
+      }),
+    ];
+    expect(collectionCatalogCoverRequests(groups, plugins)).toEqual([
+      {
+        id: `${COLLECTION_COVER_PREFIX}plugin:skyrimse`,
+        nexus_domain: "skyrimspecialedition",
+        modio_game_id: null,
+        icon_path: null,
+      },
+    ]);
+  });
+
+  it("skips groups that already have a real cover, but requests when only an icon is present", () => {
+    const det = detected({
+      id: "det-1",
+      icon_path: "/games/icon.png",
+    });
+    const groups = [
+      collectionGroup({
+        key: "has-remote",
+        coverPath: "https://images.nexusmods.com/images/games/v2/1704/tile.jpg",
+        collections: [
+          {
+            ...collectionGroup({ key: "has-remote" }).collections[0]!,
+            game: { nexus_domain: "skyrimspecialedition" },
+          },
+        ],
+      }),
+      collectionGroup({
+        key: "has-local",
+        coverPath: "/covers/skyrim.jpg",
+        collections: [
+          {
+            ...collectionGroup({ key: "has-local" }).collections[0]!,
+            game: { nexus_domain: "skyrimspecialedition" },
+          },
+        ],
+      }),
+      collectionGroup({
+        key: "only-icon",
+        coverPath: "/games/icon.png",
+        collections: [
+          {
+            ...collectionGroup({ key: "only-icon" }).collections[0]!,
+            game: { nexus_domain: "cyberpunk2077" },
+          },
+        ],
+      }),
+    ];
+    expect(collectionCatalogCoverRequests(groups, [], [det])).toEqual([
+      {
+        id: `${COLLECTION_COVER_PREFIX}only-icon`,
+        nexus_domain: "cyberpunk2077",
+        modio_game_id: null,
+        icon_path: null,
+      },
+    ]);
+  });
+});
+
+describe("applyCatalogCovers", () => {
+  it("re-applies resolved catalog posters onto a fresh scan snapshot", () => {
+    const games = [
+      detected({ id: "doom", title: "Doom - The Dark Ages" }),
+      detected({
+        id: "valor",
+        title: "Valor Mortis",
+        cover_path: "/home/luu/.config/heroic/icons/valor.png",
+        icon_path: "/home/luu/.config/heroic/icons/valor.png",
+      }),
+    ];
+    const resolved = new Map([
+      ["doom", "https://staticdelivery.nexusmods.com/images/games/v2/doom.jpg"],
+      ["valor", "https://staticdelivery.nexusmods.com/images/games/v2/valor.jpg"],
+    ]);
+
+    const updated = applyCatalogCovers(games, resolved);
+    expect(updated[0]).toMatchObject({
+      id: "doom",
+      cover_url: "https://staticdelivery.nexusmods.com/images/games/v2/doom.jpg",
+      cover_path: null,
+    });
+    expect(updated[1]).toMatchObject({
+      id: "valor",
+      cover_url: "https://staticdelivery.nexusmods.com/images/games/v2/valor.jpg",
+      cover_path: null,
+    });
+  });
+
+  it("does not overwrite a real local poster or existing cover_url", () => {
+    const games = [
+      detected({
+        id: "steam-game",
+        cover_path: "/steam/librarycache/1234/library_600x900.jpg",
+      }),
+      detected({
+        id: "heroic-game",
+        cover_url: "https://heroic.example/poster.jpg",
+      }),
+    ];
+    const resolved = new Map([
+      ["steam-game", "https://nexus.example/steam.jpg"],
+      ["heroic-game", "https://nexus.example/heroic.jpg"],
+    ]);
+
+    expect(applyCatalogCovers(games, resolved)).toBe(games);
   });
 });

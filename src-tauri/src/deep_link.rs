@@ -31,6 +31,7 @@ pub enum EmperorOpenMod {
     },
 }
 
+#[cfg(test)]
 impl EmperorOpenMod {
     pub fn build_url(&self) -> String {
         match self {

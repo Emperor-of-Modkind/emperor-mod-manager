@@ -175,6 +175,65 @@ describe("groupSavedCollectionsByGame", () => {
       "https://images.nexusmods.com/images/games/v2/1704/tile.jpg",
     );
   });
+
+  it("uses catalogCovers for unmanaged/uninstalled collection groups", () => {
+    const groups = groupSavedCollectionsByGame(
+      [
+        entry({
+          id: "x",
+          name: "X",
+          game: { nexus_domain: "cyberpunk2077", title: "Cyberpunk 2077" },
+        }),
+      ],
+      [],
+      [],
+      [],
+      {
+        "nexus:cyberpunk2077":
+          "https://images.nexusmods.com/images/games/v2/952/tile.jpg",
+      },
+    );
+    expect(groups[0]?.coverPath).toBe(
+      "https://images.nexusmods.com/images/games/v2/952/tile.jpg",
+    );
+  });
+
+  it("prefers catalogCovers over a detected launcher icon", () => {
+    const detected: DetectedGame[] = [
+      {
+        id: "det-1",
+        title: "Cyberpunk 2077",
+        install_path: "/g",
+        launcher: "Heroic",
+        supported: true,
+        plugin_id: "cyberpunk2077",
+        nexus_domain: "cyberpunk2077",
+        cover_path: "/home/luu/.config/heroic/icons/1423049311.png",
+        icon_path: "/home/luu/.config/heroic/icons/1423049311.png",
+        cover_url: null,
+        engine_hint: null,
+      },
+    ];
+    const groups = groupSavedCollectionsByGame(
+      [
+        entry({
+          id: "x",
+          name: "X",
+          game: { nexus_domain: "cyberpunk2077" },
+        }),
+      ],
+      [],
+      detected,
+      [],
+      {
+        "nexus:cyberpunk2077":
+          "https://images.nexusmods.com/images/games/v2/952/tile.jpg",
+      },
+    );
+    expect(groups[0]?.coverPath).toBe(
+      "https://images.nexusmods.com/images/games/v2/952/tile.jpg",
+    );
+  });
 });
 
 describe("savedCollectionMatchesGame", () => {
@@ -273,5 +332,62 @@ describe("generic engine titles", () => {
     });
     expect(savedCollectionMatchesGame(pack, gameOne)).toBe(true);
     expect(savedCollectionMatchesGame(pack, gameTwo)).toBe(false);
+  });
+
+  it("never titles an unmanaged generic BepInEx collection with catalog ids as Unity / BepInEx (generic)", () => {
+    const pack = entry({
+      id: "bw1",
+      name: "Walk Pack",
+      game: { plugin_id: "bepinex", nexus_domain: "bigwalk" },
+    });
+
+    const withoutCatalogTitle = groupSavedCollectionsByGame(
+      [pack],
+      [],
+      [],
+      [genericPlugin],
+      { "nexus:bigwalk": "https://example.com/bigwalk.jpg" },
+    );
+    expect(withoutCatalogTitle).toHaveLength(1);
+    expect(withoutCatalogTitle[0]?.title).toBe("bigwalk");
+
+    const withCatalogTitle = groupSavedCollectionsByGame(
+      [pack],
+      [],
+      [],
+      [genericPlugin],
+      { "nexus:bigwalk": "https://example.com/bigwalk.jpg" },
+      { "nexus:bigwalk": "Big Walk" },
+    );
+    expect(withCatalogTitle).toHaveLength(1);
+    expect(withCatalogTitle[0]?.title).toBe("Big Walk");
+  });
+
+  it("does not match an unrelated detected generic BepInEx game when hint title is missing", () => {
+    const unrelatedDetected = {
+      id: "other-bepinex",
+      title: "Some Other Unity Game",
+      nexus_domain: "",
+      install_path: "/games/other",
+      launcher: "steam",
+      plugin_id: "bepinex",
+      cover_path: "/covers/other.jpg",
+      supported: true,
+      engine_hint: null,
+    };
+    const pack = entry({
+      id: "bw2",
+      name: "Walk Pack",
+      game: { plugin_id: "bepinex", thunderstore_community: "big-walk" },
+    });
+
+    const groups = groupSavedCollectionsByGame(
+      [pack],
+      [],
+      [unrelatedDetected],
+      [genericPlugin],
+    );
+    expect(groups).toHaveLength(1);
+    expect(groups[0]?.title).toBe("big-walk");
   });
 });

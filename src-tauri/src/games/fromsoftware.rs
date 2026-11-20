@@ -940,11 +940,13 @@ pub fn winedll_has_native(opts: &str, dll: &str) -> bool {
 }
 
 /// True when launch options contain a valid native `dinput8` Wine override.
+#[cfg(test)]
 pub fn launch_options_have_dinput8_native(opts: &str) -> bool {
     winedll_has_native(opts, "dinput8")
 }
 
 /// Fix `dinput8,n,b` typo and/or ensure a proper dinput8 native override.
+#[cfg(test)]
 pub fn repair_dinput8_override(existing: &str) -> String {
     merge_fromsoft_winedll_overrides(existing, &["dinput8"])
 }

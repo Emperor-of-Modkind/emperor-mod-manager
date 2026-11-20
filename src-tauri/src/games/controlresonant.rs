@@ -10,9 +10,6 @@ use super::{
 
 pub const CONTROL_RESONANT_ROOT_DIRS: &[&str] = &["crmods", "data"];
 
-/// Steam AppID (fallback when install path has no appmanifest).
-const STEAM_APP_ID: &str = "3669870";
-
 /// Loader + known install-root config files from loose-file overhauls.
 const ROOT_FILES: &[&str] = &["winmm.dll", "crmods.txt", "renderer.ini", "nvngx.ini"];
 
@@ -182,21 +179,6 @@ fn dir_contains_dll(dir: &Path) -> bool {
         }
     }
     false
-}
-
-pub use super::wine_overrides::{launch_options_have_winmm_native, repair_winmm_override};
-
-fn resolve_steam_app_id(install_path: &Path) -> String {
-    #[cfg(target_os = "linux")]
-    {
-        crate::tools::executables::steam_app_id_from_install(&install_path.to_string_lossy())
-            .unwrap_or_else(|| STEAM_APP_ID.to_string())
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = install_path;
-        STEAM_APP_ID.to_string()
-    }
 }
 
 fn ensure_winmm_override(install_path: &Path) -> Vec<String> {
@@ -374,6 +356,7 @@ pub fn resolve_control_resonant_deploy(
 
 #[cfg(test)]
 mod tests {
+    use super::super::wine_overrides::{launch_options_have_winmm_native, repair_winmm_override};
     use super::*;
 
     fn plugin() -> ControlResonantPlugin {

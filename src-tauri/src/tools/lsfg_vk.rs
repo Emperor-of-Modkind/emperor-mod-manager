@@ -87,18 +87,6 @@ impl LsfgVkConfig {
         Ok(())
     }
 
-    pub fn profile_mut(&mut self, name: &str) -> &mut LsfgVkProfile {
-        if let Some(idx) = self.profiles.iter().position(|p| p.name == name) {
-            return &mut self.profiles[idx];
-        }
-        self.profiles.push(LsfgVkProfile {
-            name: name.to_string(),
-            ..LsfgVkProfile::default()
-        });
-        let last = self.profiles.len() - 1;
-        &mut self.profiles[last]
-    }
-
     pub fn remove_profile(&mut self, name: &str) {
         self.profiles.retain(|p| p.name != name);
     }

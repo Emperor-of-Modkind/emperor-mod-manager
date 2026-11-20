@@ -134,6 +134,21 @@ vi.mock("@tauri-apps/api/core", () => {
     }),
   });
   Element.prototype.scrollTo = () => {};
+  for (const key of ["clientWidth", "clientHeight"] as const) {
+    Object.defineProperty(HTMLElement.prototype, key, {
+      configurable: true,
+      get() {
+        return 800;
+      },
+    });
+  }
+  if (typeof globalThis.ResizeObserver === "undefined") {
+    globalThis.ResizeObserver = class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    };
+  }
   (
     globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }
   ).IS_REACT_ACT_ENVIRONMENT = true;
@@ -229,6 +244,12 @@ function latestVersion(gameId: string): VersionCall {
   return call;
 }
 
+function hasCard(title: string) {
+  return [...document.querySelectorAll(".media-card-title")].some(
+    (el) => el.textContent === title,
+  );
+}
+
 function clickCard(title: string) {
   const card = [...document.querySelectorAll(".media-card")].find(
     (el) => el.querySelector(".media-card-title")?.textContent === title,
@@ -296,10 +317,7 @@ describe("stale requirements on game switch", () => {
     await act(async () => {
       root.render(<App />);
     });
-    await waitFor(
-      () => document.body.textContent?.includes("Game A") === true,
-      "library did not list games",
-    );
+    await waitFor(() => hasCard("Game A"), "library did not list games");
 
     await act(async () => {
       clickCard("Game A");
@@ -328,6 +346,7 @@ describe("stale requirements on game switch", () => {
     await act(async () => {
       clickButton("Home");
     });
+    await waitFor(() => hasCard("Game B"), "library home did not return");
     await act(async () => {
       clickCard("Game B");
     });
@@ -361,10 +380,7 @@ describe("stale requirements on game switch", () => {
     await act(async () => {
       root.render(<App />);
     });
-    await waitFor(
-      () => document.body.textContent?.includes("Game A") === true,
-      "library did not list games",
-    );
+    await waitFor(() => hasCard("Game A"), "library did not list games");
     await act(async () => {
       clickCard("Game A");
     });
@@ -416,10 +432,7 @@ describe("stale requirements on game switch", () => {
     await act(async () => {
       root.render(<App />);
     });
-    await waitFor(
-      () => document.body.textContent?.includes("Game A") === true,
-      "library did not list games",
-    );
+    await waitFor(() => hasCard("Game A"), "library did not list games");
     await act(async () => {
       clickCard("Game A");
     });
@@ -433,6 +446,7 @@ describe("stale requirements on game switch", () => {
     await act(async () => {
       clickButton("Home");
     });
+    await waitFor(() => hasCard("Game B"), "library home did not return");
     await act(async () => {
       clickCard("Game B");
     });

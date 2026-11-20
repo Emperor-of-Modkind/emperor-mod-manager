@@ -141,8 +141,6 @@ enum Dependency {
     },
     /// Soft game version checks — treated as satisfied.
     GameVersion,
-    /// Soft FOSE/etc — treated as satisfied.
-    FoseVersion,
     /// Unknown leaf — treated as satisfied so we do not hard-block.
     Unknown,
 }
@@ -248,10 +246,9 @@ pub fn has_fomod(content_root: &Path) -> bool {
 }
 
 pub fn detect_scripted_installer(content_root: &Path) -> bool {
-    let fomod = content_root.join("fomod");
-    if !fomod.is_dir() {
+    let Some(fomod) = fomod_config_dir(content_root) else {
         return false;
-    }
+    };
     let Ok(entries) = fs::read_dir(&fomod) else {
         return false;
     };
@@ -382,7 +379,7 @@ pub fn default_selection(module: &FomodModule) -> FomodSelection {
                     .unwrap_or_default();
                 next.insert(
                     group.id.clone(),
-                    normalize_group_plugins(group, &existing, &flags),
+                    normalize_group_plugins(group, &existing, &flags, true),
                 );
             }
         }
@@ -392,19 +389,40 @@ pub fn default_selection(module: &FomodModule) -> FomodSelection {
 }
 
 pub fn normalize_selection(module: &FomodModule, selection: &FomodSelection) -> FomodSelection {
-    let flags = collect_flags(module, selection);
+    let mut flags = HashMap::new();
     let mut selected = BTreeMap::new();
     for step in &module.steps {
+        let visible = step
+            .visible
+            .as_ref()
+            .map(|d| eval_dependency(d, &flags, None))
+            .unwrap_or(true);
+        if !visible {
+            for group in &step.groups {
+                if let Some(prev) = selection.selected.get(&group.id) {
+                    selected.insert(group.id.clone(), prev.clone());
+                } else {
+                    selected.insert(group.id.clone(), default_group_plugins(group));
+                }
+            }
+            continue;
+        }
         for group in &step.groups {
+            let has_entry = selection.selected.contains_key(&group.id);
             let existing = selection
                 .selected
                 .get(&group.id)
                 .cloned()
                 .unwrap_or_default();
-            selected.insert(
-                group.id.clone(),
-                normalize_group_plugins(group, &existing, &flags),
-            );
+            let normalized = normalize_group_plugins(group, &existing, &flags, !has_entry);
+            for plugin in &group.plugins {
+                if normalized.contains(&plugin.id) {
+                    for flag in &plugin.flags {
+                        flags.insert(flag.name.clone(), flag.value.clone());
+                    }
+                }
+            }
+            selected.insert(group.id.clone(), normalized);
         }
     }
     FomodSelection { selected }
@@ -421,13 +439,14 @@ pub fn effective_selection(
 }
 
 fn default_group_plugins(group: &FomodGroup) -> Vec<String> {
-    normalize_group_plugins(group, &[], &HashMap::new())
+    normalize_group_plugins(group, &[], &HashMap::new(), true)
 }
 
 fn normalize_group_plugins(
     group: &FomodGroup,
     existing: &[String],
     flags: &HashMap<String, String>,
+    seed_recommended: bool,
 ) -> Vec<String> {
     let plugins: Vec<_> = group
         .plugins
@@ -501,8 +520,8 @@ fn normalize_group_plugins(
             Vec::new()
         }
         FomodGroupType::SelectAny => {
-            if chosen.is_empty() {
-                // Pre-select Recommended plugins for SelectAny.
+            if chosen.is_empty() && seed_recommended {
+                // Pre-select Recommended plugins for SelectAny when uninitialized.
                 return plugins
                     .iter()
                     .filter(|(_, t)| matches!(t, FomodPluginType::Recommended) || t.is_forced_on())
@@ -526,6 +545,14 @@ fn resolve_plugin_type(plugin: &FomodPlugin, flags: &HashMap<String, String>) ->
 fn collect_flags(module: &FomodModule, selection: &FomodSelection) -> HashMap<String, String> {
     let mut flags = HashMap::new();
     for step in &module.steps {
+        let visible = step
+            .visible
+            .as_ref()
+            .map(|d| eval_dependency(d, &flags, None))
+            .unwrap_or(true);
+        if !visible {
+            continue;
+        }
         for group in &step.groups {
             let Some(ids) = selection.selected.get(&group.id) else {
                 continue;
@@ -568,7 +595,7 @@ fn eval_dependency(
                 _ => present,          // Active / default
             }
         }
-        Dependency::GameVersion | Dependency::FoseVersion | Dependency::Unknown => true,
+        Dependency::GameVersion | Dependency::Unknown => true,
     }
 }
 
@@ -640,7 +667,9 @@ fn expand_file_ref(
     r: &FomodFileRef,
     by_dest: &mut BTreeMap<String, MappedDest>,
 ) -> Result<()> {
-    let source = content_root.join(normalize_fomod_path(&r.source));
+    let Some(source) = resolve_fomod_source(content_root, &r.source) else {
+        return Ok(());
+    };
     if r.is_folder {
         if !source.is_dir() {
             // Missing optional folders are common in messy packs; skip quietly.
@@ -733,6 +762,18 @@ fn normalize_fomod_path(raw: &str) -> PathBuf {
     normalize_relative(Path::new(&cleaned))
 }
 
+fn resolve_fomod_source(content_root: &Path, raw: &str) -> Option<PathBuf> {
+    let relative = normalize_fomod_path(raw);
+    if relative.as_os_str().is_empty() {
+        return Some(content_root.to_path_buf());
+    }
+    let direct = content_root.join(&relative);
+    if direct.exists() {
+        return Some(direct);
+    }
+    resolve_path_case_insensitive(content_root, &relative)
+}
+
 /// Absolute path of a plugin thumbnail, or `None` when the file is not in the package.
 ///
 /// ModuleConfig paths use Windows separators (`fomod\logo.png`). On Linux that is one
@@ -746,14 +787,14 @@ fn resolve_fomod_image(content_root: &Path, rel: &str) -> Option<String> {
     if direct.is_file() {
         return Some(direct.to_string_lossy().to_string());
     }
-    let resolved = resolve_image_case_insensitive(content_root, &relative)?;
+    let resolved = resolve_path_case_insensitive(content_root, &relative)?;
     resolved
         .is_file()
         .then(|| resolved.to_string_lossy().to_string())
 }
 
 /// Walk `relative` from `root`, using the on-disk spelling when only the case differs.
-fn resolve_image_case_insensitive(root: &Path, relative: &Path) -> Option<PathBuf> {
+fn resolve_path_case_insensitive(root: &Path, relative: &Path) -> Option<PathBuf> {
     let mut current = root.to_path_buf();
     let mut matched = false;
     for component in relative.components() {
@@ -2042,5 +2083,186 @@ mod tests {
         }
         let module = parse_module_config_bytes(&bytes).unwrap();
         assert_eq!(module.module_name, "True Cyberpsychosis");
+    }
+
+    #[test]
+    fn build_file_map_resolves_case_mismatched_sources() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("data").join("meshes")).unwrap();
+        fs::write(root.join("data").join("meshes").join("hero.nif"), b"mesh").unwrap();
+        fs::create_dir_all(root.join("extras")).unwrap();
+        fs::write(root.join("extras").join("patch.esp"), b"esp").unwrap();
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<config>
+  <moduleName>Case Source</moduleName>
+  <requiredInstallFiles>
+    <folder source="Data\Meshes" destination="Meshes"/>
+    <file source="EXTRAS\Patch.ESP" destination="Patch.esp"/>
+  </requiredInstallFiles>
+</config>"#;
+        fs::create_dir_all(root.join("Fomod")).unwrap();
+        fs::write(root.join("Fomod").join("ModuleConfig.xml"), xml).unwrap();
+
+        let module = load_module(root).unwrap().unwrap();
+        let sel = default_selection(&module);
+        let map = build_file_map(root, &module, &sel).unwrap();
+        let dests: HashSet<String> = map
+            .iter()
+            .map(|m| m.dest_rel.to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert!(dests.contains("Meshes/hero.nif"), "dests: {dests:?}");
+        assert!(dests.contains("Patch.esp"), "dests: {dests:?}");
+    }
+
+    #[test]
+    fn collect_flags_skips_invisible_steps() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<config>
+  <moduleName>Branch Flags</moduleName>
+  <installSteps order="Explicit">
+    <installStep name="Branch">
+      <optionalFileGroups>
+        <group name="Pick" type="SelectExactlyOne">
+          <plugins>
+            <plugin name="A">
+              <conditionFlags><flag name="branch">a</flag></conditionFlags>
+              <typeDescriptor><type name="Recommended"/></typeDescriptor>
+            </plugin>
+            <plugin name="B">
+              <conditionFlags><flag name="branch">b</flag></conditionFlags>
+              <typeDescriptor><type name="Optional"/></typeDescriptor>
+            </plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+    <installStep name="Only B">
+      <visible><flagDependency flag="branch" value="b"/></visible>
+      <optionalFileGroups>
+        <group name="Sub" type="SelectExactlyOne">
+          <plugins>
+            <plugin name="B Patch">
+              <conditionFlags><flag name="install_b">yes</flag></conditionFlags>
+              <typeDescriptor><type name="Recommended"/></typeDescriptor>
+            </plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+  </installSteps>
+  <conditionalFileInstalls>
+    <patterns>
+      <pattern>
+        <dependencies operator="And">
+          <flagDependency flag="install_b" value="yes"/>
+        </dependencies>
+        <files>
+          <folder source="b_files" destination=""/>
+        </files>
+      </pattern>
+    </patterns>
+  </conditionalFileInstalls>
+</config>"#;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("b_files")).unwrap();
+        fs::write(root.join("b_files").join("b.txt"), b"b").unwrap();
+        fs::create_dir_all(root.join("fomod")).unwrap();
+        fs::write(root.join("fomod").join("ModuleConfig.xml"), xml).unwrap();
+
+        let module = load_module(root).unwrap().unwrap();
+        // Default selects Branch A; hidden Step 2 must not leak `install_b=yes`.
+        let sel = default_selection(&module);
+        let flags = collect_flags(&module, &sel);
+        assert_eq!(flags.get("branch").map(String::as_str), Some("a"));
+        assert!(!flags.contains_key("install_b"));
+        let map = build_file_map(root, &module, &sel).unwrap();
+        assert!(map.is_empty(), "hidden branch files must not deploy");
+
+        // Switching to Branch B makes Step 2 visible and deploys b_files.
+        let group = &module.steps[0].groups[0];
+        let mut sel_b = sel;
+        sel_b
+            .selected
+            .insert(group.id.clone(), vec![group.plugins[1].id.clone()]);
+        let map_b = build_file_map(root, &module, &sel_b).unwrap();
+        assert_eq!(map_b.len(), 1);
+    }
+
+    #[test]
+    fn normalize_selection_propagates_step_flags_and_preserves_unchecked_select_any() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<config>
+  <moduleName>Propagate</moduleName>
+  <installSteps order="Explicit">
+    <installStep name="Step 1">
+      <optionalFileGroups>
+        <group name="Base" type="SelectExactlyOne">
+          <plugins>
+            <plugin name="Core">
+              <conditionFlags><flag name="core">on</flag></conditionFlags>
+              <typeDescriptor><type name="Recommended"/></typeDescriptor>
+            </plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+    <installStep name="Step 2">
+      <optionalFileGroups>
+        <group name="Extras" type="SelectAny">
+          <plugins>
+            <plugin name="Auto">
+              <typeDescriptor>
+                <dependencyType>
+                  <defaultType name="Optional"/>
+                  <patterns>
+                    <pattern>
+                      <dependencies operator="And">
+                        <flagDependency flag="core" value="on"/>
+                      </dependencies>
+                      <type name="Required"/>
+                    </pattern>
+                  </patterns>
+                </dependencyType>
+              </typeDescriptor>
+            </plugin>
+            <plugin name="Optional Rec">
+              <typeDescriptor><type name="Recommended"/></typeDescriptor>
+            </plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+  </installSteps>
+</config>"#;
+        let module = parse_module_config_bytes(xml.as_bytes()).unwrap();
+        let g1 = &module.steps[0].groups[0];
+        let g2 = &module.steps[1].groups[0];
+
+        // Pass a stale Step 1 id + explicitly empty Step 2 selection.
+        let mut raw = FomodSelection::default();
+        raw.selected.insert(g1.id.clone(), vec!["stale-id".into()]);
+        raw.selected.insert(g2.id.clone(), vec![]);
+
+        let normalized = normalize_selection(&module, &raw);
+        // Step 1 falls back to Core, setting core=on, which forces Auto (Required) on in Step 2,
+        // while keeping Optional Rec unchecked because the user explicitly emptied SelectAny.
+        assert_eq!(
+            normalized.selected.get(&g1.id).unwrap(),
+            &vec![g1.plugins[0].id.clone()]
+        );
+        assert_eq!(
+            normalized.selected.get(&g2.id).unwrap(),
+            &vec![g2.plugins[0].id.clone()]
+        );
+    }
+
+    #[test]
+    fn detects_scripted_installer_in_mixed_case_fomod_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("Fomod")).unwrap();
+        fs::write(tmp.path().join("Fomod").join("script.cs"), b"class Script {}").unwrap();
+        assert!(detect_scripted_installer(tmp.path()));
     }
 }

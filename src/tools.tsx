@@ -1,8 +1,10 @@
-import { Component, useCallback, useEffect, useState, type ReactNode } from "react";
+import { Component, memo, useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { ToolsSkeleton, ToolsWorkspaceSkeleton } from "./Skeleton";
 import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
 import { faGear } from "@fortawesome/free-solid-svg-icons";
 import { api } from "./api";
 import { Modal } from "./Modal";
+import { useNavSettledEffect } from "./perf";
 import type {
   AutoHdrVkConfig,
   AutoHdrVkGlobal,
@@ -476,7 +478,14 @@ function AutoHdrSettingsDialog({
   );
 }
 
-export function ToolsWorkspace() {
+const TOOLS_REFRESH_TTL_MS = 60_000;
+const gameToolsCache = new Map<string, GameToolsResponse>();
+
+export const ToolsWorkspace = memo(function ToolsWorkspace({
+  active = true,
+}: {
+  active?: boolean;
+}) {
   const [uiState, setUiState] = useState<ToolsWorkspaceState>("loading");
   const [status, setStatus] = useState<ToolsStatusResponse | null>(null);
   const [lsfgConfig, setLsfgConfig] = useState<LsfgVkConfig | null>(null);
@@ -485,29 +494,62 @@ export function ToolsWorkspace() {
   const [checkingUpdates, setCheckingUpdates] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState<SettingsTool | null>(null);
-
-  const refresh = useCallback(async () => {
-    setError(null);
-    setUiState("loading");
-    try {
-      const [s, lsfg, hdr] = await Promise.all([
-        api.getToolsStatus(),
-        api.getLsfgVkConfig(),
-        api.getAutohdrVkConfig(),
-      ]);
-      setStatus(s);
-      setLsfgConfig(normalizeLsfgConfig(lsfg));
-      setHdrConfig(normalizeHdrConfig(hdr));
-      setUiState(s.platform_linux ? "ready" : "not_linux");
-    } catch (e) {
-      setError(String(e));
-      setUiState("error");
-    }
-  }, []);
+  const lastLoadedAtRef = useRef<number>(0);
+  const inFlightRef = useRef<Promise<void> | null>(null);
+  const mountedRef = useRef(true);
 
   useEffect(() => {
-    void refresh();
-  }, [refresh]);
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  const refresh = useCallback(async (force = true) => {
+    if (
+      !force &&
+      lastLoadedAtRef.current > 0 &&
+      Date.now() - lastLoadedAtRef.current < TOOLS_REFRESH_TTL_MS
+    ) {
+      return;
+    }
+    if (inFlightRef.current) return inFlightRef.current;
+    const isCold = lastLoadedAtRef.current === 0;
+    setError(null);
+    if (isCold) setUiState("loading");
+    const job = (async () => {
+      try {
+        const [s, lsfg, hdr] = await Promise.all([
+          api.getToolsStatus(),
+          api.getLsfgVkConfig(),
+          api.getAutohdrVkConfig(),
+        ]);
+        if (!mountedRef.current) return;
+        lastLoadedAtRef.current = Date.now();
+        setStatus(s);
+        setLsfgConfig(normalizeLsfgConfig(lsfg));
+        setHdrConfig(normalizeHdrConfig(hdr));
+        setUiState(s.platform_linux ? "ready" : "not_linux");
+      } catch (e) {
+        if (!mountedRef.current) return;
+        setError(String(e));
+        if (isCold) setUiState("error");
+      } finally {
+        inFlightRef.current = null;
+      }
+    })();
+    inFlightRef.current = job;
+    return job;
+  }, []);
+
+  useNavSettledEffect(
+    active,
+    lastLoadedAtRef.current === 0 ? 0 : 150,
+    () => {
+      void refresh(false);
+    },
+    [refresh],
+  );
 
   async function checkUpdates() {
     setCheckingUpdates(true);
@@ -545,16 +587,7 @@ export function ToolsWorkspace() {
   }
 
   if (uiState === "loading") {
-    return (
-      <section className="panel">
-        <div className="panel-head">
-          <h1>Tools</h1>
-        </div>
-        <div className="detail-body">
-          <p>Loading tools…</p>
-        </div>
-      </section>
-    );
+    return <ToolsWorkspaceSkeleton />;
   }
 
   if (uiState === "error") {
@@ -635,28 +668,59 @@ export function ToolsWorkspace() {
       )}
     </section>
   );
-}
+});
 
-export function GameToolsPanel({ game }: { game: ManagedGame }) {
-  const [data, setData] = useState<GameToolsResponse | null>(null);
-  const [overrides, setOverrides] = useState<GameToolOverrides>(defaultOverrides());
+export const GameToolsPanel = memo(function GameToolsPanel({
+  game,
+  entered = true,
+}: {
+  game: ManagedGame;
+  /** False while the tools view is still entering. The form waits, the fetch does not. */
+  entered?: boolean;
+}) {
+  const cached = gameToolsCache.get(game.id) ?? null;
+  const [data, setData] = useState<GameToolsResponse | null>(cached);
+  const [overrides, setOverrides] = useState<GameToolOverrides>(
+    cached?.overrides ?? defaultOverrides(),
+  );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const reqIdRef = useRef(0);
 
-  const load = useCallback(async () => {
-    setError(null);
-    try {
-      const res = await api.getGameTools(game.id);
-      setData(res);
-      setOverrides(res.overrides ?? defaultOverrides());
-    } catch (e) {
-      setError(String(e));
-    }
-  }, [game.id]);
+  const load = useCallback(
+    async (force = false) => {
+      if (!force) {
+        const hit = gameToolsCache.get(game.id);
+        if (hit) {
+          setData(hit);
+          setOverrides(hit.overrides ?? defaultOverrides());
+          return;
+        }
+      }
+      const reqId = ++reqIdRef.current;
+      setError(null);
+      try {
+        const res = await api.getGameTools(game.id);
+        if (reqId !== reqIdRef.current) return;
+        gameToolsCache.set(game.id, res);
+        setData(res);
+        setOverrides(res.overrides ?? defaultOverrides());
+      } catch (e) {
+        if (reqId !== reqIdRef.current) return;
+        setError(String(e));
+      }
+    },
+    [game.id],
+  );
 
   useEffect(() => {
-    void load();
-  }, [load]);
+    const hit = gameToolsCache.get(game.id) ?? null;
+    setData(hit);
+    setOverrides(hit?.overrides ?? defaultOverrides());
+    if (!hit) {
+      void load(false);
+    }
+  }, [game.id, load]);
 
   async function save(patch?: Partial<GameToolOverrides>) {
     const next = { ...overrides, ...patch };
@@ -665,6 +729,7 @@ export function GameToolsPanel({ game }: { game: ManagedGame }) {
     setError(null);
     try {
       const res = await api.setGameTools(game.id, next);
+      gameToolsCache.set(game.id, res);
       setData(res);
       setOverrides(res.overrides ?? defaultOverrides());
     } catch (e) {
@@ -686,8 +751,19 @@ export function GameToolsPanel({ game }: { game: ManagedGame }) {
     } as Partial<GameToolOverrides>);
   }
 
+  if (!data && error) {
+    return (
+      <div className="detail-body game-tools">
+        <p className="error-banner">{error}</p>
+      </div>
+    );
+  }
+  if (!entered || !data) {
+    return <ToolsSkeleton />;
+  }
+
   return (
-    <div className="detail-body game-tools">
+    <div className="detail-body game-tools results-fill">
       {error && <p className="error-banner">{error}</p>}
       <div className="panel">
         <h3>Executables</h3>
@@ -706,12 +782,12 @@ export function GameToolsPanel({ game }: { game: ManagedGame }) {
         {data?.launch_options && (
           <p className="muted launch-options-preview">Launch options: {data.launch_options}</p>
         )}
-        <button type="button" onClick={() => void load()} disabled={busy}>
+        <button type="button" onClick={() => void load(true)} disabled={busy}>
           Refresh detection
         </button>
         <button
           type="button"
-          onClick={() => void api.syncGameTools(game.id).then(load)}
+          onClick={() => void api.syncGameTools(game.id).then(() => load(true))}
           disabled={busy}
         >
           Re-sync Steam launch options
@@ -763,4 +839,4 @@ export function GameToolsPanel({ game }: { game: ManagedGame }) {
       </div>
     </div>
   );
-}
+});

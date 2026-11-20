@@ -8,6 +8,35 @@ const host = process.env.TAURI_DEV_HOST;
 export default defineConfig(async () => ({
   plugins: [react()],
 
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (!id.includes("node_modules")) {
+            return undefined;
+          }
+          if (
+            id.includes("/react/") ||
+            id.includes("/react-dom/") ||
+            id.includes("/scheduler/")
+          ) {
+            return "react-vendor";
+          }
+          if (id.includes("/motion/") || id.includes("/framer-motion/")) {
+            return "motion";
+          }
+          if (id.includes("/@fortawesome/")) {
+            return "fontawesome";
+          }
+          if (id.includes("/@tauri-apps/")) {
+            return "tauri";
+          }
+          return "vendor";
+        },
+      },
+    },
+  },
+
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
   // 1. prevent Vite from obscuring rust errors

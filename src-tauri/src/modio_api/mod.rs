@@ -28,6 +28,12 @@ pub struct ModioGameHit {
     pub name_id: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ModioGameLogo {
+    pub url: String,
+    pub name: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ModioModHit {
     pub game_id: u32,
@@ -127,8 +133,11 @@ impl ModioClient {
             .collect())
     }
 
-    /// Landscape logos for games that already have a mod.io id. One batched request.
-    pub async fn game_logos(&self, ids: &[u32]) -> Result<std::collections::HashMap<u32, String>> {
+    /// Landscape logos and game names for games that already have a mod.io id. One batched request.
+    pub async fn game_logos(
+        &self,
+        ids: &[u32],
+    ) -> Result<std::collections::HashMap<u32, ModioGameLogo>> {
         use std::collections::HashMap;
 
         use modio::request::games::filters::Id as GameIdFilter;
@@ -152,7 +161,13 @@ impl ModioClient {
             for game in list.data {
                 let url = game.logo.thumb_1280x720.to_string();
                 if url.starts_with("http://") || url.starts_with("https://") {
-                    out.insert(game.id.get() as u32, url);
+                    out.insert(
+                        game.id.get() as u32,
+                        ModioGameLogo {
+                            url,
+                            name: game.name,
+                        },
+                    );
                 }
             }
         }

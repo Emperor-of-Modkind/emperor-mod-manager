@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 
-use crate::config::{GameToolOverrides, ManagedGame, Paths, ToolGameState};
+use crate::config::{GameToolOverrides, ManagedGame, Paths};
 
 use super::{
     autohdr_vk::AutoHdrVkConfig,
@@ -118,12 +118,4 @@ fn sync_steam_launch(
             .with_context(|| format!("updating Steam launch options for {}", game.title))?;
     }
     Ok(())
-}
-
-pub fn set_game_tool_state(overrides: &mut GameToolOverrides, tool: &str, state: ToolGameState) {
-    match tool {
-        "lsfg_vk" => overrides.lsfg_vk = state,
-        "autohdr_vk" => overrides.autohdr_vk = state,
-        _ => {}
-    }
 }

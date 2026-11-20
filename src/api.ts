@@ -484,8 +484,15 @@ export const api = {
     invoke<ModOptionSelection>("set_mod_options", { gameId, modId, selection }),
   listModsWithOptions: (gameId: string) =>
     invoke<string[]>("list_mods_with_options", { gameId }),
-  getFomodInstaller: (gameId: string, modId: string) =>
-    invoke<FomodInstallerView | null>("get_fomod_installer", { gameId, modId }),
+  getFomodInstaller: (
+    gameId: string,
+    modId: string,
+    selection?: FomodSelection | null,
+  ) =>
+    invoke<FomodInstallerView | null>(
+      "get_fomod_installer",
+      selection != null ? { gameId, modId, selection } : { gameId, modId },
+    ),
   setFomodSelection: (gameId: string, modId: string, selection: FomodSelection) =>
     invoke<FomodSelection>("set_fomod_selection", { gameId, modId, selection }),
   listModsNeedingFomod: (gameId: string) =>

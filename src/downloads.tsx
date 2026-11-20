@@ -1,7 +1,11 @@
 import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
 import { faTrashCan } from "@fortawesome/free-solid-svg-icons";
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { DownloadsSkeleton } from "./Skeleton";
 import type { DownloadItem } from "./types";
+
+const RECENT_PAGE_SIZE = 25;
+const QUEUE_PAGE_SIZE = 30;
 
 export type AssistQueueEntry = {
   id: string;
@@ -150,6 +154,8 @@ type DownloadsWorkspaceProps = {
   activeBatch: ActiveDownloadBatch | null;
   assistActive: boolean;
   assistHint: string | null;
+  active?: boolean;
+  loading?: boolean;
   onRefresh: () => void;
   onSkip: () => void;
   onCancel: () => void;
@@ -167,13 +173,17 @@ type DownloadsWorkspaceProps = {
   onAssistHost: (el: HTMLDivElement | null) => void;
 };
 
-export function DownloadsWorkspace(props: DownloadsWorkspaceProps) {
+export const DownloadsWorkspace = memo(function DownloadsWorkspace(
+  props: DownloadsWorkspaceProps,
+) {
   const {
     downloads,
     queue,
     activeBatch,
     assistActive,
     assistHint,
+    active = true,
+    loading = false,
     onRefresh,
     onSkip,
     onCancel,
@@ -193,11 +203,17 @@ export function DownloadsWorkspace(props: DownloadsWorkspaceProps) {
 
   const hostRef = useRef<HTMLDivElement | null>(null);
   const [showAssistRetry, setShowAssistRetry] = useState(false);
+  const [recentLimit, setRecentLimit] = useState(RECENT_PAGE_SIZE);
+  const [queueLimit, setQueueLimit] = useState(QUEUE_PAGE_SIZE);
 
   useEffect(() => {
+    if (!active) {
+      onAssistHost(null);
+      return;
+    }
     onAssistHost(hostRef.current);
     return () => onAssistHost(null);
-  }, [onAssistHost]);
+  }, [active, loading, onAssistHost]);
 
   const current =
     queue && queue.head < queue.entries.length ? queue.entries[queue.head] : null;
@@ -211,13 +227,37 @@ export function DownloadsWorkspace(props: DownloadsWorkspaceProps) {
     return () => window.clearTimeout(timer);
   }, [current, assistActive, queue?.cancelled, queue?.head]);
 
-  const pending = queue ? queue.entries.slice(queue.head + 1) : [];
-  const activeDownloads = downloads.filter(
-    (d) => d.status === "downloading" || d.status === "extracting" || d.status === "paused",
+  const pending = useMemo(
+    () => (queue ? queue.entries.slice(queue.head + 1) : []),
+    [queue],
   );
-  const recentDownloads = downloads.filter(
-    (d) =>
-      d.status !== "downloading" && d.status !== "extracting" && d.status !== "paused",
+  const activeDownloads = useMemo(
+    () =>
+      downloads.filter(
+        (d) =>
+          d.status === "downloading" ||
+          d.status === "extracting" ||
+          d.status === "paused",
+      ),
+    [downloads],
+  );
+  const recentDownloads = useMemo(
+    () =>
+      downloads.filter(
+        (d) =>
+          d.status !== "downloading" &&
+          d.status !== "extracting" &&
+          d.status !== "paused",
+      ),
+    [downloads],
+  );
+  const visibleRecent = useMemo(
+    () => recentDownloads.slice(0, recentLimit),
+    [recentDownloads, recentLimit],
+  );
+  const visiblePending = useMemo(
+    () => pending.slice(0, queueLimit),
+    [pending, queueLimit],
   );
   const showCancelRemaining =
     !queue &&
@@ -266,6 +306,9 @@ export function DownloadsWorkspace(props: DownloadsWorkspaceProps) {
         </div>
       </div>
 
+      {loading && downloads.length === 0 && !queue ? (
+        <DownloadsSkeleton />
+      ) : (
       <div className="downloads-layout">
         <div className="downloads-active">
           <h2>Downloading & installing</h2>
@@ -366,7 +409,7 @@ export function DownloadsWorkspace(props: DownloadsWorkspaceProps) {
                 </button>
               </div>
               <ul className="list downloads-recent">
-                {recentDownloads.map((d) => {
+                {visibleRecent.map((d) => {
                   const openable = d.page != null;
                   const identity = (
                     <>
@@ -431,6 +474,17 @@ export function DownloadsWorkspace(props: DownloadsWorkspaceProps) {
                   );
                 })}
               </ul>
+              {recentDownloads.length > visibleRecent.length && (
+                <div className="list-load-more">
+                  <button
+                    type="button"
+                    className="linkish"
+                    onClick={() => setRecentLimit((n) => n + RECENT_PAGE_SIZE)}
+                  >
+                    Show more ({recentDownloads.length - visibleRecent.length} remaining)
+                  </button>
+                </div>
+              )}
             </>
           )}
         </div>
@@ -469,7 +523,7 @@ export function DownloadsWorkspace(props: DownloadsWorkspaceProps) {
                   </div>
                 </li>
               )}
-              {pending.map((entry, i) => (
+              {visiblePending.map((entry, i) => (
                 <li key={entry.id}>
                   <div>
                     <strong>{entry.name}</strong>
@@ -484,9 +538,21 @@ export function DownloadsWorkspace(props: DownloadsWorkspaceProps) {
                 <li className="empty">Queue is empty.</li>
               )}
             </ul>
+            {pending.length > visiblePending.length && (
+              <div className="list-load-more">
+                <button
+                  type="button"
+                  className="linkish"
+                  onClick={() => setQueueLimit((n) => n + QUEUE_PAGE_SIZE)}
+                >
+                  Show more ({pending.length - visiblePending.length} remaining)
+                </button>
+              </div>
+            )}
           </div>
         </div>
       </div>
+      )}
     </section>
   );
-}
+});

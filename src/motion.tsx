@@ -5,6 +5,8 @@ import {
   type HTMLMotionProps,
 } from "motion/react";
 import {
+  useEffect,
+  useRef,
   type ButtonHTMLAttributes,
   type CSSProperties,
   type KeyboardEvent,
@@ -14,11 +16,17 @@ import {
 /** Shared ease. No bounce. */
 export const MOTION_EASE = [0.22, 1, 0.36, 1] as const;
 /** Controls, dialogs, and panels. */
-export const MOTION_FAST = 0.22;
+export const MOTION_FAST = 0.18;
 /** Page and view changes. */
-export const MOTION_BASE = 0.32;
-const STAGGER_CAP = 12;
-const STAGGER_STEP = 0.03;
+export const MOTION_BASE = 0.24;
+export const STAGGER_CAP = 12;
+export const STAGGER_STEP = 0.03;
+
+/** Returns CSS custom property for staggered CSS row/card entry, capped at STAGGER_CAP. */
+export function staggerStyle(index: number, enabled = true): CSSProperties | undefined {
+  if (!enabled || index < 0 || index >= STAGGER_CAP) return undefined;
+  return { "--stagger-index": index } as CSSProperties;
+}
 
 function useReduced() {
   return useReducedMotion() === true;
@@ -30,29 +38,60 @@ type ViewSwitchProps = {
   className?: string;
   /** When false, the first paint does not enter. Later key changes still animate. */
   initial?: boolean;
+  /** Fires once the entering view has finished. Exit completions are ignored. */
+  onEntered?: (viewKey: string) => void;
 };
 
-/** Crossfades a keyed view. Waits for the exit so two pages never stack. */
+/**
+ * Swaps a keyed view immediately with a fast enter-only fade so rapid tab or
+ * sub-view clicks never queue behind an exit animation. Notifies `onEntered`
+ * after the first paint frame so skeletons render before heavy lists hydrate.
+ */
 export function ViewSwitch({
   viewKey,
   children,
   className,
   initial = true,
+  onEntered,
 }: ViewSwitchProps) {
   const reduced = useReduced();
+  const onEnteredRef = useRef(onEntered);
+  onEnteredRef.current = onEntered;
+  const viewKeyRef = useRef(viewKey);
+  viewKeyRef.current = viewKey;
+  const notified = useRef<string | null>(null);
+  const sawView = useRef(false);
+
+  const settle = (key: string) => {
+    if (key !== viewKeyRef.current || notified.current === key) return;
+    notified.current = key;
+    onEnteredRef.current?.(key);
+  };
+
+  useEffect(() => {
+    const followUp = sawView.current;
+    sawView.current = true;
+    const id = window.requestAnimationFrame(() => settle(viewKey));
+    const fallbackMs = reduced || (!followUp && initial === false) ? 32 : 120;
+    const fallback = window.setTimeout(() => settle(viewKey), fallbackMs);
+    return () => {
+      window.cancelAnimationFrame(id);
+      window.clearTimeout(fallback);
+    };
+  }, [initial, reduced, viewKey]);
+
+  const animateEnter = !reduced && (initial !== false || sawView.current);
+
   return (
-    <AnimatePresence mode="wait" initial={initial}>
-      <motion.div
-        key={viewKey}
-        className={["view-enter", className].filter(Boolean).join(" ")}
-        initial={reduced ? false : { opacity: 0, y: 10 }}
-        animate={{ opacity: 1, y: 0 }}
-        exit={reduced ? { opacity: 1, y: 0 } : { opacity: 0, y: -6 }}
-        transition={{ duration: reduced ? 0 : MOTION_BASE, ease: MOTION_EASE }}
-      >
-        {children}
-      </motion.div>
-    </AnimatePresence>
+    <motion.div
+      key={viewKey}
+      className={["view-enter", className].filter(Boolean).join(" ")}
+      initial={animateEnter ? { opacity: 0, y: 6 } : false}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: animateEnter ? MOTION_FAST : 0, ease: MOTION_EASE }}
+    >
+      {children}
+    </motion.div>
   );
 }
 
@@ -158,6 +197,8 @@ type MotionCardProps = {
   children: ReactNode;
   onClick?: () => void;
   onKeyDown?: (event: KeyboardEvent<HTMLElement>) => void;
+  onPointerEnter?: () => void;
+  onPointerLeave?: () => void;
   role?: string;
   tabIndex?: number;
 };
@@ -174,8 +215,8 @@ export function MotionCard({
   return (
     <motion.article
       className={className}
-      initial={stagger ? { opacity: 0 } : false}
-      animate={{ opacity: 1 }}
+      initial={stagger ? { opacity: 0, y: 6 } : false}
+      animate={{ opacity: 1, y: 0 }}
       transition={{
         duration: stagger ? MOTION_BASE : 0,
         delay: stagger ? enterIndex * STAGGER_STEP : 0,

@@ -93,6 +93,7 @@ fn tool_status(
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 fn stub_tool_status(config_path: String) -> ToolStatus {
     ToolStatus {
         installed: false,

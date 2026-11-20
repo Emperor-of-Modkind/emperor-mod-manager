@@ -1,5 +1,5 @@
 import { openUrl } from "@tauri-apps/plugin-opener";
-import type { MouseEvent, ReactNode } from "react";
+import { memo, useMemo, type MouseEvent, type ReactNode } from "react";
 import { isSafeUrl, renderRichText } from "./richTextFormat";
 
 type RichTextProps = {
@@ -23,8 +23,12 @@ function onRichTextClick(e: MouseEvent<HTMLDivElement>) {
 }
 
 /** Renders Nexus HTML / BBCode / Markdown descriptions as sanitized rich text. */
-export function RichText({ text, className, empty = "No description available." }: RichTextProps) {
-  const html = renderRichText(text);
+export const RichText = memo(function RichText({
+  text,
+  className,
+  empty = "No description available.",
+}: RichTextProps) {
+  const html = useMemo(() => renderRichText(text), [text]);
   if (!html) {
     return <p className={className}>{empty}</p>;
   }
@@ -35,4 +39,4 @@ export function RichText({ text, className, empty = "No description available." 
       dangerouslySetInnerHTML={{ __html: html }}
     />
   );
-}
+});

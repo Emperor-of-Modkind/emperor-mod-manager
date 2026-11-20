@@ -762,6 +762,20 @@ button.tag-picker-trigger[aria-expanded="true"] {
   color: var(--muted);
 }
 
+.tag-picker-more {
+  width: 100%;
+  margin-top: 0.25rem;
+  padding: 0.35rem 0.5rem;
+  font-size: 0.78rem;
+  justify-content: center;
+}
+
+.list-load-more {
+  display: flex;
+  justify-content: center;
+  padding: 0.65rem 0 0.25rem;
+}
+
 .browse-workspace {
   display: flex;
   flex-direction: column;
@@ -774,15 +788,16 @@ button.tag-picker-trigger[aria-expanded="true"] {
 }
 
 .browse-results {
-  flex: 1;
+  flex: 1 1 0;
   min-width: 0;
   min-height: 0;
   overflow-x: hidden;
   overflow-y: auto;
+  background: var(--panel);
 }
 
 .browse-scroll-sentinel {
-  height: 1px;
+  min-height: 1px;
   width: 100%;
   pointer-events: none;
 }
@@ -810,6 +825,7 @@ ul.list.browse-virtual {
 
 .browse-virtual-grid-row {
   display: grid;
+  contain: style;
 }
 
 .browse-virtual-cell {
@@ -1087,7 +1103,7 @@ button.mods-filters-toggle.active:hover:not(:disabled) {
   border-radius: 0.4rem;
   overflow: hidden;
   background: var(--cover-placeholder);
-  border: 1px solid var(--line);
+  border: 0;
 }
 
 .collections-game-header > .list-poster .media-placeholder svg {
@@ -1116,14 +1132,91 @@ button.mods-filters-toggle.active:hover:not(:disabled) {
 
 .game-saved-collections .panel-head-inline {
   display: flex;
+  justify-content: space-between;
   align-items: center;
-  gap: 0.75rem;
-  margin-bottom: 0.75rem;
+  flex-wrap: wrap;
+  gap: 0.75rem 1rem;
+  margin-bottom: 0.65rem;
 }
 
 .game-saved-collections .panel-head-inline h2 {
   margin: 0;
   font-size: 1.1rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.saved-collection-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  align-items: center;
+}
+
+.detail-meta .saved-collection-actions {
+  margin-top: auto;
+  padding-top: 0.35rem;
+}
+
+.game-saved-collections .saved-collection-actions {
+  margin: 0.75rem 0 0.25rem;
+}
+
+.saved-collection-game-select {
+  appearance: none;
+  -webkit-appearance: none;
+  border: 0;
+  background-color: var(--surface-control);
+  background-image: var(--select-chevron);
+  background-repeat: no-repeat;
+  background-position: right 0.55rem center;
+  background-size: 0.7rem;
+  color: var(--ink);
+  border-radius: var(--shape-control);
+  padding: 0 1.75rem 0 0.75rem;
+  height: 2.25rem;
+  font: inherit;
+  line-height: 2.25rem;
+  max-width: 20rem;
+  cursor: pointer;
+  transition:
+    background-color var(--motion-fast) var(--ease-out),
+    box-shadow var(--motion-fast) var(--ease-out);
+}
+
+.saved-collection-game-select:hover {
+  background-color: color-mix(in srgb, var(--ink) 7%, var(--surface-control));
+}
+
+.panel label.saved-collection-rename-label {
+  max-width: 28rem;
+  margin: 0.25rem 0 1rem;
+}
+
+.saved-collection-rename {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.saved-collection-rename input {
+  flex: 1;
+  min-width: 0;
+}
+
+.saved-collection-code {
+  width: 100%;
+  box-sizing: border-box;
+  border: 0;
+  background: var(--surface-control);
+  color: var(--ink);
+  border-radius: var(--shape-field);
+  padding: 0.65rem 0.75rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.8rem;
+  line-height: 1.45;
+  resize: vertical;
 }
 
 .profile-import {
@@ -1459,7 +1552,7 @@ button.mods-filters-toggle.active:hover:not(:disabled) {
   height: 3rem;
   object-fit: cover;
   border-radius: 0.4rem;
-  border: 1px solid var(--line);
+  border: 0;
   flex-shrink: 0;
 }
 
@@ -2064,7 +2157,7 @@ button.linkish:hover:not(:disabled):not(.nav) {
   border-radius: 0.65rem;
   overflow: hidden;
   background: var(--cover-placeholder);
-  border: 1px solid var(--line);
+  border: 0;
 }
 
 .detail-cover img {
@@ -2279,7 +2372,7 @@ button.detail-author-link:focus-visible {
   aspect-ratio: var(--slide-ratio, 16 / 9);
   max-height: min(80vh, 960px);
   margin-inline: auto;
-  border: 1px solid var(--line);
+  border: 0;
   border-radius: 0.65rem;
   background: var(--cover-placeholder);
   overflow: hidden;
@@ -2508,25 +2601,13 @@ button.detail-author-link:focus-visible {
 
 .media-card-clickable .media-cover,
 .media-card-clickable .media-card-title {
-  transition:
-    border-color var(--motion-fast) var(--ease-out),
-    transform var(--motion-fast) var(--ease-out);
+  transition: transform var(--motion-fast) var(--ease-out);
 }
 
 .media-card-clickable:focus-visible {
   outline: none;
   box-shadow: var(--focus-ring);
   border-radius: 0.65rem;
-}
-
-.media-card-clickable:hover .media-cover,
-.media-card-clickable:focus-within .media-cover {
-  border-color: var(--accent);
-}
-
-:root[data-theme="dark"] .media-card-clickable:hover .media-cover,
-:root[data-theme="dark"] .media-card-clickable:focus-within .media-cover {
-  border-color: rgba(255, 255, 255, 0.88);
 }
 
 .media-card-unsupported {
@@ -2766,7 +2847,11 @@ button.path-link:focus-visible:not(:disabled):not(.nav) {
   border-radius: 0.4rem;
   overflow: hidden;
   background: var(--cover-placeholder);
-  border: 1px solid var(--line);
+  border: 0;
+}
+
+.list-poster {
+  position: relative;
 }
 
 .list-poster img {
@@ -2818,6 +2903,7 @@ button.path-link:focus-visible:not(:disabled):not(.nav) {
   flex-direction: column;
   gap: 0.45rem;
   min-width: 0;
+  contain: style;
 }
 
 .media-card-clickable:hover .media-cover,
@@ -2852,14 +2938,12 @@ button.path-link:focus-visible:not(:disabled):not(.nav) {
   filter: blur(36px) saturate(1.5) brightness(1.08);
 }
 
-.media-card-clickable:hover .media-cover-glow,
-.media-card-clickable:focus-within .media-cover-glow {
+.media-cover-glow.is-visible {
   opacity: 0.28;
   transform: translateY(-2px);
 }
 
-:root[data-theme="dark"] .media-card-clickable:hover .media-cover-glow,
-:root[data-theme="dark"] .media-card-clickable:focus-within .media-cover-glow {
+:root[data-theme="dark"] .media-cover-glow.is-visible {
   opacity: 0.55;
 }
 
@@ -2870,7 +2954,17 @@ button.path-link:focus-visible:not(:disabled):not(.nav) {
   border-radius: 0.65rem;
   overflow: hidden;
   background: var(--cover-placeholder);
-  border: 1px solid var(--line);
+  border: 0;
+  contain: layout style paint;
+}
+
+.media-cover-skeleton,
+.list-poster-skeleton {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  border-radius: inherit;
+  pointer-events: none;
 }
 
 .media-cover img {
@@ -2878,6 +2972,19 @@ button.path-link:focus-visible:not(:disabled):not(.nav) {
   height: 100%;
   object-fit: cover;
   display: block;
+}
+
+.media-cover img.cover-defer,
+.list-poster img.cover-defer {
+  opacity: 0;
+  transition:
+    opacity 180ms linear,
+    filter var(--motion-fast) var(--ease-out);
+}
+
+.media-cover img.cover-defer.is-ready,
+.list-poster img.cover-defer.is-ready {
+  opacity: 1;
 }
 
 .media-placeholder {
@@ -3009,7 +3116,7 @@ button.path-link:focus-visible:not(:disabled):not(.nav) {
   border-radius: 999px;
   background: var(--overlay-bg);
   color: #fff;
-  border: 1px solid var(--overlay-line);
+  border: 0;
   max-width: calc(100% - 0.9rem);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -3155,7 +3262,9 @@ button.path-link:focus-visible:not(:disabled):not(.nav) {
 .library-posters .media-cover img,
 .library-posters .media-placeholder {
   filter: brightness(0.62);
-  transition: filter var(--motion-fast) var(--ease-out);
+  transition:
+    filter var(--motion-fast) var(--ease-out),
+    opacity 180ms linear;
 }
 
 .library-posters .media-card.is-active .media-cover img,
@@ -3172,22 +3281,8 @@ button.path-link:focus-visible:not(:disabled):not(.nav) {
   filter: grayscale(1) brightness(0.55);
 }
 
-.library-posters .media-card-clickable:hover .media-cover,
-.library-posters .media-card-clickable:focus-within .media-cover,
-:root[data-theme="dark"] .library-posters .media-card-clickable:hover .media-cover,
-:root[data-theme="dark"] .library-posters .media-card-clickable:focus-within .media-cover {
-  border-color: transparent;
-}
-
-.browse-virtual-grid-row .media-cover {
-  border: 0;
-}
-
-.browse-virtual-grid-row .media-card-clickable:hover .media-cover,
-.browse-virtual-grid-row .media-card-clickable:focus-within .media-cover,
-:root[data-theme="dark"] .browse-virtual-grid-row .media-card-clickable:hover .media-cover,
-:root[data-theme="dark"] .browse-virtual-grid-row .media-card-clickable:focus-within .media-cover {
-  border-color: transparent;
+.browse-virtual-grid-row .media-card-title {
+  min-height: calc(2 * 1.25em);
 }
 
 .media-card-meta {
@@ -3320,7 +3415,7 @@ button.path-link:focus-visible:not(:disabled):not(.nav) {
   align-items: center;
   justify-content: flex-start;
   gap: 0.45rem;
-  margin-top: 1rem;
+  margin: 1rem 0 0.55rem;
 }
 
 .downloads-recent-clear {
@@ -3698,17 +3793,55 @@ button.path-link:focus-visible:not(:disabled):not(.nav) {
   min-width: 0;
 }
 
-.view-slot:has(.browse-workspace) {
-  flex: 1;
-  min-height: 0;
-}
-
-.browse-workspace > .view-enter {
+/* Stay laid out while another tab is open. display:none would zero virtual row sizes. */
+.tab-kept {
   display: flex;
   flex-direction: column;
-  flex: 1;
+  min-width: 0;
+}
+
+.tab-kept:not(.tab-parked) {
+  animation: tab-enter var(--motion-fast) var(--ease-out);
+}
+
+@keyframes tab-enter {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.tab-parked {
+  position: absolute;
+  inset: 0;
+  height: 100%;
+  overflow: hidden;
+  visibility: hidden;
+  pointer-events: none;
+  content-visibility: hidden;
+  z-index: -1;
+}
+
+/* Browse scrolls inside its results pane. Library and Collections keep scrolling main. */
+.main.main-browse-scroll {
+  overflow: hidden;
+}
+
+.tab-kept-browse:not(.tab-parked) {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.browse-workspace.view-enter {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 0;
   min-width: 0;
   min-height: 0;
+  overflow: hidden;
 }
 
 .toast-stack {
@@ -3901,6 +4034,92 @@ li.list-row-poster > .list-poster.skeleton,
   cursor: default;
 }
 
+.skeleton-detail-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+
+.skeleton-assist-box {
+  width: 100%;
+  height: 18rem;
+  margin-top: 0.5rem;
+  border-radius: var(--shape-card);
+}
+
+.skeleton-inline-stat {
+  display: inline-block;
+  width: 5.5rem;
+  height: 0.85em;
+  vertical-align: -0.1em;
+}
+
+.results-stage.is-filled {
+  position: relative;
+}
+
+.results-stage.is-filled .results-cover {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+  animation: results-cover-out 220ms linear forwards;
+}
+
+.results-fill {
+  animation: results-fill 220ms var(--ease-out);
+}
+
+.stagger-item {
+  animation: stagger-row-enter var(--motion-base) var(--ease-out) backwards;
+  animation-delay: calc(var(--stagger-index, 0) * 30ms);
+}
+
+.browse-virtual-row.is-stagger {
+  animation: stagger-virtual-row-enter var(--motion-base) var(--ease-out) backwards;
+  animation-delay: calc(var(--stagger-index, 0) * 30ms);
+}
+
+@keyframes stagger-row-enter {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes stagger-virtual-row-enter {
+  from {
+    opacity: 0;
+    translate: 0 6px;
+  }
+  to {
+    opacity: 1;
+    translate: 0 0;
+  }
+}
+
+@keyframes results-fill {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes results-cover-out {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+
 .update-toast-version,
 .update-toast-progress {
   margin: 0.2rem 0 0;
@@ -3957,7 +4176,12 @@ li.list-row-poster > .list-poster.skeleton,
   .downloads-progress-indeterminate .downloads-progress-bar,
   .throbber,
   .throbber-arc,
-  .skeleton::after {
+  .skeleton::after,
+  .results-fill,
+  .results-stage.is-filled .results-cover,
+  .tab-kept:not(.tab-parked),
+  .stagger-item,
+  .browse-virtual-row.is-stagger {
     animation: none;
   }
 
@@ -3965,8 +4189,7 @@ li.list-row-poster > .list-poster.skeleton,
   .media-card-clickable:focus-within .media-cover,
   .media-card-clickable:hover .media-card-title,
   .media-card-clickable:focus-within .media-card-title,
-  .media-card-clickable:hover .media-cover-glow,
-  .media-card-clickable:focus-within .media-cover-glow,
+  .media-cover-glow.is-visible,
   .media-cover-actions,
   button:active:not(:disabled),
   .check:active,

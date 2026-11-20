@@ -107,6 +107,7 @@ pub enum UpdateChannel {
     Deb,
     Appimage,
     Portable,
+    #[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
     Nsis,
 }
 
@@ -171,6 +172,7 @@ fn is_release_tarball(name: &str) -> bool {
 }
 
 /// Prefer AppImage on Linux and NSIS setup.exe on Windows.
+#[cfg(test)]
 pub fn pick_app_asset<'a>(release: &'a GhRelease, os: &str) -> Option<&'a GhAsset> {
     match os {
         "linux" => pick_update_asset(release, UpdateChannel::Appimage),

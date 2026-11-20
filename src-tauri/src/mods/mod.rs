@@ -782,7 +782,11 @@ fn collapse_load_order(paths: &Paths, game_id: &str, order: &mut LoadOrder) -> R
     Ok(changed)
 }
 
-fn provenance_from_removed(old: Option<StagedMod>, _new_staging: &Path) -> StagingProvenance {
+fn provenance_from_removed(
+    old: Option<StagedMod>,
+    _new_staging: &Path,
+    preserve_fomod_selection: bool,
+) -> StagingProvenance {
     let Some(old) = old else {
         return StagingProvenance {
             independent: true,
@@ -800,7 +804,14 @@ fn provenance_from_removed(old: Option<StagedMod>, _new_staging: &Path) -> Stagi
         // the same options keeps the user's picks. Anything the new manifest
         // dropped is discarded when the selection is normalized.
         option_selection: old.option_selection,
-        fomod_selection: old.fomod_selection,
+        // FOMOD updates can add, reorder, or rename steps/options (shifting
+        // index-based ids), so only preserve choices when re-staging the exact
+        // same version/file (e.g. damaged-staging repair).
+        fomod_selection: if preserve_fomod_selection {
+            old.fomod_selection
+        } else {
+            None
+        },
     }
 }
 
@@ -1206,7 +1217,7 @@ pub fn stage_overlay_dir(
     let committed = mutate_load_order(paths, game_id, |order| {
         swap_extracted_dir(&temp, &staging)?;
         let removed = take_rows(order, |m| m.id == id);
-        let provenance = provenance_from_removed(removed.first().cloned(), &staging);
+        let provenance = provenance_from_removed(removed.first().cloned(), &staging, false);
         let next_order = provenance
             .order
             .unwrap_or_else(|| order.mods.iter().map(|m| m.order).max().unwrap_or(0) + 1);
@@ -1640,7 +1651,15 @@ fn stage_filled_mod(
                     .flatten()
             })
         });
-        let provenance = provenance_from_removed(removed.first().cloned(), &staging);
+        let same_file = mod_id != 0
+            && file_id != 0
+            && removed.first().is_some_and(|old| {
+                old.source == ModSource::Nexus
+                    && old.nexus_mod_id == mod_id
+                    && old.nexus_file_id == file_id
+                    && (version.is_none() || old.version == version)
+            });
+        let provenance = provenance_from_removed(removed.first().cloned(), &staging, same_file);
         let next_order = provenance
             .order
             .unwrap_or_else(|| order.mods.iter().map(|m| m.order).max().unwrap_or(0) + 1);
@@ -2004,7 +2023,10 @@ pub fn stage_thunderstore_mod(
     let committed = mutate_load_order(paths, game_id, |order| {
         swap_extracted_dir(&temp, &staging)?;
         let removed = take_rows(order, |m| m.id == id);
-        let provenance = provenance_from_removed(removed.first().cloned(), &staging);
+        let same_version = removed
+            .first()
+            .is_some_and(|old| old.version.as_deref() == Some(version));
+        let provenance = provenance_from_removed(removed.first().cloned(), &staging, same_version);
         let next_order = provenance
             .order
             .unwrap_or_else(|| order.mods.iter().map(|m| m.order).max().unwrap_or(0) + 1);
@@ -2076,7 +2098,10 @@ pub fn stage_modio_mod(
                 && m.modio_game_id == Some(modio_game_id)
                 && m.modio_mod_id == Some(modio_mod_id)
         }));
-        let provenance = provenance_from_removed(removed.first().cloned(), &staging);
+        let same_file = removed
+            .first()
+            .is_some_and(|old| old.modio_file_id == Some(modio_file_id));
+        let provenance = provenance_from_removed(removed.first().cloned(), &staging, same_file);
         let next_order = provenance
             .order
             .unwrap_or_else(|| order.mods.iter().map(|m| m.order).max().unwrap_or(0) + 1);
@@ -3254,6 +3279,277 @@ mod tests {
         );
         assert_eq!(std::fs::read(&deployed).unwrap(), b"beat");
         assert!(!install.path().join("red4ext/plugins/audioxl").exists());
+    }
+
+    #[test]
+    fn fomod_update_clears_selection_and_redeploys_cleanly() {
+        let (tmp, paths) = test_paths();
+        let game_id = "cp_fomod_update";
+        let install = tempfile::tempdir().unwrap();
+
+        let write_fomod_zip = |path: &Path, entries: &[(&str, &[u8])]| {
+            let file = std::fs::File::create(path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            for (name, body) in entries {
+                zip.start_file::<_, ()>(*name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                std::io::Write::write_all(&mut zip, body).unwrap();
+            }
+            zip.finish().unwrap();
+        };
+
+        let v1_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<config>
+  <moduleName>Mod v1</moduleName>
+  <installSteps order="Explicit">
+    <installStep name="Variant">
+      <optionalFileGroups>
+        <group name="Style" type="SelectExactlyOne">
+          <plugins>
+            <plugin name="Classic">
+              <files><folder source="Classic" destination=""/></files>
+              <typeDescriptor><type name="Recommended"/></typeDescriptor>
+            </plugin>
+            <plugin name="Alt">
+              <files><folder source="Alt" destination=""/></files>
+              <typeDescriptor><type name="Optional"/></typeDescriptor>
+            </plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+  </installSteps>
+</config>"#;
+        let v1_zip = tmp.path().join("v1.zip");
+        write_fomod_zip(
+            &v1_zip,
+            &[
+                ("fomod/ModuleConfig.xml", v1_xml.as_bytes()),
+                ("Classic/r6/scripts/old_v1.reds", b"v1-classic"),
+                ("Alt/r6/scripts/old_alt.reds", b"v1-alt"),
+            ],
+        );
+
+        let staged_v1 = stage_mod(
+            &paths,
+            game_id,
+            "My FOMOD",
+            "cyberpunk2077",
+            99,
+            100,
+            Some("1.0".into()),
+            Some("v1.zip".into()),
+            &v1_zip,
+        )
+        .unwrap();
+        assert!(staged_v1.fomod_selection.is_none());
+
+        let m1 = fomod::load_module(Path::new(&staged_v1.staging_path))
+            .unwrap()
+            .unwrap();
+        let g1 = &m1.steps[0].groups[0];
+        let mut sel1 = fomod::default_selection(&m1);
+        sel1.selected
+            .insert(g1.id.clone(), vec![g1.plugins[1].id.clone()]);
+        set_fomod_selection(&paths, game_id, &staged_v1.id, sel1.clone()).unwrap();
+
+        let res1 = deploy(&paths, game_id, "cyberpunk2077", install.path(), None).unwrap();
+        assert_eq!(res1.file_count, 1);
+        assert!(install.path().join("r6/scripts/old_alt.reds").is_file());
+
+        // Re-staging the exact same Nexus file id preserves selection.
+        let restaged = stage_mod(
+            &paths,
+            game_id,
+            "My FOMOD",
+            "cyberpunk2077",
+            99,
+            100,
+            Some("1.0".into()),
+            Some("v1.zip".into()),
+            &v1_zip,
+        )
+        .unwrap();
+        assert_eq!(restaged.fomod_selection, Some(sel1));
+
+        // Updating to v2 (different file_id) with new options & case-mismatched folder clears selection.
+        let v2_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<config>
+  <moduleName>Mod v2</moduleName>
+  <installSteps order="Explicit">
+    <installStep name="Variant">
+      <optionalFileGroups>
+        <group name="Style" type="SelectExactlyOne">
+          <plugins>
+            <plugin name="New Default">
+              <files><folder source="NewDefault" destination=""/></files>
+              <typeDescriptor><type name="Recommended"/></typeDescriptor>
+            </plugin>
+            <plugin name="Updated Alt">
+              <files><folder source="UpdatedAlt" destination=""/></files>
+              <typeDescriptor><type name="Optional"/></typeDescriptor>
+            </plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+  </installSteps>
+</config>"#;
+        let v2_zip = tmp.path().join("v2.zip");
+        write_fomod_zip(
+            &v2_zip,
+            &[
+                ("Fomod/ModuleConfig.xml", v2_xml.as_bytes()),
+                ("newdefault/r6/scripts/v2_default.reds", b"v2-def"),
+                ("updatedalt/r6/scripts/v2_alt.reds", b"v2-alt"),
+            ],
+        );
+
+        let staged_v2 = stage_mod_replacing(
+            &paths,
+            game_id,
+            &restaged.id,
+            "My FOMOD",
+            "cyberpunk2077",
+            99,
+            200,
+            Some("2.0".into()),
+            Some("v2.zip".into()),
+            &v2_zip,
+        )
+        .unwrap();
+        assert!(
+            staged_v2.fomod_selection.is_none(),
+            "updating to a new Nexus file must clear stale FOMOD selection"
+        );
+
+        let m2 = fomod::load_module(Path::new(&staged_v2.staging_path))
+            .unwrap()
+            .unwrap();
+        let g2 = &m2.steps[0].groups[0];
+        let mut sel2 = fomod::default_selection(&m2);
+        sel2.selected
+            .insert(g2.id.clone(), vec![g2.plugins[1].id.clone()]);
+        set_fomod_selection(&paths, game_id, &staged_v2.id, sel2).unwrap();
+
+        let res2 = deploy(&paths, game_id, "cyberpunk2077", install.path(), None).unwrap();
+        assert_eq!(res2.file_count, 1, "warnings: {:?}", res2.warnings);
+        assert!(
+            !install.path().join("r6/scripts/old_alt.reds").exists(),
+            "obsolete v1 file must be purged"
+        );
+        assert_eq!(
+            std::fs::read(install.path().join("r6/scripts/v2_alt.reds")).unwrap(),
+            b"v2-alt"
+        );
+    }
+
+    #[test]
+    fn thunderstore_and_modio_fomod_updates_clear_selection_but_repairs_keep_it() {
+        let (tmp, paths) = test_paths();
+        let game_id = "fomod_ts_modio";
+        let archive = tmp.path().join("mod.zip");
+        write_zip(&archive, "plugin.dll", b"payload");
+
+        let mut selection = fomod::FomodSelection::default();
+        selection
+            .selected
+            .insert("0-step.0-group".into(), vec!["0-step.0-group.0-opt".into()]);
+
+        // Thunderstore: same version preserves selection, new version clears it.
+        let ts1 = stage_thunderstore_mod(
+            &paths,
+            game_id,
+            "community",
+            "Author",
+            "Pkg",
+            "1.0.0",
+            None,
+            "Pkg",
+            None,
+            None,
+            &archive,
+        )
+        .unwrap();
+        set_fomod_selection(&paths, game_id, &ts1.id, selection.clone()).unwrap();
+
+        let ts_repair = stage_thunderstore_mod(
+            &paths,
+            game_id,
+            "community",
+            "Author",
+            "Pkg",
+            "1.0.0",
+            None,
+            "Pkg",
+            None,
+            None,
+            &archive,
+        )
+        .unwrap();
+        assert_eq!(ts_repair.fomod_selection, Some(selection.clone()));
+
+        let ts_update = stage_thunderstore_mod(
+            &paths,
+            game_id,
+            "community",
+            "Author",
+            "Pkg",
+            "2.0.0",
+            None,
+            "Pkg",
+            None,
+            None,
+            &archive,
+        )
+        .unwrap();
+        assert!(ts_update.fomod_selection.is_none());
+
+        // mod.io: same file_id preserves selection, new file_id clears it.
+        let m1 = stage_modio_mod(
+            &paths,
+            game_id,
+            7,
+            42,
+            1,
+            "Widget",
+            Some("1.0".into()),
+            None,
+            None,
+            &archive,
+        )
+        .unwrap();
+        set_fomod_selection(&paths, game_id, &m1.id, selection.clone()).unwrap();
+
+        let m_same = stage_modio_mod(
+            &paths,
+            game_id,
+            7,
+            42,
+            1,
+            "Widget",
+            Some("1.0".into()),
+            None,
+            None,
+            &archive,
+        )
+        .unwrap();
+        assert_eq!(m_same.fomod_selection, Some(selection));
+
+        let m_update = stage_modio_mod(
+            &paths,
+            game_id,
+            7,
+            42,
+            2,
+            "Widget",
+            Some("2.0".into()),
+            None,
+            None,
+            &archive,
+        )
+        .unwrap();
+        assert!(m_update.fomod_selection.is_none());
     }
 
     #[test]

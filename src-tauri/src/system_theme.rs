@@ -409,17 +409,6 @@ fn gnome_named_accent() -> Option<(u8, u8, u8)> {
     parse_rgb_triple(hex)
 }
 
-#[cfg(target_os = "linux")]
-fn linux_accent(fallback: &str) -> (u8, u8, u8) {
-    // GTK path only: portal / GNOME named accent, then kdeglobals as last resort.
-    accent_or_fallback(
-        portal_accent()
-            .or_else(gnome_named_accent)
-            .or_else(kde_accent_only),
-        fallback,
-    )
-}
-
 type ColorIniMap = std::collections::HashMap<String, std::collections::HashMap<String, String>>;
 
 #[cfg(any(target_os = "linux", test))]
@@ -460,12 +449,6 @@ fn kde_config_path() -> Option<std::path::PathBuf> {
 fn kde_section_color(map: &ColorIniMap, section: &str, key: &str) -> Option<(u8, u8, u8)> {
     let v = map.get(section)?.get(key)?;
     parse_rgb_triple(v)
-}
-
-#[cfg(target_os = "linux")]
-fn kde_accent_only() -> Option<(u8, u8, u8)> {
-    let map = parse_color_ini_path(&kde_config_path()?)?;
-    qt_scheme_accent(&map)
 }
 
 /// Accent from a Plasma/qtct `.colors` map — never GNOME portal/gsettings.

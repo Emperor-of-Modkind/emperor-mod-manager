@@ -55,8 +55,8 @@ export function estimateStagedModRowHeight(rootPx = 16): number {
 
 /** Used before the results pane has a size. Matches the catalog default. */
 export const BROWSE_PAGE_FALLBACK = 24;
-/** Keeps a very tall window from asking for an unbounded page. */
-const BROWSE_PAGE_CAP = 120;
+/** Keeps a very tall or dense small-card window from asking for an unbounded page. */
+const BROWSE_PAGE_CAP = 48;
 
 /**
  * Hits that fill the scrollport, plus one row past the fold.
@@ -75,4 +75,62 @@ export function browsePageCount(
   const stride = rowHeight + gap;
   const visibleRows = Math.max(1, Math.ceil((viewportHeight + gap) / stride));
   return Math.min(BROWSE_PAGE_CAP, columns * (visibleRows + 1));
+}
+
+export type RectBox = {
+  top: number;
+  bottom: number;
+  left: number;
+  right: number;
+};
+
+export type SizeBox = {
+  width: number;
+  height: number;
+};
+
+/**
+ * Sentinel Y position in the scroll container's content coordinates.
+ * Unlike viewport-relative `getBoundingClientRect().top`, this does not shift
+ * when the user scrolls while an append request is in flight.
+ */
+export function sentinelContentTop(
+  sentinelTop: number,
+  rootTop: number,
+  scrollTop: number,
+): number {
+  return sentinelTop - rootTop + scrollTop;
+}
+
+/**
+ * True when `sentinelRect` intersects the visible portion of the scroll
+ * container, clamped against the browser viewport so an unconstrained scroll
+ * container can never treat off-screen rows as visible and loop forever.
+ */
+export function isSentinelInScrollView(
+  rootRect: Pick<RectBox, "top" | "left">,
+  rootClient: SizeBox,
+  sentinelRect: RectBox,
+  viewport: SizeBox,
+  margin = 0,
+): boolean {
+  if (
+    !(rootClient.height > 0) ||
+    !(rootClient.width > 0) ||
+    !(viewport.height > 0) ||
+    !(viewport.width > 0)
+  ) {
+    return false;
+  }
+  const viewTop = Math.max(rootRect.top, 0);
+  const viewBottom = Math.min(rootRect.top + rootClient.height, viewport.height);
+  const viewLeft = Math.max(rootRect.left, 0);
+  const viewRight = Math.min(rootRect.left + rootClient.width, viewport.width);
+  if (viewBottom <= viewTop || viewRight <= viewLeft) return false;
+  return (
+    sentinelRect.top < viewBottom + margin &&
+    sentinelRect.bottom > viewTop - margin &&
+    sentinelRect.left < viewRight + margin &&
+    sentinelRect.right > viewLeft - margin
+  );
 }

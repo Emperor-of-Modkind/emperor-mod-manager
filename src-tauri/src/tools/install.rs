@@ -8,7 +8,6 @@ use std::{
 
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
-use walkdir::WalkDir;
 
 use super::manifest::{ToolInstallRecord, ToolsManifest};
 
@@ -133,18 +132,4 @@ pub fn ensure_default_config(install_dir: &Path, tool_key: &str) -> Result<()> {
         super::autohdr_vk::AutoHdrVkConfig::default_config().save(&conf)?;
     }
     Ok(())
-}
-
-/// Find layer .so in install tree.
-pub fn find_layer_library(install_dir: &Path, needle: &str) -> Option<PathBuf> {
-    for entry in WalkDir::new(install_dir).max_depth(6) {
-        let entry = entry.ok()?;
-        if entry.file_type().is_file() {
-            let name = entry.file_name().to_string_lossy();
-            if name.contains(needle) && name.ends_with(".so") {
-                return Some(entry.path().to_path_buf());
-            }
-        }
-    }
-    None
 }

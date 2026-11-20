@@ -190,4 +190,124 @@ describe("FomodDialog", () => {
     });
     host.remove();
   });
+
+  it("refreshes conditional step visibility when an earlier option changes", async () => {
+    const conditionalView = (showBranchB: boolean): FomodInstallerView => ({
+      module_name: "Branching Mod",
+      unsupported_scripted: false,
+      selection: {
+        selected: {
+          "0-branch.0-pick": [
+            showBranchB ? "0-branch.0-pick.1-b" : "0-branch.0-pick.0-a",
+          ],
+          "1-only-b.0-sub": ["1-only-b.0-sub.0-patch"],
+        },
+      },
+      steps: [
+        {
+          id: "0-branch",
+          name: "Branch",
+          visible: true,
+          groups: [
+            {
+              id: "0-branch.0-pick",
+              name: "Pick",
+              type: "SelectExactlyOne",
+              plugins: [
+                {
+                  id: "0-branch.0-pick.0-a",
+                  name: "Option A",
+                  description: null,
+                  image: null,
+                  plugin_type: "Recommended",
+                },
+                {
+                  id: "0-branch.0-pick.1-b",
+                  name: "Option B",
+                  description: null,
+                  image: null,
+                  plugin_type: "Optional",
+                },
+              ],
+            },
+          ],
+        },
+        {
+          id: "1-only-b",
+          name: "Only B Step",
+          visible: showBranchB,
+          groups: [
+            {
+              id: "1-only-b.0-sub",
+              name: "Sub",
+              type: "SelectExactlyOne",
+              plugins: [
+                {
+                  id: "1-only-b.0-sub.0-patch",
+                  name: "B Patch",
+                  description: null,
+                  image: null,
+                  plugin_type: "Recommended",
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+
+    getFomodInstaller.mockImplementation(
+      (_g: string, _m: string, draft?: { selected: Record<string, string[]> }) => {
+        const picked = draft?.selected["0-branch.0-pick"] ?? [];
+        return Promise.resolve(conditionalView(picked.includes("0-branch.0-pick.1-b")));
+      },
+    );
+
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const root: Root = createRoot(host);
+
+    await act(async () => {
+      root.render(
+        <FomodDialog
+          gameId="cyberpunk2077"
+          mod={mod}
+          onClose={vi.fn()}
+          onSaved={vi.fn()}
+        />,
+      );
+    });
+    await flush();
+
+    // With Option A selected, Step 2 is hidden so the primary button is Finish.
+    expect(
+      Array.from(document.body.querySelectorAll("button")).some((b) => b.textContent === "Finish"),
+    ).toBe(true);
+
+    // Selecting Option B refreshes the installer view and reveals Step 2 ("Next").
+    const optionB = Array.from(document.body.querySelectorAll("label")).find((el) =>
+      el.textContent?.includes("Option B"),
+    );
+    expect(optionB).toBeTruthy();
+    await act(async () => {
+      optionB!.querySelector("input")!.click();
+    });
+    await flush();
+
+    const next = Array.from(document.body.querySelectorAll("button")).find(
+      (b) => b.textContent === "Next",
+    );
+    expect(next).toBeTruthy();
+    await act(async () => {
+      next!.click();
+    });
+
+    expect(document.body.textContent).toContain("Only B Step");
+    expect(document.body.textContent).toContain("B Patch");
+
+    await act(async () => {
+      root.unmount();
+    });
+    host.remove();
+  });
 });

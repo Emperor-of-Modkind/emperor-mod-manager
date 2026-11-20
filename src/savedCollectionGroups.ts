@@ -1,3 +1,4 @@
+import { isDeferredIconPath } from "./catalogCovers";
 import type {
   DetectedGame,
   GamePluginInfo,
@@ -141,7 +142,7 @@ function detectedMatchesHint(game: DetectedGame, hint: ShareGameHint): boolean {
     return true;
   }
   if (hint.plugin_id && game.plugin_id && hint.plugin_id === game.plugin_id) {
-    if (isGenericEnginePlugin(hint.plugin_id) && hint.title?.trim()) {
+    if (isGenericEnginePlugin(hint.plugin_id)) {
       return titlesMatch(hint.title, game.title);
     }
     return true;
@@ -154,7 +155,12 @@ function pluginMatchesHint(
   hint: ShareGameHint,
 ): boolean {
   if (hint.plugin_id && hint.plugin_id === plugin.id) {
-    if (isGenericEnginePlugin(hint.plugin_id) && hint.title?.trim()) return false;
+    if (
+      isGenericEnginePlugin(hint.plugin_id) &&
+      (hint.title?.trim() || hintHasCatalog(hint))
+    ) {
+      return false;
+    }
     return true;
   }
   if (
@@ -172,13 +178,16 @@ function resolveGroupMeta(
   managed: ManagedGame[],
   detected: DetectedGame[],
   plugins: GamePluginInfo[],
+  catalogCover: string | null = null,
+  catalogTitle: string | null = null,
 ): Pick<SavedCollectionGameGroup, "title" | "coverPath" | "managed"> {
   const managedMatch =
     managed.find((g) => savedCollectionMatchesGame(representative, g)) ?? null;
   if (managedMatch) {
     return {
       title: managedMatch.title,
-      coverPath: managedMatch.cover_path || managedMatch.cover_url || null,
+      coverPath:
+        managedMatch.cover_path || managedMatch.cover_url || catalogCover || null,
       managed: managedMatch,
     };
   }
@@ -186,13 +195,39 @@ function resolveGroupMeta(
   const detectedMatch =
     detected.find((g) => detectedMatchesHint(g, representative.game)) ?? null;
   if (detectedMatch) {
+    const localPoster =
+      detectedMatch.cover_path &&
+      detectedMatch.cover_path !== detectedMatch.icon_path &&
+      !isDeferredIconPath(detectedMatch.cover_path)
+        ? detectedMatch.cover_path
+        : null;
     return {
       title: detectedMatch.title,
       coverPath:
-        detectedMatch.cover_path ||
+        localPoster ||
         detectedMatch.cover_url ||
+        catalogCover ||
+        detectedMatch.cover_path ||
         detectedMatch.icon_path ||
         null,
+      managed: null,
+    };
+  }
+
+  const hintTitle = representative.game.title?.trim();
+  if (hintTitle) {
+    return {
+      title: hintTitle,
+      coverPath: catalogCover || null,
+      managed: null,
+    };
+  }
+
+  const resolvedCatalogTitle = catalogTitle?.trim();
+  if (resolvedCatalogTitle) {
+    return {
+      title: resolvedCatalogTitle,
+      coverPath: catalogCover || null,
       managed: null,
     };
   }
@@ -202,14 +237,14 @@ function resolveGroupMeta(
   if (pluginMatch) {
     return {
       title: pluginMatch.display_name,
-      coverPath: null,
+      coverPath: catalogCover || null,
       managed: null,
     };
   }
 
   return {
     title: fallbackGameTitle(representative.game, representative.source_game_id),
-    coverPath: null,
+    coverPath: catalogCover || null,
     managed: null,
   };
 }
@@ -219,6 +254,8 @@ export function groupSavedCollectionsByGame(
   managed: ManagedGame[],
   detected: DetectedGame[],
   plugins: GamePluginInfo[],
+  catalogCovers?: Record<string, string | null | undefined>,
+  catalogTitles?: Record<string, string | null | undefined>,
 ): SavedCollectionGameGroup[] {
   const byKey = new Map<string, SavedCollectionEntry[]>();
   for (const entry of collections) {
@@ -234,7 +271,14 @@ export function groupSavedCollectionsByGame(
       (a, b) =>
         new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
     );
-    const meta = resolveGroupMeta(sorted[0]!, managed, detected, plugins);
+    const meta = resolveGroupMeta(
+      sorted[0]!,
+      managed,
+      detected,
+      plugins,
+      catalogCovers?.[key] ?? null,
+      catalogTitles?.[key] ?? null,
+    );
     groups.push({
       key,
       title: meta.title,

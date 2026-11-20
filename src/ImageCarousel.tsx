@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type CSSProperties } from "react";
+import { memo, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
 import { faChevronLeft, faChevronRight } from "@fortawesome/free-solid-svg-icons";
 import { motion, useReducedMotion } from "motion/react";
@@ -16,13 +16,17 @@ function readRatio(img: HTMLImageElement): number | null {
   return null;
 }
 
-export function ImageCarousel({ slides }: { slides: GallerySlide[] }) {
+export const ImageCarousel = memo(function ImageCarousel({
+  slides,
+}: {
+  slides: GallerySlide[];
+}) {
   const [index, setIndex] = useState(0);
   const [ratio, setRatio] = useState<number | null>(null);
   const [leaving, setLeaving] = useState<GallerySlide | null>(null);
   const imgRef = useRef<HTMLImageElement>(null);
   const reduced = useReducedMotion() === true;
-  const slideKey = slides.map((slide) => slide.url).join("\n");
+  const slideKey = useMemo(() => slides.map((slide) => slide.url).join("\n"), [slides]);
   const current = slides.length === 0 ? 0 : Math.min(index, slides.length - 1);
   const slide = slides[current];
   const [trackedUrl, setTrackedUrl] = useState(slide?.url ?? "");
@@ -90,6 +94,7 @@ export function ImageCarousel({ slides }: { slides: GallerySlide[] }) {
           className="detail-carousel-slide"
           src={slide.url}
           alt={slide.caption?.trim() || "Mod image"}
+          decoding="async"
           initial={reduced || !leaving ? false : { opacity: 0 }}
           animate={{ opacity: 1 }}
           transition={{ duration: reduced ? 0 : MOTION_FAST, ease: MOTION_EASE }}
@@ -106,6 +111,7 @@ export function ImageCarousel({ slides }: { slides: GallerySlide[] }) {
             className="detail-carousel-slide detail-carousel-slide-leaving"
             src={leaving.url}
             alt=""
+            decoding="async"
             initial={{ opacity: 1 }}
             animate={{ opacity: 0 }}
             transition={{ duration: MOTION_FAST, ease: MOTION_EASE }}
@@ -141,4 +147,4 @@ export function ImageCarousel({ slides }: { slides: GallerySlide[] }) {
       ) : null}
     </div>
   );
-}
+});

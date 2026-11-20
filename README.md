@@ -1,18 +1,18 @@
 # Emperor Mod Manager
 
-Desktop mod manager for [Nexus Mods](https://www.nexusmods.com/), Thunderstore, and mod.io — on **Linux** and **Windows**.
+Desktop mod manager for [Nexus Mods](https://www.nexusmods.com/), Thunderstore, and mod.io on **Linux** and **Windows**.
 
 Browse, download, and deploy mods for dozens of games across Unity/BepInEx, Unreal, RE Engine, FromSoftware, Bethesda/Creation Engine, id Tech, and many more titles. Detects installs from Steam, Heroic, Lutris, and Bottles on Linux, and Steam, the Epic Games Launcher, and optional Heroic on Windows.
 
 ## Highlights
 
 - **One browse list** for Nexus, Thunderstore, and mod.io (filter by source when you want)
-- **Collections and modpacks** — install Nexus Collections, Thunderstore Modpacks, or paste an r2modman/Gale profile code
-- **Deploy with load order** — hardlinks when possible, copy fallback across drives
-- **Nexus Premium** — one-click API downloads and Collection batch install
-- **Download Assist** — free Nexus accounts download in-app (optional autoclick), with `nxm://` staging and local archive import
-- **Browser deep links** — “Download with manager” (`nxm://`) opens in Emperor after install
-- **Shareable mod links** — Copy link on a mod page copies an `emperor://mod/...` URL that opens that mod in Emperor (Nexus, Thunderstore, and mod.io)
+- **Collections and modpacks**: install Nexus Collections, Thunderstore Modpacks, or paste an r2modman/Gale profile code
+- **Deploy with load order**: hardlinks when possible, copy fallback across drives
+- **Nexus Premium**: one-click API downloads and Collection batch install
+- **Download Assist**: free Nexus accounts download in-app (optional autoclick), with `nxm://` staging and local archive import
+- **Browser deep links**: “Download with manager” (`nxm://`) opens in Emperor after install
+- **Shareable mod links**: Copy link on a mod page copies an `emperor://mod/...` URL that opens that mod in Emperor (Nexus, Thunderstore, and mod.io)
 - Soft dependency resolution on Thunderstore and mod.io, with a single pinned version per package
 
 ## Install
@@ -38,6 +38,14 @@ Pin a version with `EMM_VERSION=0.4.0` before the installer. Uninstall with `sud
 ### Other Linux distros
 
 Grab the `.deb` or `.AppImage` from the [latest release](https://github.com/LewisTansley/emperor-mod-manager/releases/latest). Each release also ships a `.tar.gz` with the binary, desktop entry, and icons, plus a `SHA256SUMS` file. Settings updates a `.deb` with apt, replaces an AppImage in place, or replaces a user-writable copy of the binary from that tarball.
+
+### Build from source (Linux)
+
+```bash
+./scripts/install-local.sh
+```
+
+Or `npm run install:local`. That builds the release binary (`--no-bundle`), installs it to `~/.local/bin/emperor-mod-manager`, installs the `.desktop` entry and icons under `~/.local/share/`, and registers `nxm://` and `emperor://` links. Pass `--skip-build` to reinstall an existing build or `--uninstall` to remove the local install.
 
 ### Windows
 

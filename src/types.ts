@@ -221,6 +221,7 @@ export type CatalogCoverRequest = {
 export type CatalogCoverHit = {
   id: string;
   cover_url: string;
+  title?: string | null;
 };
 
 export type CatalogSource = "nexus" | "thunderstore" | "modio";

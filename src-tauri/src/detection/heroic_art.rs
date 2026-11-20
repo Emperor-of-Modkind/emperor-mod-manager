@@ -41,6 +41,7 @@ impl LauncherArt {
 #[derive(Debug, Clone)]
 struct ArtRecord {
     url: String,
+    #[cfg(any(target_os = "windows", test))]
     title: Option<String>,
 }
 
@@ -130,6 +131,7 @@ impl HeroicResolver {
         }
     }
 
+    #[cfg(any(target_os = "windows", test))]
     pub fn library_title(&mut self, store: HeroicStore, app_id: &str) -> Option<String> {
         self.index()
             .records(store)
@@ -251,6 +253,7 @@ impl HeroicArtIndex {
                 app_id,
                 ArtRecord {
                     url,
+                    #[cfg(any(target_os = "windows", test))]
                     title: json_str(&game, &["title"]),
                 },
             );

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 
 import { api } from "./api";
@@ -72,6 +72,45 @@ function pluginDisabled(plugin: FomodPluginView) {
   return plugin.plugin_type === "NotUsable";
 }
 
+function reconcileSelectionWithView(
+  draft: FomodSelection,
+  refreshed: FomodInstallerView,
+): FomodSelection {
+  const next: Record<string, string[]> = { ...draft.selected };
+  for (const step of refreshed.steps) {
+    for (const group of step.groups) {
+      if (!(group.id in next)) {
+        next[group.id] = refreshed.selection.selected[group.id] ?? [];
+        continue;
+      }
+      const allowed = new Set(
+        group.plugins
+          .filter((p) => !pluginDisabled(p))
+          .map((p) => p.id),
+      );
+      const filtered = (next[group.id] ?? []).filter((id) => allowed.has(id));
+      for (const p of group.plugins) {
+        if (pluginLockedOn(p) && !filtered.includes(p.id)) {
+          filtered.push(p.id);
+        }
+      }
+      if (
+        (group.type === "SelectExactlyOne" || group.type === "SelectAtLeastOne") &&
+        filtered.length === 0
+      ) {
+        next[group.id] = refreshed.selection.selected[group.id] ?? [];
+      } else if (group.type === "SelectAll") {
+        next[group.id] = group.plugins
+          .filter((p) => !pluginDisabled(p))
+          .map((p) => p.id);
+      } else {
+        next[group.id] = filtered;
+      }
+    }
+  }
+  return { selected: next };
+}
+
 export function FomodDialog({ gameId, mod, progress, onClose, onSaved }: Props) {
   const [view, setView] = useState<FomodInstallerView | null>(null);
   const [selection, setSelection] = useState<FomodSelection | null>(null);
@@ -79,9 +118,19 @@ export function FomodDialog({ gameId, mod, progress, onClose, onSaved }: Props) 
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const refreshReqRef = useRef(0);
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
+    refreshReqRef.current += 1;
     setLoading(true);
     api
       .getFomodInstaller(gameId, mod.id)
@@ -110,18 +159,42 @@ export function FomodDialog({ gameId, mod, progress, onClose, onSaved }: Props) 
     [view],
   );
 
-  const current = visibleSteps[Math.min(stepIndex, Math.max(visibleSteps.length - 1, 0))];
-  const isLast = stepIndex >= visibleSteps.length - 1;
+  const clampedStepIndex = Math.min(stepIndex, Math.max(visibleSteps.length - 1, 0));
+  const current = visibleSteps[clampedStepIndex];
+  const isLast = clampedStepIndex >= visibleSteps.length - 1;
   const canFinish = Boolean(view && selection && !view.unsupported_scripted);
 
   const selectedIn = (groupId: string) => selection?.selected[groupId] ?? [];
 
   const setGroupSelection = (group: FomodGroupView, nextIds: string[]) => {
-    setSelection((prev) => {
-      if (!prev) return prev;
-      const selected = { ...prev.selected, [group.id]: nextIds };
-      return { selected };
-    });
+    if (!selection) return;
+    const nextSelection: FomodSelection = {
+      selected: { ...selection.selected, [group.id]: nextIds },
+    };
+    setSelection(nextSelection);
+    const req = ++refreshReqRef.current;
+    const currentStepId = current?.id ?? null;
+    void api
+      .getFomodInstaller(gameId, mod.id, nextSelection)
+      .then((refreshed) => {
+        if (!mountedRef.current || req !== refreshReqRef.current || !refreshed) return;
+        setView(refreshed);
+        setSelection((prev) =>
+          prev ? reconcileSelectionWithView(prev, refreshed) : refreshed.selection,
+        );
+        if (currentStepId) {
+          const nextVisible = refreshed.steps.filter((s) => s.visible);
+          const idx = nextVisible.findIndex((s) => s.id === currentStepId);
+          if (idx >= 0) {
+            setStepIndex(idx);
+          } else {
+            setStepIndex((i) => Math.min(i, Math.max(nextVisible.length - 1, 0)));
+          }
+        }
+      })
+      .catch(() => {
+        /* keep local draft selection if preview refresh fails */
+      });
   };
 
   const togglePlugin = (group: FomodGroupView, plugin: FomodPluginView) => {
@@ -194,11 +267,11 @@ export function FomodDialog({ gameId, mod, progress, onClose, onSaved }: Props) 
         >
           Cancel
         </button>
-        {stepIndex > 0 ? (
+        {clampedStepIndex > 0 ? (
           <button
             type="button"
             className="linkish"
-            onClick={() => setStepIndex((i) => Math.max(0, i - 1))}
+            onClick={() => setStepIndex(Math.max(0, clampedStepIndex - 1))}
             disabled={saving}
           >
             Back
@@ -211,7 +284,7 @@ export function FomodDialog({ gameId, mod, progress, onClose, onSaved }: Props) 
         ) : (
           <button
             type="button"
-            onClick={() => setStepIndex((i) => i + 1)}
+            onClick={() => setStepIndex(clampedStepIndex + 1)}
             disabled={saving || !stepValid}
           >
             Next

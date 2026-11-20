@@ -72,7 +72,6 @@ pub enum DownloadResumeSource {
         community: String,
         namespace: String,
         name: String,
-        version: Option<String>,
         display_name: String,
         enabled: Option<bool>,
     },
@@ -161,14 +160,14 @@ pub struct AppState {
     pub modio_search_cache: Mutex<HashMap<String, (Instant, Vec<modio_api::ModioModHit>, u32)>>,
     /// Session cache of Nexus games list for catalog matching.
     pub nexus_games_cache: Mutex<Option<Vec<nexus::NexusGameEntry>>>,
+    /// Last `scan_games` result. Health checks reuse it instead of scanning again.
+    pub detected_games: Mutex<Option<Vec<DetectedGame>>>,
     /// Session cache of Thunderstore communities for catalog matching.
     pub ts_communities_cache: Mutex<Option<Vec<thunderstore::TsCommunity>>>,
     /// Caps simultaneous transfers. Installing a collection queues dozens of
     /// downloads at once, and saturating the connection is what makes CDN
     /// streams stall and end short in the first place.
     pub download_slots: tokio::sync::Semaphore,
-    /// Same per-game lock the staging functions take.
-    pub order_locks: mods::GameOrderLocks,
 }
 
 /// Enough to keep a fast link busy without starving any single transfer.
@@ -333,9 +332,9 @@ impl AppState {
             modio_client: Mutex::new(None),
             modio_search_cache: Mutex::new(HashMap::new()),
             nexus_games_cache: Mutex::new(None),
+            detected_games: Mutex::new(None),
             ts_communities_cache: Mutex::new(None),
             download_slots: tokio::sync::Semaphore::new(MAX_CONCURRENT_DOWNLOADS),
-            order_locks: mods::shared_order_locks(),
         })
     }
 
@@ -968,9 +967,33 @@ fn allow_cover_files<'a>(app: &AppHandle, covers: impl IntoIterator<Item = &'a s
     }
 }
 
+async fn cached_detected_games(state: &AppState) -> Result<Vec<DetectedGame>, String> {
+    if let Some(games) = state
+        .detected_games
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clone()
+    {
+        return Ok(games);
+    }
+    let games = blocking(|| Ok(detection::scan_games())).await?;
+    *state
+        .detected_games
+        .lock()
+        .map_err(|e| e.to_string())? = Some(games.clone());
+    Ok(games)
+}
+
 #[tauri::command]
-pub fn scan_games(app: AppHandle, state: State<'_, AppState>) -> Result<Vec<DetectedGame>, String> {
-    let games = detection::scan_games();
+pub async fn scan_games(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Vec<DetectedGame>, String> {
+    let games = blocking(|| Ok(detection::scan_games())).await?;
+    *state
+        .detected_games
+        .lock()
+        .map_err(|e| e.to_string())? = Some(games.clone());
     allow_cover_files(&app, art_paths(&games));
 
     // Managed games keep the cover from when they were added. Steam moves art
@@ -987,6 +1010,9 @@ pub fn scan_games(app: AppHandle, state: State<'_, AppState>) -> Result<Vec<Dete
                 &game.launcher,
             )
         }) else {
+            if prune_missing_cover_path(&mut managed.cover_path) {
+                changed = true;
+            }
             continue;
         };
         if detection::sync_managed_cover(&mut managed.cover_path, &mut managed.cover_url, detected)
@@ -1004,6 +1030,18 @@ pub fn scan_games(app: AppHandle, state: State<'_, AppState>) -> Result<Vec<Dete
             .filter_map(|game| game.cover_path.as_deref()),
     );
     Ok(games)
+}
+
+fn prune_missing_cover_path(cover_path: &mut Option<String>) -> bool {
+    let missing = cover_path
+        .as_deref()
+        .is_some_and(|path| !Path::new(path).is_file());
+    if missing {
+        *cover_path = None;
+        true
+    } else {
+        false
+    }
 }
 
 fn art_paths(games: &[DetectedGame]) -> Vec<&str> {
@@ -1033,6 +1071,8 @@ pub struct CatalogCoverRequest {
 pub struct CatalogCoverHit {
     id: String,
     cover_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
 }
 
 /// Fill posters from Nexus, then mod.io, for games that still have no local cover.
@@ -1047,6 +1087,7 @@ pub async fn resolve_catalog_covers(
     }
 
     let mut nexus_ids = HashMap::new();
+    let mut nexus_titles = HashMap::new();
     if requests.iter().any(|request| {
         request
             .nexus_domain
@@ -1055,7 +1096,12 @@ pub async fn resolve_catalog_covers(
     }) {
         for game in load_nexus_games_cached(&state).await? {
             if game.id > 0 {
-                nexus_ids.insert(game.domain_name.to_ascii_lowercase(), game.id);
+                let key = game.domain_name.to_ascii_lowercase();
+                nexus_ids.insert(key.clone(), game.id);
+                let name = game.name.trim();
+                if !name.is_empty() {
+                    nexus_titles.insert(key, name.to_string());
+                }
             }
         }
     }
@@ -1077,27 +1123,38 @@ pub async fn resolve_catalog_covers(
     let mut changed = false;
     let mut hits = Vec::new();
     for request in &requests {
-        let logo = request
-            .modio_game_id
-            .and_then(|id| logos.get(&id))
-            .map(String::as_str);
+        let modio_hit = request.modio_game_id.and_then(|id| logos.get(&id));
+        let logo = modio_hit.map(|hit| hit.url.as_str());
         let Some(url) =
             detection::catalog_cover_url(request.nexus_domain.as_deref(), &nexus_ids, logo)
         else {
             continue;
         };
+        let nexus_title = request
+            .nexus_domain
+            .as_deref()
+            .map(|d| d.trim().to_ascii_lowercase())
+            .filter(|d| nexus_ids.contains_key(d))
+            .and_then(|d| nexus_titles.get(&d).cloned());
+        let title = nexus_title.or_else(|| {
+            modio_hit
+                .map(|hit| hit.name.trim().to_string())
+                .filter(|name| !name.is_empty())
+        });
         if let Some(game) = cfg
             .managed_games
             .iter_mut()
             .find(|game| game.id == request.id)
         {
-            let icon_like = game.cover_path.as_deref().is_some_and(|path| {
-                request.icon_path.as_deref() == Some(path) || detection::is_deferred_icon_path(path)
+            let replaceable = game.cover_path.as_deref().is_some_and(|path| {
+                request.icon_path.as_deref() == Some(path)
+                    || detection::is_deferred_icon_path(path)
+                    || !Path::new(path).is_file()
             });
-            if game.cover_path.is_some() && !icon_like {
+            if game.cover_path.is_some() && !replaceable {
                 continue;
             }
-            if icon_like {
+            if replaceable {
                 game.cover_path = None;
                 changed = true;
             }
@@ -1109,6 +1166,7 @@ pub async fn resolve_catalog_covers(
         hits.push(CatalogCoverHit {
             id: request.id.clone(),
             cover_url: url,
+            title,
         });
     }
     if changed {
@@ -1117,7 +1175,10 @@ pub async fn resolve_catalog_covers(
     Ok(hits)
 }
 
-async fn modio_game_logos(state: &AppState, ids: &[u32]) -> HashMap<u32, String> {
+async fn modio_game_logos(
+    state: &AppState,
+    ids: &[u32],
+) -> HashMap<u32, crate::modio_api::ModioGameLogo> {
     if ids.is_empty() {
         return HashMap::new();
     }
@@ -1152,7 +1213,16 @@ pub fn list_managed(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Vec<ManagedGame>, String> {
-    let cfg = state.config.lock().map_err(|e| e.to_string())?;
+    let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
+    let mut changed = false;
+    for game in &mut cfg.managed_games {
+        if prune_missing_cover_path(&mut game.cover_path) {
+            changed = true;
+        }
+    }
+    if changed {
+        config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())?;
+    }
     // Grant before returning so the library's first paint can load covers that
     // live outside $HOME. scan_games may not have run yet.
     allow_cover_files(
@@ -1825,24 +1895,29 @@ pub async fn suggest_catalog_ids_batch(
 }
 
 #[tauri::command]
-pub fn get_game_health(
+pub async fn get_game_health(
     state: State<'_, AppState>,
 ) -> Result<Vec<detection::reconcile::GameHealth>, String> {
-    let cfg = state.config.lock().map_err(|e| e.to_string())?;
-    let detected = detection::scan_games();
+    let detected = cached_detected_games(&state).await?;
+    let managed = state
+        .config
+        .lock()
+        .map_err(|e| e.to_string())?
+        .managed_games
+        .clone();
     Ok(detection::reconcile::compute_game_health(
-        &cfg.managed_games,
+        &managed,
         &detected,
     ))
 }
 
 #[tauri::command]
-pub fn relink_managed_game(
+pub async fn relink_managed_game(
     state: State<'_, AppState>,
     old_id: String,
     new_id: String,
 ) -> Result<ManagedGame, String> {
-    let detected = detection::scan_games();
+    let detected = cached_detected_games(&state).await?;
     let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
     detection::reconcile::relink_managed_game(&state.paths, &mut cfg, &old_id, &new_id, &detected)
         .map_err(|e| e.to_string())
@@ -2482,9 +2557,10 @@ pub async fn search_catalog(
     let total_count = nexus_total
         .saturating_add(ts_total)
         .saturating_add(modio_total);
-    let has_more = (offset + count) < nexus_total as usize
-        || (offset + count) < ts_total as usize
-        || (offset + count) < modio_total as usize;
+    let has_more = !items.is_empty()
+        && ((offset + count) < nexus_total as usize
+            || (offset + count) < ts_total as usize
+            || (offset + count) < modio_total as usize);
 
     Ok(CatalogSearchPage {
         items,
@@ -3273,7 +3349,6 @@ async fn stage_thunderstore_package(
         community: community.to_string(),
         namespace: ns.clone(),
         name: pkg_name.clone(),
-        version: Some(incoming_ver.clone()),
         display_name: display_name.to_string(),
         enabled,
     };
@@ -4596,7 +4671,8 @@ pub async fn search_collection_catalog(
 
     let items = interleave_collection_hits(vec![nexus_hits, ts_hits]);
     let total_count = nexus_total.saturating_add(ts_total);
-    let has_more = (offset + count) < nexus_total as usize || (offset + count) < ts_total as usize;
+    let has_more = !items.is_empty()
+        && ((offset + count) < nexus_total as usize || (offset + count) < ts_total as usize);
 
     Ok(CollectionCatalogPage {
         items,
@@ -5455,6 +5531,7 @@ pub async fn handle_nxm(
             return;
         }
 
+        let replaced = replace_staged_id_bg.is_some();
         let result = download_and_stage_inner(
             Some(&app_bg),
             &*state,
@@ -5482,6 +5559,7 @@ pub async fn handle_nxm(
                         "label": label,
                         "game_id": game_id,
                         "mod_id": staged.id,
+                        "replaced": replaced,
                     }),
                 );
             }
@@ -5782,6 +5860,7 @@ pub async fn start_assist_cdn_download(
             return;
         }
 
+        let replaced = replace_staged_id.is_some();
         let result = fetch_and_stage_cdn(
             &app_bg,
             &*state,
@@ -5809,6 +5888,7 @@ pub async fn start_assist_cdn_download(
                         "label": label,
                         "game_id": game_id,
                         "mod_id": staged.id,
+                        "replaced": replaced,
                     }),
                 );
             }
@@ -6353,6 +6433,7 @@ pub fn import_assist_download(
                         "label": ctx.label,
                         "game_id": ctx.game_id,
                         "mod_id": staged.id,
+                        "replaced": ctx.replace_staged_id.is_some(),
                     }),
                 );
                 Ok(Some(staged))
@@ -7915,6 +7996,7 @@ pub fn get_fomod_installer(
     state: State<'_, AppState>,
     game_id: String,
     mod_id: String,
+    selection: Option<FomodSelection>,
 ) -> Result<Option<FomodInstallerView>, String> {
     let plugin = plugin_for_game(&state, &game_id)?;
     let order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
@@ -7926,7 +8008,8 @@ pub fn get_fomod_installer(
     let Some(root) = staged_content_root(staged, plugin) else {
         return Ok(None);
     };
-    fomod::installer_view(&root, staged.fomod_selection.as_ref()).map_err(|e| e.to_string())
+    let effective = selection.as_ref().or(staged.fomod_selection.as_ref());
+    fomod::installer_view(&root, effective).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -8465,6 +8548,7 @@ pub fn resume_download(
             } => {
                 let label_clone = label.clone();
                 let game_id_clone = game_id.clone();
+                let replaced = replace_staged_id.is_some();
                 let res = download_and_stage_inner(
                     Some(&app_bg),
                     &*state,
@@ -8482,7 +8566,7 @@ pub fn resume_download(
                     file_name,
                 )
                 .await;
-                (res, label_clone, game_id_clone)
+                (res, label_clone, game_id_clone, replaced)
             }
             DownloadResumeSource::Cdn {
                 url,
@@ -8498,6 +8582,7 @@ pub fn resume_download(
             } => {
                 let label_clone = label.clone();
                 let game_id_clone = game_id.clone();
+                let replaced = replace_staged_id.is_some();
                 let res = fetch_and_stage_cdn(
                     &app_bg,
                     &*state,
@@ -8515,17 +8600,18 @@ pub fn resume_download(
                     file_name,
                 )
                 .await;
-                (res, label_clone, game_id_clone)
+                (res, label_clone, game_id_clone, replaced)
             }
             DownloadResumeSource::Thunderstore { .. } | DownloadResumeSource::Modio { .. } => (
                 Err("Cannot resume this download — use Restart instead.".into()),
                 String::new(),
                 String::new(),
+                false,
             ),
         };
 
         match result {
-            (Ok(staged), label, game_id) => {
+            (Ok(staged), label, game_id, replaced) => {
                 log::info!("download finished after resume: {label}");
                 let _ = app_bg.emit(
                     "download-finished",
@@ -8534,10 +8620,11 @@ pub fn resume_download(
                         "label": label,
                         "game_id": game_id,
                         "mod_id": staged.id,
+                        "replaced": replaced,
                     }),
                 );
             }
-            (Err(e), label, _) => {
+            (Err(e), label, _, _) => {
                 if is_pause_err(&e) {
                     log::info!("download paused: {label}");
                 } else if is_cancel_err(&e) {
@@ -8587,6 +8674,7 @@ async fn emit_download_outcome(
     queued_id: &str,
     label: &str,
     game_id: &str,
+    replaced: bool,
     result: Result<StagedMod, String>,
 ) {
     match result {
@@ -8599,6 +8687,7 @@ async fn emit_download_outcome(
                     "label": label,
                     "game_id": game_id,
                     "mod_id": staged.id,
+                    "replaced": replaced,
                 }),
             );
         }
@@ -8795,6 +8884,7 @@ pub fn restart_download(
             } => {
                 let label_clone = label.clone();
                 let game_id_clone = game_id.clone();
+                let replaced = replace_staged_id.is_some();
                 let batch_id = state
                     .download_jobs
                     .lock()
@@ -8817,7 +8907,7 @@ pub fn restart_download(
                     file_name,
                 )
                 .await;
-                (res, label_clone, game_id_clone)
+                (res, label_clone, game_id_clone, replaced)
             }
             DownloadResumeSource::Cdn {
                 url,
@@ -8833,6 +8923,7 @@ pub fn restart_download(
             } => {
                 let label_clone = label.clone();
                 let game_id_clone = game_id.clone();
+                let replaced = replace_staged_id.is_some();
                 let batch_id = state
                     .download_jobs
                     .lock()
@@ -8855,7 +8946,7 @@ pub fn restart_download(
                     file_name,
                 )
                 .await;
-                (res, label_clone, game_id_clone)
+                (res, label_clone, game_id_clone, replaced)
             }
             DownloadResumeSource::Thunderstore {
                 game_id,
@@ -8886,7 +8977,7 @@ pub fn restart_download(
                     .await
                 }
                 .await;
-                (res, label_clone, game_id_clone)
+                (res, label_clone, game_id_clone, false)
             }
             DownloadResumeSource::Modio {
                 game_id,
@@ -8912,11 +9003,11 @@ pub fn restart_download(
                     &name_id,
                 )
                 .await;
-                (res, label_clone, game_id_clone)
+                (res, label_clone, game_id_clone, false)
             }
         };
 
-        emit_download_outcome(&app_bg, &queued_id, &result.1, &result.2, result.0).await;
+        emit_download_outcome(&app_bg, &queued_id, &result.1, &result.2, result.3, result.0).await;
     });
 
     Ok(())

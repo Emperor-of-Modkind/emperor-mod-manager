@@ -1,5 +1,8 @@
 import {
+  memo,
+  startTransition,
   useCallback,
+  useDeferredValue,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -53,7 +56,6 @@ import {
 import { SourceMark } from "./SourceMark";
 import { ImageCarousel } from "./ImageCarousel";
 import {
-  FadeIn,
   MotionCard,
   NavTab,
   Collapse,
@@ -62,11 +64,36 @@ import {
   Segment,
   SegmentTab,
   ViewSwitch,
+  staggerStyle,
 } from "./motion";
 import { RichText } from "./RichText";
 import { BrowseVirtualGrid, BrowseVirtualList } from "./BrowseResults";
-import { BrowseResultsSkeleton, StagedModsSkeleton } from "./Skeleton";
-import { estimateListRowHeight, estimateStagedModRowHeight } from "./browseVirtual";
+import {
+  BrowseGridSkeleton,
+  BrowseListSkeleton,
+  BrowseResultsSkeleton,
+  CollectionDetailSkeleton,
+  InlineStatSkeleton,
+  ModDetailSkeleton,
+  StagedModsSkeleton,
+} from "./Skeleton";
+import { ResultsReveal, useReveal } from "./reveal";
+import { useQueuedImageSrc } from "./imageLoadQueue";
+import {
+  ParkedTabGate,
+  TtlTracker,
+  createThrottledBatcher,
+  shallowRecordOfObjectsEqual,
+  stringSetEqual,
+  useChunkedCount,
+  useNavSettledEffect,
+} from "./perf";
+import {
+  estimateListRowHeight,
+  estimateStagedModRowHeight,
+  isSentinelInScrollView,
+  sentinelContentTop,
+} from "./browseVirtual";
 import { AppNavHistory, type NavEntry } from "./appNavHistory";
 import { attachMouseNavigationListeners } from "./mouseNavigation";
 import { browseGameVersionOptions } from "./gameVersion";
@@ -120,7 +147,12 @@ import {
   type StatusNotice,
 } from "./StatusBanner";
 import { WineOverrideNotice } from "./WineOverrideNotice";
-import { catalogCoverRequests, isDeferredIconPath } from "./catalogCovers";
+import {
+  COLLECTION_COVER_PREFIX,
+  applyCatalogCovers,
+  catalogCoverRequests,
+  collectionCatalogCoverRequests,
+} from "./catalogCovers";
 import { nexusModUnavailable, nexusUnavailableNotice } from "./nexusAvailability";
 import type {
   AuthorSuggestion,
@@ -791,6 +823,9 @@ const SYSTEM_PALETTE_VARS = [
 
 function resolveTheme(pref: ThemePreference): "light" | "dark" {
   if (pref === "light" || pref === "dark") return pref;
+  if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
+    return "dark";
+  }
   return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
 }
 
@@ -980,31 +1015,47 @@ function PlaceholderIcon() {
   );
 }
 
-function ListPoster({
+const ListPoster = memo(function ListPoster({
   src,
   decoding,
 }: {
   src: string | null;
   decoding?: "async";
 }) {
+  const { activeSrc, status, markLoaded, markFailed } = useQueuedImageSrc(src);
+  const imgRef = useRef<HTMLImageElement | null>(null);
+
+  useLayoutEffect(() => {
+    const img = imgRef.current;
+    if (activeSrc && status === "loading" && img && img.complete && img.naturalWidth > 0) {
+      markLoaded();
+    }
+  }, [activeSrc, markLoaded, status]);
+
   return (
     <div className="list-poster" aria-hidden="true">
-      {src ? (
-        <img
-          src={src}
-          alt=""
-          loading="lazy"
-          decoding={decoding}
-          onError={(e) => {
-            (e.currentTarget as HTMLImageElement).style.display = "none";
-          }}
-        />
+      {src && status === "loading" ? (
+        <div className="list-poster-skeleton skeleton" aria-hidden="true" />
+      ) : null}
+      {src && status !== "error" ? (
+        activeSrc ? (
+          <img
+            ref={imgRef}
+            key={activeSrc}
+            className={status === "ready" ? "cover-defer is-ready" : "cover-defer"}
+            src={activeSrc}
+            alt=""
+            decoding={decoding ?? "async"}
+            onLoad={markLoaded}
+            onError={markFailed}
+          />
+        ) : null
       ) : (
         <PlaceholderIcon />
       )}
     </div>
   );
-}
+});
 
 function openExternal(url: string) {
   void (async () => {
@@ -1167,15 +1218,29 @@ function NexusFileRow(props: {
   );
 }
 
-export function NexusModFileList(props: {
+const HISTORICAL_FILES_PAGE_SIZE = 25;
+
+export const NexusModFileList = memo(function NexusModFileList(props: {
   files: ModFileInfo[];
   installLabel: string;
   installedFileIds?: ReadonlySet<number>;
   onInstall: (file: ModFileInfo) => void;
 }) {
   const { files, installLabel, installedFileIds, onInstall } = props;
-  const current = files.filter((file) => !isHistoricalModFile(file));
-  const historical = files.filter((file) => isHistoricalModFile(file));
+  const [archiveLimit, setArchiveLimit] = useState(HISTORICAL_FILES_PAGE_SIZE);
+  const { current, historical } = useMemo(() => {
+    const cur: ModFileInfo[] = [];
+    const hist: ModFileInfo[] = [];
+    for (const file of files) {
+      if (isHistoricalModFile(file)) hist.push(file);
+      else cur.push(file);
+    }
+    return { current: cur, historical: hist };
+  }, [files]);
+  const visibleHistorical = useMemo(
+    () => historical.slice(0, archiveLimit),
+    [historical, archiveLimit],
+  );
   return (
     <>
       {files.length === 0 ? (
@@ -1199,7 +1264,7 @@ export function NexusModFileList(props: {
         <details className="file-archive">
           <summary>Archived and old versions ({historical.length})</summary>
           <ul className="list">
-            {historical.map((file) => (
+            {visibleHistorical.map((file) => (
               <NexusFileRow
                 key={file.file_id}
                 file={file}
@@ -1209,11 +1274,22 @@ export function NexusModFileList(props: {
               />
             ))}
           </ul>
+          {historical.length > visibleHistorical.length && (
+            <div className="list-load-more">
+              <button
+                type="button"
+                className="linkish"
+                onClick={() => setArchiveLimit((n) => n + HISTORICAL_FILES_PAGE_SIZE)}
+              >
+                Show more ({historical.length - visibleHistorical.length} remaining)
+              </button>
+            </div>
+          )}
         </details>
       )}
     </>
   );
-}
+});
 
 function presentName(value: string | null | undefined): string | null {
   const trimmed = value?.trim();
@@ -1253,7 +1329,7 @@ function managedHealthBadge(health: GameHealth | undefined): string | null {
   return "Moved — relink available";
 }
 
-function MediaCard(props: {
+const MediaCard = memo(function MediaCard(props: {
   title: string;
   imageSrc: string | null;
   badge?: string | null;
@@ -1296,8 +1372,50 @@ function MediaCard(props: {
     enterIndex,
     plain,
   } = props;
-  const [failedSrc, setFailedSrc] = useState<string | null>(null);
-  const coverSrc = imageSrc && failedSrc !== imageSrc ? imageSrc : null;
+  const { activeSrc, status, markLoaded, markFailed } = useQueuedImageSrc(imageSrc);
+  const [glowActive, setGlowActive] = useState(false);
+  const [glowMounted, setGlowMounted] = useState(false);
+  const [glowVisible, setGlowVisible] = useState(false);
+  const imgRef = useRef<HTMLImageElement | null>(null);
+
+  const coverSrc = imageSrc && status !== "error" ? imageSrc : null;
+  const canGlow = Boolean(onClick && coverSrc && status === "ready");
+
+  useEffect(() => {
+    if (!canGlow) {
+      setGlowActive(false);
+      setGlowVisible(false);
+      setGlowMounted(false);
+      return;
+    }
+    if (glowActive) {
+      setGlowMounted(true);
+      let raf2 = 0;
+      const raf1 = window.requestAnimationFrame(() => {
+        raf2 = window.requestAnimationFrame(() => {
+          setGlowVisible(true);
+        });
+      });
+      return () => {
+        window.cancelAnimationFrame(raf1);
+        window.cancelAnimationFrame(raf2);
+      };
+    }
+    setGlowVisible(false);
+    if (!glowMounted) return;
+    const timer = window.setTimeout(() => {
+      setGlowMounted(false);
+    }, 550);
+    return () => window.clearTimeout(timer);
+  }, [canGlow, glowActive, glowMounted]);
+
+  useLayoutEffect(() => {
+    const img = imgRef.current;
+    if (activeSrc && status === "loading" && img && img.complete && img.naturalWidth > 0) {
+      markLoaded();
+    }
+  }, [activeSrc, markLoaded, status]);
+
   const classes = [
     "media-card",
     onClick ? "media-card-clickable" : "",
@@ -1316,28 +1434,47 @@ function MediaCard(props: {
     : undefined;
   const body = (
     <>
-      <div className="media-cover-stack">
-        {coverSrc ? (
+      <div
+        className="media-cover-stack"
+        onMouseEnter={onClick ? () => setGlowActive(true) : undefined}
+        onMouseLeave={onClick ? () => setGlowActive(false) : undefined}
+        onFocus={onClick ? () => setGlowActive(true) : undefined}
+        onBlur={onClick ? () => setGlowActive(false) : undefined}
+      >
+        {canGlow && glowMounted ? (
           <img
-            className="media-cover-glow"
-            src={coverSrc}
+            className={glowVisible ? "media-cover-glow is-visible" : "media-cover-glow"}
+            src={coverSrc!}
             alt=""
             aria-hidden="true"
-            loading={loading}
-            decoding={plain ? "async" : undefined}
+            decoding="async"
+            onTransitionEnd={(e) => {
+              if (e.propertyName === "opacity" && !glowActive) {
+                setGlowMounted(false);
+              }
+            }}
           />
         ) : null}
         <div className="media-cover">
+          {coverSrc && status === "loading" ? (
+            <div className="media-cover-skeleton skeleton" aria-hidden="true" />
+          ) : null}
           {badge ? <span className="media-badge">{badge}</span> : null}
           {installed ? <span className="media-status">Installed</span> : null}
           {coverSrc ? (
-            <img
-              src={coverSrc}
-              alt=""
-              loading={loading}
-              decoding={plain ? "async" : undefined}
-              onError={() => setFailedSrc(coverSrc)}
-            />
+            activeSrc ? (
+              <img
+                ref={imgRef}
+                key={activeSrc}
+                className={status === "ready" ? "cover-defer is-ready" : "cover-defer"}
+                src={activeSrc}
+                alt=""
+                loading={loading}
+                decoding="async"
+                onLoad={markLoaded}
+                onError={markFailed}
+              />
+            ) : null
           ) : (
             <PlaceholderIcon />
           )}
@@ -1409,7 +1546,203 @@ function MediaCard(props: {
       {body}
     </MotionCard>
   );
-}
+});
+
+const BrowseModGridCard = memo(function BrowseModGridCard({
+  mod: m,
+  installed,
+  isPremium,
+  onOpen,
+  onQuickInstall,
+  onUninstall,
+}: {
+  mod: CatalogHit;
+  installed: boolean;
+  isPremium: boolean;
+  onOpen: (mod: CatalogHit, tab: "info" | "files") => void;
+  onQuickInstall: (mod: CatalogHit) => void;
+  onUninstall: (mod: CatalogHit) => void;
+}) {
+  const handleOpenInfo = useCallback(() => onOpen(m, "info"), [m, onOpen]);
+  const meta = useMemo(
+    () => (
+      <>
+        <SourceMark source={m.source} />
+        {m.category ? ` · ${m.category}` : ""}
+      </>
+    ),
+    [m.category, m.source],
+  );
+  const overlay = useMemo(
+    () =>
+      m.source === "nexus" && m.endorsements != null
+        ? `${m.endorsements.toLocaleString()} endorsements`
+        : m.downloads != null
+          ? `${m.downloads.toLocaleString()} downloads`
+          : null,
+    [m.downloads, m.endorsements, m.source],
+  );
+  const coverActions = useMemo(() => {
+    if (m.source === "thunderstore") {
+      return installed ? (
+        <button
+          type="button"
+          className="danger"
+          onClick={(e) => {
+            e.stopPropagation();
+            onUninstall(m);
+          }}
+        >
+          Uninstall
+        </button>
+      ) : (
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            onOpen(m, "info");
+          }}
+        >
+          Install
+        </button>
+      );
+    }
+    if (m.source === "nexus") {
+      return (
+        <>
+          {installed ? (
+            <button
+              type="button"
+              className="danger"
+              onClick={(e) => {
+                e.stopPropagation();
+                onUninstall(m);
+              }}
+            >
+              Uninstall
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                onQuickInstall(m);
+              }}
+            >
+              {isPremium ? "Install" : "Download Assist"}
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onOpen(m, "files");
+            }}
+          >
+            Files
+          </button>
+        </>
+      );
+    }
+    return (
+      <>
+        {installed ? (
+          <button
+            type="button"
+            className="danger"
+            onClick={(e) => {
+              e.stopPropagation();
+              onUninstall(m);
+            }}
+          >
+            Uninstall
+          </button>
+        ) : null}
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            onOpen(m, "files");
+          }}
+        >
+          Files
+        </button>
+      </>
+    );
+  }, [installed, isPremium, m, onOpen, onQuickInstall, onUninstall]);
+
+  return (
+    <MediaCard
+      plain
+      title={m.name}
+      imageSrc={mediaSrc(null, m.picture_url)}
+      badge={m.author ?? "Mod"}
+      overlay={overlay}
+      meta={meta}
+      installed={installed}
+      onClick={handleOpenInfo}
+      coverActions={coverActions}
+    />
+  );
+});
+
+const BrowseCollectionGridCard = memo(function BrowseCollectionGridCard({
+  collection: c,
+  onOpen,
+  onInstall,
+}: {
+  collection: CollectionHit;
+  onOpen: (collection: CollectionHit, tab: "info" | "files") => void;
+  onInstall: (collection: CollectionHit) => void;
+}) {
+  const source = collectionHitSource(c);
+  const handleOpen = useCallback(() => onOpen(c, "info"), [c, onOpen]);
+  const meta = useMemo(
+    () => (
+      <>
+        <SourceMark source={source} />
+        {c.mod_count != null ? ` · ${c.mod_count.toLocaleString()} mods` : ""}
+        {c.file_size != null && c.file_size > 0
+          ? ` · ${formatBytes(c.file_size)}`
+          : ""}
+      </>
+    ),
+    [c.file_size, c.mod_count, source],
+  );
+  const overlay = useMemo(
+    () =>
+      c.endorsements != null
+        ? `${c.endorsements.toLocaleString()} endorsements`
+        : c.total_downloads != null
+          ? `${c.total_downloads.toLocaleString()} downloads`
+          : null,
+    [c.endorsements, c.total_downloads],
+  );
+  const coverActions = useMemo(
+    () => (
+      <button
+        onClick={(e) => {
+          e.stopPropagation();
+          onInstall(c);
+        }}
+      >
+        Install
+      </button>
+    ),
+    [c, onInstall],
+  );
+
+  return (
+    <MediaCard
+      plain
+      title={c.name}
+      imageSrc={mediaSrc(null, c.tile_image_url)}
+      badge={source === "thunderstore" ? "Modpack" : "Collection"}
+      overlay={overlay}
+      meta={meta}
+      onClick={handleOpen}
+      coverActions={coverActions}
+    />
+  );
+});
 
 function isActiveDownloadStatus(status: string): boolean {
   return status === "downloading" || status === "extracting" || status === "paused";
@@ -1516,13 +1849,39 @@ function shareModLabel(m: ShareModEntry): string {
   );
 }
 
-function ShareModList({
+const ShareModList = memo(function ShareModList({
   mods,
   scrollRef,
+  active = true,
 }: {
   mods: ShareModEntry[];
   scrollRef: RefObject<HTMLElement | null>;
+  active?: boolean;
 }) {
+  const rows = useMemo(() => mods.map((mod, index) => ({ mod, index })), [mods]);
+  const getKey = useCallback(
+    (row: { mod: ShareModEntry; index: number }) => `${row.mod.s}-${row.index}`,
+    [],
+  );
+  const renderItem = useCallback((row: { mod: ShareModEntry; index: number }) => {
+    const m = row.mod;
+    return (
+      <div>
+        <strong>{shareModLabel(m)}</strong>
+        <small>
+          {m.s}
+          {m.version ? ` · v${m.version}` : ""}
+          {m.s === "nexus" && m.mod_id != null
+            ? ` · ${m.domain} ${m.mod_id}/${m.file_id}`
+            : ""}
+          {m.s === "thunderstore"
+            ? ` · ${m.community}/${m.namespace}-${m.name}`
+            : ""}
+          {m.s === "modio" ? ` · game ${m.game_id} mod ${m.mod_id}` : ""}
+        </small>
+      </div>
+    );
+  }, []);
   if (mods.length === 0) {
     return (
       <ul className="list">
@@ -1530,34 +1889,105 @@ function ShareModList({
       </ul>
     );
   }
-  const rows = mods.map((mod, index) => ({ mod, index }));
   return (
     <BrowseVirtualList
       items={rows}
       scrollRef={scrollRef}
+      active={active}
+      staggerEnter
       estimateSize={estimateListRowHeight(false)}
-      getKey={(row) => `${row.mod.s}-${row.index}`}
+      getKey={getKey}
       rowClassName=""
-      renderItem={(row) => {
-        const m = row.mod;
-        return (
-          <div>
-            <strong>{shareModLabel(m)}</strong>
-            <small>
-              {m.s}
-              {m.version ? ` · v${m.version}` : ""}
-              {m.s === "nexus" && m.mod_id != null
-                ? ` · ${m.domain} ${m.mod_id}/${m.file_id}`
-                : ""}
-              {m.s === "thunderstore"
-                ? ` · ${m.community}/${m.namespace}-${m.name}`
-                : ""}
-              {m.s === "modio" ? ` · game ${m.game_id} mod ${m.mod_id}` : ""}
-            </small>
-          </div>
-        );
-      }}
+      renderItem={renderItem}
     />
+  );
+});
+
+function SavedCollectionStats({
+  entry,
+}: {
+  entry: SavedCollectionEntry;
+}) {
+  const builtFor = formatCollectionGameVersions(entry.game_versions);
+  const created = formatIsoDate(entry.created_at);
+  return (
+    <div className="detail-stats">
+      <span>
+        {entry.mod_count} mod{entry.mod_count === 1 ? "" : "s"}
+      </span>
+      {entry.nexus_count ? <span>{entry.nexus_count} Nexus</span> : null}
+      {entry.thunderstore_count ? (
+        <span>{entry.thunderstore_count} Thunderstore</span>
+      ) : null}
+      {entry.modio_count ? <span>{entry.modio_count} mod.io</span> : null}
+      {builtFor ? <span>Built for {builtFor}</span> : null}
+      {created ? <span>Created {created}</span> : null}
+    </div>
+  );
+}
+
+function SavedCollectionDetailBody({
+  entry,
+  mods,
+  renameValue,
+  onRenameChange,
+  onRenameSubmit,
+  showMods,
+  scrollRef,
+  active,
+}: {
+  entry: SavedCollectionEntry;
+  mods: ShareModEntry[];
+  renameValue: string;
+  onRenameChange: (value: string) => void;
+  onRenameSubmit: () => void;
+  showMods: boolean;
+  scrollRef: RefObject<HTMLElement | null>;
+  active: boolean;
+}) {
+  return (
+    <>
+      <label className="saved-collection-rename-label">
+        Name
+        <div className="saved-collection-rename">
+          <input
+            value={renameValue}
+            onChange={(e) => onRenameChange(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                onRenameSubmit();
+              }
+            }}
+          />
+          <button type="button" onClick={onRenameSubmit}>
+            Rename
+          </button>
+        </div>
+      </label>
+      <h2>Contained mods</h2>
+      <ResultsReveal
+        show={showMods}
+        skeleton={
+          <BrowseListSkeleton count={Math.min(12, entry.mod_count || 8)} />
+        }
+      >
+        {showMods ? (
+          <ShareModList
+            mods={mods}
+            scrollRef={scrollRef}
+            active={active}
+          />
+        ) : null}
+      </ResultsReveal>
+      <h2>Code</h2>
+      <textarea
+        className="saved-collection-code"
+        rows={4}
+        readOnly
+        value={entry.code}
+      />
+    </>
   );
 }
 
@@ -1620,6 +2050,10 @@ export default function App() {
     pass: FomodPass<StagedMod> | null;
   } | null>(null);
   const fomodDialogRef = useRef(fomodDialog);
+  const pendingUpdatedFomodIdsRef = useRef<Set<string>>(new Set());
+  const openUpdatedFomodsRef = useRef<
+    (list: StagedMod[], needing: string[], updatedIds: string[]) => void
+  >(() => {});
   const [loadDiagnosis, setLoadDiagnosis] = useState<LoadDiagnosis | null>(null);
   const [modsQuery, setModsQuery] = useState("");
   const [modsStatusFilter, setModsStatusFilter] =
@@ -1669,6 +2103,7 @@ export default function App() {
   const [gameSavedRename, setGameSavedRename] = useState("");
   const [orphanScan, setOrphanScan] = useState<OrphanScan | null>(null);
   const [downloads, setDownloads] = useState<DownloadItem[]>([]);
+  const [downloadsReady, setDownloadsReady] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [modHits, setModHits] = useState<CatalogHit[]>([]);
   const [collectionHits, setCollectionHits] = useState<CollectionHit[]>([]);
@@ -1676,6 +2111,7 @@ export default function App() {
   const [sourceFilter, setSourceFilter] = useState<CatalogSourceFilter>("all");
   const [browseView, setBrowseView] = useState<ViewMode>("grid");
   const [browseGridMin, setBrowseGridMin] = useState(160);
+  const deferredBrowseGridMin = useDeferredValue(browseGridMin);
   const [browseListDensity, setBrowseListDensity] =
     useState<BrowseListDensity>("posters");
   const [browseSort, setBrowseSort] = useState("endorsements");
@@ -1691,14 +2127,26 @@ export default function App() {
   const [authorSuggestLoading, setAuthorSuggestLoading] = useState(false);
   const [browseTags, setBrowseTags] = useState<BrowseTagMap>({});
   const [tagQuery, setTagQuery] = useState("");
+  const deferredTagQuery = useDeferredValue(tagQuery);
   const [tagsOpen, setTagsOpen] = useState(false);
+  const [tagsPageLimit, setTagsPageLimit] = useState(40);
+  const [expandedGroupLimits, setExpandedGroupLimits] = useState<Record<string, number>>({});
   const [browseTotalCount, setBrowseTotalCount] = useState(0);
   const [browseHasMore, setBrowseHasMore] = useState(false);
   const [browsePageCount, setBrowsePageCount] = useState(24);
   const [browseSearched, setBrowseSearched] = useState(false);
   const [browseLoading, setBrowseLoading] = useState(false);
   const [browseResultsPending, setBrowseResultsPending] = useState(false);
-  const [browseLoadingMore, setBrowseLoadingMore] = useState(false);
+  const [libraryListsReady, setLibraryListsReady] = useState(false);
+  const [savedCollectionsReady, setSavedCollectionsReady] = useState(false);
+  const [savedDetailPending, setSavedDetailPending] = useState(false);
+  const [gameSavedDetailPending, setGameSavedDetailPending] = useState(false);
+  const savedOpenRef = useRef(0);
+  const gameSavedOpenRef = useRef(0);
+  const [browseViewSettled, setBrowseViewSettled] = useState<string | null>(null);
+  const [libraryShellSettled, setLibraryShellSettled] = useState<string | null>(null);
+  const [libraryChildSettled, setLibraryChildSettled] = useState<string | null>(null);
+  const [collectionsViewSettled, setCollectionsViewSettled] = useState<string | null>(null);
   const [browseMeta, setBrowseMeta] = useState<BrowseMeta | null>(null);
   const [browseDetail, setBrowseDetail] = useState<BrowseDetail | null>(null);
   const [browseReturnTab, setBrowseReturnTab] = useState<Tab | null>(null);
@@ -1707,7 +2155,10 @@ export default function App() {
     tab: GameDetailTab;
   } | null>(null);
   const [gameInfo, setGameInfo] = useState<GameInfo | null>(null);
+  const [gameInfoLoading, setGameInfoLoading] = useState(false);
   const [modDetail, setModDetail] = useState<ModDetail | null>(null);
+  const [modDetailLoading, setModDetailLoading] = useState(false);
+  const [modFilesLoading, setModFilesLoading] = useState(false);
   const [tsDetail, setTsDetail] = useState<TsPackageDetail | null>(null);
   const [tsVersion, setTsVersion] = useState("");
   const [modioDetail, setModioDetail] = useState<ModioModDetail | null>(null);
@@ -1717,6 +2168,8 @@ export default function App() {
   const [modioGameIdEdit, setModioGameIdEdit] = useState("");
   const [collectionModFiles, setCollectionModFiles] = useState<CollectionModFile[]>([]);
   const [collectionDetail, setCollectionDetail] = useState<CollectionDetail | null>(null);
+  const [collectionDetailLoading, setCollectionDetailLoading] = useState(false);
+  const [collectionFilesLoading, setCollectionFilesLoading] = useState(false);
   const [includeOptional, setIncludeOptional] = useState(false);
   const [assistQueue, setAssistQueue] = useState<AssistQueueState | null>(null);
   const [activeBatch, setActiveBatch] = useState<ActiveDownloadBatch | null>(null);
@@ -1734,6 +2187,15 @@ export default function App() {
   const [catalogSuggestions, setCatalogSuggestions] = useState<
     Record<string, CatalogSuggestion>
   >({});
+  const catalogSuggestionsRef = useRef(catalogSuggestions);
+  catalogSuggestionsRef.current = catalogSuggestions;
+  const [collectionCatalogCovers, setCollectionCatalogCovers] = useState<
+    Record<string, string>
+  >({});
+  const [collectionCatalogTitles, setCollectionCatalogTitles] = useState<
+    Record<string, string>
+  >({});
+  const collectionCoverAttemptedRef = useRef<Set<string>>(new Set());
   const [catalogLookupBusy, setCatalogLookupBusy] = useState(false);
   const catalogSuggestGen = useRef(0);
   const catalogEnrichGen = useRef(0);
@@ -1753,6 +2215,28 @@ export default function App() {
   const [nexusLoginConfirming, setNexusLoginConfirming] = useState(false);
   const tabRef = useRef(tab);
   tabRef.current = tab;
+  const libraryKeptRef = useRef(false);
+  const collectionsKeptRef = useRef(false);
+  const browseKeptRef = useRef(false);
+  const downloadsKeptRef = useRef(false);
+  const toolsKeptRef = useRef(false);
+  const settingsKeptRef = useRef(false);
+  if (tab === "library") libraryKeptRef.current = true;
+  if (tab === "collections") collectionsKeptRef.current = true;
+  if (tab === "browse") browseKeptRef.current = true;
+  if (tab === "downloads") downloadsKeptRef.current = true;
+  if (tab === "tools") toolsKeptRef.current = true;
+  if (tab === "settings") settingsKeptRef.current = true;
+  const navTtlRef = useRef(new TtlTracker());
+  const browseMetaCacheRef = useRef<Map<string, BrowseMeta>>(new Map());
+  const gameInfoCacheRef = useRef<Map<string, GameInfo>>(new Map());
+  const gameInfoReqRef = useRef(0);
+  const appInfoLoadedRef = useRef(false);
+  const coverAttemptedRef = useRef<Set<string>>(new Set());
+  const resolvedCatalogCoversRef = useRef<Map<string, string>>(new Map());
+  const assistVisibleSentRef = useRef<boolean | null>(null);
+  const collectionsMetaGenRef = useRef(0);
+  const browseDetailReqRef = useRef(0);
   assistActiveRef.current = assistActive;
   const setupCompleteRef = useRef(false);
   const navHistoryRef = useRef<AppNavHistory | null>(null);
@@ -1805,7 +2289,14 @@ export default function App() {
   const browseResultsVisibleRef = useRef(false);
   const browsePrefetchErrorRef = useRef<string | null>(null);
   const browseSentinelRef = useRef<HTMLDivElement | null>(null);
+  const [browseSentinelEl, setBrowseSentinelEl] = useState<HTMLDivElement | null>(null);
+  const setBrowseSentinel = useCallback((el: HTMLDivElement | null) => {
+    browseSentinelRef.current = el;
+    setBrowseSentinelEl(el);
+  }, []);
   const browseLoadingMoreRef = useRef(false);
+  const browseAppendStuckRef = useRef(false);
+  const browseSentinelTopRef = useRef<number | null>(null);
   const browseNextOffsetRef = useRef(0);
   const browseAppendFailedRef = useRef(false);
   const browseRequestIdRef = useRef(0);
@@ -1878,6 +2369,7 @@ export default function App() {
     setIgnoredRequirementsOpen(false);
     setFomodNeedingIds([]);
     setFomodDialog(null);
+    pendingUpdatedFomodIdsRef.current.clear();
     missingReqRef.current += 1;
     gameVersionReqRef.current += 1;
   }
@@ -1895,15 +2387,23 @@ export default function App() {
     const reqId = ++modFilesReqRef.current;
     modFilesModIdRef.current = null;
     setModFiles([]);
-    const files = await api.modFiles(domain, modId);
-    if (reqId !== modFilesReqRef.current) return;
-    modFilesModIdRef.current = modId;
-    setModFiles(files);
+    setModFilesLoading(true);
+    try {
+      const files = await api.modFiles(domain, modId);
+      if (reqId !== modFilesReqRef.current) return;
+      modFilesModIdRef.current = modId;
+      setModFiles(files);
+    } finally {
+      if (reqId === modFilesReqRef.current) setModFilesLoading(false);
+    }
   }, []);
 
   const closeBrowseDetail = useCallback(() => {
+    browseDetailReqRef.current += 1;
     setBrowseDetail(null);
     setModDetail(null);
+    setModDetailLoading(false);
+    setModFilesLoading(false);
     setTsDetail(null);
     setTsVersion("");
     setModioDetail(null);
@@ -1911,6 +2411,8 @@ export default function App() {
     clearModFiles();
     setCollectionModFiles([]);
     setCollectionDetail(null);
+    setCollectionDetailLoading(false);
+    setCollectionFilesLoading(false);
   }, [clearModFiles]);
 
   const resetBrowseState = useCallback(() => {
@@ -1918,6 +2420,8 @@ export default function App() {
     browseResultsRequestRef.current = browseRequestIdRef.current;
     browseNextOffsetRef.current = 0;
     browseLoadingMoreRef.current = false;
+    browseAppendStuckRef.current = false;
+    browseSentinelTopRef.current = null;
     browseAppendFailedRef.current = false;
     browseScrollEpochRef.current += 1;
     browseScrollRef.current = 0;
@@ -1925,7 +2429,6 @@ export default function App() {
     browsePrefetchErrorRef.current = null;
     setBrowseLoading(false);
     setBrowseResultsPending(false);
-    setBrowseLoadingMore(false);
     closeBrowseDetail();
     setSearchQuery("");
     setModHits([]);
@@ -1991,8 +2494,12 @@ export default function App() {
       closeBrowseDetail();
       setLibraryDetail(null);
       setGameInfo(null);
+      gameSavedOpenRef.current += 1;
+      savedOpenRef.current += 1;
       setGameSavedDetail(null);
+      setGameSavedDetailPending(false);
       setSavedDetail(null);
+      setSavedDetailPending(false);
       setSavedRename("");
       setBrowseReturnTab(entry.browseReturnTab);
 
@@ -2007,13 +2514,7 @@ export default function App() {
           if (entry.libraryDetail.tab === "collections") {
             void refreshSavedCollections();
           }
-          if (game.nexus_domain) {
-            try {
-              setGameInfo(await api.getGame(game.nexus_domain));
-            } catch {
-              /* Nexus metadata is optional */
-            }
-          }
+          void loadGameInfo(game.nexus_domain);
         }
       }
 
@@ -2165,19 +2666,32 @@ export default function App() {
     return map;
   }, [gameHealth]);
 
-  const collectionNamesByModId = useMemo(() => {
-    const map = new Map<string, string[]>();
+  const collectionsByModId = useMemo(() => {
+    const map = new Map<string, ReturnType<typeof collectionsForMod>>();
     for (const m of mods) {
-      const names = collectionsForMod(m, installedCollections).map((c) => c.name);
-      if (names.length) map.set(m.id, names);
+      const matched = collectionsForMod(m, installedCollections);
+      if (matched.length) map.set(m.id, matched);
     }
     return map;
   }, [mods, installedCollections]);
 
+  const collectionNamesByModId = useMemo(() => {
+    const map = new Map<string, string[]>();
+    for (const [id, list] of collectionsByModId) {
+      map.set(
+        id,
+        list.map((c) => c.name),
+      );
+    }
+    return map;
+  }, [collectionsByModId]);
+
+  const deferredModsQuery = useDeferredValue(modsQuery);
+
   const visibleMods = useMemo(
     () =>
       filterAndSortStagedMods(mods, {
-        query: modsQuery,
+        query: deferredModsQuery,
         status: modsStatusFilter,
         source: modsSourceFilter,
         collectionId: modsCollectionFilter,
@@ -2186,13 +2700,23 @@ export default function App() {
       }),
     [
       mods,
-      modsQuery,
+      deferredModsQuery,
       modsStatusFilter,
       modsSourceFilter,
       modsCollectionFilter,
       modsSort,
       collectionNamesByModId,
     ],
+  );
+
+  const enabledModCount = useMemo(
+    () => mods.reduce((count, m) => count + (m.enabled ? 1 : 0), 0),
+    [mods],
+  );
+
+  const groupedCollectionMods = useMemo(
+    () => groupCollectionMods(collectionModFiles),
+    [collectionModFiles],
   );
 
   const modsFiltersActive =
@@ -2310,10 +2834,44 @@ export default function App() {
   }, []);
 
   const loadAppInfo = useCallback(async () => {
+    if (appInfoLoadedRef.current) return;
     try {
-      setAppInfo(await api.getAppInfo());
+      const info = await api.getAppInfo();
+      appInfoLoadedRef.current = true;
+      setAppInfo(info);
     } catch {
       /* ignore */
+    }
+  }, []);
+
+  const loadGameInfo = useCallback(async (domain: string | null | undefined) => {
+    const key = domain?.trim() ?? "";
+    const req = ++gameInfoReqRef.current;
+    if (!key) {
+      setGameInfo(null);
+      setGameInfoLoading(false);
+      return;
+    }
+    const cached = gameInfoCacheRef.current.get(key);
+    if (cached) {
+      setGameInfo(cached);
+      setGameInfoLoading(false);
+      return;
+    }
+    setGameInfo(null);
+    setGameInfoLoading(true);
+    try {
+      const info = await api.getGame(key);
+      gameInfoCacheRef.current.set(key, info);
+      if (req === gameInfoReqRef.current) {
+        setGameInfo(info);
+      }
+    } catch {
+      /* Nexus metadata is optional for local game info */
+    } finally {
+      if (req === gameInfoReqRef.current) {
+        setGameInfoLoading(false);
+      }
     }
   }, []);
 
@@ -2325,6 +2883,7 @@ export default function App() {
     }
     try {
       const status = await api.checkAppUpdate();
+      navTtlRef.current.mark("app-update");
       setAppUpdate(status);
       setAppInfo((prev) =>
         prev
@@ -2376,20 +2935,25 @@ export default function App() {
   const refreshGameHealth = useCallback(async () => {
     try {
       const health = await api.getGameHealth();
-      setGameHealth((prev) => (sameSnapshot(prev, health) ? prev : health));
+      startTransition(() => {
+        setGameHealth((prev) => (sameSnapshot(prev, health) ? prev : health));
+      });
       return health;
     } catch {
-      setGameHealth((prev) => (prev.length === 0 ? prev : []));
+      startTransition(() => {
+        setGameHealth((prev) => (prev.length === 0 ? prev : []));
+      });
       return [];
     }
   }, []);
 
   const refreshManaged = useCallback(async () => {
     const list = await api.listManaged();
-    setManaged((prev) => (sameSnapshot(prev, list) ? prev : list));
-    void refreshGameHealth();
+    startTransition(() => {
+      setManaged((prev) => (sameSnapshot(prev, list) ? prev : list));
+    });
     return list;
-  }, [refreshGameHealth]);
+  }, []);
 
   const refreshWineAdvice = useCallback(async (gameId: string) => {
     const req = ++wineAdviceReqRef.current;
@@ -2407,27 +2971,32 @@ export default function App() {
     let revealed = false;
     try {
       const list = await api.listMods(gameId);
-      if (activeGameRef.current?.id !== gameId) return;
-      setMods(list);
-      setModsReadyGameId(gameId);
+      if (activeGameRef.current?.id !== gameId) return null;
+      startTransition(() => {
+        if (activeGameRef.current?.id !== gameId) return;
+        setMods(list);
+        setModsReadyGameId(gameId);
+      });
       revealed = true;
       // Reading a manifest per mod is a disk walk, so ask once per refresh
       // instead of on every row render. The list is already visible.
       try {
         const withOptions = await api.listModsWithOptions(gameId);
-        if (activeGameRef.current?.id !== gameId) return;
+        if (activeGameRef.current?.id !== gameId) return null;
         setModsWithOptions(new Set(withOptions));
       } catch (e) {
         console.warn("list_mods_with_options failed", e);
       }
+      let needing: string[] = [];
       try {
-        const needing = await api.listModsNeedingFomod(gameId);
-        if (activeGameRef.current?.id !== gameId) return;
+        needing = await api.listModsNeedingFomod(gameId);
+        if (activeGameRef.current?.id !== gameId) return null;
         setFomodNeedingIds(needing);
       } catch (e) {
         console.warn("list_mods_needing_fomod failed", e);
       }
       void refreshWineAdvice(gameId);
+      return { list, needing };
     } finally {
       if (!revealed && activeGameRef.current?.id === gameId) {
         setModsReadyGameId(gameId);
@@ -2547,20 +3116,24 @@ export default function App() {
   }, []);
 
   const refreshDownloads = useCallback(async () => {
-    const list = await api.listDownloads();
-    const now = Date.now();
-    for (const d of list) {
-      if (isActiveDownloadStatus(d.status)) {
-        const entry = downloadProgressAtRef.current.get(d.id);
-        if (!entry) {
-          downloadProgressAtRef.current.set(d.id, {
-            bytes: d.bytes_downloaded,
-            at: now,
-          });
+    try {
+      const list = await api.listDownloads();
+      const now = Date.now();
+      for (const d of list) {
+        if (isActiveDownloadStatus(d.status)) {
+          const entry = downloadProgressAtRef.current.get(d.id);
+          if (!entry) {
+            downloadProgressAtRef.current.set(d.id, {
+              bytes: d.bytes_downloaded,
+              at: now,
+            });
+          }
         }
       }
+      setDownloads(list);
+    } finally {
+      setDownloadsReady(true);
     }
-    setDownloads(list);
   }, []);
 
   const fillCatalogCovers = useCallback(
@@ -2569,33 +3142,27 @@ export default function App() {
       managedList: ManagedGame[],
       suggestions?: Record<string, CatalogSuggestion | null | undefined>,
     ) => {
-      const requests = catalogCoverRequests(found, managedList, suggestions);
+      const requests = catalogCoverRequests(found, managedList, suggestions).filter(
+        (req) => {
+          const key = `${req.id}:${req.nexus_domain ?? ""}:${req.modio_game_id ?? ""}`;
+          return !coverAttemptedRef.current.has(key);
+        },
+      );
       if (requests.length === 0) return;
+      for (const req of requests) {
+        coverAttemptedRef.current.add(
+          `${req.id}:${req.nexus_domain ?? ""}:${req.modio_game_id ?? ""}`,
+        );
+      }
       try {
         const hits = await api.resolveCatalogCovers(requests);
         if (hits.length === 0) return;
+        for (const hit of hits) {
+          resolvedCatalogCoversRef.current.set(hit.id, hit.cover_url);
+        }
         const urls = new Map(hits.map((hit) => [hit.id, hit.cover_url]));
-        setDetected((prev) => {
-          let changed = false;
-          const next = prev.map((game) => {
-            const url = urls.get(game.id);
-            if (!url) return game;
-            const dropLocal =
-              !game.cover_path ||
-              game.cover_path === game.icon_path ||
-              isDeferredIconPath(game.cover_path);
-            const cover_path = dropLocal ? null : game.cover_path ?? null;
-            if (game.cover_url === url && (game.cover_path ?? null) === cover_path) {
-              return game;
-            }
-            changed = true;
-            return {
-              ...game,
-              cover_url: url,
-              cover_path,
-            };
-          });
-          return changed ? next : prev;
+        startTransition(() => {
+          setDetected((prev) => applyCatalogCovers(prev, urls));
         });
         await refreshManaged();
       } catch (e) {
@@ -2620,11 +3187,17 @@ export default function App() {
         setNotice(null);
       }
       try {
-        const found = await api.scanGames();
-        setDetected((prev) => (sameSnapshot(prev, found) ? prev : found));
+        const found = applyCatalogCovers(
+          await api.scanGames(),
+          resolvedCatalogCoversRef.current,
+        );
+        startTransition(() => {
+          setDetected((prev) => (sameSnapshot(prev, found) ? prev : found));
+        });
         const managedList = await refreshManaged();
-        await fillCatalogCovers(found, managedList);
+        await fillCatalogCovers(found, managedList, catalogSuggestionsRef.current);
         await refreshGameHealth();
+        navTtlRef.current.mark("library-scan");
       } catch (e) {
         if (quiet) {
           console.warn("scan_games failed", e);
@@ -2633,12 +3206,14 @@ export default function App() {
         }
       } finally {
         if (!quiet) setBusy(null);
+        setLibraryListsReady(true);
       }
     },
     [fillCatalogCovers, refreshGameHealth, refreshManaged, setError],
   );
 
   const scan = useCallback(async () => {
+    navTtlRef.current.invalidate("library-scan");
     for (;;) {
       const pending = scanInFlightRef.current;
       if (!pending) break;
@@ -2658,33 +3233,43 @@ export default function App() {
     }
   }, [performScan]);
 
-  const scanQuiet = useCallback(() => {
-    if (scanInFlightRef.current) return;
-    const job = performScan(true);
-    scanInFlightRef.current = job;
-    void job.finally(() => {
-      if (scanInFlightRef.current === job) scanInFlightRef.current = null;
-    });
-  }, [performScan]);
+  const scanQuiet = useCallback(
+    (force = false) => {
+      if (scanInFlightRef.current) return;
+      if (!force && navTtlRef.current.isFresh("library-scan", LIBRARY_SCAN_INTERVAL_MS)) {
+        return;
+      }
+      const job = performScan(true);
+      scanInFlightRef.current = job;
+      void job.finally(() => {
+        if (scanInFlightRef.current === job) scanInFlightRef.current = null;
+      });
+    },
+    [performScan],
+  );
 
-  useEffect(() => {
-    if (tab !== "library") return;
-    const tick = () => {
-      if (document.hidden) return;
-      scanQuiet();
-    };
-    tick();
-    const id = window.setInterval(tick, LIBRARY_SCAN_INTERVAL_MS);
-    const onVisible = () => {
-      if (document.hidden || tabRef.current !== "library") return;
-      scanQuiet();
-    };
-    document.addEventListener("visibilitychange", onVisible);
-    return () => {
-      window.clearInterval(id);
-      document.removeEventListener("visibilitychange", onVisible);
-    };
-  }, [tab, scanQuiet]);
+  useNavSettledEffect(
+    tab === "library",
+    150,
+    () => {
+      if (!document.hidden) scanQuiet(false);
+      const tick = () => {
+        if (document.hidden) return;
+        scanQuiet(true);
+      };
+      const id = window.setInterval(tick, LIBRARY_SCAN_INTERVAL_MS);
+      const onVisible = () => {
+        if (document.hidden || tabRef.current !== "library") return;
+        scanQuiet(false);
+      };
+      document.addEventListener("visibilitychange", onVisible);
+      return () => {
+        window.clearInterval(id);
+        document.removeEventListener("visibilitychange", onVisible);
+      };
+    },
+    [scanQuiet],
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -2743,11 +3328,17 @@ export default function App() {
     void checkForAppUpdate(true);
   }, [settings?.initial_setup_complete, checkForAppUpdate]);
 
-  useEffect(() => {
-    if (tab !== "settings") return;
-    void loadAppInfo();
-    void checkForAppUpdate(true);
-  }, [tab, loadAppInfo, checkForAppUpdate]);
+  useNavSettledEffect(
+    tab === "settings",
+    150,
+    () => {
+      void loadAppInfo();
+      if (!navTtlRef.current.isFresh("app-update", 10 * 60_000)) {
+        void checkForAppUpdate(true);
+      }
+    },
+    [loadAppInfo, checkForAppUpdate],
+  );
 
   useEffect(() => {
     const unlisten = listen<string>("app-update-progress", (event) => {
@@ -2797,10 +3388,14 @@ export default function App() {
         resetBrowseState();
         resetLibraryEphemeralState();
       }
+      savedOpenRef.current += 1;
+      gameSavedOpenRef.current += 1;
       setSavedDetail(null);
+      setSavedDetailPending(false);
       setSavedRename("");
       setSavedInstallGameId(nextId ?? "");
       setGameSavedDetail(null);
+      setGameSavedDetailPending(false);
       setMods([]);
       setModsReadyGameId(null);
     }
@@ -2841,13 +3436,8 @@ export default function App() {
     if (!activeGame || !libraryDetail) return;
     if (libraryDetail.game.id === activeGame.id) return;
     setLibraryDetail({ ...libraryDetail, game: activeGame });
-    setGameInfo(null);
-    if (activeGame.nexus_domain) {
-      void api.getGame(activeGame.nexus_domain).then(setGameInfo).catch(() => {
-        /* Nexus metadata is optional for local game info */
-      });
-    }
-  }, [activeGame, libraryDetail]);
+    void loadGameInfo(activeGame.nexus_domain);
+  }, [activeGame, libraryDetail, loadGameInfo]);
 
   const browseResultsVisible = tab === "browse" && browseDetail == null;
   browseResultsVisibleRef.current = browseResultsVisible;
@@ -2864,63 +3454,137 @@ export default function App() {
     }
   }, [browseResultsVisible, activeGame?.id]);
 
-  useEffect(() => {
-    const gameId = activeGame?.id;
-    if (!gameId || libraryDetail?.tab !== "mods" || pictureFillInFlightRef.current) return;
-    const pendingIds = mods
-      .filter(
-        (m) =>
-          m.picture_url == null &&
-          !pictureFillSkippedRef.current.has(`${gameId}:${m.id}`),
-      )
-      .map((m) => m.id);
-    if (pendingIds.length === 0) return;
-    pictureFillInFlightRef.current = true;
-    const requested = new Set(pendingIds);
-    void api
-      .fillStagedPictures(gameId)
-      .then((list) => {
-        if (activeGameRef.current?.id !== gameId) return;
-        const pictures = new Map(list.map((m) => [m.id, m.picture_url]));
-        setMods((current) =>
-          current.map((m) => {
-            if (m.picture_url != null || !requested.has(m.id)) return m;
-            const url = pictures.get(m.id);
-            if (url == null) {
-              pictureFillSkippedRef.current.add(`${gameId}:${m.id}`);
-              return m;
-            }
-            return { ...m, picture_url: url };
-          }),
-        );
-      })
-      .catch((e) => {
-        console.warn("fill_staged_pictures failed", e);
-        for (const id of requested) {
-          pictureFillSkippedRef.current.add(`${gameId}:${id}`);
-        }
-      })
-      .finally(() => {
-        pictureFillInFlightRef.current = false;
-        setPictureFillTick((n) => n + 1);
-      });
-  }, [activeGame?.id, libraryDetail?.tab, mods, pictureFillTick]);
+  const libraryShellKey = libraryDetail ? `game:${libraryDetail.game.id}` : "library-home";
+  const libraryChildKey =
+    libraryDetail == null
+      ? null
+      : libraryDetail.tab === "collections" && gameSavedDetail
+        ? `collections:${gameSavedDetail.entry.id}`
+        : libraryDetail.tab;
+  const collectionsViewKey = savedDetail
+    ? `saved:${savedDetail.entry.id}`
+    : "saved-list";
+  const browseChromeReady =
+    browseDetail == null && browseViewSettled === "browse-results";
+  const showBrowseGrid = useReveal(
+    browseResultsVisible && browseChromeReady && !browseResultsPending,
+  );
+  const showLibraryHome = useReveal(
+    libraryShellSettled === "library-home" && libraryListsReady,
+  );
+  const showMods = useReveal(
+    libraryDetail?.tab === "mods" &&
+      libraryShellSettled === libraryShellKey &&
+      libraryChildSettled === "mods" &&
+      activeGame != null &&
+      modsReadyGameId === activeGame.id,
+  );
+  const showLibraryCollections = useReveal(
+    libraryDetail?.tab === "collections" &&
+      gameSavedDetail == null &&
+      libraryShellSettled === libraryShellKey &&
+      libraryChildSettled === "collections",
+  );
+  const toolsEntered =
+    libraryDetail?.tab === "tools" &&
+    libraryShellSettled === libraryShellKey &&
+    libraryChildSettled === "tools";
+  const showCollectionsList = useReveal(
+    collectionsViewSettled === "saved-list" && savedCollectionsReady,
+  );
+  const showSavedMods = useReveal(
+    savedDetail != null &&
+      collectionsViewSettled === collectionsViewKey &&
+      !savedDetailPending,
+  );
+  const showGameSavedMods = useReveal(
+    gameSavedDetail != null &&
+      libraryChildSettled === libraryChildKey &&
+      libraryShellSettled === libraryShellKey &&
+      !gameSavedDetailPending,
+  );
+  const browseSkeletonCount = (() => {
+    const loaded = browseMode === "mods" ? modHits.length : collectionHits.length;
+    return loaded > 0 ? Math.min(browsePageCount, loaded) : browsePageCount;
+  })();
 
-  useEffect(() => {
-    if (!activeGame || libraryDetail?.tab !== "mods") return;
-    const gameId = activeGame.id;
-    let cancelled = false;
-    const poll = () => {
-      if (cancelled) return;
-      void refreshModUpdates(gameId);
-    };
-    poll();
-    const id = window.setInterval(poll, 15 * 60 * 1000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(id);
-    };
-  }, [activeGame, libraryDetail?.tab, refreshModUpdates]);
+  useLayoutEffect(() => {
+    if (!showBrowseGrid) return;
+    browseResultsRef.current?.scrollTo(0, browseScrollRef.current);
+  }, [showBrowseGrid]);
+
+  useNavSettledEffect(
+    tab === "library" && libraryDetail?.tab === "mods" && Boolean(activeGame?.id),
+    150,
+    () => {
+      const gameId = activeGame?.id;
+      if (!gameId || pictureFillInFlightRef.current) return;
+      const pendingIds = mods
+        .filter(
+          (m) =>
+            m.picture_url == null &&
+            !pictureFillSkippedRef.current.has(`${gameId}:${m.id}`),
+        )
+        .map((m) => m.id);
+      if (pendingIds.length === 0) return;
+      pictureFillInFlightRef.current = true;
+      const requested = new Set(pendingIds);
+      void api
+        .fillStagedPictures(gameId)
+        .then((list) => {
+          if (activeGameRef.current?.id !== gameId) return;
+          const pictures = new Map(list.map((m) => [m.id, m.picture_url]));
+          startTransition(() => {
+            setMods((current) =>
+              current.map((m) => {
+                if (m.picture_url != null || !requested.has(m.id)) return m;
+                const url = pictures.get(m.id);
+                if (url == null) {
+                  pictureFillSkippedRef.current.add(`${gameId}:${m.id}`);
+                  return m;
+                }
+                return { ...m, picture_url: url };
+              }),
+            );
+          });
+        })
+        .catch((e) => {
+          console.warn("fill_staged_pictures failed", e);
+          for (const id of requested) {
+            pictureFillSkippedRef.current.add(`${gameId}:${id}`);
+          }
+        })
+        .finally(() => {
+          pictureFillInFlightRef.current = false;
+          setPictureFillTick((n) => n + 1);
+        });
+    },
+    [activeGame?.id, mods, pictureFillTick],
+  );
+
+  useNavSettledEffect(
+    tab === "library" && libraryDetail?.tab === "mods" && Boolean(activeGame),
+    150,
+    () => {
+      if (!activeGame) return;
+      const gameId = activeGame.id;
+      const ttlKey = `mod-updates:${gameId}`;
+      let cancelled = false;
+      const poll = (force: boolean) => {
+        if (cancelled) return;
+        if (!force && navTtlRef.current.isFresh(ttlKey, 15 * 60_000)) return;
+        navTtlRef.current.mark(ttlKey);
+        void refreshModUpdates(gameId);
+      };
+      poll(false);
+      const id = window.setInterval(() => poll(true), 15 * 60 * 1000);
+      return () => {
+        cancelled = true;
+        window.clearInterval(id);
+      };
+    },
+    [activeGame?.id, refreshModUpdates],
+  );
 
   const stagedDisabledRequirements = useMemo(
     () => disabledRequirementWarnings(mods, missingRequirements),
@@ -2943,6 +3607,13 @@ export default function App() {
       ignoredRequirements,
     );
   }, [mods, gameVersionReport, showGameVersionWarnings, ignoredRequirements]);
+  const versionWarningByModId = useMemo(() => {
+    const map = new Map<string, (typeof versionWarnings)[number]>();
+    for (const row of versionWarnings) {
+      map.set(row.stagedId, row);
+    }
+    return map;
+  }, [versionWarnings]);
   const modalDisabledRequirements = useMemo(
     () =>
       requirementsModal
@@ -2974,11 +3645,21 @@ export default function App() {
   useEffect(() => {
     if (!activeGame || !nexusModsKey) {
       setMissingRequirements(null);
-      return;
     }
-    if (libraryDetail?.tab !== "mods") return;
-    void refreshMissingRequirements(activeGame.id);
-  }, [activeGame, libraryDetail?.tab, nexusModsKey, refreshMissingRequirements]);
+  }, [activeGame, nexusModsKey]);
+
+  useNavSettledEffect(
+    tab === "library" &&
+      libraryDetail?.tab === "mods" &&
+      Boolean(activeGame) &&
+      Boolean(nexusModsKey),
+    missingRequirements ? 150 : 0,
+    () => {
+      if (!activeGame) return;
+      void refreshMissingRequirements(activeGame.id);
+    },
+    [activeGame?.id, nexusModsKey, refreshMissingRequirements],
+  );
 
   const stagedVersionKey = useMemo(
     () => mods.map((mod) => `${mod.id}:${mod.nexus_mod_id}:${mod.collection_ids?.join(",") ?? ""}`).join("|"),
@@ -2989,10 +3670,15 @@ export default function App() {
     setGameVersionDraft(gameVersionReport?.current ?? "");
   }, [gameVersionReport]);
 
-  useEffect(() => {
-    if (!activeGame || libraryDetail?.tab !== "mods") return;
-    void refreshGameVersions(activeGame.id);
-  }, [activeGame, libraryDetail?.tab, stagedVersionKey, refreshGameVersions]);
+  useNavSettledEffect(
+    tab === "library" && libraryDetail?.tab === "mods" && Boolean(activeGame),
+    gameVersionReport ? 150 : 0,
+    () => {
+      if (!activeGame) return;
+      void refreshGameVersions(activeGame.id);
+    },
+    [activeGame?.id, stagedVersionKey, refreshGameVersions],
+  );
 
   useEffect(() => {
     setModsQuery("");
@@ -3022,23 +3708,30 @@ export default function App() {
 
   useEffect(() => {
     if (!activeGame || tab !== "browse") return;
-    if (!activeGame.nexus_domain) {
+    const domain = activeGame.nexus_domain;
+    if (!domain) {
       setBrowseMeta(null);
+      return;
+    }
+    const cached = browseMetaCacheRef.current.get(domain);
+    if (cached) {
+      setBrowseMeta((prev) => (prev === cached ? prev : cached));
       return;
     }
     let cancelled = false;
     (async () => {
       try {
-        const meta = await api.browseMeta(activeGame.nexus_domain);
+        const meta = await api.browseMeta(domain);
+        browseMetaCacheRef.current.set(domain, meta);
         if (!cancelled) setBrowseMeta(meta);
-      } catch (e) {
+      } catch {
         if (!cancelled) setBrowseMeta(null);
       }
     })();
     return () => {
       cancelled = true;
     };
-  }, [activeGame, tab]);
+  }, [activeGame?.nexus_domain, tab]);
 
   useEffect(() => {
     if (tab !== "browse") setTagsOpen(false);
@@ -3171,9 +3864,9 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    // List (and sentinel) unmount while browseDetail is open — re-bind on Back.
+    // Re-bind whenever the sentinel element mounts (after ViewSwitch / useReveal / new search).
     if (tab !== "browse" || browseDetail || !browseHasMore) return;
-    const sentinel = browseSentinelRef.current;
+    const sentinel = browseSentinelEl;
     const root = browseResultsRef.current;
     if (!sentinel || !root) return;
 
@@ -3182,15 +3875,23 @@ export default function App() {
         const visible = entries.some((e) => e.isIntersecting);
         if (!visible) {
           browseAppendFailedRef.current = false;
+          browseAppendStuckRef.current = false;
           return;
         }
         if (
           browseLoadingMoreRef.current ||
+          browseAppendStuckRef.current ||
           !browseHasMoreRef.current ||
-          browseAppendFailedRef.current
+          browseAppendFailedRef.current ||
+          !isBrowseSentinelNearView(0)
         ) {
           return;
         }
+        browseSentinelTopRef.current = sentinelContentTop(
+          sentinel.getBoundingClientRect().top,
+          root.getBoundingClientRect().top,
+          root.scrollTop,
+        );
         void runSearch(
           browseModeRef.current,
           searchQueryRef.current,
@@ -3198,21 +3899,14 @@ export default function App() {
           true,
         );
       },
-      { root, rootMargin: "240px", threshold: 0 },
+      { root, rootMargin: "0px", threshold: 0 },
     );
     observer.observe(sentinel);
     return () => observer.disconnect();
-    // Re-bind when list remounts / size / mode / view changes so the sentinel stays observed.
+    // Re-bind when the view or sentinel node changes, not when a page lands. A new length
+    // would observe again and immediately append while the sentinel is stuck.
     // eslint-disable-next-line react-hooks/exhaustive-deps -- runSearch reads latest via refs
-  }, [
-    tab,
-    browseDetail,
-    browseMode,
-    browseView,
-    browseHasMore,
-    modHits.length,
-    collectionHits.length,
-  ]);
+  }, [tab, browseDetail, browseMode, browseView, browseHasMore, browseSentinelEl]);
 
   const isPremium = settings?.user?.is_premium ?? false;
 
@@ -3228,10 +3922,13 @@ export default function App() {
     const host = resolveAssistMeasureHost();
     if (!host) {
       if (!assistActiveRef.current && !nexusLoginOpenRef.current) {
-        try {
-          await api.setAssistVisible(false);
-        } catch {
-          /* ignore */
+        if (assistVisibleSentRef.current !== false) {
+          assistVisibleSentRef.current = false;
+          try {
+            await api.setAssistVisible(false);
+          } catch {
+            /* ignore */
+          }
         }
       }
       return;
@@ -3247,6 +3944,7 @@ export default function App() {
         tabRef.current === "downloads" ||
         assistActiveRef.current
       ) {
+        assistVisibleSentRef.current = true;
         await api.setAssistVisible(true);
       }
     } catch {
@@ -3289,23 +3987,25 @@ export default function App() {
     if (nexusLoginOpen) return;
     if (!assistActive && tab !== "downloads") {
       assistSyncGenRef.current += 1;
-      api.setAssistVisible(false).catch(() => {});
+      if (assistVisibleSentRef.current !== false) {
+        assistVisibleSentRef.current = false;
+        api.setAssistVisible(false).catch(() => {});
+      }
       return;
     }
+    let rafId = 0;
     const syncSoon = () => {
-      requestAnimationFrame(() => {
+      if (rafId) return;
+      rafId = window.requestAnimationFrame(() => {
+        rafId = 0;
         if (nexusLoginOpenRef.current) return;
         void syncAssistHost();
-        requestAnimationFrame(() => {
-          if (nexusLoginOpenRef.current) return;
-          void syncAssistHost();
-        });
       });
     };
     syncSoon();
     const onResize = () => syncSoon();
     window.addEventListener("resize", onResize);
-    window.addEventListener("scroll", onResize, true);
+    window.addEventListener("scroll", onResize, { capture: true, passive: true });
     window.visualViewport?.addEventListener("resize", onResize);
     window.visualViewport?.addEventListener("scroll", onResize);
     const observer = new ResizeObserver(() => syncSoon());
@@ -3315,6 +4015,7 @@ export default function App() {
     if (miniHost) observer.observe(miniHost);
     return () => {
       assistSyncGenRef.current += 1;
+      if (rafId) window.cancelAnimationFrame(rafId);
       window.removeEventListener("resize", onResize);
       window.removeEventListener("scroll", onResize, true);
       window.visualViewport?.removeEventListener("resize", onResize);
@@ -4009,6 +4710,7 @@ export default function App() {
       game_id?: string;
       id?: string;
       mod_id?: string;
+      replaced?: boolean;
     }>("download-finished", async (event) => {
         const list = await api.listDownloads();
         setDownloads(list);
@@ -4070,11 +4772,25 @@ export default function App() {
               /* the requirement is staged either way */
             }
           }
+          if (event.payload.replaced && stagedId) {
+            pendingUpdatedFomodIdsRef.current.add(stagedId);
+          }
           try {
-            await refreshMods(gameId);
+            const refreshed = await refreshMods(gameId);
             await refreshCollections(gameId);
             await refreshModUpdates(gameId);
             await refreshMissingRequirements(gameId);
+            if (
+              refreshed &&
+              activeGameRef.current?.id === gameId &&
+              pendingUpdatedFomodIdsRef.current.size > 0 &&
+              !hasActiveDownloads(list) &&
+              !assistQueueRef.current
+            ) {
+              const ids = Array.from(pendingUpdatedFomodIdsRef.current);
+              pendingUpdatedFomodIdsRef.current.clear();
+              openUpdatedFomodsRef.current(refreshed.list, refreshed.needing, ids);
+            }
           } catch {
             /* ignore */
           }
@@ -4131,6 +4847,47 @@ export default function App() {
         }
       },
     );
+    const progressBatcher = createThrottledBatcher<
+      string,
+      {
+        id: string;
+        bytes_downloaded: number;
+        bytes_total: number | null;
+        speed_bps: number;
+        status: string;
+      }
+    >(120, (batch) => {
+      setDownloads((prevList) => {
+        let next: DownloadItem[] | null = null;
+        for (const p of batch.values()) {
+          const list = next ?? prevList;
+          const idx = list.findIndex((d) => d.id === p.id);
+          if (idx < 0) continue;
+          // A late progress event must not pull a finished row back into the
+          // active list.
+          if (isFinishedDownloadStatus(list[idx].status)) continue;
+          const current = list[idx];
+          const nextStatus = p.status || current.status;
+          if (
+            current.bytes_downloaded === p.bytes_downloaded &&
+            current.bytes_total === p.bytes_total &&
+            current.speed_bps === p.speed_bps &&
+            current.status === nextStatus
+          ) {
+            continue;
+          }
+          if (!next) next = [...prevList];
+          next[idx] = {
+            ...current,
+            bytes_downloaded: p.bytes_downloaded,
+            bytes_total: p.bytes_total,
+            speed_bps: p.speed_bps,
+            status: nextStatus,
+          };
+        }
+        return next ?? prevList;
+      });
+    });
     const unlistenProgress = listen<{
       id: string;
       bytes_downloaded: number;
@@ -4147,22 +4904,8 @@ export default function App() {
           at: now,
         });
       }
-      setDownloads((prevList) => {
-        const idx = prevList.findIndex((d) => d.id === p.id);
-        if (idx < 0) return prevList;
-        // A late progress event must not pull a finished row back into the
-        // active list.
-        if (isFinishedDownloadStatus(prevList[idx].status)) return prevList;
-        const next = [...prevList];
-        next[idx] = {
-          ...next[idx],
-          bytes_downloaded: p.bytes_downloaded,
-          bytes_total: p.bytes_total,
-          speed_bps: p.speed_bps,
-          status: p.status || next[idx].status,
-        };
-        return next;
-      });
+      const isTerminal = Boolean(p.status && isFinishedDownloadStatus(p.status));
+      progressBatcher.push(p.id, p, isTerminal);
     });
     const unlistenStarted = listen("assist-download-started", async () => {
       downloadStartedAtRef.current = Date.now();
@@ -4183,6 +4926,7 @@ export default function App() {
     });
     return () => {
       if (changedTimer != null) window.clearTimeout(changedTimer);
+      progressBatcher.cancel();
       unlistenChanged.then((f) => f());
       unlistenNxm.then((f) => f());
       unlistenEmperorMod.then((f) => f());
@@ -4584,7 +5328,7 @@ export default function App() {
       browseMode === "mods"
         ? (browseMeta?.mod_tags ?? [])
         : (browseMeta?.collection_tags ?? []);
-    const q = tagQuery.trim().toLowerCase();
+    const q = deferredTagQuery.trim().toLowerCase();
     const filtered = q ? all.filter((t) => t.toLowerCase().includes(q)) : all;
     return [...filtered].sort((a, b) => {
       const rank = (t: string) =>
@@ -4594,7 +5338,11 @@ export default function App() {
       if (ar !== br) return ar - br;
       return a.localeCompare(b, undefined, { sensitivity: "base" });
     });
-  }, [browseMeta?.mod_tags, browseMeta?.collection_tags, browseMode, browseTags, tagQuery]);
+  }, [browseMeta?.mod_tags, browseMeta?.collection_tags, browseMode, browseTags, deferredTagQuery]);
+
+  useEffect(() => {
+    if (tagsOpen) setTagsPageLimit(40);
+  }, [tagsOpen, deferredTagQuery]);
 
   async function runSearch(
     mode: "mods" | "collections" = browseMode,
@@ -4650,7 +5398,6 @@ export default function App() {
         return;
       }
       browseLoadingMoreRef.current = true;
-      setBrowseLoadingMore(true);
     }
 
     const requestId = ++browseRequestIdRef.current;
@@ -4686,7 +5433,7 @@ export default function App() {
               merged.push(item);
             }
           }
-          return merged;
+          return merged.length === prev.length ? prev : merged;
         });
       }
     };
@@ -4716,18 +5463,21 @@ export default function App() {
               merged.push(item);
             }
           }
-          return merged;
+          return merged.length === prev.length ? prev : merged;
         });
       }
     };
 
+    let committed = false;
     try {
       if (!append) {
         browseNextOffsetRef.current = 0;
+        browseLoadingMoreRef.current = false;
         browseAppendFailedRef.current = false;
+        browseAppendStuckRef.current = false;
+        browseSentinelTopRef.current = null;
         browseResultsRequestRef.current = requestId;
         setBrowseResultsPending(true);
-        setBrowseLoadingMore(false);
         const perform = async () => {
           if (mode === "mods") {
             const page = await api.searchCatalog(activeGame.id, query, {
@@ -4736,13 +5486,17 @@ export default function App() {
             });
             if (requestId !== browseRequestIdRef.current) return;
             browsePrefetchErrorRef.current = null;
-            applyModPage(
-              page.items,
-              page.total_count,
-              page.has_more,
-              page.next_offset,
-              "replace",
-            );
+            committed = true;
+            startTransition(() => {
+              applyModPage(
+                page.items,
+                page.total_count,
+                page.has_more,
+                page.next_offset,
+                "replace",
+              );
+              setBrowseResultsPending(false);
+            });
           } else {
             const page = await api.searchCollectionCatalog(activeGame.id, query, {
               ...requestOpts,
@@ -4751,14 +5505,18 @@ export default function App() {
             });
             if (requestId !== browseRequestIdRef.current) return;
             browsePrefetchErrorRef.current = null;
-            applyCollectionPage(page.items, page.total_count, "replace");
-            if (page.has_more != null) {
-              browseHasMoreRef.current = page.has_more;
-              setBrowseHasMore(page.has_more);
-            }
-            if (page.next_offset != null) {
-              browseNextOffsetRef.current = page.next_offset;
-            }
+            committed = true;
+            startTransition(() => {
+              applyCollectionPage(page.items, page.total_count, "replace");
+              if (page.has_more != null) {
+                browseHasMoreRef.current = page.has_more;
+                setBrowseHasMore(page.has_more);
+              }
+              if (page.next_offset != null) {
+                browseNextOffsetRef.current = page.next_offset;
+              }
+              setBrowseResultsPending(false);
+            });
           }
         };
         if (silent) {
@@ -4777,13 +5535,15 @@ export default function App() {
           sourceFilter,
         });
         if (requestId !== browseRequestIdRef.current) return;
-        applyModPage(
-          page.items,
-          page.total_count,
-          page.has_more,
-          page.next_offset,
-          "append",
-        );
+        startTransition(() => {
+          applyModPage(
+            page.items,
+            page.total_count,
+            page.has_more,
+            page.next_offset,
+            "append",
+          );
+        });
         appendOk = true;
         browseAppendFailedRef.current = false;
       } else {
@@ -4792,14 +5552,16 @@ export default function App() {
           sourceFilter: sourceFilter === "modio" ? "all" : sourceFilter,
         });
         if (requestId !== browseRequestIdRef.current) return;
-        applyCollectionPage(page.items, page.total_count, "append");
-        if (page.has_more != null) {
-          browseHasMoreRef.current = page.has_more;
-          setBrowseHasMore(page.has_more);
-        }
-        if (page.next_offset != null) {
-          browseNextOffsetRef.current = page.next_offset;
-        }
+        startTransition(() => {
+          applyCollectionPage(page.items, page.total_count, "append");
+          if (page.has_more != null) {
+            browseHasMoreRef.current = page.has_more;
+            setBrowseHasMore(page.has_more);
+          }
+          if (page.next_offset != null) {
+            browseNextOffsetRef.current = page.next_offset;
+          }
+        });
         appendOk = true;
         browseAppendFailedRef.current = false;
       }
@@ -4814,74 +5576,71 @@ export default function App() {
         }
       }
     } finally {
-      if (!append && browseResultsRequestRef.current === requestId) {
+      if (!append && !committed && browseResultsRequestRef.current === requestId) {
         setBrowseResultsPending(false);
       }
       if (silent && !append && requestId === browseRequestIdRef.current) {
         setBrowseLoading(false);
       }
       if (append) {
-        browseLoadingMoreRef.current = false;
-        if (requestId === browseRequestIdRef.current) {
-          setBrowseLoadingMore(false);
-        }
-        if (
-          appendOk &&
-          requestId === browseRequestIdRef.current &&
-          browseHasMoreRef.current &&
-          isBrowseSentinelNearView()
-        ) {
-          queueMicrotask(() => {
-            void runSearch(
-              browseModeRef.current,
-              searchQueryRef.current,
-              browseOptsRef.current,
-              true,
-            );
+        const before = browseSentinelTopRef.current;
+        if (requestId !== browseRequestIdRef.current) {
+          /* superseded by a newer search or reset; do not clobber its loading state */
+        } else if (!(appendOk && before != null)) {
+          browseLoadingMoreRef.current = false;
+        } else {
+          const origin = before;
+          requestAnimationFrame(() => {
+            requestAnimationFrame(() => {
+              if (requestId !== browseRequestIdRef.current) return;
+              browseLoadingMoreRef.current = false;
+              if (!browseResultsVisibleRef.current) return;
+              const marker = browseSentinelRef.current;
+              const root = browseResultsRef.current;
+              if (!marker || !root) return;
+              const after = sentinelContentTop(
+                marker.getBoundingClientRect().top,
+                root.getBoundingClientRect().top,
+                root.scrollTop,
+              );
+              if (after <= origin + 1) {
+                browseAppendStuckRef.current = true;
+                return;
+              }
+              if (
+                browseHasMoreRef.current &&
+                !browseAppendFailedRef.current &&
+                isBrowseSentinelNearView(0)
+              ) {
+                browseSentinelTopRef.current = after;
+                void runSearch(
+                  browseModeRef.current,
+                  searchQueryRef.current,
+                  browseOptsRef.current,
+                  true,
+                );
+              }
+            });
           });
         }
       }
     }
   }
 
-  function isBrowseSentinelNearView(margin = 240): boolean {
+  function isBrowseSentinelNearView(margin = 0): boolean {
     const sentinel = browseSentinelRef.current;
     const root = browseResultsRef.current;
     if (!sentinel || !root) return false;
     const rootRect = root.getBoundingClientRect();
     const sentRect = sentinel.getBoundingClientRect();
-    return (
-      sentRect.top < rootRect.bottom + margin &&
-      sentRect.bottom > rootRect.top - margin
+    return isSentinelInScrollView(
+      rootRect,
+      { width: root.clientWidth, height: root.clientHeight },
+      sentRect,
+      { width: window.innerWidth, height: window.innerHeight },
+      margin,
     );
   }
-
-  useEffect(() => {
-    if (tab !== "browse" || browseDetail || !browseHasMore) return;
-    const loaded = browseMode === "mods" ? modHits.length : collectionHits.length;
-    if (loaded === 0) return;
-    const id = requestAnimationFrame(() => {
-      if (!isBrowseSentinelNearView(0)) return;
-      void runSearch(
-        browseModeRef.current,
-        searchQueryRef.current,
-        browseOptsRef.current,
-        true,
-      );
-    });
-    return () => cancelAnimationFrame(id);
-    // runSearch and the sentinel check read the latest filters through refs.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [
-    tab,
-    browseDetail,
-    browseHasMore,
-    browseMode,
-    browseView,
-    browsePageCount,
-    modHits.length,
-    collectionHits.length,
-  ]);
 
   function clearAuthorSuggestions() {
     authorSuggestReqRef.current += 1;
@@ -5018,13 +5777,18 @@ export default function App() {
         browseDetail: { kind: "mod", hit, tab: detailTab },
       });
     }
+    const detailReq = ++browseDetailReqRef.current;
     rememberBrowseScroll();
     setBrowseDetail({ kind: "mod", hit, tab: detailTab });
     setModDetail(null);
+    setModDetailLoading(true);
+    setModFilesLoading(detailTab === "files");
     setTsDetail(null);
     setTsVersion("");
     setCollectionModFiles([]);
     setCollectionDetail(null);
+    setCollectionDetailLoading(false);
+    setCollectionFilesLoading(false);
     setModioDetail(null);
     setModioFiles([]);
     clearModFiles();
@@ -5036,47 +5800,83 @@ export default function App() {
       setBrowseDetail({ ...current, hit: nextHit });
     };
     if (hit.source === "thunderstore") {
-      if (!hit.community || !hit.namespace || !hit.package_name) return;
-      await withBusy("Loading package…", async () => {
-        const detail = await api.getThunderstorePackage(
-          hit.community!,
-          hit.namespace!,
-          hit.package_name!,
-        );
-        setTsDetail(detail);
-        setTsVersion(detail.latest_version ?? detail.versions[0]?.version_number ?? "");
-        patchBrowseHit((current) => enrichCatalogHitFromThunderstore(current, detail));
-      });
+      if (!hit.community || !hit.namespace || !hit.package_name) {
+        setModDetailLoading(false);
+        setModFilesLoading(false);
+        return;
+      }
+      try {
+        await withBusy("Loading package…", async () => {
+          const detail = await api.getThunderstorePackage(
+            hit.community!,
+            hit.namespace!,
+            hit.package_name!,
+          );
+          if (detailReq !== browseDetailReqRef.current) return;
+          setTsDetail(detail);
+          setTsVersion(detail.latest_version ?? detail.versions[0]?.version_number ?? "");
+          patchBrowseHit((current) => enrichCatalogHitFromThunderstore(current, detail));
+        });
+      } finally {
+        if (detailReq === browseDetailReqRef.current) {
+          setModDetailLoading(false);
+          setModFilesLoading(false);
+        }
+      }
       return;
     }
     if (hit.source === "modio") {
-      if (hit.modio_game_id == null || hit.modio_mod_id == null) return;
-      await withBusy("Loading mod.io mod…", async () => {
-        const detail = await api.getModioMod(hit.modio_game_id!, hit.modio_mod_id!);
-        setModioDetail(detail);
-        patchBrowseHit((current) => enrichCatalogHitFromModio(current, detail));
-        if (detailTab === "files") {
-          setModioFiles(
-            await api.modioFiles(hit.modio_game_id!, hit.modio_mod_id!),
-          );
+      if (hit.modio_game_id == null || hit.modio_mod_id == null) {
+        setModDetailLoading(false);
+        setModFilesLoading(false);
+        return;
+      }
+      try {
+        await withBusy("Loading mod.io mod…", async () => {
+          const detail = await api.getModioMod(hit.modio_game_id!, hit.modio_mod_id!);
+          if (detailReq !== browseDetailReqRef.current) return;
+          setModioDetail(detail);
+          patchBrowseHit((current) => enrichCatalogHitFromModio(current, detail));
+          if (detailTab === "files") {
+            const files = await api.modioFiles(hit.modio_game_id!, hit.modio_mod_id!);
+            if (detailReq !== browseDetailReqRef.current) return;
+            setModioFiles(files);
+          }
+        });
+      } finally {
+        if (detailReq === browseDetailReqRef.current) {
+          setModDetailLoading(false);
+          setModFilesLoading(false);
         }
-      });
+      }
       return;
     }
     const domain = hit.domain_name || activeGame.nexus_domain;
     const modId = hit.mod_id;
-    if (!modId) return;
-    await withBusy(
-      detailTab === "files" ? "Loading files…" : "Loading mod…",
-      async () => {
-        const detail = await api.getMod(domain, modId);
-        setModDetail(detail);
-        patchBrowseHit((current) => enrichCatalogHitFromNexus(current, detail));
-        if (detailTab === "files" && !nexusModUnavailable(detail)) {
-          await loadModFiles(domain, modId);
-        }
-      },
-    );
+    if (!modId) {
+      setModDetailLoading(false);
+      setModFilesLoading(false);
+      return;
+    }
+    try {
+      await withBusy(
+        detailTab === "files" ? "Loading files…" : "Loading mod…",
+        async () => {
+          const detail = await api.getMod(domain, modId);
+          if (detailReq !== browseDetailReqRef.current) return;
+          setModDetail(detail);
+          patchBrowseHit((current) => enrichCatalogHitFromNexus(current, detail));
+          if (detailTab === "files" && !nexusModUnavailable(detail)) {
+            await loadModFiles(domain, modId);
+          }
+        },
+      );
+    } finally {
+      if (detailReq === browseDetailReqRef.current) {
+        setModDetailLoading(false);
+        setModFilesLoading(false);
+      }
+    }
   }
 
   async function openStagedMod(mod: StagedMod) {
@@ -5190,59 +5990,93 @@ export default function App() {
         browseDetail: { kind: "collection", hit, tab: detailTab },
       });
     }
+    const detailReq = ++browseDetailReqRef.current;
     rememberBrowseScroll();
     setBrowseDetail({ kind: "collection", hit, tab: detailTab });
     setModDetail(null);
+    setModDetailLoading(false);
+    setModFilesLoading(false);
     clearModFiles();
     setCollectionModFiles([]);
     setCollectionDetail(null);
+    setCollectionDetailLoading(true);
+    setCollectionFilesLoading(true);
     setTsDetail(null);
     if (collectionHitSource(hit) === "thunderstore") {
-      if (!hit.community || !hit.namespace || !hit.package_name) return;
-      await withBusy("Loading modpack…", async () => {
-        const detail = await api.getThunderstorePackage(
-          hit.community!,
-          hit.namespace!,
-          hit.package_name!,
-        );
-        setTsDetail(detail);
-        setTsVersion(detail.latest_version ?? detail.versions[0]?.version_number ?? "");
-      });
+      if (!hit.community || !hit.namespace || !hit.package_name) {
+        setCollectionDetailLoading(false);
+        setCollectionFilesLoading(false);
+        return;
+      }
+      try {
+        await withBusy("Loading modpack…", async () => {
+          const detail = await api.getThunderstorePackage(
+            hit.community!,
+            hit.namespace!,
+            hit.package_name!,
+          );
+          if (detailReq !== browseDetailReqRef.current) return;
+          setTsDetail(detail);
+          setTsVersion(detail.latest_version ?? detail.versions[0]?.version_number ?? "");
+        });
+      } finally {
+        if (detailReq === browseDetailReqRef.current) {
+          setCollectionDetailLoading(false);
+          setCollectionFilesLoading(false);
+        }
+      }
       return;
     }
     const domain = hit.domain_name || activeGame.nexus_domain;
-    await withBusy(
-      detailTab === "files" ? "Loading collection mods…" : "Loading collection…",
-      async () => {
-        const detailPromise = api.getCollection({ slug: hit.slug, domain });
-        const filesPromise = api.collectionFiles({
-          slug: hit.slug,
-          revision: hit.revision_number,
-        });
-        const [detail, files] = await Promise.all([detailPromise, filesPromise]);
-        setCollectionDetail(detail);
-        setCollectionModFiles(files);
-      },
-    );
+    try {
+      await withBusy(
+        detailTab === "files" ? "Loading collection mods…" : "Loading collection…",
+        async () => {
+          const detailPromise = api.getCollection({ slug: hit.slug, domain });
+          const filesPromise = api.collectionFiles({
+            slug: hit.slug,
+            revision: hit.revision_number,
+          });
+          const [detail, files] = await Promise.all([detailPromise, filesPromise]);
+          if (detailReq !== browseDetailReqRef.current) return;
+          startTransition(() => {
+            setCollectionDetail(detail);
+            setCollectionModFiles(files);
+          });
+        },
+      );
+    } finally {
+      if (detailReq === browseDetailReqRef.current) {
+        setCollectionDetailLoading(false);
+        setCollectionFilesLoading(false);
+      }
+    }
   }
 
   async function setDetailTab(detailTab: DetailTab) {
     if (!browseDetail || !activeGame) return;
     if (browseDetail.tab === detailTab) return;
+    const detailReq = browseDetailReqRef.current;
     const next = { ...browseDetail, tab: detailTab };
     setBrowseDetail(next);
     if (next.kind === "mod") {
       if (next.hit.source === "thunderstore") {
         if (!tsDetail && next.hit.community && next.hit.namespace && next.hit.package_name) {
-          await withBusy("Loading package…", async () => {
-            const detail = await api.getThunderstorePackage(
-              next.hit.community!,
-              next.hit.namespace!,
-              next.hit.package_name!,
-            );
-            setTsDetail(detail);
-            setTsVersion(detail.latest_version ?? detail.versions[0]?.version_number ?? "");
-          });
+          setModDetailLoading(true);
+          try {
+            await withBusy("Loading package…", async () => {
+              const detail = await api.getThunderstorePackage(
+                next.hit.community!,
+                next.hit.namespace!,
+                next.hit.package_name!,
+              );
+              if (detailReq !== browseDetailReqRef.current) return;
+              setTsDetail(detail);
+              setTsVersion(detail.latest_version ?? detail.versions[0]?.version_number ?? "");
+            });
+          } finally {
+            if (detailReq === browseDetailReqRef.current) setModDetailLoading(false);
+          }
         }
       } else if (next.hit.source === "modio") {
         if (
@@ -5250,27 +6084,38 @@ export default function App() {
           next.hit.modio_mod_id != null &&
           (!modioDetail || (detailTab === "files" && modioFiles.length === 0))
         ) {
-          await withBusy(
-            detailTab === "files" ? "Loading files…" : "Loading mod.io mod…",
-            async () => {
-              if (!modioDetail) {
-                setModioDetail(
-                  await api.getModioMod(
+          const needDetail = !modioDetail;
+          const needFiles = detailTab === "files" && modioFiles.length === 0;
+          if (needDetail) setModDetailLoading(true);
+          if (needFiles) setModFilesLoading(true);
+          try {
+            await withBusy(
+              detailTab === "files" ? "Loading files…" : "Loading mod.io mod…",
+              async () => {
+                if (needDetail) {
+                  const detail = await api.getModioMod(
                     next.hit.modio_game_id!,
                     next.hit.modio_mod_id!,
-                  ),
-                );
-              }
-              if (detailTab === "files" && modioFiles.length === 0) {
-                setModioFiles(
-                  await api.modioFiles(
+                  );
+                  if (detailReq !== browseDetailReqRef.current) return;
+                  setModioDetail(detail);
+                }
+                if (needFiles) {
+                  const files = await api.modioFiles(
                     next.hit.modio_game_id!,
                     next.hit.modio_mod_id!,
-                  ),
-                );
-              }
-            },
-          );
+                  );
+                  if (detailReq !== browseDetailReqRef.current) return;
+                  setModioFiles(files);
+                }
+              },
+            );
+          } finally {
+            if (detailReq === browseDetailReqRef.current) {
+              if (needDetail) setModDetailLoading(false);
+              if (needFiles) setModFilesLoading(false);
+            }
+          }
         }
       } else if (
         detailTab === "files" &&
@@ -5280,26 +6125,42 @@ export default function App() {
         if (!nexusModUnavailable(modDetail)) {
           const domain = next.hit.domain_name || activeGame.nexus_domain;
           const modId = next.hit.mod_id;
-          await withBusy(modDetail ? "Loading files…" : "Loading mod…", async () => {
-            let detail = modDetail;
-            if (!detail) {
-              detail = await api.getMod(domain, modId);
-              setModDetail(detail);
+          const needDetail = !modDetail;
+          if (needDetail) setModDetailLoading(true);
+          setModFilesLoading(true);
+          try {
+            await withBusy(modDetail ? "Loading files…" : "Loading mod…", async () => {
+              let detail = modDetail;
+              if (!detail) {
+                detail = await api.getMod(domain, modId);
+                if (detailReq !== browseDetailReqRef.current) return;
+                setModDetail(detail);
+              }
+              if (!nexusModUnavailable(detail)) {
+                await loadModFiles(domain, modId);
+              }
+            });
+          } finally {
+            if (detailReq === browseDetailReqRef.current) {
+              if (needDetail) setModDetailLoading(false);
+              setModFilesLoading(false);
             }
-            if (!nexusModUnavailable(detail)) {
-              await loadModFiles(domain, modId);
-            }
-          });
+          }
         }
       } else if (detailTab === "info" && !modDetail && next.hit.mod_id) {
-        await withBusy("Loading mod…", async () => {
-          setModDetail(
-            await api.getMod(
+        setModDetailLoading(true);
+        try {
+          await withBusy("Loading mod…", async () => {
+            const detail = await api.getMod(
               next.hit.domain_name || activeGame.nexus_domain,
               next.hit.mod_id!,
-            ),
-          );
-        });
+            );
+            if (detailReq !== browseDetailReqRef.current) return;
+            setModDetail(detail);
+          });
+        } finally {
+          if (detailReq === browseDetailReqRef.current) setModDetailLoading(false);
+        }
       }
     } else if (
       collectionHitSource(next.hit) === "thunderstore"
@@ -5310,36 +6171,56 @@ export default function App() {
         next.hit.namespace &&
         next.hit.package_name
       ) {
-        await withBusy("Loading modpack…", async () => {
-          const detail = await api.getThunderstorePackage(
-            next.hit.community!,
-            next.hit.namespace!,
-            next.hit.package_name!,
-          );
-          setTsDetail(detail);
-          setTsVersion(
-            detail.latest_version ?? detail.versions[0]?.version_number ?? "",
-          );
-        });
+        setCollectionDetailLoading(true);
+        setCollectionFilesLoading(true);
+        try {
+          await withBusy("Loading modpack…", async () => {
+            const detail = await api.getThunderstorePackage(
+              next.hit.community!,
+              next.hit.namespace!,
+              next.hit.package_name!,
+            );
+            if (detailReq !== browseDetailReqRef.current) return;
+            setTsDetail(detail);
+            setTsVersion(
+              detail.latest_version ?? detail.versions[0]?.version_number ?? "",
+            );
+          });
+        } finally {
+          if (detailReq === browseDetailReqRef.current) {
+            setCollectionDetailLoading(false);
+            setCollectionFilesLoading(false);
+          }
+        }
       }
     } else if (detailTab === "files" && collectionModFiles.length === 0) {
-      await withBusy("Loading collection mods…", async () => {
-        setCollectionModFiles(
-          await api.collectionFiles({
+      setCollectionFilesLoading(true);
+      try {
+        await withBusy("Loading collection mods…", async () => {
+          const files = await api.collectionFiles({
             slug: next.hit.slug,
             revision: next.hit.revision_number,
-          }),
-        );
-      });
+          });
+          if (detailReq !== browseDetailReqRef.current) return;
+          startTransition(() => setCollectionModFiles(files));
+        });
+      } finally {
+        if (detailReq === browseDetailReqRef.current) setCollectionFilesLoading(false);
+      }
     } else if (detailTab === "info" && !collectionDetail) {
-      await withBusy("Loading collection…", async () => {
-        setCollectionDetail(
-          await api.getCollection({
+      setCollectionDetailLoading(true);
+      try {
+        await withBusy("Loading collection…", async () => {
+          const detail = await api.getCollection({
             slug: next.hit.slug,
             domain: next.hit.domain_name || activeGame.nexus_domain,
-          }),
-        );
-      });
+          });
+          if (detailReq !== browseDetailReqRef.current) return;
+          setCollectionDetail(detail);
+        });
+      } finally {
+        if (detailReq === browseDetailReqRef.current) setCollectionDetailLoading(false);
+      }
     }
   }
 
@@ -5358,15 +6239,15 @@ export default function App() {
         savedDetailId: null,
       });
     }
-    await api.setActiveGame(game.id);
-    setActiveId(game.id);
     resetBrowseState();
     resetLibraryEphemeralState();
     setSourceFilter((prev) =>
       clampCatalogSourceFilter(prev, game, browseMode),
     );
     setLibraryDetail({ game, tab: detailTab });
+    gameSavedOpenRef.current += 1;
     setGameSavedDetail(null);
+    setGameSavedDetailPending(false);
     setUeDomainEdit(game.nexus_domain);
     setUeProjectEdit(game.project_name ?? "");
     setTsCommunityEdit(game.thunderstore_community ?? "");
@@ -5376,16 +6257,15 @@ export default function App() {
         : "",
     );
     setTab("library");
-    setGameInfo(null);
+    setActiveId(game.id);
     if (detailTab === "collections") {
       void refreshSavedCollections();
     }
-    if (game.nexus_domain) {
-      try {
-        setGameInfo(await api.getGame(game.nexus_domain));
-      } catch {
-        /* Nexus metadata is optional for local game info */
-      }
+    void loadGameInfo(game.nexus_domain);
+    try {
+      await api.setActiveGame(game.id);
+    } catch (e) {
+      setError(String(e));
     }
   }
 
@@ -5420,7 +6300,9 @@ export default function App() {
 
   function setGameDetailTab(detailTab: GameDetailTab) {
     if (detailTab !== "collections") {
+      gameSavedOpenRef.current += 1;
       setGameSavedDetail(null);
+      setGameSavedDetailPending(false);
     }
     setLibraryDetail((prev) => (prev ? { ...prev, tab: detailTab } : prev));
     if (detailTab === "collections") {
@@ -5431,7 +6313,9 @@ export default function App() {
   function closeLibraryDetail() {
     setLibraryDetail(null);
     setGameInfo(null);
+    gameSavedOpenRef.current += 1;
     setGameSavedDetail(null);
+    setGameSavedDetailPending(false);
   }
 
   async function installModioFile(fileId?: number | null, version?: string | null) {
@@ -5911,14 +6795,23 @@ export default function App() {
     }
   }
 
-  async function refreshSavedCollections() {
+  const refreshSavedCollections = useCallback(async (force = true) => {
+    if (!force && navTtlRef.current.isFresh("saved-collections", 30_000)) {
+      setSavedCollectionsReady(true);
+      return;
+    }
     try {
       const list = await api.listSavedCollections();
-      setSavedCollections(list);
+      navTtlRef.current.mark("saved-collections");
+      startTransition(() => {
+        setSavedCollections((prev) => (sameSnapshot(prev, list) ? prev : list));
+      });
     } catch (e) {
       setError(String(e));
+    } finally {
+      setSavedCollectionsReady(true);
     }
-  }
+  }, [setError]);
 
   function closeCollectionImport() {
     setCollectionImportOpen(false);
@@ -5984,26 +6877,39 @@ export default function App() {
         savedDetailId: id,
       });
     }
-    setBusy("Loading collection…");
     setError(null);
+    const request = ++savedOpenRef.current;
+    const known = savedCollections.find((entry) => entry.id === id);
+    const installId = (entry: SavedCollectionEntry) => {
+      const matches = managed.filter((game) => savedCollectionMatchesGame(entry, game));
+      return (
+        matches[0]?.id ??
+        entry.source_game_id ??
+        activeGame?.id ??
+        managed[0]?.id ??
+        ""
+      );
+    };
+    if (known) {
+      setSavedDetail({ entry: known, mods: [] });
+      setSavedRename(known.name);
+      setSavedInstallGameId(installId(known));
+      setSavedDetailPending(true);
+    }
     try {
       const detail = await api.getSavedCollection(id);
-      setSavedDetail(detail);
-      setSavedRename(detail.entry.name);
-      const matches = managed.filter((g) =>
-        savedCollectionMatchesGame(detail.entry, g),
-      );
-      setSavedInstallGameId(
-        matches[0]?.id ??
-          detail.entry.source_game_id ??
-          activeGame?.id ??
-          managed[0]?.id ??
-          "",
-      );
+      if (request !== savedOpenRef.current) return;
+      startTransition(() => {
+        if (request !== savedOpenRef.current) return;
+        setSavedDetail(detail);
+        setSavedRename(detail.entry.name);
+        setSavedInstallGameId(installId(detail.entry));
+        setSavedDetailPending(false);
+      });
     } catch (e) {
+      if (request !== savedOpenRef.current) return;
+      setSavedDetailPending(false);
       setError(String(e));
-    } finally {
-      setBusy(null);
     }
   }
 
@@ -6017,16 +6923,27 @@ export default function App() {
         gameSavedDetailId: id,
       });
     }
-    setBusy("Loading collection…");
     setError(null);
+    const request = ++gameSavedOpenRef.current;
+    const known = savedCollections.find((entry) => entry.id === id);
+    if (known) {
+      setGameSavedDetail({ entry: known, mods: [] });
+      setGameSavedRename(known.name);
+      setGameSavedDetailPending(true);
+    }
     try {
       const detail = await api.getSavedCollection(id);
-      setGameSavedDetail(detail);
-      setGameSavedRename(detail.entry.name);
+      if (request !== gameSavedOpenRef.current) return;
+      startTransition(() => {
+        if (request !== gameSavedOpenRef.current) return;
+        setGameSavedDetail(detail);
+        setGameSavedRename(detail.entry.name);
+        setGameSavedDetailPending(false);
+      });
     } catch (e) {
+      if (request !== gameSavedOpenRef.current) return;
+      setGameSavedDetailPending(false);
       setError(String(e));
-    } finally {
-      setBusy(null);
     }
   }
 
@@ -6053,70 +6970,179 @@ export default function App() {
         managed,
         detected,
         gamePlugins,
+        collectionCatalogCovers,
+        collectionCatalogTitles,
       ),
-    [savedCollections, managed, detected, gamePlugins],
+    [
+      savedCollections,
+      managed,
+      detected,
+      gamePlugins,
+      collectionCatalogCovers,
+      collectionCatalogTitles,
+    ],
   );
-
-  const refreshCollectionsPageMeta = useCallback(async () => {
-    if (gamePlugins.length === 0) {
-      try {
-        setGamePlugins(await api.listPlugins());
-      } catch {
-        /* plugin titles are optional */
-      }
-    }
-
-    const managedMatches = managed.filter((game) =>
-      savedCollections.some((entry) => savedCollectionMatchesGame(entry, game)),
-    );
-
-    const installedIds = new Set<string>();
-    const adviceEntries: Record<string, CollectionVersionAdvice> = {};
-
-    await Promise.all(
-      managedMatches.map(async (game) => {
-        try {
-          const list = await api.listInstalledCollections(game.id);
-          for (const c of list) {
-            if (c.source !== "emperor") continue;
-            installedIds.add(c.id);
-            if (c.profile_code?.trim()) {
-              installedIds.add(c.profile_code.trim());
-            }
-          }
-        } catch {
-          /* ignore per-game failures */
-        }
-
-        const entries = savedCollections.filter((entry) =>
-          savedCollectionMatchesGame(entry, game),
-        );
-        if (entries.length === 0) return;
-        try {
-          const advice = await api.adviseCollectionVersions(
-            game.id,
-            entries.map((entry) => ({
-              id: entry.id,
-              gameVersions: entry.game_versions,
-            })),
-          );
-          for (const row of advice) {
-            adviceEntries[row.id] = row;
-          }
-        } catch {
-          /* ignore advice failures */
-        }
-      }),
-    );
-
-    setInstalledEmperorShareIds(installedIds);
-    setSavedCollectionAdvice(adviceEntries);
-  }, [gamePlugins.length, managed, savedCollections]);
 
   useEffect(() => {
     if (tab !== "collections") return;
-    void refreshCollectionsPageMeta();
-  }, [tab, refreshCollectionsPageMeta]);
+    const requests = collectionCatalogCoverRequests(
+      savedCollectionGameGroups,
+      gamePlugins,
+      detected,
+    ).filter((req) => {
+      const key = `${req.id}:${req.nexus_domain ?? ""}:${req.modio_game_id ?? ""}`;
+      return !collectionCoverAttemptedRef.current.has(key);
+    });
+    if (requests.length === 0) return;
+    for (const req of requests) {
+      collectionCoverAttemptedRef.current.add(
+        `${req.id}:${req.nexus_domain ?? ""}:${req.modio_game_id ?? ""}`,
+      );
+    }
+    let cancelled = false;
+    void api
+      .resolveCatalogCovers(requests)
+      .then((hits) => {
+        if (cancelled || hits.length === 0) return;
+        startTransition(() => {
+          setCollectionCatalogCovers((prev) => {
+            let changed = false;
+            const next = { ...prev };
+            for (const hit of hits) {
+              const groupKey = hit.id.startsWith(COLLECTION_COVER_PREFIX)
+                ? hit.id.slice(COLLECTION_COVER_PREFIX.length)
+                : hit.id;
+              if (next[groupKey] !== hit.cover_url) {
+                next[groupKey] = hit.cover_url;
+                changed = true;
+              }
+            }
+            return changed ? next : prev;
+          });
+          setCollectionCatalogTitles((prev) => {
+            let changed = false;
+            const next = { ...prev };
+            for (const hit of hits) {
+              const title = hit.title?.trim();
+              if (!title) continue;
+              const groupKey = hit.id.startsWith(COLLECTION_COVER_PREFIX)
+                ? hit.id.slice(COLLECTION_COVER_PREFIX.length)
+                : hit.id;
+              if (next[groupKey] !== title) {
+                next[groupKey] = title;
+                changed = true;
+              }
+            }
+            return changed ? next : prev;
+          });
+        });
+      })
+      .catch((e) => {
+        console.warn("resolve_catalog_covers (collections) failed", e);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [tab, savedCollectionGameGroups, gamePlugins, detected]);
+
+  const visibleCollectionGroupCount = useChunkedCount(
+    savedCollectionGameGroups.length,
+    { initial: 16, step: 16, active: tab === "collections" && !savedDetail },
+  );
+
+  const refreshCollectionsPageMeta = useCallback(
+    async (force = true) => {
+      if (!force && navTtlRef.current.isFresh("collections-meta", 30_000)) {
+        return;
+      }
+      const gen = ++collectionsMetaGenRef.current;
+      if (gamePlugins.length === 0) {
+        try {
+          const plugins = await api.listPlugins();
+          if (gen !== collectionsMetaGenRef.current) return;
+          setGamePlugins(plugins);
+        } catch {
+          /* plugin titles are optional */
+        }
+      }
+
+      const managedMatches = managed.filter((game) =>
+        savedCollections.some((entry) => savedCollectionMatchesGame(entry, game)),
+      );
+
+      const installedIds = new Set<string>();
+      const adviceEntries: Record<string, CollectionVersionAdvice> = {};
+
+      await Promise.all(
+        managedMatches.map(async (game) => {
+          try {
+            const list = await api.listInstalledCollections(game.id);
+            for (const c of list) {
+              if (c.source !== "emperor") continue;
+              installedIds.add(c.id);
+              if (c.profile_code?.trim()) {
+                installedIds.add(c.profile_code.trim());
+              }
+            }
+          } catch {
+            /* ignore per-game failures */
+          }
+
+          const entries = savedCollections.filter((entry) =>
+            savedCollectionMatchesGame(entry, game),
+          );
+          if (entries.length === 0) return;
+          try {
+            const advice = await api.adviseCollectionVersions(
+              game.id,
+              entries.map((entry) => ({
+                id: entry.id,
+                gameVersions: entry.game_versions,
+              })),
+            );
+            for (const row of advice) {
+              adviceEntries[row.id] = row;
+            }
+          } catch {
+            /* ignore advice failures */
+          }
+        }),
+      );
+
+      if (gen !== collectionsMetaGenRef.current) return;
+      navTtlRef.current.mark("collections-meta");
+      startTransition(() => {
+        setInstalledEmperorShareIds((prev) =>
+          stringSetEqual(prev, installedIds) ? prev : installedIds,
+        );
+        setSavedCollectionAdvice((prev) =>
+          shallowRecordOfObjectsEqual(prev, adviceEntries) ? prev : adviceEntries,
+        );
+      });
+    },
+    [gamePlugins.length, managed, savedCollections],
+  );
+
+  useNavSettledEffect(
+    tab === "collections",
+    savedCollectionsReady ? 150 : 0,
+    () => {
+      void refreshSavedCollections(false);
+    },
+    [refreshSavedCollections, savedCollectionsReady],
+  );
+
+  useNavSettledEffect(
+    tab === "collections",
+    150,
+    () => {
+      void refreshCollectionsPageMeta(false);
+      return () => {
+        collectionsMetaGenRef.current += 1;
+      };
+    },
+    [refreshCollectionsPageMeta],
+  );
 
   const isSavedCollectionInstalled = useCallback(
     (entry: SavedCollectionEntry) => {
@@ -6221,11 +7247,14 @@ export default function App() {
     }
 
     await withBusy("Updating mod…", async () => {
-      await api.updateStagedMod(activeGame.id, stagedId);
-      await refreshMods(activeGame.id);
+      const updated = await api.updateStagedMod(activeGame.id, stagedId);
+      const refreshed = await refreshMods(activeGame.id);
       await refreshCollections(activeGame.id);
       clearUpdateBadge();
       void refreshModUpdates(activeGame.id);
+      if (refreshed) {
+        openUpdatedFomods(refreshed.list, refreshed.needing, [updated.id]);
+      }
     });
   }
 
@@ -6299,10 +7328,12 @@ export default function App() {
       await withBusy(
         `Updating ${apiIds.length} mod${apiIds.length === 1 ? "" : "s"}…`,
         async () => {
+          const updatedIds: string[] = [];
           for (const id of apiIds) {
-            await api.updateStagedMod(activeGame.id, id);
+            const updated = await api.updateStagedMod(activeGame.id, id);
+            updatedIds.push(updated.id);
           }
-          await refreshMods(activeGame.id);
+          const refreshed = await refreshMods(activeGame.id);
           await refreshCollections(activeGame.id);
           setModUpdates((prev) => {
             const next = { ...prev };
@@ -6310,6 +7341,9 @@ export default function App() {
             return next;
           });
           void refreshModUpdates(activeGame.id);
+          if (refreshed) {
+            openUpdatedFomods(refreshed.list, refreshed.needing, updatedIds);
+          }
         },
       );
     }
@@ -6603,6 +7637,29 @@ export default function App() {
     if (step.action === "deploy") void runDeploy();
   }
 
+  function openUpdatedFomods(
+    list: StagedMod[],
+    needing: string[],
+    updatedIds: string[],
+  ) {
+    if (updatedIds.length === 0 || fomodDialogRef.current) return;
+    const needingSet = new Set(needing);
+    const byId = new Map(list.map((mod) => [mod.id, mod]));
+    const toOpen: StagedMod[] = [];
+    const seen = new Set<string>();
+    for (const id of updatedIds) {
+      if (seen.has(id) || !needingSet.has(id)) continue;
+      const mod = byId.get(id);
+      if (!mod || mod.fomod_selection) continue;
+      seen.add(id);
+      toOpen.push(mod);
+    }
+    if (toOpen.length > 0) {
+      openFomodPass(toOpen, false);
+    }
+  }
+  openUpdatedFomodsRef.current = openUpdatedFomods;
+
   function configureFomods() {
     openFomodPass(fomodNeeding, false);
   }
@@ -6669,7 +7726,28 @@ export default function App() {
 
   async function deploy() {
     if (!activeGame) return;
-    const pending = fomodModsForDeploy(fomodNeeding);
+    const gameId = activeGame.id;
+    let currentMods = mods;
+    let needingIds = shownFomodNeedingIds;
+    try {
+      needingIds = await api.listModsNeedingFomod(gameId);
+      if (activeGameRef.current?.id !== gameId) return;
+      setFomodNeedingIds(needingIds);
+      if (needingIds.some((id) => !currentMods.some((m) => m.id === id))) {
+        currentMods = await api.listMods(gameId);
+        if (activeGameRef.current?.id !== gameId) return;
+        setMods(currentMods);
+      }
+    } catch (e) {
+      console.warn("list_mods_needing_fomod before deploy failed", e);
+    }
+    const byId = new Map(currentMods.map((mod) => [mod.id, mod]));
+    const needingMods = needingIds.flatMap((id) => {
+      const mod = byId.get(id);
+      if (!mod || mod.fomod_selection) return [];
+      return [mod];
+    });
+    const pending = fomodModsForDeploy(needingMods);
     if (pending.length > 0) {
       openFomodPass(pending, true);
       return;
@@ -6793,6 +7871,85 @@ export default function App() {
   const showSidebarAssist =
     assistActive && tab !== "downloads" && !nexusLoginOpen;
 
+  const browseGridHandlersRef = useRef({
+    openMod,
+    quickInstallMod,
+    uninstallCatalogMod,
+    openCollection,
+    installCollection,
+  });
+  browseGridHandlersRef.current = {
+    openMod,
+    quickInstallMod,
+    uninstallCatalogMod,
+    openCollection,
+    installCollection,
+  };
+  const getModHitKey = useCallback((m: CatalogHit) => m.id, []);
+  const handleBrowseOpenMod = useCallback(
+    (m: CatalogHit, nextTab: "info" | "files") =>
+      browseGridHandlersRef.current.openMod(m, nextTab),
+    [],
+  );
+  const handleBrowseQuickInstall = useCallback(
+    (m: CatalogHit) => void browseGridHandlersRef.current.quickInstallMod(m),
+    [],
+  );
+  const handleBrowseUninstall = useCallback(
+    (m: CatalogHit) => void browseGridHandlersRef.current.uninstallCatalogMod(m),
+    [],
+  );
+  const handleBrowseOpenCollection = useCallback(
+    (c: CollectionHit, nextTab: "info" | "files") =>
+      browseGridHandlersRef.current.openCollection(c, nextTab),
+    [],
+  );
+  const handleBrowseInstallCollection = useCallback(
+    (c: CollectionHit) => browseGridHandlersRef.current.installCollection(c),
+    [],
+  );
+  const renderBrowseModGridItem = useCallback(
+    (m: CatalogHit) => (
+      <BrowseModGridCard
+        mod={m}
+        installed={installedIds.has(m.id)}
+        isPremium={isPremium}
+        onOpen={handleBrowseOpenMod}
+        onQuickInstall={handleBrowseQuickInstall}
+        onUninstall={handleBrowseUninstall}
+      />
+    ),
+    [
+      handleBrowseOpenMod,
+      handleBrowseQuickInstall,
+      handleBrowseUninstall,
+      installedIds,
+      isPremium,
+    ],
+  );
+  const renderBrowseCollectionGridItem = useCallback(
+    (c: CollectionHit) => (
+      <BrowseCollectionGridCard
+        collection={c}
+        onOpen={handleBrowseOpenCollection}
+        onInstall={handleBrowseInstallCollection}
+      />
+    ),
+    [handleBrowseInstallCollection, handleBrowseOpenCollection],
+  );
+  const renderBrowseGridSkeletonCard = useCallback(
+    () => (
+      <div className="media-card" aria-hidden="true">
+        <div className="media-cover-stack">
+          <div className="media-cover skeleton" />
+        </div>
+        <span className="skeleton skeleton-line skeleton-line-title" />
+        <span className="skeleton skeleton-line skeleton-line-meta" />
+      </div>
+    ),
+    [],
+  );
+
   function browseResultsNote(kind: "mods" | "collections"): string {
     if (browseLoading && !browseSearched) return "Searching…";
     if (browseSearched) return "No results for this search.";
@@ -6850,6 +8007,15 @@ export default function App() {
     />
   );
 
+  useNavSettledEffect(
+    tab === "downloads",
+    downloadsReady ? 150 : 0,
+    () => {
+      void refreshDownloads();
+    },
+    [downloadsReady, refreshDownloads],
+  );
+
   return (
     <div
       className="app"
@@ -6892,10 +8058,10 @@ export default function App() {
               active={tab === id}
               onClick={() => {
                 setTab(id);
-                if (id === "downloads") refreshDownloads();
                 if (id === "collections") {
-                  void refreshSavedCollections();
+                  savedOpenRef.current += 1;
                   setSavedDetail(null);
+                  setSavedDetailPending(false);
                 }
               }}
             >
@@ -6966,7 +8132,10 @@ export default function App() {
         )}
       </aside>
 
-      <main className="main" ref={mainScrollRef}>
+      <main
+        className={browseResultsVisible ? "main main-browse-scroll" : "main"}
+        ref={mainScrollRef}
+      >
         <Reveal show={Boolean(error || assistLoginBanner || notice)}>
           {error ? (
             <StatusBanner
@@ -6993,52 +8162,18 @@ export default function App() {
           ) : null}
         </Reveal>
 
-        {tab ? (
-        <ViewSwitch viewKey={tab} className="view-slot">
-        {tab === "setup" && (
-          <section className="panel">
-            <h1>Setup</h1>
-            <p>
-              A Nexus API key and a Nexus website sign-in are both required before
-              the rest of the app opens. Use Stay signed in. The website session
-              is saved separately from the API key. Premium and free accounts
-              both need the sign-in. mod.io is optional.
-            </p>
-            <div className="status-card">
-              <span className={settings?.has_api_key ? "pill ok" : "pill warn"}>
-                {settings?.has_api_key ? "Nexus API key saved" : "Nexus API key required"}
-              </span>
-              <span
-                className={settings?.nexus_website_signed_in ? "pill ok" : "pill warn"}
-              >
-                {settings?.nexus_website_signed_in
-                  ? "Website sign-in saved"
-                  : "Website sign-in required"}
-              </span>
-            </div>
-            {accountConnections}
-            <div className="actions">
-              <button
-                type="button"
-                disabled={!canFinishSetup}
-                title={
-                  canFinishSetup
-                    ? undefined
-                    : "Save a Nexus API key and finish website sign-in first."
-                }
-                onClick={() => void finishSetup()}
-              >
-                Finish setup
-              </button>
-            </div>
-          </section>
-        )}
-
-        {tab === "library" && (
+        {libraryKeptRef.current ? (
+        <div
+          className={tab === "library" ? "tab-kept" : "tab-kept tab-parked"}
+          inert={tab !== "library"}
+          aria-hidden={tab !== "library" ? true : undefined}
+        >
+          <ParkedTabGate active={tab === "library"}>
           <section className={libraryDetail ? "panel" : "panel library-home"}>
             <ViewSwitch
-              viewKey={libraryDetail ? `game:${libraryDetail.game.id}` : "library-home"}
+              viewKey={libraryShellKey}
               initial={false}
+              onEntered={setLibraryShellSettled}
             >
             {libraryDetail ? (
               <>
@@ -7109,11 +8244,13 @@ export default function App() {
                         {mods.length} mod{mods.length === 1 ? "" : "s"}
                       </span>
                       <span>
-                        {mods.filter((m) => m.enabled).length} enabled
+                        {enabledModCount} enabled
                       </span>
-                      {gameInfo?.mods != null && (
+                      {gameInfo?.mods != null ? (
                         <span>{gameInfo.mods.toLocaleString()} on Nexus</span>
-                      )}
+                      ) : gameInfoLoading && libraryDetail.game.nexus_domain ? (
+                        <InlineStatSkeleton />
+                      ) : null}
                       {gameInfo?.downloads != null && (
                         <span>{gameInfo.downloads.toLocaleString()} downloads</span>
                       )}
@@ -7144,12 +8281,9 @@ export default function App() {
                 </div>
 
                 <ViewSwitch
-                  viewKey={
-                    libraryDetail.tab === "collections" && gameSavedDetail
-                      ? `collections:${gameSavedDetail.entry.id}`
-                      : libraryDetail.tab
-                  }
+                  viewKey={libraryChildKey ?? libraryDetail.tab}
                   initial={false}
+                  onEntered={setLibraryChildSettled}
                 >
                 {libraryDetail.tab === "info" && (
                   <div className="detail-body">
@@ -7795,9 +8929,9 @@ export default function App() {
                       mods={fomodNeeding}
                       onConfigure={configureFomods}
                     />
-                    {activeGame && modsReadyGameId !== activeGame.id ? (
-                      <StagedModsSkeleton />
-                    ) : mods.length === 0 ? (
+                    {showMods ? (
+                      <div className="results-fill">
+                    {mods.length === 0 ? (
                       <ul className="list mods">
                         <li className="empty">No staged mods. Browse mods to install some.</li>
                       </ul>
@@ -7809,6 +8943,9 @@ export default function App() {
                     <BrowseVirtualList
                       items={modDrag.displayMods}
                       scrollRef={mainScrollRef}
+                      active={tab === "library"}
+                      staggerEnter={!modDrag.isDragging}
+                      staggerKey={activeGame?.id}
                       listRef={modDrag.listRef}
                       listClassName={
                         modDrag.isDragging ? "mods mod-list-dragging" : "mods"
@@ -7842,13 +8979,8 @@ export default function App() {
                         const pageHit = activeGame
                           ? catalogHitFromStaged(m, activeGame)
                           : null;
-                        const versionWarning = versionWarnings.find(
-                          (row) => row.stagedId === m.id,
-                        );
-                        const modCollections = collectionsForMod(
-                          m,
-                          installedCollections,
-                        );
+                        const versionWarning = versionWarningByModId.get(m.id);
+                        const modCollections = collectionsByModId.get(m.id) ?? [];
                         const isDragged = modDrag.draggingId === m.id;
                         const identity = (
                           <>
@@ -8045,6 +9177,10 @@ export default function App() {
                       }}
                     />
                     )}
+                      </div>
+                    ) : (
+                      <StagedModsSkeleton />
+                    )}
                   </div>
                 )}
                 {libraryDetail.tab === "collections" && (
@@ -8052,67 +9188,68 @@ export default function App() {
                     {gameSavedDetail ? (
                       <>
                         <div className="panel-head-inline">
-                          <button
-                            type="button"
-                            className="linkish"
-                            onClick={() => closeLibraryDetail()}
-                          >
-                            Home
-                          </button>
-                          <h2>{gameSavedDetail.entry.name}</h2>
-                        </div>
-                        <p className="note">
-                          {gameSavedDetail.entry.mod_count} mods
-                          {gameSavedDetail.entry.nexus_count
-                            ? ` · ${gameSavedDetail.entry.nexus_count} Nexus`
-                            : ""}
-                          {gameSavedDetail.entry.thunderstore_count
-                            ? ` · ${gameSavedDetail.entry.thunderstore_count} Thunderstore`
-                            : ""}
-                          {gameSavedDetail.entry.modio_count
-                            ? ` · ${gameSavedDetail.entry.modio_count} mod.io`
-                            : ""}
-                        </p>
-                        <label>
-                          Name
-                          <div className="row">
-                            <input
-                              value={gameSavedRename}
-                              onChange={(e) => setGameSavedRename(e.target.value)}
-                            />
+                          <div className="detail-head-title">
                             <button
                               type="button"
+                              onClick={() => {
+                                gameSavedOpenRef.current += 1;
+                                setGameSavedDetail(null);
+                                setGameSavedDetailPending(false);
+                                setGameSavedRename("");
+                              }}
+                            >
+                              Back
+                            </button>
+                            <h2>{gameSavedDetail.entry.name}</h2>
+                            {isSavedCollectionInstalled(gameSavedDetail.entry) ? (
+                              <span className="pill ok">Installed</span>
+                            ) : null}
+                          </div>
+                          <div className="panel-head-actions">
+                            <button
+                              type="button"
+                              className="danger"
+                              aria-label={`Delete ${gameSavedDetail.entry.name}`}
                               onClick={() =>
                                 void (async () => {
+                                  if (
+                                    !window.confirm(
+                                      `Delete ${gameSavedDetail.entry.name}?`,
+                                    )
+                                  ) {
+                                    return;
+                                  }
                                   try {
-                                    const updated = await api.renameSavedCollection(
-                                      gameSavedDetail.entry.id,
-                                      gameSavedRename,
+                                    await deleteSavedCollectionEntry(
+                                      gameSavedDetail.entry,
                                     );
-                                    setGameSavedDetail({
-                                      ...gameSavedDetail,
-                                      entry: updated,
-                                    });
-                                    await refreshSavedCollections();
+                                    gameSavedOpenRef.current += 1;
+                                    setGameSavedDetail(null);
+                                    setGameSavedDetailPending(false);
                                   } catch (e) {
                                     setError(String(e));
                                   }
                                 })()
                               }
                             >
-                              Rename
+                              Delete
                             </button>
                           </div>
-                        </label>
-                        <p className="note">
-                          Install into <strong>{libraryDetail.game.title}</strong>
-                        </p>
-                        <div className="actions" style={{ marginBottom: "1rem" }}>
+                        </div>
+                        <SavedCollectionStats entry={gameSavedDetail.entry} />
+                        {showGameVersionWarnings &&
+                          savedCollectionAdvice[gameSavedDetail.entry.id]?.status ===
+                            "mismatch" && (
+                            <p className="mod-version-warn">
+                              {savedCollectionAdvice[gameSavedDetail.entry.id]?.message}
+                            </p>
+                          )}
+                        <div className="saved-collection-actions">
                           <button
                             type="button"
                             onClick={() => void installGameSavedCollection()}
                           >
-                            Install
+                            Install into {libraryDetail.game.title}
                           </button>
                           <button
                             type="button"
@@ -8127,55 +9264,50 @@ export default function App() {
                           >
                             <FontAwesomeIcon icon={faCopy} />
                           </button>
-                          <button
-                            type="button"
-                            className="danger icon-btn"
-                            aria-label={`Delete ${gameSavedDetail.entry.name}`}
-                            title="Delete"
-                            onClick={() =>
-                              void (async () => {
-                                if (
-                                  !window.confirm(
-                                    `Delete ${gameSavedDetail.entry.name}?`,
-                                  )
-                                ) {
-                                  return;
-                                }
-                                try {
-                                  await deleteSavedCollectionEntry(
-                                    gameSavedDetail.entry,
-                                  );
-                                  setGameSavedDetail(null);
-                                } catch (e) {
-                                  setError(String(e));
-                                }
-                              })()
-                            }
-                          >
-                            <FontAwesomeIcon icon={faTrashCan} />
-                          </button>
                         </div>
-                        <h2>Contained mods</h2>
-                        <ShareModList mods={gameSavedDetail.mods} scrollRef={mainScrollRef} />
-                        <h2>Code</h2>
-                        <textarea
-                          rows={4}
-                          readOnly
-                          value={gameSavedDetail.entry.code}
+                        <SavedCollectionDetailBody
+                          entry={gameSavedDetail.entry}
+                          mods={gameSavedDetail.mods}
+                          renameValue={gameSavedRename}
+                          onRenameChange={setGameSavedRename}
+                          onRenameSubmit={() =>
+                            void (async () => {
+                              try {
+                                const updated = await api.renameSavedCollection(
+                                  gameSavedDetail.entry.id,
+                                  gameSavedRename,
+                                );
+                                setGameSavedDetail({
+                                  ...gameSavedDetail,
+                                  entry: updated,
+                                });
+                                await refreshSavedCollections();
+                              } catch (e) {
+                                setError(String(e));
+                              }
+                            })()
+                          }
+                          showMods={showGameSavedMods}
+                          scrollRef={mainScrollRef}
+                          active={tab === "library"}
                         />
                       </>
-                    ) : (
+                    ) : showLibraryCollections ? (
                       <>
                         {installedCollections.length > 0 && (
                           <div className="installed-collections">
                             <h2>Installed collections</h2>
                             <ul className="list">
-                              {installedCollections.map((c) => {
+                              {installedCollections.map((c, idx) => {
                                 const installedLabel = formatInstalledAt(
                                   c.installed_at,
                                 );
                                 return (
-                                  <li key={c.id}>
+                                  <li
+                                    key={c.id}
+                                    className="stagger-item"
+                                    style={staggerStyle(idx)}
+                                  >
                                     <div>
                                       <strong>{c.name}</strong>
                                       <small>
@@ -8227,10 +9359,11 @@ export default function App() {
                           Import code → Save only.
                         </p>
                         <ul className="list">
-                          {gameSavedCollections.map((c) => (
+                          {gameSavedCollections.map((c, idx) => (
                             <li
                               key={c.id}
-                              className="list-row-clickable"
+                              className="list-row-clickable stagger-item"
+                              style={staggerStyle(idx)}
                               onClick={() => void openGameSavedCollection(c.id)}
                             >
                               <div className="list-row-main">
@@ -8246,7 +9379,9 @@ export default function App() {
                                   {c.game.modio_game_id
                                     ? ` · mod.io ${c.game.modio_game_id}`
                                     : ""}
-                                  {` · ${new Date(c.created_at).toLocaleString()}`}
+                                  {formatIsoDate(c.created_at)
+                                    ? ` · ${formatIsoDate(c.created_at)}`
+                                    : ""}
                                 </small>
                               </div>
                               <div
@@ -8295,11 +9430,13 @@ export default function App() {
                           )}
                         </ul>
                       </>
+                    ) : (
+                      <BrowseListSkeleton count={6} />
                     )}
                   </div>
                 )}
                 {libraryDetail.tab === "tools" && settings?.platform_linux && (
-                  <GameToolsPanel game={libraryDetail.game} />
+                  <GameToolsPanel game={libraryDetail.game} entered={toolsEntered} />
                 )}
                 </ViewSwitch>
               </>
@@ -8334,11 +9471,32 @@ export default function App() {
                     </div>
                   </div>
                 )}
+                <ResultsReveal
+                  show={showLibraryHome}
+                  skeleton={
+                    <>
+                      <h2>Managed</h2>
+                      <BrowseGridSkeleton count={6} minCardPx={160} />
+                      <h2>Unmanaged</h2>
+                      <BrowseGridSkeleton count={8} minCardPx={160} />
+                    </>
+                  }
+                >
+                {showLibraryHome ? (
+                <>
                 {managed.length > 0 && (
                   <>
                     <h2>Managed</h2>
-                    <FadeIn className="media-grid library-posters">
-                        {managed.map((g, index) => {
+                    <div className="library-posters">
+                      <BrowseVirtualGrid
+                        items={managed}
+                        scrollRef={mainScrollRef}
+                        minCardPx={160}
+                        active={tab === "library"}
+                        staggerEnter
+                        trackScrollMargin
+                        getKey={(g) => g.id}
+                        renderItem={(g) => {
                           const health = gameHealthById.get(g.id);
                           const badge = managedHealthBadge(health);
                           const actions =
@@ -8375,10 +9533,9 @@ export default function App() {
                           return (
                             <MediaCard
                               key={g.id}
-                              enterIndex={index}
+                              plain
                               title={g.title}
                               imageSrc={gameCoverSrc(g)}
-                              loading="eager"
                               active={g.id === activeGame?.id}
                               badge={badge}
                               overlay={
@@ -8390,26 +9547,40 @@ export default function App() {
                               onClick={() => openGame(g, "mods")}
                             />
                           );
-                        })}
-                      </FadeIn>
+                        }}
+                      />
+                    </div>
                   </>
                 )}
                 <h2>Unmanaged</h2>
                 {catalogLookupBusy && unmanaged.length > 0 && (
                   <p className="note">Looking up Nexus / Thunderstore / mod.io…</p>
                 )}
-                <FadeIn className="media-grid library-posters">
-                    {unmanaged.map((g, index) => {
+                <div className="library-posters">
+                    {unmanaged.length === 0 ? (
+                      <p className="note">
+                        No unmanaged games found. Scan again if you installed something
+                        while the app was open.
+                      </p>
+                    ) : (
+                    <BrowseVirtualGrid
+                      items={unmanaged}
+                      scrollRef={mainScrollRef}
+                      minCardPx={160}
+                      active={tab === "library"}
+                      staggerEnter
+                      trackScrollMargin
+                      getKey={(g) => g.id}
+                      renderItem={(g) => {
                       const suggestion = catalogSuggestions[g.id];
                       const hints = catalogHints(suggestion);
                       if (g.supported) {
                         return (
                           <MediaCard
                             key={g.id}
-                            enterIndex={index}
+                            plain
                             title={g.title}
                             imageSrc={gameCoverSrc(g)}
-                            loading="eager"
                             coverMarks={hints}
                             hoverLabel="Manage"
                             onClick={() => manage(g)}
@@ -8422,10 +9593,9 @@ export default function App() {
                         return (
                           <MediaCard
                             key={g.id}
-                            enterIndex={index}
+                            plain
                             title={g.title}
                             imageSrc={gameCoverSrc(g)}
-                            loading="eager"
                             badge={catalogMatchBadge(kind)}
                             coverMarks={hints}
                             hoverLabel={catalogMatchHover(kind)}
@@ -8441,10 +9611,9 @@ export default function App() {
                         return (
                           <MediaCard
                             key={g.id}
-                            enterIndex={index}
+                            plain
                             title={g.title}
                             imageSrc={gameCoverSrc(g)}
-                            loading="eager"
                             badge={catalogMatchBadge(kind)}
                             coverMarks={hints}
                             hoverLabel={catalogMatchHover(kind)}
@@ -8459,31 +9628,443 @@ export default function App() {
                       return (
                         <MediaCard
                           key={g.id}
-                          enterIndex={index}
+                          plain
                           title={g.title}
                           imageSrc={gameCoverSrc(g)}
-                          loading="eager"
                           coverMarks={hints}
                           coverLabel="Unsupported"
                           unsupported
                         />
                       );
-                    })}
-                    {unmanaged.length === 0 && (
-                      <p className="note">
-                        No unmanaged games found. Scan again if you installed something
-                        while the app was open.
-                      </p>
+                    }}
+                    />
                     )}
-                </FadeIn>
+                </div>
+                </>
+                ) : null}
+                </ResultsReveal>
               </div>
             )}
             </ViewSwitch>
           </section>
-        )}
+          </ParkedTabGate>
+        </div>
+        ) : null}
 
-        {tab === "browse" && (
+        {collectionsKeptRef.current ? (
+        <div
+          className={tab === "collections" ? "tab-kept" : "tab-kept tab-parked"}
+          inert={tab !== "collections"}
+          aria-hidden={tab !== "collections" ? true : undefined}
+        >
+          <ParkedTabGate active={tab === "collections"}>
+          <section className="panel">
+            <ViewSwitch
+              viewKey={collectionsViewKey}
+              initial={false}
+              onEntered={setCollectionsViewSettled}
+            >
+            {savedDetail ? (() => {
+              const matchedGroup = savedCollectionGameGroups.find((g) =>
+                g.collections.some((c) => c.id === savedDetail.entry.id),
+              );
+              const coverSrc = posterSrc(matchedGroup?.coverPath ?? null);
+              const gameTitle =
+                matchedGroup?.title ??
+                savedDetail.entry.game.title ??
+                "Saved collection";
+              return (
+              <div>
+                <div className="panel-head">
+                  <div className="detail-head-title">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        savedOpenRef.current += 1;
+                        setSavedDetail(null);
+                        setSavedDetailPending(false);
+                        setSavedRename("");
+                      }}
+                    >
+                      Home
+                    </button>
+                    <h1>{savedDetail.entry.name}</h1>
+                  </div>
+                  <div className="panel-head-actions">
+                    <button
+                      type="button"
+                      className="danger"
+                      aria-label={`Delete ${savedDetail.entry.name}`}
+                      onClick={() =>
+                        void (async () => {
+                          if (!window.confirm(`Delete ${savedDetail.entry.name}?`)) {
+                            return;
+                          }
+                          try {
+                            await deleteSavedCollectionEntry(savedDetail.entry);
+                            savedOpenRef.current += 1;
+                            setSavedDetail(null);
+                            setSavedDetailPending(false);
+                          } catch (e) {
+                            setError(String(e));
+                          }
+                        })()
+                      }
+                    >
+                      Delete
+                    </button>
+                  </div>
+                </div>
+                <div className="detail-hero">
+                  <div className="detail-cover">
+                    {coverSrc ? (
+                      <img src={coverSrc} alt="" />
+                    ) : (
+                      <PlaceholderIcon />
+                    )}
+                  </div>
+                  <div className="detail-meta">
+                    <p className="detail-author">
+                      {gameTitle}
+                      {isSavedCollectionInstalled(savedDetail.entry) ? (
+                        <>
+                          {" "}
+                          <span className="pill ok">Installed</span>
+                        </>
+                      ) : null}
+                    </p>
+                    <SavedCollectionStats entry={savedDetail.entry} />
+                    {showGameVersionWarnings &&
+                      savedCollectionAdvice[savedDetail.entry.id]?.status ===
+                        "mismatch" && (
+                        <p className="mod-version-warn">
+                          {savedCollectionAdvice[savedDetail.entry.id]?.message}
+                        </p>
+                      )}
+                    <div className="saved-collection-actions">
+                      <select
+                        className="saved-collection-game-select"
+                        aria-label="Install into"
+                        value={savedInstallGameId}
+                        onChange={(e) => setSavedInstallGameId(e.target.value)}
+                      >
+                        <option value="">Select managed game…</option>
+                        {managed.map((g) => (
+                          <option key={g.id} value={g.id}>
+                            {g.title}
+                            {savedCollectionMatchesGame(savedDetail.entry, g)
+                              ? " (match)"
+                              : ""}
+                          </option>
+                        ))}
+                      </select>
+                      <button type="button" onClick={() => void installSavedCollection()}>
+                        Install
+                      </button>
+                      <button
+                        type="button"
+                        className="icon-btn"
+                        aria-label="Copy code"
+                        title="Copy code"
+                        onClick={() =>
+                          void navigator.clipboard.writeText(savedDetail.entry.code)
+                        }
+                      >
+                        <FontAwesomeIcon icon={faCopy} />
+                      </button>
+                    </div>
+                  </div>
+                </div>
+                <div className="detail-body">
+                  <SavedCollectionDetailBody
+                    entry={savedDetail.entry}
+                    mods={savedDetail.mods}
+                    renameValue={savedRename}
+                    onRenameChange={setSavedRename}
+                    onRenameSubmit={() =>
+                      void (async () => {
+                        try {
+                          const updated = await api.renameSavedCollection(
+                            savedDetail.entry.id,
+                            savedRename,
+                          );
+                          setSavedDetail({ ...savedDetail, entry: updated });
+                          await refreshSavedCollections();
+                        } catch (e) {
+                          setError(String(e));
+                        }
+                      })()
+                    }
+                    showMods={showSavedMods}
+                    scrollRef={mainScrollRef}
+                    active={tab === "collections"}
+                  />
+                </div>
+              </div>
+              );
+            })() : (
+              <div>
+                <div className="panel-head">
+                  <h1>Saved Collections</h1>
+                  <div className="panel-head-actions">
+                    <button
+                      type="button"
+                      className="icon-btn"
+                      aria-label="Import collection"
+                      title="Import collection"
+                      onClick={() => {
+                        setError(null);
+                        setCollectionImportOpen(true);
+                      }}
+                    >
+                      <FontAwesomeIcon icon={faPlus} />
+                    </button>
+                  </div>
+                </div>
+                <p className="note">
+                  Local Emperor share codes grouped by game. Create one from Library →
+                  game → Mods → Share loadout, or import a code or file here.
+                </p>
+                {showCollectionsList ? (
+                <div className="results-fill">
+                <ul className="list collections-by-game">
+                  {savedCollectionGameGroups.slice(0, visibleCollectionGroupCount).map((group, idx) => {
+                    const expanded = expandedCollectionGameKey === group.key;
+                    const childLimit = expandedGroupLimits[group.key] ?? 25;
+                    const visibleChildren = expanded
+                      ? group.collections.slice(0, childLimit)
+                      : [];
+                    return (
+                      <li
+                        key={group.key}
+                        className="collections-game-row list-row-poster stagger-item"
+                        style={staggerStyle(idx)}
+                      >
+                        <div
+                          className="collections-game-header list-row-clickable"
+                          aria-expanded={expanded}
+                          onClick={() =>
+                            setExpandedCollectionGameKey(
+                              expanded ? null : group.key,
+                            )
+                          }
+                          onKeyDown={(e: ReactKeyboardEvent<HTMLDivElement>) => {
+                            if (e.key === "Enter" || e.key === " ") {
+                              e.preventDefault();
+                              setExpandedCollectionGameKey(
+                                expanded ? null : group.key,
+                              );
+                            }
+                          }}
+                          role="button"
+                          tabIndex={0}
+                        >
+                          <ListPoster src={posterSrc(group.coverPath)} />
+                          <div className="list-row-main">
+                            <strong>{group.title}</strong>
+                            <small>
+                              {group.collections.length} collection
+                              {group.collections.length === 1 ? "" : "s"}
+                              {group.managed ? " · managed" : " · not managed"}
+                            </small>
+                          </div>
+                        </div>
+                        <Collapse
+                          show={expanded}
+                          className="collections-game-expand"
+                        >
+                          <ul className="list collections-game-children">
+                            {visibleChildren.map((c, childIdx) => {
+                              const builtFor = formatCollectionGameVersions(
+                                c.game_versions,
+                              );
+                              const advice = savedCollectionAdvice[c.id];
+                              const installed = isSavedCollectionInstalled(c);
+                              return (
+                                <li
+                                  key={c.id}
+                                  className="list-row-clickable stagger-item"
+                                  style={staggerStyle(childIdx)}
+                                  onClick={() => void openSavedCollection(c.id)}
+                                >
+                                  <div className="list-row-main">
+                                    <strong>
+                                      {c.name}
+                                      {installed ? (
+                                        <span className="pill ok">Installed</span>
+                                      ) : null}
+                                    </strong>
+                                    <small>
+                                      {c.mod_count} mods
+                                      {builtFor ? ` · Built for ${builtFor}` : ""}
+                                      {formatIsoDate(c.created_at)
+                                    ? ` · ${formatIsoDate(c.created_at)}`
+                                    : ""}
+                                    </small>
+                                    {showGameVersionWarnings &&
+                                      advice?.status === "mismatch" && (
+                                        <small className="mod-version-warn">
+                                          {advice.message}
+                                        </small>
+                                      )}
+                                  </div>
+                                  <div
+                                    className="actions"
+                                    onClick={(e) => e.stopPropagation()}
+                                  >
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        void (async () => {
+                                          if (group.managed) {
+                                            await runUnifiedImport(
+                                              group.managed.id,
+                                              c.code,
+                                              c.name,
+                                            );
+                                            await refreshCollectionsPageMeta();
+                                            return;
+                                          }
+                                          await openSavedCollection(c.id);
+                                        })()
+                                      }
+                                    >
+                                      Install
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className="icon-btn"
+                                      aria-label={`Copy ${c.name}`}
+                                      title="Copy"
+                                      onClick={() =>
+                                        void navigator.clipboard.writeText(c.code)
+                                      }
+                                    >
+                                      <FontAwesomeIcon icon={faCopy} />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className="danger icon-btn"
+                                      aria-label={`Delete ${c.name}`}
+                                      title="Delete"
+                                      onClick={() =>
+                                        void (async () => {
+                                          if (
+                                            !window.confirm(`Delete ${c.name}?`)
+                                          ) {
+                                            return;
+                                          }
+                                          try {
+                                            await deleteSavedCollectionEntry(c);
+                                          } catch (err) {
+                                            setError(String(err));
+                                          }
+                                        })()
+                                      }
+                                    >
+                                      <FontAwesomeIcon icon={faTrashCan} />
+                                    </button>
+                                  </div>
+                                </li>
+                              );
+                            })}
+                          </ul>
+                          {expanded && group.collections.length > visibleChildren.length && (
+                            <div className="list-load-more">
+                              <button
+                                type="button"
+                                className="linkish"
+                                onClick={() =>
+                                  setExpandedGroupLimits((prev) => ({
+                                    ...prev,
+                                    [group.key]: (prev[group.key] ?? 25) + 25,
+                                  }))
+                                }
+                              >
+                                Show more ({group.collections.length - visibleChildren.length} remaining)
+                              </button>
+                            </div>
+                          )}
+                        </Collapse>
+                      </li>
+                    );
+                  })}
+                  {savedCollectionGameGroups.length === 0 && (
+                    <li className="empty">
+                      No saved share codes yet. Share a loadout from a managed game.
+                    </li>
+                  )}
+                </ul>
+                </div>
+                ) : (
+                  <BrowseListSkeleton count={6} posters />
+                )}
+              </div>
+            )}
+            </ViewSwitch>
+          </section>
+          </ParkedTabGate>
+        </div>
+        ) : null}
+
+        {tab === "setup" ? (
+        <ViewSwitch viewKey={tab} className="view-slot">
+        {tab === "setup" && (
+          <section className="panel">
+            <h1>Setup</h1>
+            <p>
+              A Nexus API key and a Nexus website sign-in are both required before
+              the rest of the app opens. Use Stay signed in. The website session
+              is saved separately from the API key. Premium and free accounts
+              both need the sign-in. mod.io is optional.
+            </p>
+            <div className="status-card">
+              <span className={settings?.has_api_key ? "pill ok" : "pill warn"}>
+                {settings?.has_api_key ? "Nexus API key saved" : "Nexus API key required"}
+              </span>
+              <span
+                className={settings?.nexus_website_signed_in ? "pill ok" : "pill warn"}
+              >
+                {settings?.nexus_website_signed_in
+                  ? "Website sign-in saved"
+                  : "Website sign-in required"}
+              </span>
+            </div>
+            {accountConnections}
+            <div className="actions">
+              <button
+                type="button"
+                disabled={!canFinishSetup}
+                title={
+                  canFinishSetup
+                    ? undefined
+                    : "Save a Nexus API key and finish website sign-in first."
+                }
+                onClick={() => void finishSetup()}
+              >
+                Finish setup
+              </button>
+            </div>
+          </section>
+        )}
+        </ViewSwitch>
+        ) : null}
+
+        {browseKeptRef.current ? (
+        <div
+          className={
+            tab === "browse"
+              ? browseDetail == null
+                ? "tab-kept tab-kept-browse"
+                : "tab-kept"
+              : "tab-kept tab-parked"
+          }
+          inert={tab !== "browse"}
+          aria-hidden={tab !== "browse" ? true : undefined}
+        >
+          <ParkedTabGate active={tab === "browse"}>
           <ViewSwitch
+            onEntered={setBrowseViewSettled}
             viewKey={
               browseDetail
                 ? browseDetail.kind === "mod"
@@ -8829,6 +10410,9 @@ export default function App() {
                     </div>
 
                     {browseDetail.tab === "info" ? (
+                      modDetailLoading && !modDetail && !tsDetail && !modioDetail ? (
+                        <ModDetailSkeleton tab="info" />
+                      ) : (
                       <div className="detail-body">
                         {browseDetail.hit.source !== "thunderstore" &&
                           browseDetail.hit.source !== "modio" && (
@@ -8896,6 +10480,11 @@ export default function App() {
                           </>
                         ) : null}
                       </div>
+                      )
+                    ) : modFilesLoading &&
+                      modFiles.length === 0 &&
+                      modioFiles.length === 0 ? (
+                      <ModDetailSkeleton tab="files" />
                     ) : (
                       <div className="detail-body">
                         <h2>Files</h2>
@@ -9040,115 +10629,133 @@ export default function App() {
                     </div>
 
                     {browseDetail.tab === "info" ? (
-                      <div className="detail-body">
-                        <h2>About</h2>
-                        <RichText
-                          className="detail-description detail-description-html"
-                          text={
-                            collectionHitSource(browseDetail.hit) === "thunderstore"
-                              ? (tsDetail?.description ?? browseDetail.hit.summary)
-                              : (collectionDetail?.description ??
-                                collectionDetail?.summary ??
-                                browseDetail.hit.summary)
-                          }
-                        />
-                      </div>
+                      collectionDetailLoading && !collectionDetail && !tsDetail ? (
+                        <CollectionDetailSkeleton tab="info" />
+                      ) : (
+                        <div className="detail-body">
+                          <h2>About</h2>
+                          <RichText
+                            className="detail-description detail-description-html"
+                            text={
+                              collectionHitSource(browseDetail.hit) === "thunderstore"
+                                ? (tsDetail?.description ?? browseDetail.hit.summary)
+                                : (collectionDetail?.description ??
+                                  collectionDetail?.summary ??
+                                  browseDetail.hit.summary)
+                            }
+                          />
+                        </div>
+                      )
                     ) : collectionHitSource(browseDetail.hit) === "thunderstore" ? (
-                      <div className="detail-body">
-                        <h2>
-                          Included mods (
-                          {(tsDetail?.versions[0]?.dependencies.length ?? 0) + 1})
-                        </h2>
-                        <ul className="list">
-                          <li>
-                            <div>
-                              <strong>{browseDetail.hit.name}</strong>
-                              <small>modpack</small>
-                            </div>
-                          </li>
-                          {(tsDetail?.versions[0]?.dependencies ?? []).map((dep) => (
-                            <li key={dep}>
+                      collectionFilesLoading && !tsDetail ? (
+                        <CollectionDetailSkeleton tab="files" />
+                      ) : (
+                        <div className="detail-body">
+                          <h2>
+                            Included mods (
+                            {(tsDetail?.versions[0]?.dependencies.length ?? 0) + 1})
+                          </h2>
+                          <ul className="list">
+                            <li>
                               <div>
-                                <strong>{dep}</strong>
-                                <small>dependency</small>
+                                <strong>{browseDetail.hit.name}</strong>
+                                <small>modpack</small>
                               </div>
                             </li>
-                          ))}
-                        </ul>
-                      </div>
+                            {(tsDetail?.versions[0]?.dependencies ?? []).map((dep) => (
+                              <li key={dep}>
+                                <div>
+                                  <strong>{dep}</strong>
+                                  <small>dependency</small>
+                                </div>
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      )
+                    ) : collectionFilesLoading && groupedCollectionMods.length === 0 ? (
+                      <CollectionDetailSkeleton tab="files" />
                     ) : (
                       <div className="detail-body">
-                        {(() => {
-                          const groups = groupCollectionMods(collectionModFiles);
-                          return (
-                            <>
-                              <h2>
-                                Included mods ({groups.length})
-                                {collectionModFiles.length > 0 &&
-                                collectionModFiles.length !== groups.length
-                                  ? ` · ${collectionModFiles.length} files`
-                                  : ""}
-                              </h2>
-                              <ul className="list">
-                                {groups.map((group) => {
-                                  const primary = group.files[0];
-                                  const extras =
-                                    group.files.length > 1
-                                      ? ` · ${group.files.length} files`
-                                      : "";
-                                  return (
-                                    <li
-                                      key={group.mod_id}
-                                      className="list-row-clickable"
-                                      onClick={() =>
-                                        openMod(
-                                          {
-                                            source: "nexus",
-                                            id: `nexus:${group.domain_name}:${group.mod_id}`,
-                                            name: group.mod_name,
-                                            summary: null,
-                                            picture_url: null,
-                                            downloads: null,
-                                            endorsements: null,
-                                            author: null,
-                                            category: null,
-                                            tags: [],
-                                            mod_id: group.mod_id,
-                                            domain_name: group.domain_name,
-                                            community: null,
-                                            namespace: null,
-                                            package_name: null,
-                                            full_name: null,
-                                            package_url: null,
-                                            rating_score: null,
-                                            latest_version: null,
-                                            modio_game_id: null,
-                                            modio_mod_id: null,
-                                            profile_url: null,
-                                          },
-                                          "info",
-                                        )
-                                      }
-                                    >
-                                      <div>
-                                        <strong>{group.mod_name}</strong>
-                                        <small>
-                                          {primary.file_name}
-                                          {primary.version ? ` · v${primary.version}` : ""}
-                                          {primary.optional ? " · optional" : ""}
-                                          {extras}
-                                        </small>
-                                      </div>
-                                    </li>
-                                  );
-                                })}
-                                {collectionModFiles.length === 0 && (
-                                  <li className="empty">No mods found in this collection.</li>
-                                )}
-                              </ul>
-                            </>
-                          );
-                        })()}
+                        <h2>
+                          Included mods ({groupedCollectionMods.length})
+                          {collectionModFiles.length > 0 &&
+                          collectionModFiles.length !== groupedCollectionMods.length
+                            ? ` · ${collectionModFiles.length} files`
+                            : ""}
+                        </h2>
+                        {groupedCollectionMods.length === 0 ? (
+                          <ul className="list">
+                            <li className="empty">No mods found in this collection.</li>
+                          </ul>
+                        ) : (
+                          <BrowseVirtualList
+                            items={groupedCollectionMods}
+                            scrollRef={mainScrollRef}
+                            active={tab === "browse"}
+                            staggerEnter
+                            estimateSize={estimateListRowHeight(false)}
+                            getKey={(group) => `${group.domain_name}:${group.mod_id}`}
+                            rowClassName="list-row-clickable"
+                            renderItem={(group) => {
+                              const primary = group.files[0];
+                              const extras =
+                                group.files.length > 1
+                                  ? ` · ${group.files.length} files`
+                                  : "";
+                              const openGroupMod = () =>
+                                openMod(
+                                  {
+                                    source: "nexus",
+                                    id: `nexus:${group.domain_name}:${group.mod_id}`,
+                                    name: group.mod_name,
+                                    summary: null,
+                                    picture_url: null,
+                                    downloads: null,
+                                    endorsements: null,
+                                    author: null,
+                                    category: null,
+                                    tags: [],
+                                    mod_id: group.mod_id,
+                                    domain_name: group.domain_name,
+                                    community: null,
+                                    namespace: null,
+                                    package_name: null,
+                                    full_name: null,
+                                    package_url: null,
+                                    rating_score: null,
+                                    latest_version: null,
+                                    modio_game_id: null,
+                                    modio_mod_id: null,
+                                    profile_url: null,
+                                  },
+                                  "info",
+                                );
+                              return (
+                                <div
+                                  className="list-row-main"
+                                  role="button"
+                                  tabIndex={0}
+                                  onClick={openGroupMod}
+                                  onKeyDown={(e) => {
+                                    if (e.key === "Enter" || e.key === " ") {
+                                      e.preventDefault();
+                                      openGroupMod();
+                                    }
+                                  }}
+                                >
+                                  <strong>{group.mod_name}</strong>
+                                  <small>
+                                    {primary.file_name}
+                                    {primary.version ? ` · v${primary.version}` : ""}
+                                    {primary.optional ? " · optional" : ""}
+                                    {extras}
+                                  </small>
+                                </div>
+                              );
+                            }}
+                          />
+                        )}
                       </div>
                     )}
                   </>
@@ -9156,7 +10763,7 @@ export default function App() {
                 </ViewSwitch>
               </>
             ) : (
-              <div className="view-enter">
+              <>
                 <div className="browse-chrome">
                 <div className="panel-head">
                   <div className="detail-head-title">
@@ -9610,7 +11217,8 @@ export default function App() {
                               {orderedTags.length === 0 ? (
                                 <div className="tag-picker-empty">No tags</div>
                               ) : (
-                                orderedTags.map((t) => {
+                                <>
+                                {orderedTags.slice(0, tagsPageLimit).map((t) => {
                                   const state = browseTags[t];
                                   return (
                                     <button
@@ -9637,7 +11245,17 @@ export default function App() {
                                       <span>{t}</span>
                                     </button>
                                   );
-                                })
+                                })}
+                                {orderedTags.length > tagsPageLimit && (
+                                  <button
+                                    type="button"
+                                    className="tag-picker-item tag-picker-more"
+                                    onClick={() => setTagsPageLimit((n) => n + 60)}
+                                  >
+                                    Show more ({orderedTags.length - tagsPageLimit} remaining)
+                                  </button>
+                                )}
+                                </>
                               )}
                             </div>
                         </PopIn>
@@ -9683,138 +11301,28 @@ export default function App() {
                         </button>
                       </div>
                     ) : null}
-                    {browseResultsPending ? (
-                      <BrowseResultsSkeleton
-                        view={browseView}
-                        posters={browseListDensity === "posters"}
-                        count={browsePageCount}
-                        minCardPx={browseGridMin}
-                      />
-                    ) : (
-                    <>
+                    {showBrowseGrid ? (
+                    <div className="results-fill">
                     {browseMode === "mods" ? (
                       browseView === "grid" ? (
-                        <FadeIn key={modHits[0]?.id ?? `mods:${searchQuery}`}>
+                        <>
                           {modHits.length === 0 ? (
                             <p className="note">{browseResultsNote("mods")}</p>
                           ) : (
                             <BrowseVirtualGrid
                               items={modHits}
                               scrollRef={browseResultsRef}
-                              minCardPx={browseGridMin}
+                              active={tab === "browse"}
+                              staggerEnter
+                              minCardPx={deferredBrowseGridMin}
+                              fixedRowHeight
                               onPageSize={onBrowsePageSize}
-                              getKey={(m) => m.id}
-                              renderItem={(m) => {
-                                const meta = (
-                                  <>
-                                    <SourceMark source={m.source} />
-                                    {m.category ? ` · ${m.category}` : ""}
-                                  </>
-                                );
-                                return (
-                                  <MediaCard
-                                    plain
-                                    title={m.name}
-                                    imageSrc={mediaSrc(null, m.picture_url)}
-                                    badge={m.author ?? "Mod"}
-                                    overlay={
-                                      m.source === "nexus" && m.endorsements != null
-                                        ? `${m.endorsements.toLocaleString()} endorsements`
-                                        : m.downloads != null
-                                          ? `${m.downloads.toLocaleString()} downloads`
-                                          : null
-                                    }
-                                    meta={meta}
-                                    installed={installedIds.has(m.id)}
-                                    onClick={() => openMod(m, "info")}
-                                    coverActions={
-                                      m.source === "thunderstore" ? (
-                                        installedIds.has(m.id) ? (
-                                          <button
-                                            type="button"
-                                            className="danger"
-                                            onClick={(e) => {
-                                              e.stopPropagation();
-                                              void uninstallCatalogMod(m);
-                                            }}
-                                          >
-                                            Uninstall
-                                          </button>
-                                        ) : (
-                                          <button
-                                            onClick={(e) => {
-                                              e.stopPropagation();
-                                              openMod(m, "info");
-                                            }}
-                                          >
-                                            Install
-                                          </button>
-                                        )
-                                      ) : m.source === "nexus" ? (
-                                        <>
-                                          {installedIds.has(m.id) ? (
-                                            <button
-                                              type="button"
-                                              className="danger"
-                                              onClick={(e) => {
-                                                e.stopPropagation();
-                                                void uninstallCatalogMod(m);
-                                              }}
-                                            >
-                                              Uninstall
-                                            </button>
-                                          ) : (
-                                            <button
-                                              type="button"
-                                              onClick={(e) => {
-                                                e.stopPropagation();
-                                                void quickInstallMod(m);
-                                              }}
-                                            >
-                                              {isPremium ? "Install" : "Download Assist"}
-                                            </button>
-                                          )}
-                                          <button
-                                            type="button"
-                                            onClick={(e) => {
-                                              e.stopPropagation();
-                                              openMod(m, "files");
-                                            }}
-                                          >
-                                            Files
-                                          </button>
-                                        </>
-                                      ) : (
-                                        <>
-                                          {installedIds.has(m.id) ? (
-                                            <button
-                                              type="button"
-                                              className="danger"
-                                              onClick={(e) => {
-                                                e.stopPropagation();
-                                                void uninstallCatalogMod(m);
-                                              }}
-                                            >
-                                              Uninstall
-                                            </button>
-                                          ) : null}
-                                          <button
-                                            onClick={(e) => {
-                                              e.stopPropagation();
-                                              openMod(m, "files");
-                                            }}
-                                          >
-                                            Files
-                                          </button>
-                                        </>
-                                      )
-                                    }
-                                  />
-                                );
-                              }}
+                              getKey={getModHitKey}
+                              renderItem={renderBrowseModGridItem}
+                              renderSkeletonItem={renderBrowseGridSkeletonCard}
                             />
                           )}
-                        </FadeIn>
+                        </>
                       ) : modHits.length === 0 ? (
                         <ul className="list">
                           <li className="empty">{browseResultsNote("mods")}</li>
@@ -9822,6 +11330,8 @@ export default function App() {
                       ) : (
                         <BrowseVirtualList
                           items={modHits}
+                          active={tab === "browse"}
+                          staggerEnter
                           scrollRef={browseResultsRef}
                           onPageSize={onBrowsePageSize}
                           getKey={(m) => m.id}
@@ -9959,69 +11469,24 @@ export default function App() {
                         />
                       )
                     ) : browseView === "grid" ? (
-                      <FadeIn
-                        key={
-                          collectionHits[0]
-                            ? collectionHitKey(collectionHits[0])
-                            : `collections:${searchQuery}`
-                        }
-                      >
+                      <>
                         {collectionHits.length === 0 ? (
                           <p className="note">{browseResultsNote("collections")}</p>
                         ) : (
                           <BrowseVirtualGrid
                             items={collectionHits}
                             scrollRef={browseResultsRef}
-                            minCardPx={browseGridMin}
+                            active={tab === "browse"}
+                            staggerEnter
+                            minCardPx={deferredBrowseGridMin}
+                            fixedRowHeight
                             onPageSize={onBrowsePageSize}
                             getKey={collectionHitKey}
-                            renderItem={(c) => {
-                              const meta = (
-                                <>
-                                  <SourceMark source={collectionHitSource(c)} />
-                                  {c.mod_count != null
-                                    ? ` · ${c.mod_count.toLocaleString()} mods`
-                                    : ""}
-                                  {c.file_size != null && c.file_size > 0
-                                    ? ` · ${formatBytes(c.file_size)}`
-                                    : ""}
-                                </>
-                              );
-                              return (
-                                <MediaCard
-                                  plain
-                                  title={c.name}
-                                  imageSrc={mediaSrc(null, c.tile_image_url)}
-                                  badge={
-                                    collectionHitSource(c) === "thunderstore"
-                                      ? "Modpack"
-                                      : "Collection"
-                                  }
-                                  overlay={
-                                    c.endorsements != null
-                                      ? `${c.endorsements.toLocaleString()} endorsements`
-                                      : c.total_downloads != null
-                                        ? `${c.total_downloads.toLocaleString()} downloads`
-                                        : null
-                                  }
-                                  meta={meta}
-                                  onClick={() => openCollection(c, "info")}
-                                  coverActions={
-                                    <button
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        installCollection(c);
-                                      }}
-                                    >
-                                      Install
-                                    </button>
-                                  }
-                                />
-                              );
-                            }}
+                            renderItem={renderBrowseCollectionGridItem}
+                            renderSkeletonItem={renderBrowseGridSkeletonCard}
                           />
                         )}
-                      </FadeIn>
+                      </>
                     ) : collectionHits.length === 0 ? (
                       <ul className="list">
                         <li className="empty">{browseResultsNote("collections")}</li>
@@ -10030,6 +11495,8 @@ export default function App() {
                       <BrowseVirtualList
                         items={collectionHits}
                         scrollRef={browseResultsRef}
+                        active={tab === "browse"}
+                        staggerEnter
                         onPageSize={onBrowsePageSize}
                         getKey={collectionHitKey}
                         rowClassName={
@@ -10084,18 +11551,20 @@ export default function App() {
                         }}
                       />
                     )}
-                    <div
-                      ref={browseSentinelRef}
-                      className="browse-scroll-sentinel"
-                      aria-hidden="true"
-                    />
-                    {browseLoadingMore ? (
-                      <BrowseResultsSkeleton
-                        view={browseView}
-                        posters={browseListDensity === "posters"}
-                        rows={2}
-                        minCardPx={browseGridMin}
-                      />
+                    {browseHasMore ? (
+                      <div
+                        ref={setBrowseSentinel}
+                        className="browse-scroll-sentinel"
+                      >
+                        {tab === "browse" ? (
+                          <BrowseResultsSkeleton
+                            view={browseView}
+                            posters={browseListDensity === "posters"}
+                            rows={2}
+                            minCardPx={deferredBrowseGridMin}
+                          />
+                        ) : null}
+                      </div>
                     ) : null}
                     {(modHits.length > 0 || collectionHits.length > 0) && (
                       <p className="browse-page-status note">
@@ -10111,333 +11580,39 @@ export default function App() {
                         {browseHasMore ? " · scroll for more" : ""}
                       </p>
                     )}
-                    </>
-                    )}
+                    </div>
+                    ) : browseResultsVisible ? (
+                      <BrowseResultsSkeleton
+                        view={browseView}
+                        posters={browseListDensity === "posters"}
+                        count={browseSkeletonCount}
+                        minCardPx={browseGridMin}
+                      />
+                    ) : null}
                   </div>
                 ) : null}
-              </div>
+              </>
             )}
           </ViewSwitch>
-        )}
+          </ParkedTabGate>
+        </div>
+        ) : null}
 
-        {tab === "collections" && (
-          <section className="panel">
-            <ViewSwitch
-              viewKey={savedDetail ? `saved:${savedDetail.entry.id}` : "saved-list"}
-              initial={false}
-            >
-            {savedDetail ? (
-              <div>
-                <div className="panel-head">
-                  <button
-                    type="button"
-                    className="linkish"
-                    onClick={() => {
-                      setSavedDetail(null);
-                      setSavedRename("");
-                    }}
-                  >
-                    Home
-                  </button>
-                  <h1>{savedDetail.entry.name}</h1>
-                </div>
-                <div className="detail-body">
-                  <p className="note">
-                    {savedDetail.entry.mod_count} mods
-                    {savedDetail.entry.nexus_count
-                      ? ` · ${savedDetail.entry.nexus_count} Nexus`
-                      : ""}
-                    {savedDetail.entry.thunderstore_count
-                      ? ` · ${savedDetail.entry.thunderstore_count} Thunderstore`
-                      : ""}
-                    {savedDetail.entry.modio_count
-                      ? ` · ${savedDetail.entry.modio_count} mod.io`
-                      : ""}
-                    {formatCollectionGameVersions(savedDetail.entry.game_versions)
-                      ? ` · Built for ${formatCollectionGameVersions(savedDetail.entry.game_versions)}`
-                      : ""}
-                    {isSavedCollectionInstalled(savedDetail.entry) ? (
-                      <>
-                        {" "}
-                        <span className="pill ok">Installed</span>
-                      </>
-                    ) : null}
-                  </p>
-                  {showGameVersionWarnings &&
-                    savedCollectionAdvice[savedDetail.entry.id]?.status ===
-                      "mismatch" && (
-                      <p className="mod-version-warn">
-                        {savedCollectionAdvice[savedDetail.entry.id]?.message}
-                      </p>
-                    )}
-                  <label>
-                    Name
-                    <div className="row">
-                      <input
-                        value={savedRename}
-                        onChange={(e) => setSavedRename(e.target.value)}
-                      />
-                      <button
-                        type="button"
-                        onClick={() =>
-                          void (async () => {
-                            try {
-                              const updated = await api.renameSavedCollection(
-                                savedDetail.entry.id,
-                                savedRename,
-                              );
-                              setSavedDetail({ ...savedDetail, entry: updated });
-                              await refreshSavedCollections();
-                            } catch (e) {
-                              setError(String(e));
-                            }
-                          })()
-                        }
-                      >
-                        Rename
-                      </button>
-                    </div>
-                  </label>
-                  <label>
-                    Install into
-                    <select
-                      value={savedInstallGameId}
-                      onChange={(e) => setSavedInstallGameId(e.target.value)}
-                    >
-                      <option value="">Select managed game…</option>
-                      {managed.map((g) => (
-                        <option key={g.id} value={g.id}>
-                          {g.title}
-                          {savedCollectionMatchesGame(savedDetail.entry, g)
-                            ? " (match)"
-                            : ""}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <div className="actions" style={{ marginBottom: "1rem" }}>
-                    <button type="button" onClick={() => void installSavedCollection()}>
-                      Install
-                    </button>
-                    <button
-                      type="button"
-                      className="icon-btn"
-                      aria-label="Copy code"
-                      title="Copy code"
-                      onClick={() =>
-                        void navigator.clipboard.writeText(savedDetail.entry.code)
-                      }
-                    >
-                      <FontAwesomeIcon icon={faCopy} />
-                    </button>
-                    <button
-                      type="button"
-                      className="danger icon-btn"
-                      aria-label={`Delete ${savedDetail.entry.name}`}
-                      title="Delete"
-                      onClick={() =>
-                        void (async () => {
-                          if (!window.confirm(`Delete ${savedDetail.entry.name}?`)) {
-                            return;
-                          }
-                          try {
-                            await deleteSavedCollectionEntry(savedDetail.entry);
-                            setSavedDetail(null);
-                          } catch (e) {
-                            setError(String(e));
-                          }
-                        })()
-                      }
-                    >
-                      <FontAwesomeIcon icon={faTrashCan} />
-                    </button>
-                  </div>
-                  <h2>Contained mods</h2>
-                  <ShareModList mods={savedDetail.mods} scrollRef={mainScrollRef} />
-                  <h2>Code</h2>
-                  <textarea rows={4} readOnly value={savedDetail.entry.code} />
-                </div>
-              </div>
-            ) : (
-              <div>
-                <div className="panel-head">
-                  <h1>Saved Collections</h1>
-                  <div className="panel-head-actions">
-                    <button
-                      type="button"
-                      className="icon-btn"
-                      aria-label="Import collection"
-                      title="Import collection"
-                      onClick={() => {
-                        setError(null);
-                        setCollectionImportOpen(true);
-                      }}
-                    >
-                      <FontAwesomeIcon icon={faPlus} />
-                    </button>
-                  </div>
-                </div>
-                <p className="note">
-                  Local Emperor share codes grouped by game. Create one from Library →
-                  game → Mods → Share loadout, or import a code or file here.
-                </p>
-                <ul className="list collections-by-game">
-                  {savedCollectionGameGroups.map((group) => {
-                    const expanded = expandedCollectionGameKey === group.key;
-                    return (
-                      <li
-                        key={group.key}
-                        className="collections-game-row list-row-poster"
-                      >
-                        <div
-                          className="collections-game-header list-row-clickable"
-                          aria-expanded={expanded}
-                          onClick={() =>
-                            setExpandedCollectionGameKey(
-                              expanded ? null : group.key,
-                            )
-                          }
-                          onKeyDown={(e: ReactKeyboardEvent<HTMLDivElement>) => {
-                            if (e.key === "Enter" || e.key === " ") {
-                              e.preventDefault();
-                              setExpandedCollectionGameKey(
-                                expanded ? null : group.key,
-                              );
-                            }
-                          }}
-                          role="button"
-                          tabIndex={0}
-                        >
-                          <ListPoster src={posterSrc(group.coverPath)} />
-                          <div className="list-row-main">
-                            <strong>{group.title}</strong>
-                            <small>
-                              {group.collections.length} collection
-                              {group.collections.length === 1 ? "" : "s"}
-                              {group.managed ? " · managed" : " · not managed"}
-                            </small>
-                          </div>
-                        </div>
-                        <Collapse
-                          show={expanded}
-                          className="collections-game-expand"
-                        >
-                          <ul className="list collections-game-children">
-                            {group.collections.map((c) => {
-                              const builtFor = formatCollectionGameVersions(
-                                c.game_versions,
-                              );
-                              const advice = savedCollectionAdvice[c.id];
-                              const installed = isSavedCollectionInstalled(c);
-                              return (
-                                <li
-                                  key={c.id}
-                                  className="list-row-clickable"
-                                  onClick={() => void openSavedCollection(c.id)}
-                                >
-                                  <div className="list-row-main">
-                                    <strong>
-                                      {c.name}
-                                      {installed ? (
-                                        <span className="pill ok">Installed</span>
-                                      ) : null}
-                                    </strong>
-                                    <small>
-                                      {c.mod_count} mods
-                                      {builtFor ? ` · Built for ${builtFor}` : ""}
-                                      {` · ${new Date(c.created_at).toLocaleString()}`}
-                                    </small>
-                                    {showGameVersionWarnings &&
-                                      advice?.status === "mismatch" && (
-                                        <small className="mod-version-warn">
-                                          {advice.message}
-                                        </small>
-                                      )}
-                                  </div>
-                                  <div
-                                    className="actions"
-                                    onClick={(e) => e.stopPropagation()}
-                                  >
-                                    <button
-                                      type="button"
-                                      onClick={() =>
-                                        void (async () => {
-                                          if (group.managed) {
-                                            await runUnifiedImport(
-                                              group.managed.id,
-                                              c.code,
-                                              c.name,
-                                            );
-                                            await refreshCollectionsPageMeta();
-                                            return;
-                                          }
-                                          await openSavedCollection(c.id);
-                                        })()
-                                      }
-                                    >
-                                      Install
-                                    </button>
-                                    <button
-                                      type="button"
-                                      className="icon-btn"
-                                      aria-label={`Copy ${c.name}`}
-                                      title="Copy"
-                                      onClick={() =>
-                                        void navigator.clipboard.writeText(c.code)
-                                      }
-                                    >
-                                      <FontAwesomeIcon icon={faCopy} />
-                                    </button>
-                                    <button
-                                      type="button"
-                                      className="danger icon-btn"
-                                      aria-label={`Delete ${c.name}`}
-                                      title="Delete"
-                                      onClick={() =>
-                                        void (async () => {
-                                          if (
-                                            !window.confirm(`Delete ${c.name}?`)
-                                          ) {
-                                            return;
-                                          }
-                                          try {
-                                            await deleteSavedCollectionEntry(c);
-                                          } catch (err) {
-                                            setError(String(err));
-                                          }
-                                        })()
-                                      }
-                                    >
-                                      <FontAwesomeIcon icon={faTrashCan} />
-                                    </button>
-                                  </div>
-                                </li>
-                              );
-                            })}
-                          </ul>
-                        </Collapse>
-                      </li>
-                    );
-                  })}
-                  {savedCollectionGameGroups.length === 0 && (
-                    <li className="empty">
-                      No saved share codes yet. Share a loadout from a managed game.
-                    </li>
-                  )}
-                </ul>
-              </div>
-            )}
-            </ViewSwitch>
-          </section>
-        )}
-
-        {tab === "downloads" && (
+        {downloadsKeptRef.current ? (
+        <div
+          className={tab === "downloads" ? "tab-kept" : "tab-kept tab-parked"}
+          inert={tab !== "downloads"}
+          aria-hidden={tab !== "downloads" ? true : undefined}
+        >
+          <ParkedTabGate active={tab === "downloads"}>
           <DownloadsWorkspace
             downloads={downloads}
             queue={assistQueue}
             activeBatch={activeBatch}
             assistActive={assistActive}
             assistHint={assistHint}
+            active={tab === "downloads"}
+            loading={!downloadsReady}
             onRefresh={refreshDownloads}
             onSkip={() => skipAssistCurrent()}
             onCancel={() => cancelAssistQueue()}
@@ -10454,15 +11629,31 @@ export default function App() {
             onResumeDownload={(id) => resumeOneDownload(id)}
             onAssistHost={handleAssistHost}
           />
-        )}
+          </ParkedTabGate>
+        </div>
+        ) : null}
 
-        {tab === "tools" && (
+        {toolsKeptRef.current ? (
+        <div
+          className={tab === "tools" ? "tab-kept" : "tab-kept tab-parked"}
+          inert={tab !== "tools"}
+          aria-hidden={tab !== "tools" ? true : undefined}
+        >
+          <ParkedTabGate active={tab === "tools"}>
           <ToolsErrorBoundary>
-            <ToolsWorkspace />
+            <ToolsWorkspace active={tab === "tools"} />
           </ToolsErrorBoundary>
-        )}
+          </ParkedTabGate>
+        </div>
+        ) : null}
 
-        {tab === "settings" && (
+        {settingsKeptRef.current ? (
+        <div
+          className={tab === "settings" ? "tab-kept" : "tab-kept tab-parked"}
+          inert={tab !== "settings"}
+          aria-hidden={tab !== "settings" ? true : undefined}
+        >
+          <ParkedTabGate active={tab === "settings"}>
           <section className="panel">
             <h1>Settings</h1>
             <SettingsSection title="App updates" defaultOpen>
@@ -10812,8 +12003,8 @@ export default function App() {
               {accountConnections}
             </SettingsSection>
           </section>
-        )}
-        </ViewSwitch>
+          </ParkedTabGate>
+        </div>
         ) : null}
       </main>
       {loadDiagnosis && (
