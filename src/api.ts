@@ -105,6 +105,8 @@ export const api = {
     invoke<void>("set_recent_downloads_limit", { limit }),
   setBannerTimeouts: (timeouts: BannerTimeouts) =>
     invoke<void>("set_banner_timeouts", { timeouts }),
+  setBrowseGridSize: (size: number) =>
+    invoke<void>("set_browse_grid_size", { size }),
   scanModOrphans: () => invoke<OrphanScan>("scan_mod_orphans"),
   clearDownloadCache: () =>
     invoke<ClearDownloadCacheResult>("clear_download_cache"),

@@ -111,6 +111,7 @@ pub fn run() {
             commands::set_install_click_behavior,
             commands::set_recent_downloads_limit,
             commands::set_banner_timeouts,
+            commands::set_browse_grid_size,
             commands::set_active_game,
             commands::set_api_key,
             commands::validate_user,

@@ -230,6 +230,15 @@ type BrowseListDensity = "compact" | "posters";
 type DetailTab = "info" | "files";
 type BrowseTagMap = Record<string, TagFilterState>;
 
+const BROWSE_GRID_MIN_PX = 120;
+const BROWSE_GRID_MAX_PX = 280;
+const BROWSE_GRID_DEFAULT_PX = 160;
+
+function clampBrowseGridSize(size: number): number {
+  if (!Number.isFinite(size)) return BROWSE_GRID_DEFAULT_PX;
+  return Math.min(BROWSE_GRID_MAX_PX, Math.max(BROWSE_GRID_MIN_PX, Math.round(size)));
+}
+
 type SaveImportPrompt = {
   gameId: string;
   code: string;
@@ -2218,8 +2227,10 @@ export default function App() {
   const [browseMode, setBrowseMode] = useState<"mods" | "collections">("mods");
   const [sourceFilter, setSourceFilter] = useState<CatalogSourceFilter>("all");
   const [browseView, setBrowseView] = useState<ViewMode>("grid");
-  const [browseGridMin, setBrowseGridMin] = useState(160);
+  const [browseGridMin, setBrowseGridMin] = useState(BROWSE_GRID_DEFAULT_PX);
   const deferredBrowseGridMin = useDeferredValue(browseGridMin);
+  const browseGridSaveTimerRef = useRef<number | null>(null);
+  const browseGridPendingRef = useRef<number | null>(null);
   const [browseListDensity, setBrowseListDensity] =
     useState<BrowseListDensity>("posters");
   const [browseSort, setBrowseSort] = useState("endorsements");
@@ -2965,12 +2976,49 @@ export default function App() {
     setupCompleteRef.current = s.initial_setup_complete === true;
     setSettings(s);
     setActiveId(s.last_active_game_id);
+    if (
+      typeof s.browse_grid_size === "number" &&
+      browseGridPendingRef.current === null
+    ) {
+      setBrowseGridMin(clampBrowseGridSize(s.browse_grid_size));
+    }
     await applyAppearance(
       s.theme ?? "system",
       s.theme_style ?? "app",
       s.accent_color,
     );
     return s;
+  }, []);
+
+  const handleBrowseGridMinChange = useCallback((nextRaw: number) => {
+    const next = clampBrowseGridSize(nextRaw);
+    setBrowseGridMin(next);
+    browseGridPendingRef.current = next;
+    if (browseGridSaveTimerRef.current !== null) {
+      window.clearTimeout(browseGridSaveTimerRef.current);
+    }
+    browseGridSaveTimerRef.current = window.setTimeout(() => {
+      browseGridSaveTimerRef.current = null;
+      const pending = browseGridPendingRef.current;
+      browseGridPendingRef.current = null;
+      if (pending !== null) {
+        void api.setBrowseGridSize(pending).catch(() => {});
+      }
+    }, 250);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (browseGridSaveTimerRef.current !== null) {
+        window.clearTimeout(browseGridSaveTimerRef.current);
+        browseGridSaveTimerRef.current = null;
+      }
+      const pending = browseGridPendingRef.current;
+      browseGridPendingRef.current = null;
+      if (pending !== null) {
+        void api.setBrowseGridSize(pending).catch(() => {});
+      }
+    };
   }, []);
 
   const loadAppInfo = useCallback(async () => {
@@ -5570,10 +5618,11 @@ export default function App() {
   );
 
   const orderedTags = useMemo(() => {
-    const all =
+    const all = (
       browseMode === "mods"
         ? (browseMeta?.mod_tags ?? [])
-        : (browseMeta?.collection_tags ?? []);
+        : (browseMeta?.collection_tags ?? [])
+    ).filter((t) => t.trim().toLowerCase() !== "nsfw");
     const q = deferredTagQuery.trim().toLowerCase();
     const filtered = q ? all.filter((t) => t.toLowerCase().includes(q)) : all;
     return [...filtered].sort((a, b) => {
@@ -5932,6 +5981,26 @@ export default function App() {
       tagsExclude,
       offset: 0,
     });
+  }
+
+  const hideNsfw = settings?.adult_content === false;
+
+  async function toggleBrowseHideNsfw() {
+    const nextAdultContent = hideNsfw;
+    setSettings((prev) =>
+      prev ? { ...prev, adult_content: nextAdultContent } : prev,
+    );
+    try {
+      await api.setAdultContent(nextAdultContent);
+      await refreshSettings();
+      await runSearch(browseMode, searchQuery, {
+        ...browseOpts,
+        offset: 0,
+      });
+    } catch (err) {
+      await refreshSettings();
+      setError(String(err));
+    }
   }
 
   function clearBrowseFilters() {
@@ -11043,12 +11112,12 @@ export default function App() {
                         Size
                         <input
                           type="range"
-                          min={120}
-                          max={280}
+                          min={BROWSE_GRID_MIN_PX}
+                          max={BROWSE_GRID_MAX_PX}
                           step={10}
                           value={browseGridMin}
                           aria-label="Grid size"
-                          onChange={(e) => setBrowseGridMin(Number(e.target.value))}
+                          onChange={(e) => handleBrowseGridMinChange(Number(e.target.value))}
                         />
                       </label>
                     )}
@@ -11419,6 +11488,23 @@ export default function App() {
                             </div>
                         </PopIn>
                       </div>
+                      <button
+                        type="button"
+                        role="switch"
+                        aria-checked={hideNsfw}
+                        className="browse-nsfw-toggle"
+                        onClick={() => void toggleBrowseHideNsfw()}
+                        title={
+                          hideNsfw
+                            ? "NSFW content is hidden (click to show)"
+                            : "Showing NSFW content (click to hide)"
+                        }
+                      >
+                        <span className="browse-nsfw-track" aria-hidden="true">
+                          <span className="browse-nsfw-thumb" />
+                        </span>
+                        <span>Hide NSFW</span>
+                      </button>
                       <button
                         type="button"
                         className="filters-clear"

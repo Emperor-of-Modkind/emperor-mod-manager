@@ -853,6 +853,73 @@ ul.list.browse-virtual {
   margin-bottom: 0;
 }
 
+.browse-nsfw-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  height: 2.25rem;
+  box-sizing: border-box;
+  align-self: flex-end;
+  padding: 0 0.7rem 0 0.5rem;
+  border: 0;
+  border-radius: var(--shape-control);
+  background: var(--surface-control);
+  color: var(--ink);
+  font: inherit;
+  font-size: 0.85rem;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.browse-nsfw-toggle:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.browse-nsfw-toggle[aria-checked="true"] {
+  background: color-mix(in srgb, var(--accent) 14%, var(--surface-control));
+  color: var(--accent-ink, var(--accent));
+}
+
+button.browse-nsfw-toggle[aria-checked="true"]:hover:not(:disabled) {
+  background-color: color-mix(in srgb, var(--accent) 20%, var(--surface-control));
+  color: var(--accent-ink, var(--accent));
+}
+
+.browse-nsfw-track {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  width: 1.9rem;
+  height: 1.1rem;
+  border-radius: var(--shape-control);
+  background: color-mix(in srgb, var(--ink) 24%, transparent);
+  flex: 0 0 auto;
+  transition: background-color var(--motion-fast) var(--ease-out);
+}
+
+.browse-nsfw-toggle[aria-checked="true"] .browse-nsfw-track {
+  background: var(--accent);
+}
+
+.browse-nsfw-thumb {
+  width: 0.82rem;
+  height: 0.82rem;
+  border-radius: 999px;
+  background: var(--panel);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.22);
+  transform: translateX(0.14rem);
+  transition:
+    transform var(--motion-fast) var(--ease-out),
+    background-color var(--motion-fast) var(--ease-out);
+}
+
+.browse-nsfw-toggle[aria-checked="true"] .browse-nsfw-thumb {
+  transform: translateX(0.94rem);
+  background: var(--on-accent, #fff);
+}
+
 .filters .segment {
   align-self: flex-end;
 }
@@ -1890,8 +1957,8 @@ button.tag-picker-trigger[aria-expanded="true"]:not(.nav) {
   color: var(--ink);
 }
 
-button:active:not(:disabled):not(.nav):not(.linkish):not(.icon-btn):not(.mods-toolbar-icon-btn):not(.danger):not(.accent):not(.tag-picker-trigger):not(.accent-swatch):not(.mod-collection-chip):not(.detail-author-link):not(.detail-carousel-prev):not(.detail-carousel-next),
-button.active:not(:disabled):not(.nav):not(.linkish):not(.icon-btn):not(.mods-toolbar-icon-btn):not(.danger):not(.accent):not(.tag-picker-trigger):not(.accent-swatch):not(.mod-collection-chip) {
+button:active:not(:disabled):not(.nav):not(.linkish):not(.icon-btn):not(.mods-toolbar-icon-btn):not(.danger):not(.accent):not(.tag-picker-trigger):not(.browse-nsfw-toggle):not(.accent-swatch):not(.mod-collection-chip):not(.detail-author-link):not(.detail-carousel-prev):not(.detail-carousel-next),
+button.active:not(:disabled):not(.nav):not(.linkish):not(.icon-btn):not(.mods-toolbar-icon-btn):not(.danger):not(.accent):not(.tag-picker-trigger):not(.browse-nsfw-toggle):not(.accent-swatch):not(.mod-collection-chip) {
   background: var(--accent);
   color: var(--on-accent, #fff);
 }

@@ -431,13 +431,26 @@ impl P2pService {
             .await
             .context("bind iroh endpoint")?;
         let _ = self.endpoint.set(ep.clone());
+        let _ = tokio::time::timeout(Duration::from_secs(3), ep.online()).await;
         self.emit_changed();
+
+        // Kick off initial friend presence & collection sync, then keepalive every 25s.
+        let sync_svc = Arc::clone(&self);
+        tauri::async_runtime::spawn(async move {
+            let _ = sync_svc.refresh_all_friends().await;
+            let mut interval = tokio::time::interval(Duration::from_secs(25));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let _ = sync_svc.heartbeat_friends().await;
+            }
+        });
 
         while let Some(incoming) = ep.accept().await {
             let svc = Arc::clone(&self);
             tauri::async_runtime::spawn(async move {
                 if let Err(e) = svc.handle_incoming(incoming).await {
-                    log::debug!("P2P incoming stream error: {e:#}");
+                    log::debug!("P2P incoming connection error: {e:#}");
                 }
             });
         }
@@ -452,97 +465,120 @@ impl P2pService {
         }
     }
 
-    async fn handle_incoming(&self, incoming: Incoming) -> Result<()> {
+    async fn handle_incoming(self: &Arc<Self>, incoming: Incoming) -> Result<()> {
         let conn = incoming.await?;
         let remote_id = conn.remote_id().to_string();
-        let (mut send, mut recv) = conn.accept_bi().await?;
-        let req: P2pRequest = read_frame(&mut recv).await?;
 
-        let Some(ep) = self.endpoint.get() else {
-            write_frame(&mut send, &P2pResponse::Denied("Endpoint not ready".into())).await?;
-            return Ok(());
-        };
-        let local_addr = ep.addr();
+        while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+            let req: P2pRequest = match read_frame(&mut recv).await {
+                Ok(r) => r,
+                Err(_) => break,
+            };
 
-        match req {
-            P2pRequest::Hello { display_name, addr } => {
-                let (accepted, local_name) = {
-                    let mut store = self.store.lock().map_err(|e| anyhow!("{e}"))?;
-                    let local_name = store.display_name.clone();
-                    if let Some(friend) = store.friends.iter_mut().find(|f| f.peer_id == remote_id)
-                    {
-                        friend.status = FriendStatus::Connected;
-                        friend.display_name = display_name;
-                        friend.addr = addr;
-                        friend.online = true;
-                        friend.last_seen_at = Some(now_rfc3339());
-                        (true, local_name)
-                    } else {
-                        if let Some(existing) = store
-                            .pending_requests
-                            .iter_mut()
-                            .find(|r| r.peer_id == remote_id)
+            let Some(ep) = self.endpoint.get() else {
+                let _ = write_frame(&mut send, &P2pResponse::Denied("Endpoint not ready".into())).await;
+                break;
+            };
+            let local_addr = ep.addr();
+
+            match req {
+                P2pRequest::Hello { display_name, addr } => {
+                    let (accepted, needs_profile_pull, local_name) = {
+                        let mut store = self.store.lock().map_err(|e| anyhow!("{e}"))?;
+                        let local_name = store.display_name.clone();
+                        if let Some(friend) = store.friends.iter_mut().find(|f| f.peer_id == remote_id)
                         {
-                            existing.display_name = display_name;
-                            existing.addr = addr;
+                            let was_pending = friend.status == FriendStatus::PendingOutgoing;
+                            let missing_profile = friend.cached_profile.is_none();
+                            friend.status = FriendStatus::Connected;
+                            friend.display_name = display_name;
+                            friend.addr = addr;
+                            friend.online = true;
+                            friend.last_seen_at = Some(now_rfc3339());
+                            (true, was_pending || missing_profile, local_name)
                         } else {
-                            store.pending_requests.push(PendingFriendRequest {
-                                peer_id: remote_id,
-                                display_name,
-                                addr,
-                                received_at: now_rfc3339(),
-                            });
+                            if let Some(existing) = store
+                                .pending_requests
+                                .iter_mut()
+                                .find(|r| r.peer_id == remote_id)
+                            {
+                                existing.display_name = display_name;
+                                existing.addr = addr;
+                            } else {
+                                store.pending_requests.push(PendingFriendRequest {
+                                    peer_id: remote_id.clone(),
+                                    display_name,
+                                    addr,
+                                    received_at: now_rfc3339(),
+                                });
+                            }
+                            (false, false, local_name)
                         }
-                        (false, local_name)
+                    };
+                    if let Ok(store) = self.store.lock() {
+                        let _ = save_friends_store(&self.paths, &store);
                     }
-                };
-                if let Ok(store) = self.store.lock() {
-                    let _ = save_friends_store(&self.paths, &store);
+                    self.emit_changed();
+                    write_frame(
+                        &mut send,
+                        &P2pResponse::HelloAck {
+                            accepted,
+                            display_name: local_name,
+                            addr: local_addr,
+                        },
+                    )
+                    .await?;
+
+                    if accepted && needs_profile_pull {
+                        let svc = Arc::clone(self);
+                        let pid = remote_id.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let _ = svc.sync_peer_profile_only(&pid).await;
+                        });
+                    }
                 }
-                self.emit_changed();
-                write_frame(
-                    &mut send,
-                    &P2pResponse::HelloAck {
-                        accepted,
-                        display_name: local_name,
-                        addr: local_addr,
-                    },
-                )
-                .await?;
-            }
-            P2pRequest::GetProfile { known_hashes } => {
-                let snapshot = {
-                    let mut store = self.store.lock().map_err(|e| anyhow!("{e}"))?;
-                    let is_friend = store
-                        .friends
-                        .iter()
-                        .any(|f| f.peer_id == remote_id && f.status == FriendStatus::Connected);
-                    if !is_friend {
-                        None
-                    } else {
-                        if let Some(f) = store.friends.iter_mut().find(|f| f.peer_id == remote_id) {
-                            f.online = true;
-                            f.last_seen_at = Some(now_rfc3339());
+                P2pRequest::GetProfile { known_hashes } => {
+                    let (snapshot, status_flipped) = {
+                        let mut store = self.store.lock().map_err(|e| anyhow!("{e}"))?;
+                        let is_friend = store
+                            .friends
+                            .iter()
+                            .any(|f| f.peer_id == remote_id && f.status == FriendStatus::Connected);
+                        if !is_friend {
+                            (None, false)
+                        } else {
+                            let mut flipped = false;
+                            if let Some(f) = store.friends.iter_mut().find(|f| f.peer_id == remote_id) {
+                                if !f.online {
+                                    flipped = true;
+                                }
+                                f.online = true;
+                                f.last_seen_at = Some(now_rfc3339());
+                            }
+                            let local_id = ep.id().to_string();
+                            let profile = build_local_profile(
+                                &self.paths,
+                                &local_id,
+                                &store,
+                                Some(&known_hashes),
+                            );
+                            (Some(profile), flipped)
                         }
-                        let local_id = ep.id().to_string();
-                        Some(build_local_profile(
-                            &self.paths,
-                            &local_id,
-                            &store,
-                            Some(&known_hashes),
-                        ))
+                    };
+                    if status_flipped {
+                        self.emit_changed();
                     }
-                };
-                match snapshot {
-                    Some(profile) => {
-                        write_frame(&mut send, &P2pResponse::Profile(profile)).await?;
-                    }
-                    None => {
-                        write_frame(
-                            &mut send,
-                            &P2pResponse::Denied("Not connected as friends".into()),
-                        )
-                        .await?;
+                    match snapshot {
+                        Some(profile) => {
+                            write_frame(&mut send, &P2pResponse::Profile(profile)).await?;
+                        }
+                        None => {
+                            write_frame(
+                                &mut send,
+                                &P2pResponse::Denied("Not connected as friends".into()),
+                            )
+                            .await?;
+                        }
                     }
                 }
             }
@@ -702,84 +738,99 @@ impl P2pService {
         self.get_state()
     }
 
-    async fn dial_and_sync_peer(&self, peer_id: &str) -> Result<()> {
+    async fn heartbeat_friends(&self) -> Result<()> {
+        let peers: Vec<(String, FriendStatus)> = {
+            let store = self.store.lock().map_err(|e| anyhow!("{e}"))?;
+            store
+                .friends
+                .iter()
+                .map(|f| (f.peer_id.clone(), f.status))
+                .collect()
+        };
+        for (pid, status) in peers {
+            match status {
+                FriendStatus::Connected => {
+                    let _ = self.sync_peer_profile_only(&pid).await;
+                }
+                FriendStatus::PendingOutgoing => {
+                    let _ = self.dial_and_sync_peer(&pid).await;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn connect_peer(ep: &Endpoint, addr: &EndpointAddr) -> Result<iroh::endpoint::Connection> {
+        match tokio::time::timeout(DIAL_TIMEOUT, ep.connect(addr.clone(), P2P_ALPN)).await {
+            Ok(Ok(conn)) => Ok(conn),
+            _ => {
+                // Fallback to n0/pkarr discovery with just EndpointId if cached socket addrs are stale.
+                let conn = tokio::time::timeout(
+                    DIAL_TIMEOUT,
+                    ep.connect(EndpointAddr::new(addr.id), P2P_ALPN),
+                )
+                .await
+                .map_err(|_| anyhow!("connect timed out"))??;
+                Ok(conn)
+            }
+        }
+    }
+
+    fn peer_context(&self, peer_id: &str) -> Result<Option<(EndpointAddr, String, HashMap<String, String>)>> {
+        let store = self.store.lock().map_err(|e| anyhow!("{e}"))?;
+        let Some(friend) = store.friends.iter().find(|f| f.peer_id == peer_id) else {
+            return Ok(None);
+        };
+        let mut hashes = HashMap::new();
+        if let Some(profile) = &friend.cached_profile {
+            for c in &profile.collections {
+                hashes.insert(c.id.clone(), c.share_hash.clone());
+            }
+        }
+        Ok(Some((
+            friend.addr.clone(),
+            store.display_name.clone(),
+            hashes,
+        )))
+    }
+
+    fn apply_fetched_profile(&self, peer_id: &str, mut profile: PeerProfileSummary) -> Result<()> {
+        let mut store = self.store.lock().map_err(|e| anyhow!("{e}"))?;
+        if let Some(f) = store.friends.iter_mut().find(|f| f.peer_id == peer_id) {
+            // Rehydrate unchanged share_code strings from cache.
+            if let Some(prev) = &f.cached_profile {
+                let prev_codes: HashMap<&str, &str> = prev
+                    .collections
+                    .iter()
+                    .map(|c| (c.id.as_str(), c.share_code.as_str()))
+                    .collect();
+                for col in &mut profile.collections {
+                    if col.share_code.is_empty() {
+                        if let Some(cached_code) = prev_codes.get(col.id.as_str()) {
+                            col.share_code = (*cached_code).to_string();
+                        }
+                    }
+                }
+            }
+            f.display_name = profile.display_name.clone();
+            f.cached_profile = Some(profile);
+            f.online = true;
+            f.last_seen_at = Some(now_rfc3339());
+        }
+        let _ = save_friends_store(&self.paths, &store);
+        Ok(())
+    }
+
+    async fn sync_peer_profile_only(&self, peer_id: &str) -> Result<()> {
         let Some(ep) = self.endpoint.get() else {
             return Ok(());
         };
-        let (addr, local_name, local_addr, known_hashes) = {
-            let store = self.store.lock().map_err(|e| anyhow!("{e}"))?;
-            let Some(friend) = store.friends.iter().find(|f| f.peer_id == peer_id) else {
-                return Ok(());
-            };
-            let mut hashes = HashMap::new();
-            if let Some(profile) = &friend.cached_profile {
-                for c in &profile.collections {
-                    hashes.insert(c.id.clone(), c.share_hash.clone());
-                }
-            }
-            (
-                friend.addr.clone(),
-                store.display_name.clone(),
-                ep.addr(),
-                hashes,
-            )
-        };
-
-        // 1. Send Hello so mutual state & addresses stay fresh.
-        let hello_res = tokio::time::timeout(DIAL_TIMEOUT, async {
-            let conn = ep.connect(addr.clone(), P2P_ALPN).await?;
-            let (mut send, mut recv) = conn.open_bi().await?;
-            write_frame(
-                &mut send,
-                &P2pRequest::Hello {
-                    display_name: local_name,
-                    addr: local_addr,
-                },
-            )
-            .await?;
-            let resp: P2pResponse = read_frame(&mut recv).await?;
-            Ok::<_, anyhow::Error>(resp)
-        })
-        .await;
-
-        let accepted = match hello_res {
-            Ok(Ok(P2pResponse::HelloAck {
-                accepted,
-                display_name,
-                addr: remote_addr,
-            })) => {
-                let mut store = self.store.lock().map_err(|e| anyhow!("{e}"))?;
-                if let Some(f) = store.friends.iter_mut().find(|f| f.peer_id == peer_id) {
-                    f.online = true;
-                    f.last_seen_at = Some(now_rfc3339());
-                    f.display_name = display_name;
-                    f.addr = remote_addr;
-                    if accepted {
-                        f.status = FriendStatus::Connected;
-                    }
-                }
-                let _ = save_friends_store(&self.paths, &store);
-                accepted
-            }
-            _ => {
-                let mut store = self.store.lock().map_err(|e| anyhow!("{e}"))?;
-                if let Some(f) = store.friends.iter_mut().find(|f| f.peer_id == peer_id) {
-                    f.online = false;
-                }
-                let _ = save_friends_store(&self.paths, &store);
-                self.emit_changed();
-                return Ok(());
-            }
-        };
-
-        if !accepted {
-            self.emit_changed();
+        let Some((addr, _, known_hashes)) = self.peer_context(peer_id)? else {
             return Ok(());
-        }
+        };
 
-        // 2. Fetch live share codes (with hash delta optimization).
         let profile_res = tokio::time::timeout(DIAL_TIMEOUT, async {
-            let conn = ep.connect(addr, P2P_ALPN).await?;
+            let conn = Self::connect_peer(ep, &addr).await?;
             let (mut send, mut recv) = conn.open_bi().await?;
             write_frame(&mut send, &P2pRequest::GetProfile { known_hashes }).await?;
             let resp: P2pResponse = read_frame(&mut recv).await?;
@@ -787,30 +838,98 @@ impl P2pService {
         })
         .await;
 
-        if let Ok(Ok(P2pResponse::Profile(mut profile))) = profile_res {
-            let mut store = self.store.lock().map_err(|e| anyhow!("{e}"))?;
-            if let Some(f) = store.friends.iter_mut().find(|f| f.peer_id == peer_id) {
-                // Rehydrate unchanged share_code strings from cache.
-                if let Some(prev) = &f.cached_profile {
-                    let prev_codes: HashMap<&str, &str> = prev
-                        .collections
-                        .iter()
-                        .map(|c| (c.id.as_str(), c.share_code.as_str()))
-                        .collect();
-                    for col in &mut profile.collections {
-                        if col.share_code.is_empty() {
-                            if let Some(cached_code) = prev_codes.get(col.id.as_str()) {
-                                col.share_code = (*cached_code).to_string();
-                            }
+        match profile_res {
+            Ok(Ok(P2pResponse::Profile(profile))) => {
+                self.apply_fetched_profile(peer_id, profile)?;
+            }
+            Ok(Ok(P2pResponse::Denied(_))) => {
+                // Remote peer hasn't accepted or removed us; keep online state accurate.
+            }
+            _ => {
+                let mut store = self.store.lock().map_err(|e| anyhow!("{e}"))?;
+                if let Some(f) = store.friends.iter_mut().find(|f| f.peer_id == peer_id) {
+                    f.online = false;
+                }
+                let _ = save_friends_store(&self.paths, &store);
+            }
+        }
+        self.emit_changed();
+        Ok(())
+    }
+
+    async fn dial_and_sync_peer(&self, peer_id: &str) -> Result<()> {
+        let Some(ep) = self.endpoint.get() else {
+            return Ok(());
+        };
+        let Some((addr, local_name, known_hashes)) = self.peer_context(peer_id)? else {
+            return Ok(());
+        };
+        let local_addr = ep.addr();
+
+        // Single connection: stream 1 = Hello, stream 2 = GetProfile (if accepted).
+        let session_res = tokio::time::timeout(DIAL_TIMEOUT, async {
+            let conn = Self::connect_peer(ep, &addr).await?;
+            let (mut send1, mut recv1) = conn.open_bi().await?;
+            write_frame(
+                &mut send1,
+                &P2pRequest::Hello {
+                    display_name: local_name,
+                    addr: local_addr,
+                },
+            )
+            .await?;
+            let hello_resp: P2pResponse = read_frame(&mut recv1).await?;
+
+            let accepted = match &hello_resp {
+                P2pResponse::HelloAck { accepted, .. } => *accepted,
+                _ => false,
+            };
+
+            let profile_resp = if accepted {
+                let (mut send2, mut recv2) = conn.open_bi().await?;
+                write_frame(&mut send2, &P2pRequest::GetProfile { known_hashes }).await?;
+                Some(read_frame::<P2pResponse>(&mut recv2).await?)
+            } else {
+                None
+            };
+
+            Ok::<_, anyhow::Error>((hello_resp, profile_resp))
+        })
+        .await;
+
+        match session_res {
+            Ok(Ok((
+                P2pResponse::HelloAck {
+                    accepted,
+                    display_name,
+                    addr: remote_addr,
+                },
+                profile_resp,
+            ))) => {
+                {
+                    let mut store = self.store.lock().map_err(|e| anyhow!("{e}"))?;
+                    if let Some(f) = store.friends.iter_mut().find(|f| f.peer_id == peer_id) {
+                        f.online = true;
+                        f.last_seen_at = Some(now_rfc3339());
+                        f.display_name = display_name;
+                        f.addr = remote_addr;
+                        if accepted {
+                            f.status = FriendStatus::Connected;
                         }
                     }
+                    let _ = save_friends_store(&self.paths, &store);
                 }
-                f.display_name = profile.display_name.clone();
-                f.cached_profile = Some(profile);
-                f.online = true;
-                f.last_seen_at = Some(now_rfc3339());
+                if let Some(P2pResponse::Profile(profile)) = profile_resp {
+                    self.apply_fetched_profile(peer_id, profile)?;
+                }
             }
-            let _ = save_friends_store(&self.paths, &store);
+            _ => {
+                let mut store = self.store.lock().map_err(|e| anyhow!("{e}"))?;
+                if let Some(f) = store.friends.iter_mut().find(|f| f.peer_id == peer_id) {
+                    f.online = false;
+                }
+                let _ = save_friends_store(&self.paths, &store);
+            }
         }
 
         self.emit_changed();
@@ -930,5 +1049,132 @@ mod tests {
                 .share_code,
             "#emperor1test"
         );
+    }
+
+    #[tokio::test]
+    async fn two_endpoints_mutual_accept_syncs_both_profiles() {
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+        let paths_a = Paths {
+            config_dir: dir_a.path().join("cfg"),
+            data_dir: dir_a.path().join("data"),
+            cache_dir: dir_a.path().join("cache"),
+        };
+        let paths_b = Paths {
+            config_dir: dir_b.path().join("cfg"),
+            data_dir: dir_b.path().join("data"),
+            cache_dir: dir_b.path().join("cache"),
+        };
+        fs::create_dir_all(&paths_a.data_dir).unwrap();
+        fs::create_dir_all(&paths_b.data_dir).unwrap();
+
+        // Give Peer A a saved collection so it has 1 collection to share.
+        let sample_manifest = crate::share::ShareManifest {
+            v: 1,
+            name: Some("Alice Pack".into()),
+            game: crate::share::ShareGameHint {
+                id: Some("skyrim".into()),
+                plugin_id: Some("skyrim".into()),
+                nexus_domain: Some("skyrimspecialedition".into()),
+                thunderstore_community: None,
+                modio_game_id: None,
+                title: Some("Skyrim SE".into()),
+                project_name: None,
+            },
+            game_versions: None,
+            mods: vec![crate::share::ShareModEntry {
+                s: crate::share::ShareModSource::Nexus,
+                domain: Some("skyrimspecialedition".into()),
+                mod_id: Some(10),
+                file_id: Some(20),
+                community: None,
+                namespace: None,
+                name: None,
+                game_id: None,
+                display_name: Some("SkyUI".into()),
+                version: Some("5.2".into()),
+                fomod: None,
+                options: None,
+            }],
+        };
+        let code_a = crate::share::encode_share_manifest(&sample_manifest).unwrap();
+        let entry_a = crate::share::entry_from_code(&code_a, Some("Alice Pack".into()), None).unwrap();
+        crate::share::add_saved_collection(&paths_a, entry_a).unwrap();
+
+        let svc_a = P2pService::new(paths_a);
+        let svc_b = P2pService::new(paths_b);
+        svc_a.set_display_name("Alice".into()).unwrap();
+        svc_b.set_display_name("Bob".into()).unwrap();
+
+        let ep_a = Endpoint::builder(presets::N0DisableRelay)
+            .alpns(vec![P2P_ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let ep_b = Endpoint::builder(presets::N0DisableRelay)
+            .alpns(vec![P2P_ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+
+        let _ = svc_a.endpoint.set(ep_a.clone());
+        let _ = svc_b.endpoint.set(ep_b.clone());
+
+        let accept_a = {
+            let svc = Arc::clone(&svc_a);
+            let ep = ep_a.clone();
+            tokio::spawn(async move {
+                while let Some(inc) = ep.accept().await {
+                    let s = Arc::clone(&svc);
+                    tokio::spawn(async move {
+                        let _ = s.handle_incoming(inc).await;
+                    });
+                }
+            })
+        };
+        let accept_b = {
+            let svc = Arc::clone(&svc_b);
+            let ep = ep_b.clone();
+            tokio::spawn(async move {
+                while let Some(inc) = ep.accept().await {
+                    let s = Arc::clone(&svc);
+                    tokio::spawn(async move {
+                        let _ = s.handle_incoming(inc).await;
+                    });
+                }
+            })
+        };
+
+        let join_a = svc_a.get_state().unwrap().join_code.unwrap();
+        let state_b1 = svc_b.add_friend_by_code(join_a).await.unwrap();
+        assert_eq!(state_b1.friends.len(), 1);
+        assert_eq!(state_b1.friends[0].status, FriendStatus::PendingOutgoing);
+
+        // Alice should have a pending request from Bob.
+        let state_a1 = svc_a.get_state().unwrap();
+        assert_eq!(state_a1.pending_requests.len(), 1);
+        let bob_id = state_a1.pending_requests[0].peer_id.clone();
+
+        // Alice accepts Bob.
+        let state_a2 = svc_a.respond_friend_request(bob_id, true).await.unwrap();
+        assert_eq!(state_a2.friends.len(), 1);
+        assert_eq!(state_a2.friends[0].status, FriendStatus::Connected);
+        assert!(state_a2.friends[0].online);
+
+        // Bob should now be Connected, online, AND have Alice's 1 collection cached (via reverse sync).
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let state_b2 = svc_b.get_state().unwrap();
+        assert_eq!(state_b2.friends[0].status, FriendStatus::Connected);
+        assert!(state_b2.friends[0].online);
+        let alice_cols = &state_b2.friends[0]
+            .cached_profile
+            .as_ref()
+            .expect("Bob should have Alice's cached profile")
+            .collections;
+        assert_eq!(alice_cols.len(), 1);
+        assert_eq!(alice_cols[0].name, "Alice Pack");
+
+        accept_a.abort();
+        accept_b.abort();
     }
 }

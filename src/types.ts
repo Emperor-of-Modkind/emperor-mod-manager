@@ -1058,6 +1058,7 @@ export type Settings = {
   linux_system_backend?: LinuxSystemBackend;
   install_click_behavior?: InstallClickBehavior;
   recent_downloads_limit?: number;
+  browse_grid_size?: number;
   banner_timeouts?: BannerTimeouts;
   has_api_key: boolean;
   has_modio_api_key?: boolean;

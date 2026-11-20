@@ -128,6 +128,9 @@ pub struct AppConfig {
     /// Auto-dismiss timeouts (seconds) for status banners; `0` means never.
     #[serde(default)]
     pub banner_timeouts: BannerTimeouts,
+    /// Last used minimum card width (px) for the Browse grid.
+    #[serde(default = "default_browse_grid_size")]
+    pub browse_grid_size: u32,
     /// Set after the first import of managed games from legacy nexus-manager config.
     #[serde(default)]
     pub legacy_games_merged: bool,
@@ -202,6 +205,18 @@ pub fn clamp_recent_downloads_limit(limit: u32) -> u32 {
     limit.clamp(MIN_RECENT_DOWNLOADS_LIMIT, MAX_RECENT_DOWNLOADS_LIMIT)
 }
 
+pub const MIN_BROWSE_GRID_SIZE: u32 = 120;
+pub const MAX_BROWSE_GRID_SIZE: u32 = 280;
+pub const DEFAULT_BROWSE_GRID_SIZE: u32 = 160;
+
+fn default_browse_grid_size() -> u32 {
+    DEFAULT_BROWSE_GRID_SIZE
+}
+
+pub fn clamp_browse_grid_size(size: u32) -> u32 {
+    size.clamp(MIN_BROWSE_GRID_SIZE, MAX_BROWSE_GRID_SIZE)
+}
+
 pub const MAX_BANNER_TIMEOUT_SECONDS: u32 = 86_400;
 
 /// Per-color auto-dismiss timeouts in seconds (`0` means never auto-dismiss).
@@ -264,6 +279,7 @@ impl Default for AppConfig {
             install_click_behavior: InstallClickBehavior::Downloads,
             recent_downloads_limit: default_recent_downloads_limit(),
             banner_timeouts: BannerTimeouts::default(),
+            browse_grid_size: default_browse_grid_size(),
             legacy_games_merged: false,
             tools: ToolsConfig::default(),
             initial_setup_complete: None,
@@ -586,5 +602,20 @@ mod tests {
         let raw = toml::to_string_pretty(&custom).unwrap();
         let reloaded: AppConfig = toml::from_str(&raw).unwrap();
         assert_eq!(reloaded.banner_timeouts, custom.banner_timeouts);
+    }
+
+    #[test]
+    fn browse_grid_size_defaults_and_clamps() {
+        let cfg: AppConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.browse_grid_size, DEFAULT_BROWSE_GRID_SIZE);
+        assert_eq!(clamp_browse_grid_size(40), MIN_BROWSE_GRID_SIZE);
+        assert_eq!(clamp_browse_grid_size(500), MAX_BROWSE_GRID_SIZE);
+        assert_eq!(clamp_browse_grid_size(220), 220);
+
+        let mut custom = cfg;
+        custom.browse_grid_size = clamp_browse_grid_size(240);
+        let raw = toml::to_string_pretty(&custom).unwrap();
+        let reloaded: AppConfig = toml::from_str(&raw).unwrap();
+        assert_eq!(reloaded.browse_grid_size, 240);
     }
 }

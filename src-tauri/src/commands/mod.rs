@@ -2064,6 +2064,7 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<serde_json::Value, Str
         "linux_system_backend": cfg.linux_system_backend,
         "install_click_behavior": cfg.install_click_behavior,
         "recent_downloads_limit": config::clamp_recent_downloads_limit(cfg.recent_downloads_limit),
+        "browse_grid_size": config::clamp_browse_grid_size(cfg.browse_grid_size),
         "banner_timeouts": {
             "info": (banner_timeouts.info > 0).then_some(banner_timeouts.info),
             "warn": (banner_timeouts.warn > 0).then_some(banner_timeouts.warn),
@@ -2246,6 +2247,14 @@ pub fn set_banner_timeouts(
     });
     let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
     cfg.banner_timeouts = next;
+    config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn set_browse_grid_size(state: State<'_, AppState>, size: u32) -> Result<(), String> {
+    let size = config::clamp_browse_grid_size(size);
+    let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
+    cfg.browse_grid_size = size;
     config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())
 }
 
