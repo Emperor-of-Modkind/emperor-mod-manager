@@ -9,6 +9,7 @@ use regex::Regex;
 use walkdir::WalkDir;
 
 /// Scan install directory for Windows executables (Proton games).
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 pub fn detect_executables(install_path: &str, max: usize) -> Vec<String> {
     let root = Path::new(install_path);
     if !root.is_dir() {
@@ -104,6 +105,7 @@ fn parse_appmanifest_appid(acf_path: &Path) -> Option<String> {
     None
 }
 
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 pub fn profile_name_for_game(game_id: &str) -> String {
     format!("emm-{game_id}")
 }

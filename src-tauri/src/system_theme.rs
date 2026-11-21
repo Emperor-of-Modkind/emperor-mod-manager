@@ -409,6 +409,7 @@ fn gnome_named_accent() -> Option<(u8, u8, u8)> {
     parse_rgb_triple(hex)
 }
 
+#[cfg(any(target_os = "linux", test))]
 type ColorIniMap = std::collections::HashMap<String, std::collections::HashMap<String, String>>;
 
 #[cfg(any(target_os = "linux", test))]

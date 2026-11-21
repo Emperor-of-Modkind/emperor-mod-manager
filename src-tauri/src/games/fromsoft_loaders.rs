@@ -55,14 +55,21 @@ fn legacy_nexus_source(plugin_id: &str) -> Option<(&'static str, u64)> {
 pub fn is_fromsoft_plugin(plugin_id: &str) -> bool {
     matches!(
         plugin_id,
-        "eldenring" | "darksouls3" | "darksouls2" | "darksoulsremastered" | "darksouls"
+        "eldenring"
+            | "eldenringnightreign"
+            | "armoredcore6firesofrubicon"
+            | "sekiro"
+            | "darksouls3"
+            | "darksouls2"
+            | "darksoulsremastered"
+            | "darksouls"
     )
 }
 
 fn is_legacy_plugin(plugin_id: &str) -> bool {
     matches!(
         plugin_id,
-        "darksouls" | "darksoulsremastered" | "darksouls2"
+        "darksouls" | "darksoulsremastered" | "darksouls2" | "sekiro"
     )
 }
 
@@ -469,6 +476,8 @@ fn me3_on_path() -> bool {
 fn me2_game_type(plugin_id: &str) -> &'static str {
     match plugin_id {
         "darksouls3" => "ds3",
+        "armoredcore6firesofrubicon" => "ac6",
+        "eldenringnightreign" => "nr",
         _ => "er",
     }
 }

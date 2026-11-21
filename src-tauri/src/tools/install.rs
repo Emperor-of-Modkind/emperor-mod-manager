@@ -94,6 +94,7 @@ pub fn normalize_install_root(install_dir: &Path) -> Result<PathBuf> {
     Ok(install_dir.to_path_buf())
 }
 
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 pub fn register_install(
     manifest_path: &Path,
     tool_key: &str,
@@ -116,6 +117,7 @@ pub fn register_install(
 }
 
 /// Copy example conf if missing after install.
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 pub fn ensure_default_config(install_dir: &Path, tool_key: &str) -> Result<()> {
     let conf = install_dir.join("conf.toml");
     if conf.exists() {

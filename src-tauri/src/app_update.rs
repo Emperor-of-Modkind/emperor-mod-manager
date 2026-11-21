@@ -15,7 +15,9 @@ use crate::config::APP_VERSION;
 use crate::github_release::{self, GhRelease, UpdateChannel};
 
 const APP_REPO: &str = "LewisTansley/emperor-mod-manager";
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 const ARCH_PKGNAME: &str = "emperor-mod-manager-bin";
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 const REPO_URL: &str = "https://github.com/LewisTansley/emperor-mod-manager";
 const PROGRESS_EVENT: &str = "app-update-progress";
 
@@ -29,6 +31,7 @@ pub struct AppUpdateStatus {
     pub install_via: Option<UpdateChannel>,
 }
 
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 #[derive(Debug, Clone)]
 struct InstallProbe {
     appimage_env: Option<String>,
@@ -40,6 +43,7 @@ struct InstallProbe {
 
 /// Classify the running install. AppImage wins, then the package that owns the
 /// binary, then a copy the user can overwrite themselves.
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 fn classify_install(probe: &InstallProbe) -> Option<UpdateChannel> {
     let appimage_env = probe.appimage_env.as_ref().is_some_and(|s| !s.is_empty());
     let appimage_file = probe
@@ -228,6 +232,7 @@ fn query_dpkg_owner(exe: &Path) -> Option<String> {
 
 /// Refuse a PKGBUILD that is not this app's release package. `makepkg` still
 /// verifies the tarball checksum published in the release asset.
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 fn validate_pkgbuild(text: &str) -> Result<(), String> {
     let pkgname_ok = text.lines().any(|line| {
         matches!(
@@ -578,6 +583,7 @@ async fn apply_portable(app: &AppHandle, tarball: &Path) -> Result<AppInstallRes
 }
 
 /// Pull `emperor-mod-manager` out of `emperor-mod-manager-<version>-x86_64.tar.gz`.
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 fn extract_release_binary(archive_path: &Path, dest: &Path) -> Result<(), String> {
     let file = std::fs::File::open(archive_path).map_err(|e| e.to_string())?;
     let decoder = flate2::read::GzDecoder::new(file);

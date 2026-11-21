@@ -11,7 +11,11 @@ mod heroic_art;
 pub mod reconcile;
 mod steam_shortcuts;
 
-pub(crate) use catalog_art::{catalog_cover_url, is_deferred_icon_path};
+pub(crate) use catalog_art::{
+    apply_cached_catalog_covers, catalog_cover_url, is_deferred_icon_path, modio_cache_key,
+    nexus_cache_key, now_unix_secs, write_cached_image, CacheLookup, CachedCatalogCover,
+    CatalogCoverCache, MAX_CATALOG_COVER_BYTES,
+};
 
 #[cfg(target_os = "linux")]
 mod linux;

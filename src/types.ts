@@ -229,6 +229,7 @@ export type CatalogCoverRequest = {
 export type CatalogCoverHit = {
   id: string;
   cover_url: string;
+  cover_path?: string | null;
   title?: string | null;
 };
 
@@ -1173,6 +1174,7 @@ export type Settings = {
   has_modio_api_key?: boolean;
   initial_setup_complete: boolean;
   nexus_website_signed_in: boolean;
+  modio_website_signed_in?: boolean;
   user: NexusUser | null;
   config_dir: string;
   data_dir: string;

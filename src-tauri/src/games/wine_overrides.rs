@@ -5,6 +5,8 @@
 //! such as `BepInEx/plugins` are skipped so a normal mod DLL is not treated as a
 //! Wine proxy.
 
+#![cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;

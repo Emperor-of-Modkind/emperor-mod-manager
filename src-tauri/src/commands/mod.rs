@@ -1140,7 +1140,9 @@ pub async fn scan_games(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Vec<DetectedGame>, String> {
-    let games = blocking(|| Ok(detection::scan_games())).await?;
+    let covers_dir = state.paths.cache_dir.join("covers");
+    let mut games = blocking(|| Ok(detection::scan_games())).await?;
+    detection::apply_cached_catalog_covers(&mut games, &covers_dir);
     *state
         .detected_games
         .lock()
@@ -1223,13 +1225,54 @@ pub struct CatalogCoverHit {
     id: String,
     cover_url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    cover_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     title: Option<String>,
+}
+
+enum PosterFetch {
+    Ok(Vec<u8>),
+    Missing,
+    TransientError,
+}
+
+async fn download_catalog_poster(http: &reqwest::Client, url: &str) -> PosterFetch {
+    let Ok(resp) = http
+        .get(url)
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+    else {
+        return PosterFetch::TransientError;
+    };
+    let status = resp.status();
+    if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::GONE {
+        return PosterFetch::Missing;
+    }
+    if !status.is_success() {
+        return PosterFetch::TransientError;
+    }
+    if resp
+        .content_length()
+        .is_some_and(|len| len > detection::MAX_CATALOG_COVER_BYTES as u64)
+    {
+        return PosterFetch::TransientError;
+    }
+    let Ok(bytes) = resp.bytes().await else {
+        return PosterFetch::TransientError;
+    };
+    if bytes.is_empty() || bytes.len() > detection::MAX_CATALOG_COVER_BYTES {
+        return PosterFetch::TransientError;
+    }
+    PosterFetch::Ok(bytes.to_vec())
 }
 
 /// Fill posters from Nexus, then mod.io, for games that still have no local cover.
 /// Only ids already stored on the game are used — titles are not fuzzy-matched.
+/// Resolved posters are cached on disk under `cache_dir/covers/` across scans and restarts.
 #[tauri::command]
 pub async fn resolve_catalog_covers(
+    app: AppHandle,
     state: State<'_, AppState>,
     requests: Vec<CatalogCoverRequest>,
 ) -> Result<Vec<CatalogCoverHit>, String> {
@@ -1237,92 +1280,250 @@ pub async fn resolve_catalog_covers(
         return Ok(Vec::new());
     }
 
-    let mut nexus_ids = HashMap::new();
-    let mut nexus_titles = HashMap::new();
-    if requests.iter().any(|request| {
-        request
-            .nexus_domain
-            .as_deref()
-            .is_some_and(|domain| !domain.trim().is_empty())
-    }) {
-        for game in load_nexus_games_cached(&state).await? {
-            if game.id > 0 {
-                let key = game.domain_name.to_ascii_lowercase();
-                nexus_ids.insert(key.clone(), game.id);
-                let name = game.name.trim();
-                if !name.is_empty() {
-                    nexus_titles.insert(key, name.to_string());
+    let covers_dir = state.paths.cache_dir.join("covers");
+    let mut cache = detection::CatalogCoverCache::load(&covers_dir);
+    let now = detection::now_unix_secs();
+
+    let mut hits = Vec::new();
+    let mut misses = Vec::new();
+    for request in &requests {
+        match cache.lookup(request.nexus_domain.as_deref(), request.modio_game_id, now) {
+            detection::CacheLookup::Hit(entry) => {
+                if let Some(cover_path) = entry.cover_path {
+                    let cover_url = entry.cover_url.unwrap_or_default();
+                    hits.push(CatalogCoverHit {
+                        id: request.id.clone(),
+                        cover_url,
+                        cover_path: Some(cover_path),
+                        title: entry.title,
+                    });
+                }
+            }
+            detection::CacheLookup::Negative => {}
+            detection::CacheLookup::Miss => misses.push(request),
+        }
+    }
+
+    if !misses.is_empty() {
+        let mut nexus_ids = HashMap::new();
+        let mut nexus_titles = HashMap::new();
+        if misses.iter().any(|request| {
+            request
+                .nexus_domain
+                .as_deref()
+                .is_some_and(|domain| !domain.trim().is_empty())
+        }) {
+            for game in load_nexus_games_cached(&state).await? {
+                if game.id > 0 {
+                    let key = game.domain_name.to_ascii_lowercase();
+                    nexus_ids.insert(key.clone(), game.id);
+                    let name = game.name.trim();
+                    if !name.is_empty() {
+                        nexus_titles.insert(key, name.to_string());
+                    }
                 }
             }
         }
-    }
 
-    let mut modio_ids = Vec::new();
-    for request in &requests {
-        if detection::catalog_cover_url(request.nexus_domain.as_deref(), &nexus_ids, None).is_none()
-        {
-            if let Some(id) = request.modio_game_id.filter(|id| *id > 0) {
-                modio_ids.push(id);
+        let mut modio_ids = Vec::new();
+        for request in &misses {
+            if detection::catalog_cover_url(request.nexus_domain.as_deref(), &nexus_ids, None)
+                .is_none()
+            {
+                if let Some(id) = request.modio_game_id.filter(|id| *id > 0) {
+                    modio_ids.push(id);
+                }
             }
         }
+        modio_ids.sort_unstable();
+        modio_ids.dedup();
+        let logos = modio_game_logos(&state, &modio_ids).await;
+
+        struct ResolvedMiss<'a> {
+            request: &'a CatalogCoverRequest,
+            cache_key: String,
+            url: String,
+            title: Option<String>,
+        }
+
+        let mut resolved_misses = Vec::new();
+        let mut unique_downloads: HashMap<String, (String, Option<String>)> = HashMap::new();
+        for request in misses {
+            let modio_hit = request.modio_game_id.and_then(|id| logos.get(&id));
+            let logo = modio_hit.map(|hit| hit.url.as_str());
+            let Some(url) =
+                detection::catalog_cover_url(request.nexus_domain.as_deref(), &nexus_ids, logo)
+            else {
+                continue;
+            };
+            let nexus_key = request
+                .nexus_domain
+                .as_deref()
+                .map(|d| d.trim().to_ascii_lowercase())
+                .filter(|d| nexus_ids.contains_key(d));
+            let cache_key = if let Some(ref d) = nexus_key {
+                detection::nexus_cache_key(d).unwrap_or_default()
+            } else if let Some(id) = request.modio_game_id.filter(|id| *id > 0) {
+                detection::modio_cache_key(id).unwrap_or_default()
+            } else {
+                continue;
+            };
+            let title = nexus_key
+                .and_then(|d| nexus_titles.get(&d).cloned())
+                .or_else(|| {
+                    modio_hit
+                        .map(|hit| hit.name.trim().to_string())
+                        .filter(|name| !name.is_empty())
+                });
+            unique_downloads
+                .entry(cache_key.clone())
+                .or_insert_with(|| (url.clone(), title.clone()));
+            resolved_misses.push(ResolvedMiss {
+                request,
+                cache_key,
+                url,
+                title,
+            });
+        }
+
+        use futures_util::stream::{self, StreamExt};
+        let http = state.cdn_http.clone();
+        let fetched: Vec<(String, String, Option<String>, PosterFetch)> =
+            stream::iter(unique_downloads.into_iter().map(
+                |(cache_key, (url, title))| {
+                    let http = http.clone();
+                    async move {
+                        let res = download_catalog_poster(&http, &url).await;
+                        (cache_key, url, title, res)
+                    }
+                },
+            ))
+            .buffer_unordered(6)
+            .collect()
+            .await;
+
+        let mut cached_paths: HashMap<String, Option<String>> = HashMap::new();
+        let mut cache_dirty = false;
+        for (cache_key, url, title, res) in fetched {
+            match res {
+                PosterFetch::Ok(bytes) => {
+                    match detection::write_cached_image(&covers_dir, &cache_key, &url, &bytes) {
+                        Ok(path) => {
+                            cache.insert(
+                                cache_key.clone(),
+                                detection::CachedCatalogCover {
+                                    cover_path: Some(path.clone()),
+                                    cover_url: Some(url),
+                                    title,
+                                    fetched_at: now,
+                                    missing: false,
+                                },
+                            );
+                            cache_dirty = true;
+                            cached_paths.insert(cache_key, Some(path));
+                        }
+                        Err(e) => {
+                            log::warn!("failed to write cached catalog poster {cache_key}: {e}");
+                            cached_paths.insert(cache_key, None);
+                        }
+                    }
+                }
+                PosterFetch::Missing => {
+                    cache.insert(
+                        cache_key.clone(),
+                        detection::CachedCatalogCover {
+                            cover_path: None,
+                            cover_url: None,
+                            title: None,
+                            fetched_at: now,
+                            missing: true,
+                        },
+                    );
+                    cache_dirty = true;
+                    cached_paths.insert(cache_key, None);
+                }
+                PosterFetch::TransientError => {
+                    cached_paths.insert(cache_key, None);
+                }
+            }
+        }
+        if cache_dirty {
+            if let Err(e) = cache.save(&covers_dir) {
+                log::warn!("failed to save catalog cover index: {e}");
+            }
+        }
+
+        for miss in resolved_misses {
+            let Some(cover_path) = cached_paths.get(&miss.cache_key).cloned() else {
+                continue;
+            };
+            // Skip negative-cached 404/410 responses (not present in cached_paths as Some, and
+            // recorded as missing in cache). Transient errors still fall back to cover_url.
+            let is_missing = matches!(
+                cache.lookup(miss.request.nexus_domain.as_deref(), miss.request.modio_game_id, now),
+                detection::CacheLookup::Negative
+            );
+            if is_missing {
+                continue;
+            }
+            hits.push(CatalogCoverHit {
+                id: miss.request.id.clone(),
+                cover_url: miss.url,
+                cover_path,
+                title: miss.title,
+            });
+        }
     }
-    modio_ids.sort_unstable();
-    modio_ids.dedup();
-    let logos = modio_game_logos(&state, &modio_ids).await;
 
     let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
     let mut changed = false;
-    let mut hits = Vec::new();
-    for request in &requests {
-        let modio_hit = request.modio_game_id.and_then(|id| logos.get(&id));
-        let logo = modio_hit.map(|hit| hit.url.as_str());
-        let Some(url) =
-            detection::catalog_cover_url(request.nexus_domain.as_deref(), &nexus_ids, logo)
+    for hit in &hits {
+        let Some(game) = cfg
+            .managed_games
+            .iter_mut()
+            .find(|game| game.id == hit.id)
         else {
             continue;
         };
-        let nexus_title = request
-            .nexus_domain
-            .as_deref()
-            .map(|d| d.trim().to_ascii_lowercase())
-            .filter(|d| nexus_ids.contains_key(d))
-            .and_then(|d| nexus_titles.get(&d).cloned());
-        let title = nexus_title.or_else(|| {
-            modio_hit
-                .map(|hit| hit.name.trim().to_string())
-                .filter(|name| !name.is_empty())
+        let icon_path = requests
+            .iter()
+            .find(|req| req.id == hit.id)
+            .and_then(|req| req.icon_path.as_deref());
+        let replaceable = game.cover_path.as_deref().is_some_and(|path| {
+            icon_path == Some(path)
+                || detection::is_deferred_icon_path(path)
+                || !Path::new(path).is_file()
         });
-        if let Some(game) = cfg
-            .managed_games
-            .iter_mut()
-            .find(|game| game.id == request.id)
-        {
-            let replaceable = game.cover_path.as_deref().is_some_and(|path| {
-                request.icon_path.as_deref() == Some(path)
-                    || detection::is_deferred_icon_path(path)
-                    || !Path::new(path).is_file()
-            });
-            if game.cover_path.is_some() && !replaceable {
-                continue;
+        if game.cover_path.is_some() && !replaceable {
+            continue;
+        }
+        if let Some(ref local_path) = hit.cover_path {
+            if game.cover_path.as_deref() != Some(local_path.as_str()) {
+                game.cover_path = Some(local_path.clone());
+                changed = true;
             }
+            if game.cover_url.is_some() {
+                game.cover_url = None;
+                changed = true;
+            }
+        } else {
             if replaceable {
                 game.cover_path = None;
                 changed = true;
             }
-            if game.cover_url.as_deref() != Some(url.as_str()) {
-                game.cover_url = Some(url.clone());
+            if game.cover_url.as_deref() != Some(hit.cover_url.as_str()) {
+                game.cover_url = Some(hit.cover_url.clone());
                 changed = true;
             }
         }
-        hits.push(CatalogCoverHit {
-            id: request.id.clone(),
-            cover_url: url,
-            title,
-        });
     }
     if changed {
         config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())?;
     }
+    allow_cover_files(
+        &app,
+        hits.iter().filter_map(|hit| hit.cover_path.as_deref()),
+    );
     Ok(hits)
 }
 
@@ -2420,6 +2621,7 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<serde_json::Value, Str
         "has_modio_api_key": has_modio_api_key,
         "initial_setup_complete": initial_setup_complete,
         "nexus_website_signed_in": cfg.nexus_website_signed_in,
+        "modio_website_signed_in": cfg.modio_website_signed_in,
         "user": user,
         "config_dir": state.paths.config_dir,
         "data_dir": state.paths.data_dir,
@@ -7063,6 +7265,7 @@ pub async fn list_mods(
 
 struct PreparedWineOverrides {
     advice: Option<games::WineOverrideAdvice>,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     app_id: Option<String>,
 }
 
@@ -10122,6 +10325,9 @@ pub struct LaunchPreview {
 }
 
 fn build_launch_preview(state: &AppState, game: &ManagedGame) -> LaunchPreview {
+    #[cfg(not(target_os = "linux"))]
+    let _ = state;
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
     let mut auto_env_vars: Vec<config::LaunchEnvVar> = Vec::new();
 
     #[cfg(target_os = "linux")]

@@ -77,6 +77,7 @@ async fn fetch_all_releases(repo: &str) -> Result<Option<GhRelease>> {
     Ok(releases.into_iter().next())
 }
 
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 pub fn pick_linux_asset<'a>(release: &'a GhRelease, tool: &str) -> Option<&'a GhAsset> {
     let patterns: &[&str] = match tool {
         "lsfg_vk" => &[
@@ -103,9 +104,13 @@ pub fn pick_linux_asset<'a>(release: &'a GhRelease, tool: &str) -> Option<&'a Gh
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum UpdateChannel {
+    #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
     Pacman,
+    #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
     Deb,
+    #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
     Appimage,
+    #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
     Portable,
     #[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
     Nsis,

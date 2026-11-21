@@ -80,6 +80,7 @@ where
 }
 
 /// First install path for each cleaned title.
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 pub fn installs_by_title(games: &[ShortcutInstall]) -> HashMap<String, PathBuf> {
     let mut map = HashMap::new();
     for game in games {

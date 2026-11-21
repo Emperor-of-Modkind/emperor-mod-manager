@@ -87,10 +87,12 @@ impl LsfgVkConfig {
         Ok(())
     }
 
+    #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
     pub fn remove_profile(&mut self, name: &str) {
         self.profiles.retain(|p| p.name != name);
     }
 
+    #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
     pub fn default_profile(&self) -> LsfgVkProfile {
         self.profiles.first().cloned().unwrap_or_default()
     }

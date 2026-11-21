@@ -12,6 +12,36 @@ pub const MHW_ROOT_DIRS: &[&str] = &["nativepc", "nativePC", "reframework"];
 const ROOT_DLLS: &[&str] = &["dinput8.dll", "openvr_api.dll", "openxr_loader.dll"];
 
 pub struct MonsterHunterWorldPlugin;
+pub struct DragonsDogmaDarkArisenPlugin;
+
+impl GamePlugin for DragonsDogmaDarkArisenPlugin {
+    fn info(&self) -> GamePluginInfo {
+        GamePluginInfo {
+            id: "dragonsdogma",
+            display_name: "Dragon's Dogma: Dark Arisen",
+            nexus_domain: "dragonsdogma",
+            match_names: &[
+                "dragon's dogma dark arisen",
+                "dragons dogma dark arisen",
+                "dragon's dogma",
+                "dragons dogma",
+                "dragonsdogma",
+            ],
+        }
+    }
+
+    fn prefers_mod_folder(&self) -> bool {
+        false
+    }
+
+    fn preserve_staging_root_names(&self) -> &[&str] {
+        MHW_ROOT_DIRS
+    }
+
+    fn resolve_deploy_root(&self, install_path: &Path, relative: &Path) -> Result<PathBuf> {
+        Ok(resolve_mhw_deploy(install_path, relative))
+    }
+}
 
 impl GamePlugin for MonsterHunterWorldPlugin {
     fn info(&self) -> GamePluginInfo {

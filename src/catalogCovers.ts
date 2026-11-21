@@ -46,31 +46,52 @@ function firstModioId(
   return null;
 }
 
+export type ResolvedCatalogCover =
+  | string
+  | {
+      coverPath?: string | null;
+      coverUrl?: string | null;
+    };
+
 /** Re-apply resolved catalog posters onto detected games that still lack a real local cover. */
 export function applyCatalogCovers(
   games: DetectedGame[],
-  resolvedUrls: ReadonlyMap<string, string>,
+  resolved: ReadonlyMap<string, ResolvedCatalogCover>,
 ): DetectedGame[] {
-  if (resolvedUrls.size === 0) return games;
+  if (resolved.size === 0) return games;
   let changed = false;
   const next = games.map((game) => {
-    const url = resolvedUrls.get(game.id);
-    if (!url) return game;
+    const entry = resolved.get(game.id);
+    if (!entry) return game;
     if (!needsCatalogPoster(game.cover_path, game.cover_url, game.icon_path)) {
       return game;
     }
+    const resolvedPath = typeof entry === "string" ? null : entry.coverPath ?? null;
+    const resolvedUrl = typeof entry === "string" ? entry : entry.coverUrl ?? null;
+    if (resolvedPath) {
+      if (game.cover_path === resolvedPath && (game.cover_url ?? null) === null) {
+        return game;
+      }
+      changed = true;
+      return {
+        ...game,
+        cover_path: resolvedPath,
+        cover_url: null,
+      };
+    }
+    if (!resolvedUrl) return game;
     const dropLocal =
       !game.cover_path ||
       game.cover_path === game.icon_path ||
       isDeferredIconPath(game.cover_path);
     const cover_path = dropLocal ? null : game.cover_path ?? null;
-    if (game.cover_url === url && (game.cover_path ?? null) === cover_path) {
+    if (game.cover_url === resolvedUrl && (game.cover_path ?? null) === cover_path) {
       return game;
     }
     changed = true;
     return {
       ...game,
-      cover_url: url,
+      cover_url: resolvedUrl,
       cover_path,
     };
   });
@@ -182,8 +203,9 @@ export function mergeCollectionCatalogCovers(
     const groupKey = hit.id.startsWith(COLLECTION_COVER_PREFIX)
       ? hit.id.slice(COLLECTION_COVER_PREFIX.length)
       : hit.id;
-    if (next[groupKey] !== hit.cover_url) {
-      next[groupKey] = hit.cover_url;
+    const cover = hit.cover_path || hit.cover_url;
+    if (cover && next[groupKey] !== cover) {
+      next[groupKey] = cover;
       changed = true;
     }
   }

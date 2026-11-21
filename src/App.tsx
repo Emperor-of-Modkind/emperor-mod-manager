@@ -19,6 +19,7 @@ import {
   faBars,
   faCaretDown,
   faCopy,
+  faDownload,
   faEye,
   faEyeSlash,
   faFileImport,
@@ -185,6 +186,7 @@ import {
   collectionCatalogCoverRequests,
   mergeCollectionCatalogCovers,
   mergeCollectionCatalogTitles,
+  type ResolvedCatalogCover,
 } from "./catalogCovers";
 import { nexusModUnavailable, nexusUnavailableNotice } from "./nexusAvailability";
 import type {
@@ -1406,88 +1408,82 @@ const BrowseModGridCard = memo(function BrowseModGridCard({
     return m.downloads != null ? `${m.downloads.toLocaleString()} downloads` : null;
   }, [m.downloads, m.endorsements, m.source, sort]);
   const coverActions = useMemo(() => {
+    const viewButton = (
+      <button
+        type="button"
+        aria-label="View mod"
+        title="View mod"
+        onClick={(e) => {
+          e.stopPropagation();
+          onOpen(m, "info");
+        }}
+      >
+        <FontAwesomeIcon icon={faEye} aria-hidden="true" />
+      </button>
+    );
+    const uninstallButton = (
+      <button
+        type="button"
+        className="danger"
+        aria-label="Uninstall"
+        title="Uninstall"
+        onClick={(e) => {
+          e.stopPropagation();
+          onUninstall(m);
+        }}
+      >
+        <FontAwesomeIcon icon={faTrashCan} aria-hidden="true" />
+      </button>
+    );
     if (m.source === "thunderstore") {
       return installed ? (
-        <button
-          type="button"
-          className="danger"
-          onClick={(e) => {
-            e.stopPropagation();
-            onUninstall(m);
-          }}
-        >
-          Uninstall
-        </button>
+        <>
+          {viewButton}
+          {uninstallButton}
+        </>
       ) : (
         <button
+          type="button"
+          className="media-cover-action-primary"
+          aria-label="Install"
+          title="Install"
           onClick={(e) => {
             e.stopPropagation();
             onOpen(m, "info");
           }}
         >
-          Install
+          <FontAwesomeIcon icon={faDownload} aria-hidden="true" />
         </button>
       );
     }
     if (m.source === "nexus") {
+      const installLabel = isPremium ? "Install" : "Download Assist";
       return (
         <>
+          {viewButton}
           {installed ? (
-            <button
-              type="button"
-              className="danger"
-              onClick={(e) => {
-                e.stopPropagation();
-                onUninstall(m);
-              }}
-            >
-              Uninstall
-            </button>
+            uninstallButton
           ) : (
             <button
               type="button"
+              className="media-cover-action-primary"
+              aria-label={installLabel}
+              title={installLabel}
               onClick={(e) => {
                 e.stopPropagation();
                 onQuickInstall(m);
               }}
             >
-              {isPremium ? "Install" : "Download Assist"}
+              <FontAwesomeIcon icon={faDownload} aria-hidden="true" />
             </button>
           )}
-          <button
-            type="button"
-            onClick={(e) => {
-              e.stopPropagation();
-              onOpen(m, "files");
-            }}
-          >
-            Files
-          </button>
         </>
       );
     }
     return (
       <>
-        {installed ? (
-          <button
-            type="button"
-            className="danger"
-            onClick={(e) => {
-              e.stopPropagation();
-              onUninstall(m);
-            }}
-          >
-            Uninstall
-          </button>
-        ) : null}
-        <button
-          onClick={(e) => {
-            e.stopPropagation();
-            onOpen(m, "files");
-          }}
-        >
-          Files
-        </button>
+        {viewButton}
+        {installed ? uninstallButton : null}
       </>
     );
   }, [installed, isPremium, m, onOpen, onQuickInstall, onUninstall]);
@@ -1541,16 +1537,33 @@ const BrowseCollectionGridCard = memo(function BrowseCollectionGridCard({
   );
   const coverActions = useMemo(
     () => (
-      <button
-        onClick={(e) => {
-          e.stopPropagation();
-          onInstall(c);
-        }}
-      >
-        Install
-      </button>
+      <>
+        <button
+          type="button"
+          aria-label="View collection"
+          title="View collection"
+          onClick={(e) => {
+            e.stopPropagation();
+            onOpen(c, "info");
+          }}
+        >
+          <FontAwesomeIcon icon={faEye} aria-hidden="true" />
+        </button>
+        <button
+          type="button"
+          className="media-cover-action-primary"
+          aria-label="Install"
+          title="Install"
+          onClick={(e) => {
+            e.stopPropagation();
+            onInstall(c);
+          }}
+        >
+          <FontAwesomeIcon icon={faDownload} aria-hidden="true" />
+        </button>
+      </>
     ),
-    [c, onInstall],
+    [c, onInstall, onOpen],
   );
 
   return (
@@ -2080,6 +2093,7 @@ export default function App() {
   const nexusLoginHostRef = useRef<HTMLDivElement | null>(null);
   const nexusLoginOpenRef = useRef(false);
   const nexusLoginAlreadyOpenRef = useRef(false);
+  const nexusLoginSkipCloseRef = useRef(false);
   const nexusLoginGenRef = useRef(0);
   const [nexusLoginOpen, setNexusLoginOpen] = useState(false);
   const [webLoginProvider, setWebLoginProvider] = useState<"nexus" | "modio" | "nexus-key">("nexus");
@@ -2106,7 +2120,7 @@ export default function App() {
   const gameInfoReqRef = useRef(0);
   const appInfoLoadedRef = useRef(false);
   const coverAttemptedRef = useRef<Set<string>>(new Set());
-  const resolvedCatalogCoversRef = useRef<Map<string, string>>(new Map());
+  const resolvedCatalogCoversRef = useRef<Map<string, ResolvedCatalogCover>>(new Map());
   const assistVisibleSentRef = useRef<boolean | null>(null);
   const collectionsMetaGenRef = useRef(0);
   const browseDetailReqRef = useRef(0);
@@ -3118,12 +3132,17 @@ export default function App() {
       try {
         const hits = await api.resolveCatalogCovers(requests);
         if (hits.length === 0) return;
+        const resolved = new Map<string, ResolvedCatalogCover>();
         for (const hit of hits) {
-          resolvedCatalogCoversRef.current.set(hit.id, hit.cover_url);
+          const entry: ResolvedCatalogCover = {
+            coverPath: hit.cover_path ?? null,
+            coverUrl: hit.cover_url,
+          };
+          resolvedCatalogCoversRef.current.set(hit.id, entry);
+          resolved.set(hit.id, entry);
         }
-        const urls = new Map(hits.map((hit) => [hit.id, hit.cover_url]));
         startTransition(() => {
-          setDetected((prev) => applyCatalogCovers(prev, urls));
+          setDetected((prev) => applyCatalogCovers(prev, resolved));
         });
         await refreshManaged();
       } catch (e) {
@@ -4152,8 +4171,11 @@ export default function App() {
       window.visualViewport?.removeEventListener("resize", syncSoon);
       window.visualViewport?.removeEventListener("scroll", syncSoon);
       observer?.disconnect();
-      // Backstop: if this session was cancelled, ensure the native webview is gone.
-      if (!nexusLoginOpenRef.current) {
+      // Backstop: if this session was cancelled, ensure the native webview is gone,
+      // unless Rust is keeping it alive in the background for API key capture.
+      const skipClose = nexusLoginSkipCloseRef.current;
+      nexusLoginSkipCloseRef.current = false;
+      if (!nexusLoginOpenRef.current && !skipClose) {
         api.closeDownloadAssist().catch(() => {});
       }
     };
@@ -4164,6 +4186,7 @@ export default function App() {
       if (!nexusLoginOpenRef.current) return;
       nexusLoginGenRef.current += 1;
       nexusLoginOpenRef.current = false;
+      nexusLoginSkipCloseRef.current = true;
       setNexusLoginConfirming(false);
       setNexusLoginOpen(false);
       // Do not close the assist webview here: Rust hides it and reuses the
@@ -5088,6 +5111,13 @@ export default function App() {
   async function clearNexusWebsiteSession() {
     await withBusy("Clearing Nexus website session…", async () => {
       await api.clearAssistSession();
+      await refreshSettings();
+    });
+  }
+
+  async function clearModioWebsiteSession() {
+    await withBusy("Clearing mod.io website session…", async () => {
+      await api.clearModioSession();
       await refreshSettings();
     });
   }
@@ -8985,6 +9015,7 @@ export default function App() {
         setNexusLoginOpen(true);
       }}
       onClearWebsiteSession={() => void clearNexusWebsiteSession()}
+      onClearModioWebsiteSession={() => void clearModioWebsiteSession()}
     />
   );
 
@@ -10608,18 +10639,6 @@ export default function App() {
               to enable downloads. Your API key is retrieved automatically in the
               background after signing in. mod.io is optional.
             </p>
-            <div className="status-card">
-              <span
-                className={settings?.nexus_website_signed_in ? "pill ok" : "pill warn"}
-              >
-                {settings?.nexus_website_signed_in
-                  ? "Website sign-in saved"
-                  : "Website sign-in required"}
-              </span>
-              <span className={settings?.has_api_key ? "pill ok" : "pill warn"}>
-                {settings?.has_api_key ? "Nexus API key saved" : "API key pending"}
-              </span>
-            </div>
             {accountConnections}
             <div className="actions">
               <button
@@ -13069,6 +13088,14 @@ export default function App() {
           onClose={closeNexusLogin}
           footer={
             <div className="modal-foot-actions">
+              <button
+                type="button"
+                className="linkish"
+                onClick={() => void api.reloadAssistWebview().catch(() => {})}
+                disabled={nexusLoginConfirming}
+              >
+                Reload
+              </button>
               <button
                 type="button"
                 className="linkish"

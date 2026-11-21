@@ -1,5 +1,7 @@
 //! Installed tool versions tracked by Emperor.
 
+#![cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+
 use std::{fs, path::Path};
 
 use anyhow::{Context, Result};

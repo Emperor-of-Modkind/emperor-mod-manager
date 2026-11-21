@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 
 use super::{content_folder_wrap_name, normalize_relative, GamePlugin, GamePluginInfo};
 
+#[cfg(any(not(windows), test))]
 const STEAM_APP_ID: &str = "108600";
 const MANAGED_IDS_FILE: &str = ".emperor-mods.txt";
 /// Build 42 version folders score at least this (`42` → 42_000).

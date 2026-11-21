@@ -49,21 +49,113 @@ const MODIO_KEY_SENTINEL_PATH: &str = "/capture-modio-key";
 const NEXUS_API_KEY_PAGE_URL: &str = "https://www.nexusmods.com/users/myaccount?tab=api";
 const MODIO_ACCESS_PAGE_URL: &str = "https://mod.io/me/access";
 
+#[cfg(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+const LINUX_WEBKIT_USER_AGENT: &str =
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Safari/605.1.15";
+
+/// Lightweight cookie-consent auto-acceptor injected on mod.io pages (including
+/// login/home) so consent modals don't block login or API key capture.
+const COOKIE_DISMISS_JS: &str = r#"
+(function () {
+  var hrefKey = location.href || '';
+  if (window.__emmCookieDismissHref === hrefKey && window.__emmCookieDismissTimer) return;
+  window.__emmCookieDismissHref = hrefKey;
+  if (window.__emmCookieDismissTimer) clearInterval(window.__emmCookieDismissTimer);
+  var deadline = Date.now() + 30000;
+
+  function isVisible(el) {
+    if (!el || el.disabled) return false;
+    try {
+      var st = window.getComputedStyle(el);
+      if (st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') === 0) return false;
+      var r = el.getBoundingClientRect();
+      return r.width > 2 && r.height > 2;
+    } catch (e) { return false; }
+  }
+
+  function collectRoots(root, out) {
+    out.push(root);
+    try {
+      var all = root.querySelectorAll('*');
+      for (var i = 0; i < all.length; i++) {
+        if (all[i].shadowRoot) collectRoots(all[i].shadowRoot, out);
+      }
+      var frames = root.querySelectorAll('iframe');
+      for (var f = 0; f < frames.length; f++) {
+        try {
+          if (frames[f].contentDocument) collectRoots(frames[f].contentDocument, out);
+        } catch (e) {}
+      }
+    } catch (e) {}
+  }
+
+  function clickCmpAccept(roots) {
+    var cmpSel = '#onetrust-accept-btn-handler, #CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll, #CybotCookiebotDialogBodyButtonAccept, #didomi-notice-agree-button, [data-testid="uc-accept-all-button"], .qc-cmp2-summary-buttons button[mode="primary"], .cc-accept, .cc-allow, [data-testid*="accept-cookie" i], [id*="accept-cookie" i], [class*="accept-cookie" i]';
+    for (var r = 0; r < roots.length; r++) {
+      var direct = roots[r].querySelector(cmpSel);
+      if (isVisible(direct)) { direct.click(); return true; }
+      var containers = roots[r].querySelectorAll('[id*="cookie" i], [class*="cookie" i], [class*="consent" i], [aria-label*="cookie" i], [aria-label*="consent" i], [role="dialog"], footer');
+      for (var c = 0; c < containers.length; c++) {
+        if (!isVisible(containers[c])) continue;
+        var ctx = ((containers[c].id || '') + ' ' + (containers[c].className || '') + ' ' + (containers[c].innerText || '')).toLowerCase();
+        if (ctx.indexOf('cookie') === -1 && ctx.indexOf('consent') === -1 && ctx.indexOf('privacy') === -1 && ctx.indexOf('gdpr') === -1) continue;
+        var btns = containers[c].querySelectorAll('button, a[role="button"], input[type="button"], input[type="submit"]');
+        for (var b = 0; b < btns.length; b++) {
+          if (!isVisible(btns[b])) continue;
+          var lbl = ((btns[b].innerText || btns[b].textContent || btns[b].value || '') + '').toLowerCase().replace(/\s+/g, ' ').trim();
+          if (/(reject|decline|manage|settings|preferences|customize|necessary)/.test(lbl)) continue;
+          if (/^(accept( all)?( cookies)?|accept & continue|allow all( cookies)?|allow cookies|agree|i agree|i accept|got it|ok)$/.test(lbl)) {
+            btns[b].click();
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
+  window.__emmCookieDismissTimer = setInterval(function () {
+    if (Date.now() > deadline) {
+      clearInterval(window.__emmCookieDismissTimer);
+      window.__emmCookieDismissTimer = null;
+      return;
+    }
+    var roots = [];
+    collectRoots(document, roots);
+    if (clickCmpAccept(roots)) {
+      clearInterval(window.__emmCookieDismissTimer);
+      window.__emmCookieDismissTimer = null;
+    }
+  }, 400);
+})();
+"#;
+
 /// Scrapes or requests the user's personal API key on the Nexus API Access page
 /// and hands it back to Rust via an intercepted sentinel navigation.
 const API_KEY_CAPTURE_JS: &str = r#"
 (function () {
-  if (window.__emmApiKeyCaptureRunning) return;
-  window.__emmApiKeyCaptureRunning = true;
+  var hrefKey = location.href || '';
+  if (window.__emmApiKeyCaptureHref === hrefKey && window.__emmApiKeyCaptureTimer) return;
+  window.__emmApiKeyCaptureHref = hrefKey;
+  if (window.__emmApiKeyCaptureTimer) clearInterval(window.__emmApiKeyCaptureTimer);
   try { window.confirm = function () { return true; }; } catch (e) {}
   var deadline = Date.now() + 60000;
   var lastActionAt = 0;
   var sent = false;
+  var rejected = window.__emmRejectedApiKeys || (window.__emmRejectedApiKeys = {});
 
   function sendKey(key) {
-    if (sent || !key) return;
+    if (sent || !key || rejected[key]) return;
     sent = true;
-    clearInterval(timer);
+    rejected[key] = true;
+    clearInterval(window.__emmApiKeyCaptureTimer);
+    window.__emmApiKeyCaptureTimer = null;
     window.location.href = 'https://emperor-mod-manager.invalid/capture-api-key?key=' + encodeURIComponent(key);
   }
 
@@ -92,6 +184,12 @@ const API_KEY_CAPTURE_JS: &str = r#"
       for (var i = 0; i < all.length; i++) {
         if (all[i].shadowRoot) collectRoots(all[i].shadowRoot, out);
       }
+      var frames = root.querySelectorAll('iframe');
+      for (var f = 0; f < frames.length; f++) {
+        try {
+          if (frames[f].contentDocument) collectRoots(frames[f].contentDocument, out);
+        } catch (e) {}
+      }
     } catch (e) {}
   }
 
@@ -102,18 +200,21 @@ const API_KEY_CAPTURE_JS: &str = r#"
   }
 
   function dismissCookieBanners(roots) {
+    var cmpSel = '#onetrust-accept-btn-handler, #CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll, #CybotCookiebotDialogBodyButtonAccept, #didomi-notice-agree-button, [data-testid="uc-accept-all-button"], .qc-cmp2-summary-buttons button[mode="primary"], .cc-accept, .cc-allow, [data-testid*="accept-cookie" i], [id*="accept-cookie" i], [class*="accept-cookie" i]';
     for (var r = 0; r < roots.length; r++) {
-      var oneTrust = roots[r].querySelector('#onetrust-accept-btn-handler, .cc-accept, .cc-allow');
-      if (isVisible(oneTrust)) { oneTrust.click(); return true; }
-      var containers = roots[r].querySelectorAll('[id*="cookie" i], [class*="cookie" i], [class*="consent" i], [aria-label*="cookie" i], [role="dialog"]');
+      var direct = roots[r].querySelector(cmpSel);
+      if (isVisible(direct)) { direct.click(); return true; }
+      var containers = roots[r].querySelectorAll('[id*="cookie" i], [class*="cookie" i], [class*="consent" i], [aria-label*="cookie" i], [aria-label*="consent" i], [role="dialog"], footer');
       for (var c = 0; c < containers.length; c++) {
+        if (!isVisible(containers[c])) continue;
         var ctx = ((containers[c].id || '') + ' ' + (containers[c].className || '') + ' ' + (containers[c].innerText || '')).toLowerCase();
-        if (ctx.indexOf('cookie') === -1 && ctx.indexOf('consent') === -1 && ctx.indexOf('privacy') === -1) continue;
+        if (ctx.indexOf('cookie') === -1 && ctx.indexOf('consent') === -1 && ctx.indexOf('privacy') === -1 && ctx.indexOf('gdpr') === -1) continue;
         var btns = containers[c].querySelectorAll('button, a[role="button"], input[type="button"], input[type="submit"]');
         for (var b = 0; b < btns.length; b++) {
           if (!isVisible(btns[b])) continue;
-          var lbl = ((btns[b].innerText || btns[b].textContent || btns[b].value || '') + '').toLowerCase().trim();
-          if (/^(accept( all)?( cookies)?|allow all|agree|i agree|got it|ok)$/.test(lbl)) {
+          var lbl = ((btns[b].innerText || btns[b].textContent || btns[b].value || '') + '').toLowerCase().replace(/\s+/g, ' ').trim();
+          if (/(reject|decline|manage|settings|preferences|customize|necessary)/.test(lbl)) continue;
+          if (/^(accept( all)?( cookies)?|accept & continue|allow all( cookies)?|allow cookies|agree|i agree|i accept|got it|ok)$/.test(lbl)) {
             btns[b].click();
             return true;
           }
@@ -124,17 +225,30 @@ const API_KEY_CAPTURE_JS: &str = r#"
   }
 
   function findPersonalKey(roots) {
+    var ordered = [];
     for (var r = 0; r < roots.length; r++) {
-      var clipEls = roots[r].querySelectorAll('[data-clipboard-text], [data-value]');
+      var headings = roots[r].querySelectorAll('h1, h2, h3, h4, strong, label, p');
+      for (var h = 0; h < headings.length; h++) {
+        var ht = (headings[h].textContent || '').toLowerCase();
+        if (ht.indexOf('personal api key') !== -1) {
+          var sec = headings[h].closest('section, article, form, div');
+          if (sec) ordered.push(sec);
+        }
+      }
+    }
+    for (var i = 0; i < roots.length; i++) ordered.push(roots[i]);
+    for (var k = 0; k < ordered.length; k++) {
+      var scope = ordered[k];
+      var clipEls = scope.querySelectorAll('[data-clipboard-text], [data-value]');
       for (var c = 0; c < clipEls.length; c++) {
         var cv = (clipEls[c].getAttribute('data-clipboard-text') || clipEls[c].getAttribute('data-value') || '').trim();
-        if (looksLikeApiKey(cv)) return cv;
+        if (looksLikeApiKey(cv) && !rejected[cv]) return cv;
       }
-      var inputs = roots[r].querySelectorAll('input[readonly], input[type="text"], textarea[readonly], code, pre');
+      var inputs = scope.querySelectorAll('input[readonly], input[type="text"], input[type="password"], textarea, code, pre');
       for (var j = 0; j < inputs.length; j++) {
         var el = inputs[j];
         var val = (el.value !== undefined ? el.value : el.textContent || '').trim();
-        if (looksLikeApiKey(val)) return val;
+        if (looksLikeApiKey(val) && !rejected[val]) return val;
       }
     }
     return null;
@@ -165,7 +279,7 @@ const API_KEY_CAPTURE_JS: &str = r#"
       for (var i = 0; i < buttons.length; i++) {
         var el = buttons[i];
         if (!isVisible(el)) continue;
-        var label = ((el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || '') + '').toLowerCase().trim();
+        var label = ((el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || el.getAttribute('title') || '') + '').toLowerCase().trim();
         if (label === 'show' || label === 'reveal' || label.indexOf('show key') !== -1 || label.indexOf('reveal') !== -1) {
           el.click();
           return true;
@@ -184,9 +298,10 @@ const API_KEY_CAPTURE_JS: &str = r#"
     return false;
   }
 
-  var timer = setInterval(function () {
+  window.__emmApiKeyCaptureTimer = setInterval(function () {
     if (sent || Date.now() > deadline) {
-      clearInterval(timer);
+      clearInterval(window.__emmApiKeyCaptureTimer);
+      window.__emmApiKeyCaptureTimer = null;
       return;
     }
     var roots = allRoots();
@@ -209,17 +324,22 @@ const API_KEY_CAPTURE_JS: &str = r#"
 /// and hands it back to Rust via an intercepted sentinel navigation.
 const MODIO_API_KEY_CAPTURE_JS: &str = r#"
 (function () {
-  if (window.__emmModioKeyCaptureRunning) return;
-  window.__emmModioKeyCaptureRunning = true;
+  var hrefKey = location.href || '';
+  if (window.__emmModioKeyCaptureHref === hrefKey && window.__emmModioKeyCaptureTimer) return;
+  window.__emmModioKeyCaptureHref = hrefKey;
+  if (window.__emmModioKeyCaptureTimer) clearInterval(window.__emmModioKeyCaptureTimer);
   try { window.confirm = function () { return true; }; } catch (e) {}
   var deadline = Date.now() + 60000;
   var lastActionAt = 0;
   var sent = false;
+  var rejected = window.__emmRejectedModioKeys || (window.__emmRejectedModioKeys = {});
 
   function sendKey(key) {
-    if (sent || !key) return;
+    if (sent || !key || rejected[key]) return;
     sent = true;
-    clearInterval(timer);
+    rejected[key] = true;
+    clearInterval(window.__emmModioKeyCaptureTimer);
+    window.__emmModioKeyCaptureTimer = null;
     window.location.href = 'https://emperor-mod-manager.invalid/capture-modio-key?key=' + encodeURIComponent(key);
   }
 
@@ -246,6 +366,12 @@ const MODIO_API_KEY_CAPTURE_JS: &str = r#"
       for (var i = 0; i < all.length; i++) {
         if (all[i].shadowRoot) collectRoots(all[i].shadowRoot, out);
       }
+      var frames = root.querySelectorAll('iframe');
+      for (var f = 0; f < frames.length; f++) {
+        try {
+          if (frames[f].contentDocument) collectRoots(frames[f].contentDocument, out);
+        } catch (e) {}
+      }
     } catch (e) {}
   }
 
@@ -256,18 +382,21 @@ const MODIO_API_KEY_CAPTURE_JS: &str = r#"
   }
 
   function dismissCookieBanners(roots) {
+    var cmpSel = '#onetrust-accept-btn-handler, #CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll, #CybotCookiebotDialogBodyButtonAccept, #didomi-notice-agree-button, [data-testid="uc-accept-all-button"], .qc-cmp2-summary-buttons button[mode="primary"], .cc-accept, .cc-allow, [data-testid*="accept-cookie" i], [id*="accept-cookie" i], [class*="accept-cookie" i]';
     for (var r = 0; r < roots.length; r++) {
-      var oneTrust = roots[r].querySelector('#onetrust-accept-btn-handler, .cc-accept, .cc-allow');
-      if (isVisible(oneTrust)) { oneTrust.click(); return true; }
-      var containers = roots[r].querySelectorAll('[id*="cookie" i], [class*="cookie" i], [class*="consent" i], [aria-label*="cookie" i], [role="dialog"]');
+      var direct = roots[r].querySelector(cmpSel);
+      if (isVisible(direct)) { direct.click(); return true; }
+      var containers = roots[r].querySelectorAll('[id*="cookie" i], [class*="cookie" i], [class*="consent" i], [aria-label*="cookie" i], [aria-label*="consent" i], [role="dialog"], footer');
       for (var c = 0; c < containers.length; c++) {
+        if (!isVisible(containers[c])) continue;
         var ctx = ((containers[c].id || '') + ' ' + (containers[c].className || '') + ' ' + (containers[c].innerText || '')).toLowerCase();
-        if (ctx.indexOf('cookie') === -1 && ctx.indexOf('consent') === -1 && ctx.indexOf('privacy') === -1) continue;
+        if (ctx.indexOf('cookie') === -1 && ctx.indexOf('consent') === -1 && ctx.indexOf('privacy') === -1 && ctx.indexOf('gdpr') === -1) continue;
         var btns = containers[c].querySelectorAll('button, a[role="button"], input[type="button"], input[type="submit"]');
         for (var b = 0; b < btns.length; b++) {
           if (!isVisible(btns[b])) continue;
-          var lbl = ((btns[b].innerText || btns[b].textContent || btns[b].value || '') + '').toLowerCase().trim();
-          if (/^(accept( all)?( cookies)?|allow all|agree|i agree|got it|ok)$/.test(lbl)) {
+          var lbl = ((btns[b].innerText || btns[b].textContent || btns[b].value || '') + '').toLowerCase().replace(/\s+/g, ' ').trim();
+          if (/(reject|decline|manage|settings|preferences|customize|necessary)/.test(lbl)) continue;
+          if (/^(accept( all)?( cookies)?|accept & continue|allow all( cookies)?|allow cookies|agree|i agree|i accept|got it|ok)$/.test(lbl)) {
             btns[b].click();
             return true;
           }
@@ -279,17 +408,32 @@ const MODIO_API_KEY_CAPTURE_JS: &str = r#"
 
   function findModioKey(roots) {
     for (var r = 0; r < roots.length; r++) {
+      var headings = roots[r].querySelectorAll('h1, h2, h3, h4, strong, label, p');
+      for (var h = 0; h < headings.length; h++) {
+        var ht = (headings[h].textContent || '').toLowerCase();
+        if (ht.indexOf('api key') !== -1 || ht.indexOf('read-only') !== -1) {
+          var sec = headings[h].closest('section, article, form, div');
+          if (sec) {
+            var secEls = sec.querySelectorAll('input, textarea, code, pre, [data-clipboard-text], [data-value], span, div');
+            for (var s = 0; s < secEls.length; s++) {
+              var sel = secEls[s];
+              if (sel.children && sel.children.length > 0 && sel.tagName !== 'CODE' && sel.tagName !== 'PRE') continue;
+              var sv = (sel.getAttribute('data-clipboard-text') || sel.getAttribute('data-value') || (sel.value !== undefined ? sel.value : sel.textContent) || '').trim();
+              if (looksLikeModioKey(sv) && !rejected[sv]) return sv;
+            }
+          }
+        }
+      }
       var clipEls = roots[r].querySelectorAll('[data-clipboard-text], [data-value]');
       for (var c = 0; c < clipEls.length; c++) {
         var cv = (clipEls[c].getAttribute('data-clipboard-text') || clipEls[c].getAttribute('data-value') || '').trim();
-        if (looksLikeModioKey(cv)) return cv;
+        if (looksLikeModioKey(cv) && !rejected[cv]) return cv;
       }
-      var inputs = roots[r].querySelectorAll('input[readonly], input[type="text"], textarea[readonly], code, pre, span, div');
+      var inputs = roots[r].querySelectorAll('input[readonly], input[type="text"], input[type="password"], textarea[readonly], code, pre');
       for (var i = 0; i < inputs.length; i++) {
         var el = inputs[i];
-        if (el.children && el.children.length > 0 && el.tagName !== 'CODE' && el.tagName !== 'PRE') continue;
         var val = (el.value !== undefined ? el.value : el.textContent || '').trim();
-        if (looksLikeModioKey(val)) return val;
+        if (looksLikeModioKey(val) && !rejected[val]) return val;
       }
     }
     return null;
@@ -320,7 +464,7 @@ const MODIO_API_KEY_CAPTURE_JS: &str = r#"
       for (var i = 0; i < buttons.length; i++) {
         var el = buttons[i];
         if (!isVisible(el)) continue;
-        var label = ((el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || '') + '').toLowerCase().trim();
+        var label = ((el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || el.getAttribute('title') || '') + '').toLowerCase().trim();
         if (label === 'show' || label === 'reveal' || label.indexOf('show key') !== -1 || label.indexOf('reveal') !== -1) {
           el.click();
           return true;
@@ -339,9 +483,10 @@ const MODIO_API_KEY_CAPTURE_JS: &str = r#"
     return false;
   }
 
-  var timer = setInterval(function () {
+  window.__emmModioKeyCaptureTimer = setInterval(function () {
     if (sent || Date.now() > deadline) {
-      clearInterval(timer);
+      clearInterval(window.__emmModioKeyCaptureTimer);
+      window.__emmModioKeyCaptureTimer = null;
       return;
     }
     var roots = allRoots();
@@ -1269,6 +1414,16 @@ fn clear_pending_assist_url(app: &tauri::AppHandle) {
     }
 }
 
+#[cfg_attr(
+    not(any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    )),
+    allow(dead_code)
+)]
 fn store_pending_assist_url(state: &AppState, url: &url::Url) {
     match state.assist_pending_url.lock() {
         Ok(mut pending) => {
@@ -1279,12 +1434,32 @@ fn store_pending_assist_url(state: &AppState, url: &url::Url) {
     }
 }
 
+#[cfg_attr(
+    not(any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    )),
+    allow(dead_code)
+)]
 fn release_assist_load_hold(state: &AppState) {
     state
         .assist_hide_until_loaded
         .store(false, Ordering::SeqCst);
 }
 
+#[cfg_attr(
+    not(any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    )),
+    allow(dead_code)
+)]
 fn flush_pending_assist_navigation(app: &tauri::AppHandle, state: &AppState) -> Result<(), String> {
     let raw = state
         .assist_pending_url
@@ -1520,6 +1695,33 @@ fn is_modio_access_url(raw: &str) -> bool {
         && url.path().trim_end_matches('/').eq_ignore_ascii_case("/me/access")
 }
 
+fn is_modio_login_url(raw: &str) -> bool {
+    let Ok(url) = url::Url::parse(raw) else {
+        return false;
+    };
+    let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+    if host != "mod.io" && host != "www.mod.io" {
+        return false;
+    }
+    let path = url.path().to_ascii_lowercase();
+    path.contains("/login")
+        || path.contains("/auth")
+        || path.contains("/oauth")
+        || path.contains("/register")
+        || path.contains("/signin")
+        || path.contains("/sign-in")
+}
+
+fn should_redirect_modio_to_access(raw: &str) -> bool {
+    let Ok(url) = url::Url::parse(raw) else {
+        return false;
+    };
+    let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+    (host == "mod.io" || host == "www.mod.io")
+        && !is_modio_access_url(raw)
+        && !is_modio_login_url(raw)
+}
+
 fn intercept_login_navigation(app: &tauri::AppHandle, nav_url: &url::Url) -> bool {
     if let Some(key) = parse_captured_api_key(nav_url) {
         let handle = app.clone();
@@ -1551,18 +1753,23 @@ async fn complete_modio_key_capture(app: tauri::AppHandle, key: String) {
     if !in_modio {
         return;
     }
-    state.assist_desired_visible.store(false, Ordering::SeqCst);
-    let _ = apply_assist_desired_visible(&app, &state);
     match crate::commands::save_and_validate_modio_key(&state, key).await {
         Ok(()) => {
             log::info!("mod.io api key captured via webview");
+            if let Err(e) = set_modio_website_signed_in(&state, true) {
+                log::warn!("mod.io website sign-in flag: {e}");
+            }
+            state.assist_desired_visible.store(false, Ordering::SeqCst);
+            let _ = apply_assist_desired_visible(&app, &state);
             let _ = app.emit("modio-api-key-captured", ());
+            let _ = close_assist_intentionally(&app, &state);
         }
         Err(e) => {
-            log::warn!("mod.io api key capture validation failed: {e}");
+            // Keep the WebView open if a false-positive hex string failed validation
+            // so the script can keep polling or the user can complete login/generation.
+            log::warn!("mod.io api key capture validation failed (keeping webview open): {e}");
         }
     }
-    let _ = close_assist_intentionally(&app, &state);
 }
 
 async fn complete_api_key_capture(app: tauri::AppHandle, key: String) {
@@ -1578,12 +1785,14 @@ async fn complete_api_key_capture(app: tauri::AppHandle, key: String) {
         Ok(user) => {
             log::info!("nexus api key captured silently for {}", user.name);
             let _ = app.emit("nexus-api-key-captured", &user);
+            let _ = close_assist_intentionally(&app, &state);
         }
         Err(e) => {
-            log::warn!("nexus api key capture validation failed: {e}");
+            // Keep the WebView alive on false-positive validation so the 6s reveal
+            // fallback can still show the page if needed.
+            log::warn!("nexus api key capture validation failed (keeping webview open): {e}");
         }
     }
-    let _ = close_assist_intentionally(&app, &state);
 }
 
 fn schedule_nexus_login_close(app: tauri::AppHandle, generation: u64) {
@@ -2117,6 +2326,17 @@ pub async fn open_download_assist_inner(
         .initialization_script(CDN_HOOK_JS)
         .on_navigation(move |nav_url| intercept_assist_navigation(&handle_nav, nav_url));
 
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
+    {
+        builder = builder.user_agent(LINUX_WEBKIT_USER_AGENT);
+    }
+
     if autoclick {
         builder = builder.initialization_script(AUTOCLICK_JS);
     }
@@ -2325,6 +2545,10 @@ async fn open_login_webview(
     let generation = state.assist_window_gen.fetch_add(1, Ordering::SeqCst) + 1;
     let bounds = stored_bounds(state);
     let is_nexus = matches!(purpose, AssistPurpose::WebsiteLogin);
+    let profile_dir = match purpose {
+        AssistPurpose::ModioLogin => state.paths.modio_webview_dir(),
+        _ => state.paths.assist_webview_dir(),
+    };
     set_assist_context(
         state,
         AssistContext {
@@ -2342,8 +2566,7 @@ async fn open_login_webview(
         },
     );
 
-    let assist_dir = state.paths.assist_webview_dir();
-    fs::create_dir_all(&assist_dir).map_err(|e| e.to_string())?;
+    fs::create_dir_all(&profile_dir).map_err(|e| e.to_string())?;
     let window = main_window(&app)?;
 
     #[cfg(any(
@@ -2369,8 +2592,19 @@ async fn open_login_webview(
 
     let handle_nav = app.clone();
     let mut builder = WebviewBuilder::new(ASSIST_LABEL, initial_url)
-        .data_directory(assist_dir)
+        .data_directory(profile_dir)
         .on_navigation(move |nav_url| intercept_login_navigation(&handle_nav, nav_url));
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
+    {
+        builder = builder.user_agent(LINUX_WEBKIT_USER_AGENT);
+    }
 
     let handle_new = app.clone();
     builder = builder.on_new_window(move |url, _features| {
@@ -2384,6 +2618,7 @@ async fn open_login_webview(
 
     let handle_load = app.clone();
     let done = Arc::new(AtomicBool::new(false));
+    let modio_redirects = Arc::new(std::sync::atomic::AtomicU8::new(0));
     if is_nexus {
         // One watcher for the whole WebsiteLogin lifetime; page-load only does an immediate check.
         watch_nexus_login_cookie(app.clone(), generation, done.clone());
@@ -2408,8 +2643,20 @@ async fn open_login_webview(
                 }
                 Some(AssistPurpose::ModioLogin) => {
                     note_assist_document_ready(&handle_load, &href);
+                    if href.to_ascii_lowercase().contains("mod.io") {
+                        let _ = webview.eval(COOKIE_DISMISS_JS);
+                    }
                     if is_modio_access_url(&href) {
+                        if let Err(e) = set_modio_website_signed_in(&state, true) {
+                            log::warn!("mod.io website sign-in flag: {e}");
+                        }
                         let _ = webview.eval(MODIO_API_KEY_CAPTURE_JS);
+                    } else if should_redirect_modio_to_access(&href)
+                        && modio_redirects.fetch_add(1, Ordering::SeqCst) < 3
+                    {
+                        if let Ok(target) = MODIO_ACCESS_PAGE_URL.parse::<url::Url>() {
+                            let _ = webview.navigate(target);
+                        }
                     }
                     return;
                 }
@@ -2457,8 +2704,7 @@ async fn open_login_webview(
         target_os = "openbsd"
     ))]
     {
-        state.assist_hide_until_loaded.store(true, Ordering::SeqCst);
-        if let Err(e) = crate::linux_embed::attach_assist(&window, bounds, false) {
+        if let Err(e) = crate::linux_embed::attach_assist(&window, bounds, true) {
             release_assist_load_hold(state);
             let _ = take_assist_context(state);
             let _ = close_assist_webview(&app);
@@ -2479,8 +2725,21 @@ async fn open_login_webview(
         target_os = "netbsd",
         target_os = "openbsd"
     ))]
-    store_pending_assist_url(state, &parsed);
+    {
+        store_pending_assist_url(state, &parsed);
+        // Keep the login WebView visible & interactive from the start so
+        // Cloudflare Turnstile does not see an invisible/insensitive frame.
+        release_assist_load_hold(state);
+    }
     apply_assist_desired_visible(&app, state)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn reload_assist_webview(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(webview) = app.get_webview(ASSIST_LABEL) {
+        webview.reload().map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
@@ -2498,6 +2757,24 @@ pub fn clear_assist_session(
     }
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     set_nexus_website_signed_in(&state, false)
+}
+
+/// Close any active mod.io login webview and delete its WebKit profile (mod.io website cookies).
+#[tauri::command]
+pub fn clear_modio_session(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    if peek_assist_context(&state).is_some_and(|c| matches!(c.purpose, AssistPurpose::ModioLogin)) {
+        close_assist_intentionally(&app, &state)?;
+    }
+
+    let dir = state.paths.modio_webview_dir();
+    if dir.exists() {
+        fs::remove_dir_all(&dir).map_err(|e| format!("clear mod.io session: {e}"))?;
+    }
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    set_modio_website_signed_in(&state, false)
 }
 
 /// Manual confirm after the user finishes Nexus sign-in in the assist webview.
@@ -2552,6 +2829,15 @@ fn set_nexus_website_signed_in(state: &AppState, signed_in: bool) -> Result<(), 
         return Ok(());
     }
     cfg.nexus_website_signed_in = signed_in;
+    crate::config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())
+}
+
+fn set_modio_website_signed_in(state: &AppState, signed_in: bool) -> Result<(), String> {
+    let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
+    if cfg.modio_website_signed_in == signed_in {
+        return Ok(());
+    }
+    cfg.modio_website_signed_in = signed_in;
     crate::config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())
 }
 
@@ -2798,9 +3084,27 @@ mod tests {
         assert!(!is_modio_access_url("https://mod.io/login"));
         assert!(!is_modio_access_url("https://example.com/me/access"));
 
+        assert!(is_modio_login_url("https://mod.io/login"));
+        assert!(is_modio_login_url("https://www.mod.io/auth/steam"));
+        assert!(!is_modio_login_url("https://mod.io/me/access"));
+        assert!(should_redirect_modio_to_access("https://mod.io/"));
+        assert!(should_redirect_modio_to_access("https://mod.io/me"));
+        assert!(!should_redirect_modio_to_access("https://mod.io/login"));
+        assert!(!should_redirect_modio_to_access("https://mod.io/me/access"));
+
         assert!(API_KEY_CAPTURE_JS.contains("dismissCookieBanners"));
         assert!(API_KEY_CAPTURE_JS.contains("clickConfirmDialogIfPresent"));
         assert!(MODIO_API_KEY_CAPTURE_JS.contains("dismissCookieBanners"));
         assert!(MODIO_API_KEY_CAPTURE_JS.contains("clickConfirmDialogIfPresent"));
+        assert!(COOKIE_DISMISS_JS.contains("CybotCookiebotDialogBodyButtonAccept"));
+        assert!(COOKIE_DISMISS_JS.contains("contentDocument"));
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd"
+        ))]
+        assert!(LINUX_WEBKIT_USER_AGENT.contains("Safari/605.1.15"));
     }
 }

@@ -9,6 +9,7 @@ import {
   type ReactNode,
   type TransitionEvent as ReactTransitionEvent,
 } from "react";
+import { createPortal } from "react-dom";
 import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
 import { faCheck } from "@fortawesome/free-solid-svg-icons";
 import { useQueuedImageSrc } from "./imageLoadQueue";
@@ -144,15 +145,28 @@ export const MediaCard = memo(function MediaCard(props: {
   const [glowActive, setGlowActive] = useState(false);
   const [glowMounted, setGlowMounted] = useState(false);
   const [glowVisible, setGlowVisible] = useState(false);
+  const [glowHost, setGlowHost] = useState<HTMLElement | null>(null);
+  const stackRef = useRef<HTMLDivElement | null>(null);
+  const glowRef = useRef<HTMLImageElement | null>(null);
 
   const coverSrc = imageSrc && status !== "error" ? imageSrc : null;
   const canGlow = Boolean(onClick && coverSrc && status === "ready");
+
+  const activateGlow = useCallback(() => {
+    setGlowHost(stackRef.current?.closest<HTMLElement>(".panel") ?? null);
+    setGlowActive(true);
+  }, []);
+
+  const deactivateGlow = useCallback(() => {
+    setGlowActive(false);
+  }, []);
 
   useEffect(() => {
     if (!canGlow) {
       setGlowActive(false);
       setGlowVisible(false);
       setGlowMounted(false);
+      setGlowHost(null);
       return;
     }
     if (glowActive) {
@@ -176,6 +190,65 @@ export const MediaCard = memo(function MediaCard(props: {
     return () => window.clearTimeout(timer);
   }, [canGlow, glowActive, glowMounted]);
 
+  useLayoutEffect(() => {
+    if (!canGlow || !glowMounted || !glowHost || !glowHost.isConnected) return;
+    const syncPosition = () => {
+      const stackEl = stackRef.current;
+      const glowEl = glowRef.current;
+      if (!stackEl || !glowEl || !glowHost.isConnected) return;
+      const stackRect = stackEl.getBoundingClientRect();
+      const hostRect = glowHost.getBoundingClientRect();
+      const width = stackRect.width * 1.36;
+      const height = stackRect.height * 1.36;
+      const left = stackRect.left - hostRect.left - glowHost.clientLeft - stackRect.width * 0.18;
+      const top = stackRect.top - hostRect.top - glowHost.clientTop - stackRect.height * 0.18;
+      glowEl.style.left = `${left}px`;
+      glowEl.style.top = `${top}px`;
+      glowEl.style.width = `${width}px`;
+      glowEl.style.height = `${height}px`;
+    };
+    syncPosition();
+    let rafId = 0;
+    const scheduleSync = () => {
+      if (rafId) return;
+      rafId = window.requestAnimationFrame(() => {
+        rafId = 0;
+        syncPosition();
+      });
+    };
+    glowHost.addEventListener("scroll", scheduleSync, { capture: true, passive: true });
+    window.addEventListener("resize", scheduleSync, { passive: true });
+    return () => {
+      glowHost.removeEventListener("scroll", scheduleSync, { capture: true });
+      window.removeEventListener("resize", scheduleSync);
+      if (rafId) window.cancelAnimationFrame(rafId);
+    };
+  }, [canGlow, glowMounted, glowHost]);
+
+  const useGlowPortal = Boolean(glowHost && glowHost.isConnected);
+  const glowImg =
+    canGlow && glowMounted ? (
+      <img
+        ref={glowRef}
+        className={[
+          "media-cover-glow",
+          useGlowPortal ? "media-cover-glow-portal" : "",
+          glowVisible ? "is-visible" : "",
+        ]
+          .filter(Boolean)
+          .join(" ")}
+        src={coverSrc!}
+        alt=""
+        aria-hidden="true"
+        decoding="async"
+        onTransitionEnd={(e) => {
+          if (e.propertyName === "opacity" && !glowActive) {
+            setGlowMounted(false);
+          }
+        }}
+      />
+    ) : null;
+
   const classes = [
     "media-card",
     onClick ? "media-card-clickable" : "",
@@ -195,26 +268,14 @@ export const MediaCard = memo(function MediaCard(props: {
   const body = (
     <>
       <div
+        ref={stackRef}
         className="media-cover-stack"
-        onMouseEnter={onClick ? () => setGlowActive(true) : undefined}
-        onMouseLeave={onClick ? () => setGlowActive(false) : undefined}
-        onFocus={onClick ? () => setGlowActive(true) : undefined}
-        onBlur={onClick ? () => setGlowActive(false) : undefined}
+        onMouseEnter={onClick ? activateGlow : undefined}
+        onMouseLeave={onClick ? deactivateGlow : undefined}
+        onFocus={onClick ? activateGlow : undefined}
+        onBlur={onClick ? deactivateGlow : undefined}
       >
-        {canGlow && glowMounted ? (
-          <img
-            className={glowVisible ? "media-cover-glow is-visible" : "media-cover-glow"}
-            src={coverSrc!}
-            alt=""
-            aria-hidden="true"
-            decoding="async"
-            onTransitionEnd={(e) => {
-              if (e.propertyName === "opacity" && !glowActive) {
-                setGlowMounted(false);
-              }
-            }}
-          />
-        ) : null}
+        {glowImg ? (useGlowPortal ? createPortal(glowImg, glowHost!) : glowImg) : null}
         <div className="media-cover">
           {showSkeleton ? (
             <div className="media-cover-skeleton skeleton" aria-hidden="true" />

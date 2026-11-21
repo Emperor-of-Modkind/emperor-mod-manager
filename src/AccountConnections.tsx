@@ -14,6 +14,7 @@ type AccountConnectionsProps = {
   onSignIn: () => void;
   onModioSignIn: () => void;
   onClearWebsiteSession: () => void;
+  onClearModioWebsiteSession: () => void;
 };
 
 export function AccountConnections({
@@ -30,6 +31,7 @@ export function AccountConnections({
   onSignIn,
   onModioSignIn,
   onClearWebsiteSession,
+  onClearModioWebsiteSession,
 }: AccountConnectionsProps) {
   return (
     <>
@@ -39,20 +41,36 @@ export function AccountConnections({
         ). Your website session enables Free Download Assist and automatically
         retrieves your personal API key in the background.
       </p>
-      {(settings?.user || settings?.nexus_website_signed_in) && (
-        <div className="status-card">
-          {settings?.user ? (
+      {settings && (
+        <div className="status-card" data-testid="nexus-status-card">
+          {settings.user && (
             <>
-              Signed in as <strong>{settings.user.name}</strong>
+              <span>
+                Signed in as <strong>{settings.user.name}</strong>
+              </span>
               {settings.user.is_premium ? (
                 <span className="pill ok">Premium</span>
               ) : (
                 <span className="pill warn">Free — Download Assist</span>
               )}
             </>
-          ) : (
-            <span className="pill ok">Website session saved</span>
           )}
+          <span
+            className={
+              settings.nexus_website_signed_in ? "pill ok" : "pill warn"
+            }
+          >
+            {settings.nexus_website_signed_in
+              ? "Website: Signed in"
+              : "Website: Not signed in"}
+          </span>
+          <span className={settings.user ? "pill ok" : "pill warn"}>
+            {settings.user
+              ? "API key: Saved"
+              : settings.has_api_key
+                ? "API key: Saved (unverified)"
+                : "API key: Not set"}
+          </span>
         </div>
       )}
       <div className="actions">
@@ -114,9 +132,20 @@ export function AccountConnections({
         mod.io to retrieve your API key automatically in the background. OAuth,
         uploads, and ratings are not supported.
       </p>
-      {settings?.has_modio_api_key && (
-        <div className="status-card">
-          <span className="pill ok">mod.io API key saved</span>
+      {settings && (
+        <div className="status-card" data-testid="modio-status-card">
+          <span className={settings.has_modio_api_key ? "pill ok" : "pill muted"}>
+            {settings.has_modio_api_key
+              ? "API key: Saved"
+              : "API key: Not set (optional)"}
+          </span>
+          <span
+            className={settings.modio_website_signed_in ? "pill ok" : "pill muted"}
+          >
+            {settings.modio_website_signed_in
+              ? "Website session: Saved"
+              : "Website session: Not saved"}
+          </span>
         </div>
       )}
       <div className="actions">
@@ -132,6 +161,11 @@ export function AccountConnections({
         >
           Log in to mod.io
         </button>
+        {settings?.modio_website_signed_in && (
+          <button type="button" onClick={onClearModioWebsiteSession}>
+            Clear mod.io website session
+          </button>
+        )}
         {settings?.has_modio_api_key && (
           <button
             type="button"

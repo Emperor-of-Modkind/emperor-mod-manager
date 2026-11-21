@@ -221,6 +221,7 @@ pub fn resolve_patcher_command(install_path: &Path) -> Option<PatcherCommand> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PatcherCommand {
     Native(PathBuf),
+    #[cfg_attr(windows, allow(dead_code))]
     Wine(PathBuf),
 }
 

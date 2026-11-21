@@ -95,6 +95,7 @@ fn tool_status(
 }
 
 #[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
 fn stub_tool_status(config_path: String) -> ToolStatus {
     ToolStatus {
         installed: false,
@@ -107,6 +108,7 @@ fn stub_tool_status(config_path: String) -> ToolStatus {
 }
 
 #[tauri::command]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn get_tools_status(state: State<'_, AppState>) -> Result<ToolsStatusResponse, String> {
     let (lsfg_vk_repo, autohdr_vk_repo) = {
         let cfg = state.config.lock().map_err(|e| e.to_string())?;
@@ -146,6 +148,7 @@ pub fn get_tools_status(state: State<'_, AppState>) -> Result<ToolsStatusRespons
 }
 
 #[tauri::command]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub async fn check_tool_updates(state: State<'_, AppState>) -> Result<ToolUpdatesResponse, String> {
     #[cfg(not(target_os = "linux"))]
     {
@@ -189,6 +192,7 @@ pub async fn check_tool_updates(state: State<'_, AppState>) -> Result<ToolUpdate
 }
 
 #[tauri::command]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub async fn install_tool(
     state: State<'_, AppState>,
     tool: String,

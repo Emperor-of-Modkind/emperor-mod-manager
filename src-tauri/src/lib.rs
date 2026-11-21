@@ -221,7 +221,9 @@ pub fn run() {
             assist::open_modio_website_login,
             assist::confirm_nexus_website_login,
             assist::close_download_assist,
+            assist::reload_assist_webview,
             assist::clear_assist_session,
+            assist::clear_modio_session,
             assist::set_assist_bounds,
             assist::set_assist_visible,
             #[cfg(target_os = "linux")]

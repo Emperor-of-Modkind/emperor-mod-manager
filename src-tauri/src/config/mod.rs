@@ -150,6 +150,9 @@ pub struct AppConfig {
     /// Nexus website session captured by the sign-in window (Stay signed in).
     #[serde(default)]
     pub nexus_website_signed_in: bool,
+    /// mod.io website session captured by the sign-in window.
+    #[serde(default)]
+    pub modio_website_signed_in: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -302,6 +305,7 @@ impl Default for AppConfig {
             tools: ToolsConfig::default(),
             initial_setup_complete: None,
             nexus_website_signed_in: false,
+            modio_website_signed_in: false,
         }
     }
 }
@@ -401,6 +405,7 @@ impl Paths {
         fs::create_dir_all(&paths.cache_dir)?;
         fs::create_dir_all(paths.downloads_dir())?;
         fs::create_dir_all(paths.assist_webview_dir())?;
+        fs::create_dir_all(paths.modio_webview_dir())?;
         Ok(paths)
     }
 
@@ -430,6 +435,11 @@ impl Paths {
     /// Persistent WebKit profile for Download Assist (Nexus website cookies).
     pub fn assist_webview_dir(&self) -> PathBuf {
         self.data_dir.join("assist-webview")
+    }
+
+    /// Persistent WebKit profile for mod.io website login cookies.
+    pub fn modio_webview_dir(&self) -> PathBuf {
+        self.data_dir.join("modio-webview")
     }
 
     pub fn game_data_dir(&self, game_id: &str) -> PathBuf {
@@ -473,6 +483,7 @@ impl Paths {
         self.data_dir.join("tools")
     }
 
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn tools_manifest_file(&self) -> PathBuf {
         self.tools_dir().join("manifest.json")
     }
@@ -583,6 +594,7 @@ mod tests {
         let cfg: AppConfig = toml::from_str("").unwrap();
         assert_eq!(cfg.initial_setup_complete, None);
         assert!(!cfg.nexus_website_signed_in);
+        assert!(!cfg.modio_website_signed_in);
     }
 
     #[test]

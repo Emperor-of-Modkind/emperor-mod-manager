@@ -184,6 +184,36 @@ re_engine_plugin!(
 );
 
 re_engine_plugin!(
+    DragonsDogma2Plugin,
+    "dragonsdogma2",
+    "Dragon's Dogma 2",
+    "dragonsdogma2",
+    &[
+        "dragon's dogma 2",
+        "dragons dogma 2",
+        "dragonsdogma2",
+        "dragon's dogma ii",
+        "dragons dogma ii",
+    ]
+);
+
+re_engine_plugin!(
+    DevilMayCry5Plugin,
+    "devilmaycry5",
+    "Devil May Cry 5",
+    "devilmaycry5",
+    &["devil may cry 5", "devilmaycry5", "dmc 5", "dmc5"]
+);
+
+re_engine_plugin!(
+    StreetFighter6Plugin,
+    "streetfighter6",
+    "Street Fighter 6",
+    "streetfighter6",
+    &["street fighter 6", "streetfighter6", "sf6"]
+);
+
+re_engine_plugin!(
     ResidentEvilRequiemPlugin,
     "residentevilrequiem",
     "Resident Evil Requiem",

@@ -49,6 +49,9 @@ pub const FROMSOFT_ROOT_DIRS: &[&str] = &[
 /// Known game executables under a Steam `Game/` subdirectory.
 const GAME_SUBDIR_EXES: &[&str] = &[
     "eldenring.exe",
+    "nightreign.exe",
+    "armoredcore6.exe",
+    "sekiro.exe",
     "darksoulsiii.exe",
     "darksoulsii.exe",
     "darksouls.exe",
@@ -725,6 +728,7 @@ const SEAMLESS_SED: &str =
     r#"echo "%command%" | sed 's/DarkSoulsII\.exe/ds2sc_launcher.exe/' | sh"#;
 
 /// True when launch options rewrite Steam's exe to the Seamless launcher.
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 pub fn launch_options_have_seamless_rewrite(opts: &str) -> bool {
     let lower = opts.to_lowercase();
     lower.contains("ds2sc_launcher.exe")
@@ -748,6 +752,7 @@ pub fn empty_seamless_cooppassword(game_root: &Path) -> bool {
     false
 }
 
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 pub fn ensure_seamless_launch_options(existing: &str) -> String {
     if launch_options_have_seamless_rewrite(existing) {
         return existing.to_string();
@@ -894,6 +899,7 @@ fn ds2_combo_warnings(install_path: &Path, game_root: &Path) -> Vec<String> {
 }
 
 /// Native DLL names Proton must load from the Game folder.
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 pub fn needed_fromsoft_native_dlls(game_root: &Path) -> Vec<&'static str> {
     let mut dlls = Vec::new();
     if find_file_ci(game_root, "dinput8.dll").is_some() {
@@ -908,6 +914,7 @@ pub fn needed_fromsoft_native_dlls(game_root: &Path) -> Vec<&'static str> {
     dlls
 }
 
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 pub fn winedll_has_native(opts: &str, dll: &str) -> bool {
     let lower = opts.to_lowercase();
     let dll = dll.to_ascii_lowercase();
@@ -951,6 +958,7 @@ pub fn repair_dinput8_override(existing: &str) -> String {
     merge_fromsoft_winedll_overrides(existing, &["dinput8"])
 }
 
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 fn strip_seamless_rewrite(opts: &str) -> (String, bool) {
     if !launch_options_have_seamless_rewrite(opts) {
         return (opts.to_string(), false);
@@ -970,6 +978,7 @@ fn strip_seamless_rewrite(opts: &str) -> (String, bool) {
 }
 
 /// Strip `WINEDLLOVERRIDES=…` tokens (quoted or bare) and bare `%command%` placeholders.
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 fn strip_winedll_tokens(opts: &str) -> (String, bool) {
     let mut out = String::new();
     let mut had_command = false;
@@ -1022,6 +1031,7 @@ fn strip_winedll_tokens(opts: &str) -> (String, bool) {
 }
 
 /// Merge required native DLL overrides into existing Steam launch options.
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 pub fn merge_fromsoft_winedll_overrides(existing: &str, dlls: &[&str]) -> String {
     if dlls.is_empty() {
         return existing.to_string();
@@ -1372,6 +1382,29 @@ macro_rules! fromsoft_modern_plugin {
 }
 
 fromsoft_modern_plugin!(
+    EldenRingNightreignPlugin,
+    "eldenringnightreign",
+    "Elden Ring Nightreign",
+    "eldenringnightreign",
+    "nightreign",
+    &["elden ring nightreign", "eldenringnightreign", "nightreign"]
+);
+
+fromsoft_modern_plugin!(
+    ArmoredCore6Plugin,
+    "armoredcore6firesofrubicon",
+    "Armored Core VI: Fires of Rubicon",
+    "armoredcore6firesofrubicon",
+    "armoredcore6",
+    &[
+        "armored core vi",
+        "armored core 6",
+        "armoredcore6",
+        "fires of rubicon",
+    ]
+);
+
+fromsoft_modern_plugin!(
     EldenRingPlugin,
     "eldenring",
     "Elden Ring",
@@ -1392,6 +1425,14 @@ fromsoft_modern_plugin!(
         "darksouls3",
         "darksoulsiii"
     ]
+);
+
+fromsoft_legacy_plugin!(
+    SekiroPlugin,
+    "sekiro",
+    "Sekiro: Shadows Die Twice",
+    "sekiro",
+    &["sekiro", "shadows die twice"]
 );
 
 fromsoft_legacy_plugin!(

@@ -28,94 +28,86 @@ const LOADER_FILES: &[&str] = &[
     ".doorstop_version",
 ];
 
-pub struct BonelabPlugin;
-pub struct BoneworksPlugin;
+macro_rules! melonloader_plugin {
+    ($struct:ident, $id:expr, $display:expr, $domain:expr, $matches:expr) => {
+        pub struct $struct;
 
-impl GamePlugin for BonelabPlugin {
-    fn info(&self) -> GamePluginInfo {
-        GamePluginInfo {
-            id: "bonelab",
-            display_name: "BONELAB",
-            nexus_domain: "bonelab",
-            match_names: &["bonelab", "bone lab"],
+        impl GamePlugin for $struct {
+            fn info(&self) -> GamePluginInfo {
+                GamePluginInfo {
+                    id: $id,
+                    display_name: $display,
+                    nexus_domain: $domain,
+                    match_names: $matches,
+                }
+            }
+
+            fn preserve_staging_root_names(&self) -> &[&str] {
+                MELONLOADER_PRESERVE_ROOTS
+            }
+
+            fn should_wrap_as_mod_folder(&self, content_root: &Path) -> bool {
+                !looks_like_melonloader_pack(content_root) && looks_like_melon_mod(content_root)
+            }
+
+            fn wrap_mod_folder_name(&self, content_root: &Path, staged_name: &str) -> String {
+                content_folder_wrap_name(content_root, staged_name)
+            }
+
+            fn deploys_to_install_root(&self, content_root: &Path) -> bool {
+                looks_like_melonloader_pack(content_root)
+            }
+
+            fn preflight_warnings(&self, install_path: &Path) -> Vec<String> {
+                melonloader_preflight(install_path)
+            }
+
+            fn load_log_sources(&self, install_path: &Path) -> Vec<super::LogSource> {
+                melonloader_log_sources(install_path)
+            }
+
+            fn staging_deploy_warnings(&self, content_root: &Path, mod_name: &str) -> Vec<String> {
+                melon_staging_warnings(content_root, mod_name)
+            }
+
+            fn resolve_deploy_root(&self, install_path: &Path, relative: &Path) -> Result<PathBuf> {
+                Ok(resolve_melon_deploy(install_path, relative))
+            }
         }
-    }
-
-    fn preserve_staging_root_names(&self) -> &[&str] {
-        MELONLOADER_PRESERVE_ROOTS
-    }
-
-    fn should_wrap_as_mod_folder(&self, content_root: &Path) -> bool {
-        !looks_like_melonloader_pack(content_root) && looks_like_melon_mod(content_root)
-    }
-
-    fn wrap_mod_folder_name(&self, content_root: &Path, staged_name: &str) -> String {
-        content_folder_wrap_name(content_root, staged_name)
-    }
-
-    fn deploys_to_install_root(&self, content_root: &Path) -> bool {
-        looks_like_melonloader_pack(content_root)
-    }
-
-    fn preflight_warnings(&self, install_path: &Path) -> Vec<String> {
-        melonloader_preflight(install_path)
-    }
-
-    fn load_log_sources(&self, install_path: &Path) -> Vec<super::LogSource> {
-        melonloader_log_sources(install_path)
-    }
-
-    fn staging_deploy_warnings(&self, content_root: &Path, mod_name: &str) -> Vec<String> {
-        melon_staging_warnings(content_root, mod_name)
-    }
-
-    fn resolve_deploy_root(&self, install_path: &Path, relative: &Path) -> Result<PathBuf> {
-        Ok(resolve_melon_deploy(install_path, relative))
-    }
+    };
 }
 
-impl GamePlugin for BoneworksPlugin {
-    fn info(&self) -> GamePluginInfo {
-        GamePluginInfo {
-            id: "boneworks",
-            display_name: "BONEWORKS",
-            nexus_domain: "boneworks",
-            match_names: &["boneworks", "bone works"],
-        }
-    }
+melonloader_plugin!(
+    BonelabPlugin,
+    "bonelab",
+    "BONELAB",
+    "bonelab",
+    &["bonelab", "bone lab"]
+);
 
-    fn preserve_staging_root_names(&self) -> &[&str] {
-        MELONLOADER_PRESERVE_ROOTS
-    }
+melonloader_plugin!(
+    BoneworksPlugin,
+    "boneworks",
+    "BONEWORKS",
+    "boneworks",
+    &["boneworks", "bone works"]
+);
 
-    fn should_wrap_as_mod_folder(&self, content_root: &Path) -> bool {
-        !looks_like_melonloader_pack(content_root) && looks_like_melon_mod(content_root)
-    }
+melonloader_plugin!(
+    TheLongDarkPlugin,
+    "thelongdark",
+    "The Long Dark",
+    "thelongdark",
+    &["the long dark", "thelongdark"]
+);
 
-    fn wrap_mod_folder_name(&self, content_root: &Path, staged_name: &str) -> String {
-        content_folder_wrap_name(content_root, staged_name)
-    }
-
-    fn deploys_to_install_root(&self, content_root: &Path) -> bool {
-        looks_like_melonloader_pack(content_root)
-    }
-
-    fn preflight_warnings(&self, install_path: &Path) -> Vec<String> {
-        melonloader_preflight(install_path)
-    }
-
-    fn load_log_sources(&self, install_path: &Path) -> Vec<super::LogSource> {
-        melonloader_log_sources(install_path)
-    }
-
-    fn staging_deploy_warnings(&self, content_root: &Path, mod_name: &str) -> Vec<String> {
-        melon_staging_warnings(content_root, mod_name)
-    }
-
-    fn resolve_deploy_root(&self, install_path: &Path, relative: &Path) -> Result<PathBuf> {
-        Ok(resolve_melon_deploy(install_path, relative))
-    }
-}
+melonloader_plugin!(
+    BloonsTd6Plugin,
+    "bloonstd6",
+    "Bloons TD 6",
+    "bloonstd6",
+    &["bloons td 6", "bloonstd6", "btd6"]
+);
 
 pub fn melonloader_present(install_path: &Path) -> bool {
     install_path.join("MelonLoader").is_dir()

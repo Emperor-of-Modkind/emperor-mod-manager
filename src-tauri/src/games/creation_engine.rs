@@ -12,11 +12,20 @@ use anyhow::{Context, Result};
 use super::{normalize_relative, GamePlugin, GamePluginInfo, PluginSkip};
 
 const SKYRIM_SE_APP_ID: &str = "489830";
+const SKYRIM_LE_APP_ID: &str = "72850";
 const FALLOUT4_APP_ID: &str = "377160";
+const FALLOUT_NV_APP_ID: &str = "22380";
+const FALLOUT3_APP_ID: &str = "22300";
+const OBLIVION_APP_ID: &str = "22330";
+const MORROWIND_APP_ID: &str = "22320";
 const STARFIELD_APP_ID: &str = "1716740";
 const OBLIVION_REMASTERED_APP_ID: &str = "2623190";
 
-pub const CREATION_ENGINE_ROOT_DIRS: &[&str] = &["Data", "SKSE", "F4SE", "SFSE", "OBSE", "Scripts"];
+pub const CREATION_ENGINE_ROOT_DIRS: &[&str] = &[
+    "Data", "SKSE", "F4SE", "SFSE", "OBSE", "NVSE", "FOSE", "MWSE", "Scripts",
+];
+
+pub const MORROWIND_ROOT_DIRS: &[&str] = &["Data Files", "MWSE", "Textures", "Meshes", "Icons", "Sound", "Splash", "BookArt", "Fonts", "Music", "Shaders"];
 
 pub const OBLIVION_REMASTERED_ROOT_DIRS: &[&str] = &[
     "OblivionRemastered",
@@ -63,15 +72,46 @@ const OBLIVION_REMASTERED_MASTERS: &[&str] = &[
     "AltarESPLocal.esp",
 ];
 
+const FALLOUT_NV_MASTERS: &[&str] = &[
+    "FalloutNV.esm",
+    "DeadMoney.esm",
+    "HonestHearts.esm",
+    "OldWorldBlues.esm",
+    "LonesomeRoad.esm",
+    "GunRunnersArsenal.esm",
+];
+
+const FALLOUT3_MASTERS: &[&str] = &[
+    "Fallout3.esm",
+    "Anchorage.esm",
+    "ThePitt.esm",
+    "BrokenSteel.esm",
+    "PointLookout.esm",
+    "Zeta.esm",
+];
+
+const OBLIVION_MASTERS: &[&str] = &["Oblivion.esm"];
+
+const MORROWIND_MASTERS: &[&str] = &["Morrowind.esm", "Tribunal.esm", "Bloodmoon.esm"];
+
 const EXTENDER_LOADERS: &[&str] = &[
     "skse64_loader.exe",
     "skse64_loader",
+    "skse_loader.exe",
+    "skse_loader",
     "f4se_loader.exe",
     "f4se_loader",
+    "nvse_loader.exe",
+    "nvse_loader",
+    "fose_loader.exe",
+    "fose_loader",
     "sfse_loader.exe",
     "sfse_loader",
     "obse64_loader.exe",
     "obse64_loader",
+    "obse_loader.exe",
+    "obse_loader",
+    "mwse.dll",
 ];
 
 #[derive(Clone, Copy)]
@@ -205,9 +245,269 @@ macro_rules! ce_title_plugin {
     };
 }
 
+const FALLOUT_NV: CreationTitle = CreationTitle {
+    id: "newvegas",
+    display_name: "Fallout: New Vegas",
+    nexus_domain: "newvegas",
+    match_names: &["fallout new vegas", "fallout: new vegas", "newvegas", "fnv"],
+    steam_app_id: FALLOUT_NV_APP_ID,
+    local_appdata_game: "FalloutNV",
+    plugins_in_documents: false,
+    documents_game: "",
+    extender_names: &["nvse_loader.exe", "nvse_loader", "nvse_1_4.dll"],
+    required_masters: FALLOUT_NV_MASTERS,
+    asterisk_enabled: false,
+};
+
+const FALLOUT3: CreationTitle = CreationTitle {
+    id: "fallout3",
+    display_name: "Fallout 3",
+    nexus_domain: "fallout3",
+    match_names: &["fallout 3", "fallout3"],
+    steam_app_id: FALLOUT3_APP_ID,
+    local_appdata_game: "Fallout3",
+    plugins_in_documents: false,
+    documents_game: "",
+    extender_names: &["fose_loader.exe", "fose_loader", "fose_1_7.dll"],
+    required_masters: FALLOUT3_MASTERS,
+    asterisk_enabled: false,
+};
+
+const OBLIVION: CreationTitle = CreationTitle {
+    id: "oblivion",
+    display_name: "The Elder Scrolls IV: Oblivion",
+    nexus_domain: "oblivion",
+    match_names: &["elder scrolls iv oblivion", "tes iv oblivion", "oblivion"],
+    steam_app_id: OBLIVION_APP_ID,
+    local_appdata_game: "Oblivion",
+    plugins_in_documents: false,
+    documents_game: "",
+    extender_names: &["obse_loader.exe", "obse_loader", "obse_1_2_416.dll"],
+    required_masters: OBLIVION_MASTERS,
+    asterisk_enabled: false,
+};
+
+const SKYRIM_LE: CreationTitle = CreationTitle {
+    id: "skyrim",
+    display_name: "Skyrim (2011)",
+    nexus_domain: "skyrim",
+    match_names: &["elder scrolls v skyrim", "skyrim legendary", "skyrim"],
+    steam_app_id: SKYRIM_LE_APP_ID,
+    local_appdata_game: "Skyrim",
+    plugins_in_documents: false,
+    documents_game: "",
+    extender_names: &["skse_loader.exe", "skse_loader", "skse_1_9_32.dll"],
+    required_masters: SKYRIM_SE_MASTERS,
+    asterisk_enabled: false,
+};
+
 ce_title_plugin!(SkyrimSpecialEditionPlugin, SKYRIM_SE);
+ce_title_plugin!(SkyrimPlugin, SKYRIM_LE);
 ce_title_plugin!(Fallout4Plugin, FALLOUT4);
+ce_title_plugin!(FalloutNewVegasPlugin, FALLOUT_NV);
+ce_title_plugin!(Fallout3Plugin, FALLOUT3);
+ce_title_plugin!(OblivionPlugin, OBLIVION);
 ce_title_plugin!(StarfieldPlugin, STARFIELD);
+
+pub struct MorrowindPlugin;
+
+impl GamePlugin for MorrowindPlugin {
+    fn info(&self) -> GamePluginInfo {
+        GamePluginInfo {
+            id: "morrowind",
+            display_name: "The Elder Scrolls III: Morrowind",
+            nexus_domain: "morrowind",
+            match_names: &[
+                "elder scrolls iii morrowind",
+                "tes iii morrowind",
+                "morrowind",
+            ],
+        }
+    }
+
+    fn preserve_staging_root_names(&self) -> &[&str] {
+        MORROWIND_ROOT_DIRS
+    }
+
+    fn deploys_to_install_root(&self, content_root: &Path) -> bool {
+        looks_like_script_extender(content_root)
+    }
+
+    fn resolve_deploy_root(&self, install_path: &Path, relative: &Path) -> Result<PathBuf> {
+        let normalized = normalize_relative(relative);
+        let mut comps = normalized.components();
+        let first = comps
+            .next()
+            .and_then(|c| match c {
+                Component::Normal(s) => Some(s.to_string_lossy().to_lowercase()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let data_files = find_or_default_data_files(install_path);
+        if first == "data files" || first == "data" {
+            let rest: PathBuf = comps.collect();
+            return Ok(data_files.join(rest));
+        }
+        Ok(data_files.join(&normalized))
+    }
+
+    fn after_deploy(
+        &self,
+        install_path: &Path,
+        _enabled_mod_folders: &[String],
+    ) -> Result<Vec<String>> {
+        let data_files = find_or_default_data_files(install_path);
+        let mut warnings = update_morrowind_ini(install_path, &data_files)?;
+        warnings.extend(update_openmw_cfg_if_present(install_path, &data_files)?);
+        Ok(warnings)
+    }
+}
+
+fn find_or_default_data_files(install_path: &Path) -> PathBuf {
+    if let Ok(entries) = std::fs::read_dir(install_path) {
+        for entry in entries.flatten() {
+            if entry.file_type().is_ok_and(|t| t.is_dir())
+                && entry
+                    .file_name()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case("Data Files")
+            {
+                return entry.path();
+            }
+        }
+    }
+    install_path.join("Data Files")
+}
+
+fn morrowind_plugin_list(data_files: &Path) -> Vec<String> {
+    let mut masters = Vec::new();
+    let mut esps = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(data_files) {
+        for entry in entries.flatten() {
+            if !entry.file_type().is_ok_and(|t| t.is_file()) {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let lower = name.to_ascii_lowercase();
+            if lower.ends_with(".esm") {
+                masters.push(name);
+            } else if lower.ends_with(".esp") || lower.ends_with(".omwaddon") {
+                esps.push(name);
+            }
+        }
+    }
+    masters.sort_by_key(|n| {
+        let pos = MORROWIND_MASTERS
+            .iter()
+            .position(|m| m.eq_ignore_ascii_case(n))
+            .unwrap_or(MORROWIND_MASTERS.len());
+        (pos, n.to_ascii_lowercase())
+    });
+    esps.sort_by_key(|n| n.to_ascii_lowercase());
+    masters.extend(esps);
+    masters
+}
+
+fn update_morrowind_ini(install_path: &Path, data_files: &Path) -> Result<Vec<String>> {
+    let ini_path = install_path.join("Morrowind.ini");
+    if !ini_path.is_file() {
+        return Ok(Vec::new());
+    }
+    let plugins = morrowind_plugin_list(data_files);
+    if plugins.is_empty() {
+        return Ok(Vec::new());
+    }
+    let existing = std::fs::read_to_string(&ini_path).unwrap_or_default();
+    let mut out = String::new();
+    let mut in_game_files = false;
+    let mut wrote_section = false;
+    for line in existing.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            if in_game_files && !wrote_section {
+                for (i, plugin) in plugins.iter().enumerate() {
+                    out.push_str(&format!("GameFile{i}={plugin}\n"));
+                }
+                wrote_section = true;
+            }
+            in_game_files = trimmed.eq_ignore_ascii_case("[Game Files]");
+            out.push_str(line);
+            out.push('\n');
+            if in_game_files {
+                for (i, plugin) in plugins.iter().enumerate() {
+                    out.push_str(&format!("GameFile{i}={plugin}\n"));
+                }
+                wrote_section = true;
+            }
+            continue;
+        }
+        if in_game_files && trimmed.to_ascii_lowercase().starts_with("gamefile") {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !wrote_section {
+        if !out.ends_with('\n') && !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str("[Game Files]\n");
+        for (i, plugin) in plugins.iter().enumerate() {
+            out.push_str(&format!("GameFile{i}={plugin}\n"));
+        }
+    }
+    std::fs::write(&ini_path, out)
+        .with_context(|| format!("write {}", ini_path.display()))?;
+    Ok(Vec::new())
+}
+
+fn openmw_cfg_path(install_path: &Path) -> Option<PathBuf> {
+    let local = install_path.join("openmw.cfg");
+    if local.is_file() {
+        return Some(local);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            let xdg = home.join(".config").join("openmw").join("openmw.cfg");
+            if xdg.is_file() {
+                return Some(xdg);
+            }
+        }
+    }
+    if let Some(docs) = super::user_data::documents_dir(install_path, MORROWIND_APP_ID) {
+        let candidate = docs.join("My Games").join("OpenMW").join("openmw.cfg");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn update_openmw_cfg_if_present(install_path: &Path, data_files: &Path) -> Result<Vec<String>> {
+    let Some(cfg_path) = openmw_cfg_path(install_path) else {
+        return Ok(Vec::new());
+    };
+    let plugins = morrowind_plugin_list(data_files);
+    if plugins.is_empty() {
+        return Ok(Vec::new());
+    }
+    let existing = std::fs::read_to_string(&cfg_path).unwrap_or_default();
+    let mut out = String::new();
+    for line in existing.lines() {
+        if line.trim_start().starts_with("content=") {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    for plugin in &plugins {
+        out.push_str(&format!("content={plugin}\n"));
+    }
+    std::fs::write(&cfg_path, out)
+        .with_context(|| format!("write {}", cfg_path.display()))?;
+    Ok(Vec::new())
+}
 
 pub struct OblivionRemasteredPlugin;
 
@@ -307,16 +607,22 @@ fn looks_like_script_extender(content_root: &Path) -> bool {
     };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_lowercase();
-        if name.starts_with("skse64") && name.ends_with(".dll") {
+        if (name.starts_with("skse64") || name.starts_with("skse_")) && name.ends_with(".dll") {
             return true;
         }
         if name.starts_with("f4se_") && name.ends_with(".dll") {
+            return true;
+        }
+        if (name.starts_with("nvse_") || name.starts_with("fose_")) && name.ends_with(".dll") {
             return true;
         }
         if name.starts_with("sfse_") && name.ends_with(".dll") {
             return true;
         }
         if name.starts_with("obse") && name.ends_with(".dll") {
+            return true;
+        }
+        if name == "mwse.dll" {
             return true;
         }
     }

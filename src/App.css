@@ -624,11 +624,13 @@ a {
   display: flex;
   flex-direction: column;
   min-height: 0;
-  padding: 1.25rem 1.5rem 2rem;
+  padding: 1.25rem;
   overflow: hidden;
 }
 
 .panel {
+  position: relative;
+  isolation: isolate;
   background: var(--panel);
   border: 0;
   border-radius: var(--shape-sheet);
@@ -926,6 +928,7 @@ button.tag-picker-trigger[aria-expanded="true"] {
   flex-direction: column;
   flex: 1;
   min-height: 0;
+  overflow: hidden;
 }
 
 .browse-chrome {
@@ -938,7 +941,6 @@ button.tag-picker-trigger[aria-expanded="true"] {
   min-height: 0;
   overflow-x: hidden;
   overflow-y: auto;
-  background: var(--panel);
 }
 
 .browse-scroll-sentinel {
@@ -2384,6 +2386,7 @@ button.linkish:hover:not(:disabled):not(.nav) {
 
 .status-card {
   display: flex;
+  flex-wrap: wrap;
   gap: 0.6rem;
   align-items: center;
   padding: 0.75rem 0.9rem;
@@ -2407,6 +2410,10 @@ button.linkish:hover:not(:disabled):not(.nav) {
 
 .pill.warn {
   color: var(--warn);
+}
+
+.pill.muted {
+  color: var(--muted);
 }
 
 .segment {
@@ -3695,6 +3702,10 @@ button.path-link:focus-visible:not(:disabled):not(.nav) {
     transform var(--motion-fast) var(--ease-out);
 }
 
+.media-cover-glow-portal {
+  z-index: -1;
+}
+
 :root[data-theme="dark"] .media-cover-glow {
   filter: blur(36px) saturate(1.5) brightness(1.08);
 }
@@ -3951,6 +3962,9 @@ button.path-link:focus-visible:not(:disabled):not(.nav) {
 }
 
 .media-cover-actions button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
   flex: 1;
   width: 100%;
   min-width: 0;
@@ -3967,6 +3981,10 @@ button.path-link:focus-visible:not(:disabled):not(.nav) {
   text-overflow: ellipsis;
   pointer-events: none;
   transition: background-color var(--motion-fast) var(--ease-out);
+}
+
+.media-cover-actions button svg {
+  font-size: 1.25rem;
 }
 
 .media-cover-actions button:not(:last-child) {
@@ -3986,23 +4004,20 @@ button.path-link:focus-visible:not(:disabled):not(.nav) {
   color: #fff;
 }
 
-.media-card .media-cover-actions button:first-child:hover:not(:disabled):not(.danger),
-.media-card .media-cover-actions button:first-child:focus-visible:not(:disabled):not(.danger) {
+.media-card .media-cover-actions button.media-cover-action-primary:hover:not(:disabled):not(.danger),
+.media-card .media-cover-actions button.media-cover-action-primary:focus-visible:not(:disabled):not(.danger) {
   background: color-mix(in srgb, var(--accent) 42%, transparent);
   border-color: rgba(255, 255, 255, 0.14);
   color: #fff;
 }
 
-.media-cover-actions button.danger,
-.media-cover-actions button.danger:first-child {
+.media-cover-actions button.danger {
   background: transparent;
   color: #fff;
 }
 
 .media-card .media-cover-actions button.danger:hover:not(:disabled),
-.media-card .media-cover-actions button.danger:first-child:hover:not(:disabled),
-.media-card .media-cover-actions button.danger:focus-visible:not(:disabled),
-.media-card .media-cover-actions button.danger:first-child:focus-visible:not(:disabled) {
+.media-card .media-cover-actions button.danger:focus-visible:not(:disabled) {
   background: color-mix(in srgb, var(--danger) 42%, transparent);
   border-color: rgba(255, 255, 255, 0.14);
   color: #fff;
@@ -4660,6 +4675,10 @@ button.path-link:focus-visible:not(:disabled):not(.nav) {
   flex: 1 1 0;
   min-width: 0;
   min-height: 0;
+}
+
+.tab-kept-browse:not(.tab-parked),
+.page-panel {
   overflow: hidden;
 }
 

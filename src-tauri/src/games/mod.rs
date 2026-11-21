@@ -11,32 +11,49 @@ use crate::config::Paths;
 use crate::mods::options::ModOptionSet;
 use crate::nexus::NexusClient;
 
+mod assettocorsa;
 mod baldursgate3;
+mod beamng;
 mod bepinex_install;
 mod bladeandsorcery;
+mod civilization;
 mod controlresonant;
 mod creation_engine;
 mod cyberpunk2077;
 mod daysgone;
+mod decima;
+mod diablo2r;
+mod dragonageorigins;
 mod dressmaker;
 mod exe_version;
+mod factorio;
+mod farmingsimulator;
 mod firstlight;
+mod folder_mods;
 mod fromsoft_loaders;
 mod fromsoftware;
+mod ghostoftsushima;
+mod hades;
 mod helldivers2;
 mod id_tech;
+mod kenshi;
 mod kingdomcome;
+mod kotor;
+mod ksp;
 mod log_sources;
 mod melonloader;
 mod monsterhunterworld;
 mod mountandblade;
 mod mysummercar;
 mod nomanssky;
+mod paradox;
 mod projectzomboid;
+mod rage_engine;
 mod re_engine;
 mod rimworld;
 mod scstrucksim;
 mod sevendaystodie;
+mod sims2;
 mod sims3;
 mod sims4;
 mod sims_framework;
@@ -44,7 +61,10 @@ mod smapi_install;
 mod snowrunner;
 mod spaceengineers;
 mod stardewvalley;
+mod starsector;
 mod theforest;
+mod totalwar;
+mod umm;
 mod unity_bepinex;
 mod unreal_engine;
 mod user_data;
@@ -52,49 +72,81 @@ mod valve;
 mod warhammer40kdarktide;
 mod wine_overrides;
 mod witcher3;
+mod x4foundations;
+mod xray_engine;
 
-pub use baldursgate3::BaldursGate3Plugin;
+pub use assettocorsa::AssettoCorsaPlugin;
+pub use baldursgate3::{BaldursGate3Plugin, DivinityOriginalSin2Plugin};
+pub use beamng::BeamNgDrivePlugin;
 pub use bladeandsorcery::BladeAndSorceryPlugin;
+pub use civilization::{Civilization6Plugin, Civilization7Plugin};
 pub use controlresonant::ControlResonantPlugin;
 pub use creation_engine::{
-    Fallout4Plugin, OblivionRemasteredPlugin, SkyrimSpecialEditionPlugin, StarfieldPlugin,
+    Fallout3Plugin, Fallout4Plugin, FalloutNewVegasPlugin, MorrowindPlugin, OblivionPlugin,
+    OblivionRemasteredPlugin, SkyrimPlugin, SkyrimSpecialEditionPlugin, StarfieldPlugin,
 };
 pub use cyberpunk2077::Cyberpunk2077Plugin;
 pub use daysgone::DaysGonePlugin;
+pub use decima::{DeathStrandingPlugin, HorizonForbiddenWestPlugin, HorizonZeroDawnPlugin};
+pub use diablo2r::Diablo2ResurrectedPlugin;
+pub use dragonageorigins::DragonAgeOriginsPlugin;
 pub(crate) use dressmaker::plugin_id_for_install;
 pub use dressmaker::DressmakerPlugin;
 pub use exe_version::detect_install_version;
+pub use factorio::FactorioPlugin;
+pub use farmingsimulator::{FarmingSimulator22Plugin, FarmingSimulator25Plugin};
 pub use firstlight::FirstLightPlugin;
+pub use folder_mods::{
+    BarotraumaPlugin, DarkestDungeonPlugin, DwarfFortressPlugin, VintageStoryPlugin,
+};
 pub use fromsoft_loaders::install_legacy_from_archive;
 pub use fromsoftware::{
-    DarkSouls2Plugin, DarkSouls3Plugin, DarkSoulsPlugin, DarkSoulsRemasteredPlugin, EldenRingPlugin,
+    ArmoredCore6Plugin, DarkSouls2Plugin, DarkSouls3Plugin, DarkSoulsPlugin,
+    DarkSoulsRemasteredPlugin, EldenRingNightreignPlugin, EldenRingPlugin, SekiroPlugin,
 };
+pub use ghostoftsushima::GhostOfTsushimaPlugin;
+pub use hades::{Hades2Plugin, HadesPlugin};
 pub use helldivers2::Helldivers2Plugin;
 pub use id_tech::{
     Doom2016Plugin, DoomEternalPlugin, DoomTheDarkAgesPlugin, Wolfenstein2Plugin,
     WolfensteinNewOrderPlugin, WolfensteinOldBloodPlugin, WolfensteinYoungbloodPlugin,
 };
+pub use kenshi::KenshiPlugin;
 pub use kingdomcome::{KingdomComeDeliverance2Plugin, KingdomComeDeliverancePlugin};
-pub use melonloader::{BonelabPlugin, BoneworksPlugin};
-pub use monsterhunterworld::MonsterHunterWorldPlugin;
+pub use kotor::{Kotor2Plugin, KotorPlugin};
+pub use ksp::KerbalSpaceProgramPlugin;
+pub use melonloader::{BloonsTd6Plugin, BonelabPlugin, BoneworksPlugin, TheLongDarkPlugin};
+pub use monsterhunterworld::{DragonsDogmaDarkArisenPlugin, MonsterHunterWorldPlugin};
 pub use mountandblade::{MountAndBlade2BannerlordPlugin, MountAndBladeWarbandPlugin};
 pub use mysummercar::MySummerCarPlugin;
 pub use nomanssky::NoMansSkyPlugin;
+pub use paradox::{
+    CrusaderKings3Plugin, EuropaUniversalis4Plugin, HeartsOfIron4Plugin, StellarisPlugin,
+    Victoria3Plugin,
+};
 pub use projectzomboid::ProjectZomboidPlugin;
+pub use rage_engine::{GrandTheftAuto5Plugin, RedDeadRedemption2Plugin};
 pub use re_engine::{
-    MonsterHunterRisePlugin, MonsterHunterWildsPlugin, ResidentEvil22019Plugin,
-    ResidentEvil32020Plugin, ResidentEvil42023Plugin, ResidentEvil7Plugin,
-    ResidentEvilRequiemPlugin, ResidentEvilVillagePlugin,
+    DevilMayCry5Plugin, DragonsDogma2Plugin, MonsterHunterRisePlugin, MonsterHunterWildsPlugin,
+    ResidentEvil22019Plugin, ResidentEvil32020Plugin, ResidentEvil42023Plugin, ResidentEvil7Plugin,
+    ResidentEvilRequiemPlugin, ResidentEvilVillagePlugin, StreetFighter6Plugin,
 };
 pub use rimworld::RimWorldPlugin;
 pub use scstrucksim::{AmericanTruckSimulatorPlugin, EuroTruckSimulator2Plugin};
 pub use sevendaystodie::SevenDaysToDiePlugin;
+pub use sims2::Sims2Plugin;
 pub use sims3::Sims3Plugin;
 pub use sims4::Sims4Plugin;
 pub use snowrunner::SnowRunnerPlugin;
 pub use spaceengineers::SpaceEngineersPlugin;
 pub use stardewvalley::StardewValleyPlugin;
+pub use starsector::StarsectorPlugin;
 pub use theforest::TheForestPlugin;
+pub use totalwar::{
+    TotalWarRome2Plugin, TotalWarShogun2Plugin, TotalWarThreeKingdomsPlugin,
+    TotalWarWarhammer3Plugin,
+};
+pub use umm::{PathfinderWotrPlugin, Warhammer40kRogueTraderPlugin};
 pub use unity_bepinex::{
     bepinex_pack_deploy_root, looks_like_unity_install, rewrite_ror2_bepinexpack_dest,
     thunderstore_community_for_plugin, AgainstTheStormPlugin, AmongUsPlugin, AtlyssPlugin,
@@ -123,6 +175,10 @@ pub use wine_overrides::WineOverrideAdvice;
 #[cfg(target_os = "linux")]
 pub use wine_overrides::{advise_wine_overrides, StagedProxySource};
 pub use witcher3::Witcher3Plugin;
+pub use x4foundations::X4FoundationsPlugin;
+pub use xray_engine::{
+    StalkerAnomalyPlugin, StalkerCallOfPripyatPlugin, StalkerShadowOfChernobylPlugin,
+};
 
 /// What `deploy_mods` knows about the install while a plugin prepares it.
 pub struct RuntimePrep<'a> {
@@ -415,14 +471,20 @@ pub fn all_plugins() -> Vec<&'static dyn GamePlugin> {
         &WolfensteinNewOrderPlugin,
         &StardewValleyPlugin,
         &BaldursGate3Plugin,
+        &DivinityOriginalSin2Plugin,
         &Cyberpunk2077Plugin,
         &Witcher3Plugin,
         &FirstLightPlugin,
         &ControlResonantPlugin,
         &DaysGonePlugin,
         &Warhammer40kDarktidePlugin,
+        &Warhammer40kRogueTraderPlugin,
+        &PathfinderWotrPlugin,
         &Helldivers2Plugin,
         &Stalker2HeartOfChornobylPlugin,
+        &StalkerAnomalyPlugin,
+        &StalkerShadowOfChernobylPlugin,
+        &StalkerCallOfPripyatPlugin,
         &PalworldPlugin,
         &HogwartsLegacyPlugin,
         &ReadyOrNotPlugin,
@@ -431,6 +493,7 @@ pub fn all_plugins() -> Vec<&'static dyn GamePlugin> {
         &DeepRockGalacticPlugin,
         &PavlovPlugin,
         &OblivionRemasteredPlugin,
+        &OblivionPlugin,
         &UnrealEnginePlugin,
         &HollowKnightSilksongPlugin,
         &LethalCompanyPlugin,
@@ -456,6 +519,8 @@ pub fn all_plugins() -> Vec<&'static dyn GamePlugin> {
         &InscryptionPlugin,
         &BonelabPlugin,
         &BoneworksPlugin,
+        &TheLongDarkPlugin,
+        &BloonsTd6Plugin,
         &BladeAndSorceryPlugin,
         &TheForestPlugin,
         &MySummerCarPlugin,
@@ -465,12 +530,17 @@ pub fn all_plugins() -> Vec<&'static dyn GamePlugin> {
         &NoMansSkyPlugin,
         &Sims4Plugin,
         &Sims3Plugin,
+        &Sims2Plugin,
         &SnowRunnerPlugin,
         &EuroTruckSimulator2Plugin,
         &AmericanTruckSimulatorPlugin,
         &SpaceEngineersPlugin,
         &SkyrimSpecialEditionPlugin,
+        &SkyrimPlugin,
         &Fallout4Plugin,
+        &FalloutNewVegasPlugin,
+        &Fallout3Plugin,
+        &MorrowindPlugin,
         &StarfieldPlugin,
         &MountAndBlade2BannerlordPlugin,
         &MountAndBladeWarbandPlugin,
@@ -479,7 +549,10 @@ pub fn all_plugins() -> Vec<&'static dyn GamePlugin> {
         &DressmakerPlugin,
         &ChefRpgPlugin,
         &BepInExPlugin,
+        &EldenRingNightreignPlugin,
         &EldenRingPlugin,
+        &ArmoredCore6Plugin,
+        &SekiroPlugin,
         &DarkSouls3Plugin,
         &DarkSouls2Plugin,
         &DarkSoulsRemasteredPlugin,
@@ -487,12 +560,57 @@ pub fn all_plugins() -> Vec<&'static dyn GamePlugin> {
         &MonsterHunterWildsPlugin,
         &MonsterHunterRisePlugin,
         &MonsterHunterWorldPlugin,
+        &DragonsDogma2Plugin,
+        &DragonsDogmaDarkArisenPlugin,
+        &DevilMayCry5Plugin,
+        &StreetFighter6Plugin,
         &ResidentEvilRequiemPlugin,
         &ResidentEvilVillagePlugin,
         &ResidentEvil42023Plugin,
         &ResidentEvil32020Plugin,
         &ResidentEvil22019Plugin,
         &ResidentEvil7Plugin,
+        // Paradox Clausewitz
+        &HeartsOfIron4Plugin,
+        &StellarisPlugin,
+        &CrusaderKings3Plugin,
+        &EuropaUniversalis4Plugin,
+        &Victoria3Plugin,
+        // Total War
+        &TotalWarWarhammer3Plugin,
+        &TotalWarThreeKingdomsPlugin,
+        &TotalWarRome2Plugin,
+        &TotalWarShogun2Plugin,
+        // Rockstar RAGE
+        &RedDeadRedemption2Plugin,
+        &GrandTheftAuto5Plugin,
+        // Decima
+        &HorizonZeroDawnPlugin,
+        &HorizonForbiddenWestPlugin,
+        &DeathStrandingPlugin,
+        // Standalone & Paired
+        &FactorioPlugin,
+        &FarmingSimulator25Plugin,
+        &FarmingSimulator22Plugin,
+        &AssettoCorsaPlugin,
+        &BeamNgDrivePlugin,
+        &KerbalSpaceProgramPlugin,
+        &KenshiPlugin,
+        &X4FoundationsPlugin,
+        &Civilization7Plugin,
+        &Civilization6Plugin,
+        &GhostOfTsushimaPlugin,
+        &DragonAgeOriginsPlugin,
+        &Diablo2ResurrectedPlugin,
+        &StarsectorPlugin,
+        &Hades2Plugin,
+        &HadesPlugin,
+        &Kotor2Plugin,
+        &KotorPlugin,
+        &BarotraumaPlugin,
+        &DwarfFortressPlugin,
+        &DarkestDungeonPlugin,
+        &VintageStoryPlugin,
         // Valve (more specific titles first)
         &HalfLife2DeathmatchPlugin,
         &HalfLife2Plugin,
@@ -1082,6 +1200,93 @@ mod tests {
             ("Dota 2", "dota2"),
             ("Deadlock", "deadlock"),
             ("Aperture Desk Job", "aperturedeskjob"),
+        ];
+        for (title, expected_id) in cases {
+            assert_eq!(
+                match_plugin(title, None)
+                    .unwrap_or_else(|| panic!("expected match for {title}"))
+                    .id,
+                expected_id,
+                "title: {title}"
+            );
+        }
+    }
+
+    #[test]
+    fn match_expanded_game_titles_and_disambiguation() {
+        let cases = [
+            // Creation Engine disambiguation
+            ("The Elder Scrolls V: Skyrim Special Edition", "skyrimspecialedition"),
+            ("The Elder Scrolls V: Skyrim", "skyrim"),
+            ("The Elder Scrolls IV: Oblivion Remastered", "oblivionremastered"),
+            ("The Elder Scrolls IV: Oblivion", "oblivion"),
+            ("The Elder Scrolls III: Morrowind", "morrowind"),
+            ("Fallout: New Vegas", "newvegas"),
+            ("Fallout 3 - Game of the Year Edition", "fallout3"),
+            // FromSoftware disambiguation
+            ("ELDEN RING NIGHTREIGN", "eldenringnightreign"),
+            ("ELDEN RING", "eldenring"),
+            ("ARMORED CORE VI FIRES OF RUBICON", "armoredcore6firesofrubicon"),
+            ("Sekiro: Shadows Die Twice", "sekiro"),
+            // Capcom RE Engine & MT Framework disambiguation
+            ("Dragon's Dogma 2", "dragonsdogma2"),
+            ("Dragon's Dogma: Dark Arisen", "dragonsdogma"),
+            ("Devil May Cry 5", "devilmaycry5"),
+            ("Street Fighter 6", "streetfighter6"),
+            // Larian & Sims & MelonLoader
+            ("Divinity: Original Sin 2 - Definitive Edition", "divinityoriginalsin2definitiveedition"),
+            ("The Sims 2 Legacy", "sims2"),
+            ("The Long Dark", "thelongdark"),
+            ("Bloons TD 6", "bloonstd6"),
+            // Paradox Clausewitz
+            ("Hearts of Iron IV", "heartsofironiv"),
+            ("Stellaris", "stellaris"),
+            ("Crusader Kings III", "crusaderkings3"),
+            ("Europa Universalis IV", "europauniversalisiv"),
+            ("Victoria 3", "victoria3"),
+            // Total War
+            ("Total War: WARHAMMER III", "totalwarwarhammer3"),
+            ("Total War: THREE KINGDOMS", "totalwarthreekingdoms"),
+            ("Total War: ROME II - Emperor Edition", "totalwarrome2"),
+            ("Total War: SHOGUN 2", "totalwarshogun2"),
+            // Rockstar RAGE
+            ("Red Dead Redemption 2", "reddeadredemption2"),
+            ("Grand Theft Auto V", "gta5"),
+            // Decima
+            ("Horizon Zero Dawn Complete Edition", "horizonzerodawn"),
+            ("Horizon Forbidden West Complete Edition", "horizonforbiddenwest"),
+            ("DEATH STRANDING DIRECTOR'S CUT", "deathstranding"),
+            // S.T.A.L.K.E.R. X-Ray vs S.T.A.L.K.E.R. 2
+            ("S.T.A.L.K.E.R. 2: Heart of Chornobyl", "stalker2heartofchornobyl"),
+            ("S.T.A.L.K.E.R.: Anomaly", "stalkeranomaly"),
+            ("S.T.A.L.K.E.R.: Shadow of Chernobyl", "stalkershadowofchernobyl"),
+            ("S.T.A.L.K.E.R.: Call of Pripyat", "stalkercallofpripyat"),
+            // Standalone & Paired
+            ("Factorio", "factorio"),
+            ("Farming Simulator 25", "farmingsimulator25"),
+            ("Farming Simulator 22", "farmingsimulator22"),
+            ("Assetto Corsa", "assettocorsa"),
+            ("BeamNG.drive", "beamngdrive"),
+            ("Kerbal Space Program", "kerbalspaceprogram"),
+            ("Kenshi", "kenshi"),
+            ("X4: Foundations", "x4foundations"),
+            ("Sid Meier's Civilization VII", "civilizationvii"),
+            ("Sid Meier's Civilization VI", "civilizationvi"),
+            ("Ghost of Tsushima DIRECTOR'S CUT", "ghostoftsushima"),
+            ("Dragon Age: Origins - Ultimate Edition", "dragonage"),
+            ("Diablo II: Resurrected", "diablo2resurrected"),
+            ("Starsector", "starsector"),
+            ("Hades II", "hades2"),
+            ("Hades", "hades"),
+            ("STAR WARS Knights of the Old Republic II - The Sith Lords", "kotor2"),
+            ("STAR WARS - Knights of the Old Republic", "kotor"),
+            ("Barotrauma", "barotrauma"),
+            ("Dwarf Fortress", "dwarffortress"),
+            ("Darkest Dungeon", "darkestdungeon"),
+            ("Vintage Story", "vintagestory"),
+            // Owlcat / UMM
+            ("Pathfinder: Wrath of the Righteous - Enhanced Edition", "pathfinderwrathoftherighteous"),
+            ("Warhammer 40,000: Rogue Trader", "warhammer40kroguetrader"),
         ];
         for (title, expected_id) in cases {
             assert_eq!(

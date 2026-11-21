@@ -5,6 +5,59 @@ use anyhow::Result;
 use super::{GamePlugin, GamePluginInfo};
 
 pub struct BaldursGate3Plugin;
+pub struct DivinityOriginalSin2Plugin;
+
+const DOS2_STEAM_APP_ID: &str = "435150";
+
+impl GamePlugin for DivinityOriginalSin2Plugin {
+    fn info(&self) -> GamePluginInfo {
+        GamePluginInfo {
+            id: "divinityoriginalsin2definitiveedition",
+            display_name: "Divinity: Original Sin 2 - Definitive Edition",
+            nexus_domain: "divinityoriginalsin2definitiveedition",
+            match_names: &[
+                "divinity original sin 2",
+                "divinity: original sin 2",
+                "divinityoriginalsin2",
+                "dos2",
+            ],
+        }
+    }
+
+    fn prefers_mod_folder(&self) -> bool {
+        false
+    }
+
+    fn preserve_staging_root_names(&self) -> &[&str] {
+        &["Mods", "Data", "DefEd"]
+    }
+
+    fn resolve_deploy_root(&self, install_path: &Path, relative: &Path) -> Result<PathBuf> {
+        let normalized = super::normalize_relative(relative);
+        let first = normalized
+            .components()
+            .next()
+            .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        if first == "data" || first == "defed" {
+            return Ok(install_path.join(&normalized));
+        }
+
+        let mods_dir = super::user_data::documents_dir(install_path, DOS2_STEAM_APP_ID)
+            .map(|docs| {
+                docs.join("Larian Studios")
+                    .join("Divinity Original Sin 2 Definitive Edition")
+                    .join("Mods")
+            })
+            .unwrap_or_else(|| install_path.join("Mods"));
+
+        if first == "mods" {
+            let stripped = normalized.strip_prefix(normalized.components().next().unwrap()).unwrap_or(&normalized);
+            return Ok(mods_dir.join(stripped));
+        }
+        Ok(mods_dir.join(&normalized))
+    }
+}
 
 impl GamePlugin for BaldursGate3Plugin {
     fn info(&self) -> GamePluginInfo {

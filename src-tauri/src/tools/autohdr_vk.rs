@@ -115,6 +115,7 @@ impl AutoHdrVkConfig {
         Ok(())
     }
 
+    #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
     pub fn profile_mut(&mut self, exe: &str) -> &mut AutoHdrVkProfile {
         let exe_lower = exe.to_lowercase();
         if let Some(idx) = self
@@ -137,6 +138,7 @@ impl AutoHdrVkConfig {
         &mut self.profiles[last]
     }
 
+    #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
     pub fn remove_profile(&mut self, exe: &str) {
         self.profiles.retain(|p| !p.exe.eq_ignore_ascii_case(exe));
     }

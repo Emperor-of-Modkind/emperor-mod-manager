@@ -75,6 +75,7 @@ impl HeroicResolver {
         }
     }
 
+    #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
     pub fn resolve(
         &mut self,
         launcher: &str,
@@ -298,10 +299,12 @@ impl HeroicArtIndex {
     }
 }
 
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 pub fn is_heroic_launcher(launcher: &str) -> bool {
     launcher.to_ascii_lowercase().contains("heroic")
 }
 
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 pub fn store_from_launcher(launcher: &str) -> Option<HeroicStore> {
     if !is_heroic_launcher(launcher) {
         return None;

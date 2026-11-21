@@ -314,6 +314,32 @@ describe("applyCatalogCovers", () => {
 
     expect(applyCatalogCovers(games, resolved)).toBe(games);
   });
+
+  it("prefers cached local cover_path over cover_url when present", () => {
+    const games = [
+      detected({
+        id: "heroic-no-cover",
+        cover_path: "/home/u/.config/heroic/icons/999.png",
+        icon_path: "/home/u/.config/heroic/icons/999.png",
+      }),
+    ];
+    const resolved = new Map([
+      [
+        "heroic-no-cover",
+        {
+          coverPath: "/cache/covers/catalog-nexus-doom.jpg",
+          coverUrl: "https://images.nexusmods.com/images/games/v2/doom/tile.jpg",
+        },
+      ],
+    ]);
+
+    const next = applyCatalogCovers(games, resolved);
+    expect(next[0]).toMatchObject({
+      id: "heroic-no-cover",
+      cover_path: "/cache/covers/catalog-nexus-doom.jpg",
+      cover_url: null,
+    });
+  });
 });
 
 describe("mergeCollectionCatalogCovers & mergeCollectionCatalogTitles", () => {
@@ -344,6 +370,19 @@ describe("mergeCollectionCatalogCovers & mergeCollectionCatalogTitles", () => {
       "nexus:stardewvalley": "Stardew Valley",
     });
     expect(mergeCollectionCatalogTitles(titles1, hits)).toBe(titles1);
+  });
+
+  it("prefers cached cover_path over cover_url in mergeCollectionCatalogCovers", () => {
+    const hits = [
+      {
+        id: `${COLLECTION_COVER_PREFIX}nexus:stardewvalley`,
+        cover_url: "https://images.nexusmods.com/images/games/v2/1303/tile.jpg",
+        cover_path: "/cache/covers/catalog-nexus-stardewvalley.jpg",
+      },
+    ];
+    expect(mergeCollectionCatalogCovers({}, hits)).toEqual({
+      "nexus:stardewvalley": "/cache/covers/catalog-nexus-stardewvalley.jpg",
+    });
   });
 
   it("formats deduplication keys consistently", () => {
