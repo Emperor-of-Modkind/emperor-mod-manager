@@ -172,6 +172,7 @@ function useStableRect(active: boolean) {
         cb(rect);
       };
       publish();
+      if (typeof ResizeObserver === "undefined") return;
       const observer = new ResizeObserver(publish);
       observer.observe(el);
       return () => observer.disconnect();
@@ -202,7 +203,7 @@ function useScrollWidth(scrollRef: ScrollRef, active = true): number {
         frame = requestAnimationFrame(watch);
         return;
       }
-      if (!observer) {
+      if (!observer && typeof ResizeObserver !== "undefined") {
         observer = new ResizeObserver(() => publish(el.clientWidth));
         observer.observe(el);
       }
@@ -227,6 +228,8 @@ type BrowseVirtualGridProps<T> = {
   renderItem: (item: T, index: number) => ReactNode;
   renderSkeletonItem?: (index: number) => ReactNode;
   fixedRowHeight?: boolean;
+  /** Whether cards in this grid include the `.media-card-meta` line below the title. */
+  hasMeta?: boolean;
   fillTrailingSkeletons?: boolean;
   initialScrollTop?: number;
   onPageSize?: (count: number) => void;
@@ -252,6 +255,7 @@ function BrowseVirtualGridInner<T,>({
   renderItem,
   renderSkeletonItem,
   fixedRowHeight = false,
+  hasMeta = true,
   fillTrailingSkeletons = false,
   initialScrollTop,
   onPageSize,
@@ -292,6 +296,7 @@ function BrowseVirtualGridInner<T,>({
       onPageSizeRef.current?.(count);
     };
     report();
+    if (typeof ResizeObserver === "undefined") return;
     const observer = new ResizeObserver(report);
     observer.observe(el);
     return () => observer.disconnect();
@@ -311,6 +316,7 @@ function BrowseVirtualGridInner<T,>({
       setScrollMargin((prev) => (Math.abs(prev - next) < 0.5 ? prev : next));
     };
     publish();
+    if (typeof ResizeObserver === "undefined") return;
     const observer = new ResizeObserver(publish);
     observer.observe(scroll);
     if (grid.parentElement) observer.observe(grid.parentElement);
@@ -330,7 +336,7 @@ function BrowseVirtualGridInner<T,>({
     [columns, items],
   );
 
-  const rowHeight = estimateGridRowHeight(cardWidth, rem);
+  const rowHeight = estimateGridRowHeight(cardWidth, rem, hasMeta);
   const virtualizer = useVirtualizer({
     count: rowCount,
     getScrollElement: () => scrollRef.current,
@@ -611,6 +617,7 @@ function BrowseVirtualListInner<T,>({
       setScrollMargin((prev) => (Math.abs(prev - next) < 0.5 ? prev : next));
     };
     publish();
+    if (typeof ResizeObserver === "undefined") return;
     const observer = new ResizeObserver(publish);
     observer.observe(scroll);
     if (list.parentElement) observer.observe(list.parentElement);
@@ -625,6 +632,7 @@ function BrowseVirtualListInner<T,>({
       onPageSizeRef.current?.(browsePageCount(1, el.clientHeight, estimateSize, rowGap));
     };
     report();
+    if (typeof ResizeObserver === "undefined") return;
     const observer = new ResizeObserver(report);
     observer.observe(el);
     return () => observer.disconnect();

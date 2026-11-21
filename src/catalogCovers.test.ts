@@ -2,8 +2,11 @@ import { describe, expect, it } from "vitest";
 import {
   COLLECTION_COVER_PREFIX,
   applyCatalogCovers,
+  catalogCoverRequestKey,
   catalogCoverRequests,
   collectionCatalogCoverRequests,
+  mergeCollectionCatalogCovers,
+  mergeCollectionCatalogTitles,
 } from "./catalogCovers";
 import type { SavedCollectionGameGroup } from "./savedCollectionGroups";
 import type {
@@ -310,5 +313,47 @@ describe("applyCatalogCovers", () => {
     ]);
 
     expect(applyCatalogCovers(games, resolved)).toBe(games);
+  });
+});
+
+describe("mergeCollectionCatalogCovers & mergeCollectionCatalogTitles", () => {
+  it("strips collection prefix, merges new covers/titles, and preserves reference when unchanged", () => {
+    const hits = [
+      {
+        id: `${COLLECTION_COVER_PREFIX}nexus:stardewvalley`,
+        cover_url: "https://images.nexusmods.com/images/games/v2/1303/tile.jpg",
+        title: "Stardew Valley",
+      },
+      {
+        id: `${COLLECTION_COVER_PREFIX}modio:42`,
+        cover_url: "https://thumb.modcdn.io/42.png",
+        title: "  ",
+      },
+    ];
+
+    const covers1 = mergeCollectionCatalogCovers({}, hits);
+    expect(covers1).toEqual({
+      "nexus:stardewvalley":
+        "https://images.nexusmods.com/images/games/v2/1303/tile.jpg",
+      "modio:42": "https://thumb.modcdn.io/42.png",
+    });
+    expect(mergeCollectionCatalogCovers(covers1, hits)).toBe(covers1);
+
+    const titles1 = mergeCollectionCatalogTitles({}, hits);
+    expect(titles1).toEqual({
+      "nexus:stardewvalley": "Stardew Valley",
+    });
+    expect(mergeCollectionCatalogTitles(titles1, hits)).toBe(titles1);
+  });
+
+  it("formats deduplication keys consistently", () => {
+    expect(
+      catalogCoverRequestKey({
+        id: `${COLLECTION_COVER_PREFIX}nexus:stardewvalley`,
+        nexus_domain: "stardewvalley",
+        modio_game_id: null,
+        icon_path: null,
+      }),
+    ).toBe(`${COLLECTION_COVER_PREFIX}nexus:stardewvalley:stardewvalley:`);
   });
 });

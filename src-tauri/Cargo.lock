@@ -1547,7 +1547,7 @@ checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
 
 [[package]]
 name = "emperor-mod-manager"
-version = "0.8.4"
+version = "0.8.5"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

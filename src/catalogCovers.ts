@@ -1,5 +1,6 @@
 import type { SavedCollectionGameGroup } from "./savedCollectionGroups";
 import type {
+  CatalogCoverHit,
   CatalogCoverRequest,
   CatalogSuggestion,
   DetectedGame,
@@ -164,4 +165,48 @@ export function collectionCatalogCoverRequests(
     });
   }
   return requests;
+}
+
+export function catalogCoverRequestKey(req: CatalogCoverRequest): string {
+  return `${req.id}:${req.nexus_domain ?? ""}:${req.modio_game_id ?? ""}`;
+}
+
+export function mergeCollectionCatalogCovers(
+  prev: Record<string, string>,
+  hits: CatalogCoverHit[],
+): Record<string, string> {
+  if (hits.length === 0) return prev;
+  let changed = false;
+  const next = { ...prev };
+  for (const hit of hits) {
+    const groupKey = hit.id.startsWith(COLLECTION_COVER_PREFIX)
+      ? hit.id.slice(COLLECTION_COVER_PREFIX.length)
+      : hit.id;
+    if (next[groupKey] !== hit.cover_url) {
+      next[groupKey] = hit.cover_url;
+      changed = true;
+    }
+  }
+  return changed ? next : prev;
+}
+
+export function mergeCollectionCatalogTitles(
+  prev: Record<string, string>,
+  hits: CatalogCoverHit[],
+): Record<string, string> {
+  if (hits.length === 0) return prev;
+  let changed = false;
+  const next = { ...prev };
+  for (const hit of hits) {
+    const title = hit.title?.trim();
+    if (!title) continue;
+    const groupKey = hit.id.startsWith(COLLECTION_COVER_PREFIX)
+      ? hit.id.slice(COLLECTION_COVER_PREFIX.length)
+      : hit.id;
+    if (next[groupKey] !== title) {
+      next[groupKey] = title;
+      changed = true;
+    }
+  }
+  return changed ? next : prev;
 }

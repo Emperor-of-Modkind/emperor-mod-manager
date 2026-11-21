@@ -9,10 +9,7 @@ import {
   useRef,
   useState,
   type CSSProperties,
-  type KeyboardEvent as ReactKeyboardEvent,
-  type ReactNode,
   type RefObject,
-  type TransitionEvent as ReactTransitionEvent,
 } from "react";
 import { createPortal } from "react-dom";
 import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
@@ -21,7 +18,6 @@ import {
   faArrowUp,
   faBars,
   faCaretDown,
-  faCheck,
   faCopy,
   faEye,
   faEyeSlash,
@@ -46,8 +42,8 @@ import { AccountConnections } from "./AccountConnections";
 import {
   CollectionDetailView,
   CollectionStats,
+  ContainedModsSection,
   EditableCollectionTitle,
-  ShareModList,
 } from "./CollectionDetailView";
 import { CollectionsGameList } from "./CollectionsGameList";
 import {
@@ -80,7 +76,6 @@ import {
 import { SourceMark, sourceMarkName } from "./SourceMark";
 import { ImageCarousel } from "./ImageCarousel";
 import {
-  MotionCard,
   NavGroup,
   NavTab,
   Collapse,
@@ -91,6 +86,7 @@ import {
   ViewSwitch,
   staggerStyle,
 } from "./motion";
+import { MediaCard, PlaceholderIcon, useDecodedImageReveal } from "./MediaCard";
 import { RichText } from "./RichText";
 import { BrowseVirtualGrid, BrowseVirtualList } from "./BrowseResults";
 import {
@@ -102,7 +98,6 @@ import {
   StagedModsSkeleton,
 } from "./Skeleton";
 import { ResultsReveal, useReveal } from "./reveal";
-import { useQueuedImageSrc } from "./imageLoadQueue";
 import {
   ParkedTabGate,
   TtlTracker,
@@ -184,10 +179,12 @@ import {
 import { WineOverrideNotice } from "./WineOverrideNotice";
 import { CollectionIntegrityDialog } from "./CollectionIntegrityDialog";
 import {
-  COLLECTION_COVER_PREFIX,
   applyCatalogCovers,
+  catalogCoverRequestKey,
   catalogCoverRequests,
   collectionCatalogCoverRequests,
+  mergeCollectionCatalogCovers,
+  mergeCollectionCatalogTitles,
 } from "./catalogCovers";
 import { nexusModUnavailable, nexusUnavailableNotice } from "./nexusAvailability";
 import type {
@@ -1058,79 +1055,6 @@ function shortLauncher(launcher: string): string {
   return launcher.split("(")[0]?.trim() || launcher;
 }
 
-function PlaceholderIcon() {
-  return (
-    <div className="media-placeholder" aria-hidden>
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
-        <rect x="3" y="6" width="18" height="12" rx="2" />
-        <path d="M8 12h.01M12 10v4M16 12h.01" strokeLinecap="round" />
-      </svg>
-    </div>
-  );
-}
-
-function useDecodedImageReveal(src: string | null) {
-  const { activeSrc, status, markLoaded, markFailed } = useQueuedImageSrc(src);
-  const imgRef = useRef<HTMLImageElement | null>(null);
-  const activeSrcRef = useRef(activeSrc);
-  activeSrcRef.current = activeSrc;
-  const [fadeDone, setFadeDone] = useState(false);
-
-  useEffect(() => {
-    if (status !== "ready") {
-      setFadeDone(false);
-      return;
-    }
-    if (fadeDone) return;
-    const timer = window.setTimeout(() => setFadeDone(true), 220);
-    return () => window.clearTimeout(timer);
-  }, [fadeDone, status]);
-
-  const handleImgLoad = useCallback(() => {
-    const img = imgRef.current;
-    const expected = activeSrcRef.current;
-    if (!expected) return;
-    if (img && typeof img.decode === "function") {
-      img.decode().then(
-        () => {
-          if (activeSrcRef.current === expected) markLoaded();
-        },
-        () => {
-          if (activeSrcRef.current === expected) markLoaded();
-        },
-      );
-    } else {
-      markLoaded();
-    }
-  }, [markLoaded]);
-
-  useLayoutEffect(() => {
-    const img = imgRef.current;
-    if (activeSrc && status === "loading" && img && img.complete && img.naturalWidth > 0) {
-      handleImgLoad();
-    }
-  }, [activeSrc, handleImgLoad, status]);
-
-  const handleTransitionEnd = useCallback(
-    (e: ReactTransitionEvent<HTMLImageElement>) => {
-      if (e.propertyName === "opacity" && status === "ready") {
-        setFadeDone(true);
-      }
-    },
-    [status],
-  );
-
-  return {
-    imgRef,
-    activeSrc,
-    status,
-    showSkeleton: Boolean(src && status !== "error" && !(status === "ready" && fadeDone)),
-    handleImgLoad,
-    markFailed,
-    handleTransitionEnd,
-  };
-}
-
 const ListPoster = memo(function ListPoster({
   src,
   decoding,
@@ -1446,234 +1370,6 @@ function managedHealthBadge(health: GameHealth | undefined): string | null {
   return "Moved — relink available";
 }
 
-const MediaCard = memo(function MediaCard(props: {
-  title: string;
-  imageSrc: string | null;
-  badge?: string | null;
-  overlay?: string | null;
-  tags?: string[];
-  coverMarks?: { source: CatalogSource; label: string }[];
-  meta?: ReactNode;
-  installed?: boolean;
-  actions?: ReactNode;
-  coverActions?: ReactNode;
-  coverLabel?: string | null;
-  hoverLabel?: string | null;
-  unsupported?: boolean;
-  /** The game currently open in the app. Library grids keep this title at full strength. */
-  active?: boolean;
-  /** Library grids are small. Eager avoids WebView2 leaving lazy images blank until a click. */
-  loading?: "eager" | "lazy";
-  onClick?: () => void;
-  enterIndex?: number;
-  /** Skip the motion wrapper. Browse virtualization mounts cards while scrolling. */
-  plain?: boolean;
-}) {
-  const {
-    title,
-    imageSrc,
-    badge,
-    overlay,
-    tags,
-    coverMarks,
-    meta,
-    installed,
-    actions,
-    coverActions,
-    coverLabel,
-    hoverLabel,
-    unsupported,
-    active,
-    loading = "lazy",
-    onClick,
-    enterIndex,
-    plain,
-  } = props;
-  const {
-    imgRef,
-    activeSrc,
-    status,
-    showSkeleton,
-    handleImgLoad,
-    markFailed,
-    handleTransitionEnd,
-  } = useDecodedImageReveal(imageSrc);
-  const [glowActive, setGlowActive] = useState(false);
-  const [glowMounted, setGlowMounted] = useState(false);
-  const [glowVisible, setGlowVisible] = useState(false);
-
-  const coverSrc = imageSrc && status !== "error" ? imageSrc : null;
-  const canGlow = Boolean(onClick && coverSrc && status === "ready");
-
-  useEffect(() => {
-    if (!canGlow) {
-      setGlowActive(false);
-      setGlowVisible(false);
-      setGlowMounted(false);
-      return;
-    }
-    if (glowActive) {
-      setGlowMounted(true);
-      let raf2 = 0;
-      const raf1 = window.requestAnimationFrame(() => {
-        raf2 = window.requestAnimationFrame(() => {
-          setGlowVisible(true);
-        });
-      });
-      return () => {
-        window.cancelAnimationFrame(raf1);
-        window.cancelAnimationFrame(raf2);
-      };
-    }
-    setGlowVisible(false);
-    if (!glowMounted) return;
-    const timer = window.setTimeout(() => {
-      setGlowMounted(false);
-    }, 550);
-    return () => window.clearTimeout(timer);
-  }, [canGlow, glowActive, glowMounted]);
-
-  const classes = [
-    "media-card",
-    onClick ? "media-card-clickable" : "",
-    unsupported ? "media-card-unsupported" : "",
-    active ? "is-active" : "",
-  ]
-    .filter(Boolean)
-    .join(" ");
-  const onKeyDown = onClick
-    ? (event: ReactKeyboardEvent<HTMLElement>) => {
-        if (event.key === "Enter" || event.key === " ") {
-          event.preventDefault();
-          onClick();
-        }
-      }
-    : undefined;
-  const body = (
-    <>
-      <div
-        className="media-cover-stack"
-        onMouseEnter={onClick ? () => setGlowActive(true) : undefined}
-        onMouseLeave={onClick ? () => setGlowActive(false) : undefined}
-        onFocus={onClick ? () => setGlowActive(true) : undefined}
-        onBlur={onClick ? () => setGlowActive(false) : undefined}
-      >
-        {canGlow && glowMounted ? (
-          <img
-            className={glowVisible ? "media-cover-glow is-visible" : "media-cover-glow"}
-            src={coverSrc!}
-            alt=""
-            aria-hidden="true"
-            decoding="async"
-            onTransitionEnd={(e) => {
-              if (e.propertyName === "opacity" && !glowActive) {
-                setGlowMounted(false);
-              }
-            }}
-          />
-        ) : null}
-        <div className="media-cover">
-          {showSkeleton ? (
-            <div className="media-cover-skeleton skeleton" aria-hidden="true" />
-          ) : null}
-          {overlay || badge ? (
-            <div className="media-cover-top-left">
-              {overlay ? <span className="media-overlay">{overlay}</span> : null}
-              {badge ? <span className="media-badge">{badge}</span> : null}
-            </div>
-          ) : null}
-          {installed ? (
-            <span className="media-status" title="Installed" aria-label="Installed">
-              <FontAwesomeIcon icon={faCheck} aria-hidden="true" />
-            </span>
-          ) : null}
-          {coverSrc ? (
-            activeSrc ? (
-              <img
-                ref={imgRef}
-                key={activeSrc}
-                className={status === "ready" ? "cover-defer is-ready" : "cover-defer"}
-                src={activeSrc}
-                alt=""
-                loading={loading}
-                decoding="async"
-                onLoad={handleImgLoad}
-                onError={markFailed}
-                onTransitionEnd={handleTransitionEnd}
-              />
-            ) : null
-          ) : (
-            <PlaceholderIcon />
-          )}
-          {coverMarks && coverMarks.length > 0 ? (
-            <div className="media-cover-tags">
-              {coverMarks.map((mark) => (
-                <SourceMark key={mark.source} source={mark.source} label={mark.label} />
-              ))}
-            </div>
-          ) : null}
-          {coverLabel ? (
-            <span className="media-cover-label">{coverLabel}</span>
-          ) : null}
-          {hoverLabel ? (
-            <span className="media-cover-label media-cover-hover">{hoverLabel}</span>
-          ) : null}
-          {coverActions ? (
-            <div
-              className="media-cover-actions"
-              onClick={(e) => e.stopPropagation()}
-              onKeyDown={(e) => e.stopPropagation()}
-            >
-              {coverActions}
-            </div>
-          ) : null}
-        </div>
-      </div>
-      <div className="media-card-title">{title}</div>
-      {meta ? <div className="media-card-meta">{meta}</div> : null}
-      {tags && tags.length > 0 ? (
-        <div className="media-card-tags">
-          {tags.map((t) => (
-            <span key={t} className="pill">
-              {t}
-            </span>
-          ))}
-        </div>
-      ) : null}
-      {actions ? (
-        <div className="actions" onClick={(e) => e.stopPropagation()} onKeyDown={(e) => e.stopPropagation()}>
-          {actions}
-        </div>
-      ) : null}
-    </>
-  );
-  if (plain) {
-    return (
-      <article
-        className={classes}
-        onClick={onClick}
-        onKeyDown={onKeyDown}
-        role={onClick ? "button" : undefined}
-        tabIndex={onClick ? 0 : undefined}
-      >
-        {body}
-      </article>
-    );
-  }
-  return (
-    <MotionCard
-      className={classes}
-      enterIndex={enterIndex}
-      onClick={onClick}
-      onKeyDown={onKeyDown}
-      role={onClick ? "button" : undefined}
-      tabIndex={onClick ? 0 : undefined}
-    >
-      {body}
-    </MotionCard>
-  );
-});
-
 const BrowseModGridCard = memo(function BrowseModGridCard({
   mod: m,
   sort,
@@ -1971,30 +1667,25 @@ function SavedCollectionDetailBody({
   showMods,
   scrollRef,
   active,
+  onOpenMod,
 }: {
   entry: SavedCollectionEntry;
   mods: ShareModEntry[];
   showMods: boolean;
   scrollRef: RefObject<HTMLElement | null>;
   active: boolean;
+  onOpenMod?: (hit: CatalogHit) => void;
 }) {
   return (
     <>
-      <h2>Contained mods</h2>
-      <ResultsReveal
-        show={showMods}
-        skeleton={
-          <BrowseListSkeleton count={Math.min(12, entry.mod_count || 8)} />
-        }
-      >
-        {showMods ? (
-          <ShareModList
-            mods={mods}
-            scrollRef={scrollRef}
-            active={active}
-          />
-        ) : null}
-      </ResultsReveal>
+      <ContainedModsSection
+        mods={mods}
+        showMods={showMods}
+        skeletonCount={entry.mod_count || 8}
+        scrollRef={scrollRef}
+        active={active}
+        onOpenMod={onOpenMod}
+      />
       <h2>Code</h2>
       <textarea
         className="saved-collection-code"
@@ -2464,6 +2155,9 @@ export default function App() {
   const launchMenuRef = useRef<HTMLDivElement | null>(null);
   const mainScrollRef = useRef<HTMLElement | null>(null);
   const browseResultsRef = useRef<HTMLDivElement | null>(null);
+  const libraryHomeScrollRef = useRef<HTMLDivElement | null>(null);
+  const libraryDetailScrollRef = useRef<HTMLDivElement | null>(null);
+  const browseDetailScrollRef = useRef<HTMLDivElement | null>(null);
   const browseScrollRef = useRef(0);
   const browseScrollEpochRef = useRef(0);
   const browseScrollArmedEpochRef = useRef(0);
@@ -3709,6 +3403,14 @@ export default function App() {
       main?.scrollTo(0, 0);
     }
   }, [browseResultsVisible, activeGame?.id]);
+
+  useLayoutEffect(() => {
+    libraryDetailScrollRef.current?.scrollTo(0, 0);
+  }, [libraryDetail?.game.id]);
+
+  useLayoutEffect(() => {
+    browseDetailScrollRef.current?.scrollTo(0, 0);
+  }, [browseDetail]);
 
   const libraryShellKey = libraryDetail ? `game:${libraryDetail.game.id}` : "library-home";
   const collectionsViewKey = savedDetail
@@ -6276,6 +5978,41 @@ export default function App() {
     });
   }
 
+  async function openCollectionMod(
+    hit: CatalogHit,
+    returnTab: "collections" | "friends" | "library",
+    targetGameId?: string | null,
+  ) {
+    const targetGame =
+      (targetGameId ? managed.find((g) => g.id === targetGameId) : null) ??
+      activeGame;
+    if (!targetGame) {
+      setNotice({
+        kind: "warn",
+        message: "Manage this game in Library to open in Browse.",
+      });
+      return;
+    }
+    if (activeGame?.id !== targetGame.id) {
+      pendingEmperorModRef.current = { hit, gameId: targetGame.id };
+      setBrowseReturnTab(returnTab);
+      try {
+        await api.setActiveGame(targetGame.id);
+      } catch (e) {
+        pendingEmperorModRef.current = null;
+        setError(String(e));
+        return;
+      }
+      setActiveId(targetGame.id);
+      return;
+    }
+    setBrowseReturnTab(returnTab);
+    setTab("browse");
+    await openMod(hit, "info", {
+      navOverrides: { tab: "browse", browseReturnTab: returnTab },
+    });
+  }
+
   async function openRecentDownload(item: DownloadItem) {
     const hit = catalogHitFromDownload(item);
     const gameId = item.page?.game_id;
@@ -7668,15 +7405,12 @@ export default function App() {
       savedCollectionGameGroups,
       gamePlugins,
       detected,
-    ).filter((req) => {
-      const key = `${req.id}:${req.nexus_domain ?? ""}:${req.modio_game_id ?? ""}`;
-      return !collectionCoverAttemptedRef.current.has(key);
-    });
+    ).filter(
+      (req) => !collectionCoverAttemptedRef.current.has(catalogCoverRequestKey(req)),
+    );
     if (requests.length === 0) return;
     for (const req of requests) {
-      collectionCoverAttemptedRef.current.add(
-        `${req.id}:${req.nexus_domain ?? ""}:${req.modio_game_id ?? ""}`,
-      );
+      collectionCoverAttemptedRef.current.add(catalogCoverRequestKey(req));
     }
     let cancelled = false;
     void api
@@ -7684,36 +7418,12 @@ export default function App() {
       .then((hits) => {
         if (cancelled || hits.length === 0) return;
         startTransition(() => {
-          setCollectionCatalogCovers((prev) => {
-            let changed = false;
-            const next = { ...prev };
-            for (const hit of hits) {
-              const groupKey = hit.id.startsWith(COLLECTION_COVER_PREFIX)
-                ? hit.id.slice(COLLECTION_COVER_PREFIX.length)
-                : hit.id;
-              if (next[groupKey] !== hit.cover_url) {
-                next[groupKey] = hit.cover_url;
-                changed = true;
-              }
-            }
-            return changed ? next : prev;
-          });
-          setCollectionCatalogTitles((prev) => {
-            let changed = false;
-            const next = { ...prev };
-            for (const hit of hits) {
-              const title = hit.title?.trim();
-              if (!title) continue;
-              const groupKey = hit.id.startsWith(COLLECTION_COVER_PREFIX)
-                ? hit.id.slice(COLLECTION_COVER_PREFIX.length)
-                : hit.id;
-              if (next[groupKey] !== title) {
-                next[groupKey] = title;
-                changed = true;
-              }
-            }
-            return changed ? next : prev;
-          });
+          setCollectionCatalogCovers((prev) =>
+            mergeCollectionCatalogCovers(prev, hits),
+          );
+          setCollectionCatalogTitles((prev) =>
+            mergeCollectionCatalogTitles(prev, hits),
+          );
         });
       })
       .catch((e) => {
@@ -8999,6 +8709,153 @@ export default function App() {
     ),
     [],
   );
+  const renderLibraryGridSkeletonCard = useCallback(
+    () => (
+      <div className="media-card" aria-hidden="true">
+        <div className="media-cover-stack">
+          <div className="media-cover skeleton" />
+        </div>
+        <span className="skeleton skeleton-line skeleton-line-title" />
+      </div>
+    ),
+    [],
+  );
+  const getLibraryGameKey = useCallback(
+    (g: ManagedGame | DetectedGame) => g.id,
+    [],
+  );
+  const managedHasActions = useMemo(
+    () =>
+      managed.some((g) => {
+        const status = gameHealthById.get(g.id)?.status;
+        return status === "relocate_candidate" || status === "missing";
+      }),
+    [gameHealthById, managed],
+  );
+  const renderLibraryManagedItem = useCallback(
+    (g: ManagedGame) => {
+      const health = gameHealthById.get(g.id);
+      const badge = managedHealthBadge(health);
+      const actions =
+        health?.status === "relocate_candidate" ? (
+          <>
+            <button
+              type="button"
+              onClick={() =>
+                setRelinkPrompt({
+                  game: g,
+                  health,
+                })
+              }
+            >
+              Relink
+            </button>
+            <button
+              type="button"
+              className="danger"
+              onClick={() => openUnmanageModal(g)}
+            >
+              Unmanage
+            </button>
+          </>
+        ) : health?.status === "missing" ? (
+          <button
+            type="button"
+            className="danger"
+            onClick={() => openUnmanageModal(g)}
+          >
+            Unmanage
+          </button>
+        ) : undefined;
+      return (
+        <MediaCard
+          key={g.id}
+          plain
+          title={g.title}
+          imageSrc={gameCoverSrc(g)}
+          active={g.id === activeGame?.id}
+          badge={badge}
+          overlay={
+            health?.status === "missing"
+              ? g.install_path
+              : health?.new_install_path ?? undefined
+          }
+          actions={actions}
+          onClick={() => openGame(g)}
+        />
+      );
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [activeGame?.id, gameHealthById],
+  );
+  const renderLibraryUnmanagedItem = useCallback(
+    (g: DetectedGame) => {
+      const suggestion = catalogSuggestions[g.id];
+      const hints = catalogHints(suggestion);
+      if (g.supported) {
+        return (
+          <MediaCard
+            key={g.id}
+            plain
+            title={g.title}
+            imageSrc={gameCoverSrc(g)}
+            coverMarks={hints}
+            hoverLabel="Manage"
+            onClick={() => manage(g)}
+          />
+        );
+      }
+      if (g.engine_hint === "unreal" && g.install_path) {
+        const kind = catalogMatchCardKind(suggestion);
+        const ready = kind === "ready";
+        return (
+          <MediaCard
+            key={g.id}
+            plain
+            title={g.title}
+            imageSrc={gameCoverSrc(g)}
+            badge={catalogMatchBadge(kind)}
+            coverMarks={hints}
+            hoverLabel={catalogMatchHover(kind)}
+            onClick={() =>
+              ready ? manageUnrealQuick(g) : beginUnrealManage(g)
+            }
+          />
+        );
+      }
+      if (g.engine_hint === "bepinex" && g.install_path) {
+        const kind = catalogMatchCardKind(suggestion);
+        const ready = kind === "ready";
+        return (
+          <MediaCard
+            key={g.id}
+            plain
+            title={g.title}
+            imageSrc={gameCoverSrc(g)}
+            badge={catalogMatchBadge(kind)}
+            coverMarks={hints}
+            hoverLabel={catalogMatchHover(kind)}
+            onClick={() =>
+              ready ? manageBepinexQuick(g) : beginBepinexManage(g)
+            }
+          />
+        );
+      }
+      return (
+        <MediaCard
+          key={g.id}
+          plain
+          title={g.title}
+          imageSrc={gameCoverSrc(g)}
+          coverMarks={hints}
+          coverLabel="Unsupported"
+          unsupported
+        />
+      );
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [catalogSuggestions],
+  );
 
   function browseResultsNote(kind: "mods" | "collections"): string {
     if (browseLoading && !browseSearched) return "Searching…";
@@ -9269,14 +9126,16 @@ export default function App() {
           aria-hidden={tab !== "library" ? true : undefined}
         >
           <ParkedTabGate active={tab === "library"}>
-          <section className={libraryDetail ? "panel" : "panel library-home"}>
+          <section className={libraryDetail ? "panel page-panel" : "panel page-panel library-home"}>
             <ViewSwitch
               viewKey={libraryShellKey}
+              className="page-view"
               initial={false}
               onEntered={setLibraryShellSettled}
             >
             {libraryDetail ? (
               <>
+                <div className="page-chrome">
                 <div className="panel-head">
                   <div className="detail-head-title">
                     <button type="button" onClick={() => closeLibraryDetail()}>
@@ -9420,17 +9279,6 @@ export default function App() {
                         >
                           Info
                         </button>
-                        <button
-                          type="button"
-                          role="menuitem"
-                          onClick={() => {
-                            setGameSettingsMenuOpen(false);
-                            void refreshSavedCollections();
-                            setGameModal("collections");
-                          }}
-                        >
-                          Collections
-                        </button>
                         {settings?.platform_linux && (
                           <button
                             type="button"
@@ -9511,12 +9359,43 @@ export default function App() {
                         </button>
                       )}
                     </div>
-                    {installedCollections.length > 0 && (
-                      <div
-                        className="detail-installed-collections"
-                        aria-label="Installed collections"
-                      >
-                        {installedCollections.map((c) => {
+                    <div
+                      className="detail-collections-box"
+                      tabIndex={0}
+                      onClick={(e) => {
+                        if ((e.target as HTMLElement).closest("button")) {
+                          return;
+                        }
+                        void refreshSavedCollections();
+                        setGameModal("collections");
+                      }}
+                      onKeyDown={(e) => {
+                        if (
+                          e.target === e.currentTarget &&
+                          (e.key === "Enter" || e.key === " ")
+                        ) {
+                          e.preventDefault();
+                          void refreshSavedCollections();
+                          setGameModal("collections");
+                        }
+                      }}
+                    >
+                      <div className="detail-collections-header">
+                        <span className="detail-collections-title">
+                          Collections
+                        </span>
+                        {installedCollections.length > 0 && (
+                          <span className="detail-collections-count">
+                            · {installedCollections.length}
+                          </span>
+                        )}
+                      </div>
+                      {installedCollections.length > 0 ? (
+                        <div
+                          className="detail-installed-collections"
+                          aria-label="Installed collections"
+                        >
+                          {installedCollections.map((c) => {
                           const installedLabel = formatInstalledAt(
                             c.installed_at,
                           );
@@ -9705,12 +9584,19 @@ export default function App() {
                             </article>
                           );
                         })}
-                      </div>
-                    )}
+                        </div>
+                      ) : (
+                        <div className="detail-collections-empty">
+                          No collections installed
+                        </div>
+                      )}
+                    </div>
                   </div>
                 </div>
+                </div>
 
-                <div className="detail-body">
+                <div className="detail-body page-view">
+                  <div className="page-chrome">
                     <Reveal
                       show={Boolean(
                         settings?.platform_linux &&
@@ -9961,6 +9847,8 @@ export default function App() {
                       mods={fomodNeeding}
                       onConfigure={configureFomods}
                     />
+                  </div>
+                  <div className="page-scroll" ref={libraryDetailScrollRef}>
                     {showMods ? (
                       <div className="results-fill">
                     {mods.length === 0 ? (
@@ -9974,7 +9862,7 @@ export default function App() {
                     ) : (
                     <BrowseVirtualList
                       items={modDrag.displayMods}
-                      scrollRef={mainScrollRef}
+                      scrollRef={libraryDetailScrollRef}
                       active={tab === "library"}
                       staggerEnter={!modDrag.isDragging}
                       staggerKey={activeGame?.id}
@@ -10225,9 +10113,11 @@ export default function App() {
                       <StagedModsSkeleton />
                     )}
                   </div>
+                </div>
               </>
             ) : (
-              <div>
+              <div className="page-view">
+                <div className="page-chrome">
                 <div className="panel-head">
                   <h1>Library</h1>
                   <div className="panel-head-actions">
@@ -10257,6 +10147,8 @@ export default function App() {
                     </div>
                   </div>
                 )}
+                </div>
+                <div className="page-scroll" ref={libraryHomeScrollRef}>
                 <ResultsReveal
                   show={showLibraryHome}
                   skeleton={
@@ -10276,64 +10168,16 @@ export default function App() {
                     <div className="library-posters">
                       <BrowseVirtualGrid
                         items={managed}
-                        scrollRef={mainScrollRef}
+                        scrollRef={libraryHomeScrollRef}
                         minCardPx={160}
+                        fixedRowHeight={!managedHasActions}
+                        hasMeta={false}
                         active={tab === "library"}
                         staggerEnter
                         trackScrollMargin
-                        getKey={(g) => g.id}
-                        renderItem={(g) => {
-                          const health = gameHealthById.get(g.id);
-                          const badge = managedHealthBadge(health);
-                          const actions =
-                            health?.status === "relocate_candidate" ? (
-                              <>
-                                <button
-                                  type="button"
-                                  onClick={() =>
-                                    setRelinkPrompt({
-                                      game: g,
-                                      health,
-                                    })
-                                  }
-                                >
-                                  Relink
-                                </button>
-                                <button
-                                  type="button"
-                                  className="danger"
-                                  onClick={() => openUnmanageModal(g)}
-                                >
-                                  Unmanage
-                                </button>
-                              </>
-                            ) : health?.status === "missing" ? (
-                              <button
-                                type="button"
-                                className="danger"
-                                onClick={() => openUnmanageModal(g)}
-                              >
-                                Unmanage
-                              </button>
-                            ) : undefined;
-                          return (
-                            <MediaCard
-                              key={g.id}
-                              plain
-                              title={g.title}
-                              imageSrc={gameCoverSrc(g)}
-                              active={g.id === activeGame?.id}
-                              badge={badge}
-                              overlay={
-                                health?.status === "missing"
-                                  ? g.install_path
-                                  : health?.new_install_path ?? undefined
-                              }
-                              actions={actions}
-                              onClick={() => openGame(g)}
-                            />
-                          );
-                        }}
+                        getKey={getLibraryGameKey}
+                        renderItem={renderLibraryManagedItem}
+                        renderSkeletonItem={renderLibraryGridSkeletonCard}
                       />
                     </div>
                   </>
@@ -10351,84 +10195,23 @@ export default function App() {
                     ) : (
                     <BrowseVirtualGrid
                       items={unmanaged}
-                      scrollRef={mainScrollRef}
+                      scrollRef={libraryHomeScrollRef}
                       minCardPx={160}
+                      fixedRowHeight
+                      hasMeta={false}
                       active={tab === "library"}
                       staggerEnter
                       trackScrollMargin
-                      getKey={(g) => g.id}
-                      renderItem={(g) => {
-                      const suggestion = catalogSuggestions[g.id];
-                      const hints = catalogHints(suggestion);
-                      if (g.supported) {
-                        return (
-                          <MediaCard
-                            key={g.id}
-                            plain
-                            title={g.title}
-                            imageSrc={gameCoverSrc(g)}
-                            coverMarks={hints}
-                            hoverLabel="Manage"
-                            onClick={() => manage(g)}
-                          />
-                        );
-                      }
-                      if (g.engine_hint === "unreal" && g.install_path) {
-                        const kind = catalogMatchCardKind(suggestion);
-                        const ready = kind === "ready";
-                        return (
-                          <MediaCard
-                            key={g.id}
-                            plain
-                            title={g.title}
-                            imageSrc={gameCoverSrc(g)}
-                            badge={catalogMatchBadge(kind)}
-                            coverMarks={hints}
-                            hoverLabel={catalogMatchHover(kind)}
-                            onClick={() =>
-                              ready ? manageUnrealQuick(g) : beginUnrealManage(g)
-                            }
-                          />
-                        );
-                      }
-                      if (g.engine_hint === "bepinex" && g.install_path) {
-                        const kind = catalogMatchCardKind(suggestion);
-                        const ready = kind === "ready";
-                        return (
-                          <MediaCard
-                            key={g.id}
-                            plain
-                            title={g.title}
-                            imageSrc={gameCoverSrc(g)}
-                            badge={catalogMatchBadge(kind)}
-                            coverMarks={hints}
-                            hoverLabel={catalogMatchHover(kind)}
-                            onClick={() =>
-                              ready
-                                ? manageBepinexQuick(g)
-                                : beginBepinexManage(g)
-                            }
-                          />
-                        );
-                      }
-                      return (
-                        <MediaCard
-                          key={g.id}
-                          plain
-                          title={g.title}
-                          imageSrc={gameCoverSrc(g)}
-                          coverMarks={hints}
-                          coverLabel="Unsupported"
-                          unsupported
-                        />
-                      );
-                    }}
+                      getKey={getLibraryGameKey}
+                      renderItem={renderLibraryUnmanagedItem}
+                      renderSkeletonItem={renderLibraryGridSkeletonCard}
                     />
                     )}
                 </div>
                 </>
                 ) : null}
                 </ResultsReveal>
+                </div>
               </div>
             )}
             </ViewSwitch>
@@ -10444,9 +10227,10 @@ export default function App() {
           aria-hidden={tab !== "collections" ? true : undefined}
         >
           <ParkedTabGate active={tab === "collections"}>
-          <section className="panel">
+          <section className="panel page-panel">
             <ViewSwitch
               viewKey={collectionsViewKey}
+              className="page-view"
               initial={false}
               onEntered={setCollectionsViewSettled}
             >
@@ -10555,16 +10339,28 @@ export default function App() {
                   skeletonCount={savedDetail.entry.mod_count}
                   scrollRef={mainScrollRef}
                   active={tab === "collections"}
+                  onOpenMod={(hit) =>
+                    void openCollectionMod(
+                      hit,
+                      "collections",
+                      savedInstallGameId ||
+                        managed.find((g) =>
+                          savedCollectionMatchesGame(savedDetail.entry, g),
+                        )?.id ||
+                        null,
+                    )
+                  }
                 />
               );
             })() : (
-              <div>
+              <div className="page-view">
+                <div className="page-chrome">
                 <div className="panel-head">
                   <h1>Saved Collections</h1>
                   <div className="panel-head-actions">
                     <button
                       type="button"
-                      className="icon-btn"
+                      className="mods-toolbar-icon-btn"
                       aria-label="Import collection"
                       title="Import collection"
                       onClick={() => {
@@ -10580,6 +10376,8 @@ export default function App() {
                   Local Emperor share codes grouped by game. Create one from Library →
                   game → Save loadout, or import a code or file here.
                 </p>
+                </div>
+                <div className="page-scroll">
                 {showCollectionsList ? (
                   <CollectionsGameList
                     groups={savedCollectionGameGroups}
@@ -10713,6 +10511,7 @@ export default function App() {
                 ) : (
                   <BrowseListSkeleton count={6} posters />
                 )}
+                </div>
               </div>
             )}
             </ViewSwitch>
@@ -10724,8 +10523,13 @@ export default function App() {
         {tab === "setup" ? (
         <ViewSwitch viewKey={tab} className="view-slot">
         {tab === "setup" && (
-          <section className="panel">
-            <h1>Setup</h1>
+          <section className="panel page-panel">
+            <div className="page-chrome">
+            <div className="panel-head">
+              <h1>Setup</h1>
+            </div>
+            </div>
+            <div className="page-scroll">
             <p>
               A Nexus API key and a Nexus website sign-in are both required before
               the rest of the app opens. Use Stay signed in. The website session
@@ -10759,6 +10563,7 @@ export default function App() {
                 Finish setup
               </button>
             </div>
+            </div>
           </section>
         )}
         </ViewSwitch>
@@ -10777,6 +10582,7 @@ export default function App() {
               detected={detected}
               plugins={gamePlugins}
               catalogCovers={collectionCatalogCovers}
+              catalogTitles={collectionCatalogTitles}
               activeGameId={activeGame?.id ?? null}
               scrollRef={mainScrollRef}
               installedShareIds={installedEmperorShareIds}
@@ -10814,6 +10620,9 @@ export default function App() {
                   friendSync ?? null,
                 );
               }}
+              onOpenMod={(hit, targetGameId) =>
+                void openCollectionMod(hit, "friends", targetGameId)
+              }
             />
           </ParkedTabGate>
         </div>
@@ -10841,11 +10650,12 @@ export default function App() {
                   : `collection:${browseDetail.hit.slug}`
                 : "browse-results"
             }
-            className={browseDetail ? "panel" : "panel browse-workspace"}
+            className={browseDetail ? "panel page-panel" : "panel browse-workspace"}
             initial={false}
           >
             {browseDetail ? (
               <>
+                <div className="page-chrome">
                 <div className="panel-head">
                   <div className="detail-head-title">
                     <button type="button" onClick={() => closeBrowseDetail()}>
@@ -10882,15 +10692,18 @@ export default function App() {
                     )}
                   </Segment>
                 </div>
+                </div>
 
                 <ViewSwitch
                   viewKey={`${browseDetail.kind}:${browseDetail.tab}:${
                     browseDetail.kind === "mod" ? browseDetail.hit.id : browseDetail.hit.slug
                   }`}
+                  className="page-view"
                   initial={false}
                 >
                 {browseDetail.kind === "mod" ? (
                   <>
+                    <div className="page-chrome">
                     <div className="detail-hero">
                       <div className="detail-cover">
                         {mediaSrc(
@@ -11060,7 +10873,7 @@ export default function App() {
                           {modDeepLinkFromHit(browseDetail.hit) ? (
                             <button
                               type="button"
-                              className="icon-btn"
+                              className="mods-toolbar-icon-btn"
                               aria-label="Copy link"
                               title="Copy link"
                               onClick={() => void copyModDeepLink(browseDetail.hit)}
@@ -11177,12 +10990,15 @@ export default function App() {
                         </div>
                       </div>
                     </div>
+                    </div>
 
                     {browseDetail.tab === "info" ? (
                       modDetailLoading && !modDetail && !tsDetail && !modioDetail ? (
+                        <div className="page-scroll" ref={browseDetailScrollRef}>
                         <ModDetailSkeleton tab="info" />
+                        </div>
                       ) : (
-                      <div className="detail-body">
+                      <div className="detail-body page-scroll" ref={browseDetailScrollRef}>
                         {browseDetail.hit.source !== "thunderstore" &&
                           browseDetail.hit.source !== "modio" && (
                             <NexusUnavailableCallout detail={modDetail} />
@@ -11253,9 +11069,11 @@ export default function App() {
                     ) : modFilesLoading &&
                       modFiles.length === 0 &&
                       modioFiles.length === 0 ? (
+                      <div className="page-scroll" ref={browseDetailScrollRef}>
                       <ModDetailSkeleton tab="files" />
+                      </div>
                     ) : (
-                      <div className="detail-body">
+                      <div className="detail-body page-scroll" ref={browseDetailScrollRef}>
                         <h2>Files</h2>
                         {browseDetail.hit.source === "modio" ? (
                           <ul className="list">
@@ -11304,6 +11122,7 @@ export default function App() {
                   </>
                 ) : (
                   <>
+                    <div className="page-chrome">
                     <div className="detail-hero">
                       <div className="detail-cover">
                         {mediaSrc(null, browseDetail.hit.tile_image_url) ? (
@@ -11396,12 +11215,15 @@ export default function App() {
                         )}
                       </div>
                     </div>
+                    </div>
 
                     {browseDetail.tab === "info" ? (
                       collectionDetailLoading && !collectionDetail && !tsDetail ? (
+                        <div className="page-scroll" ref={browseDetailScrollRef}>
                         <CollectionDetailSkeleton tab="info" />
+                        </div>
                       ) : (
-                        <div className="detail-body">
+                        <div className="detail-body page-scroll" ref={browseDetailScrollRef}>
                           <h2>About</h2>
                           <RichText
                             className="detail-description detail-description-html"
@@ -11417,13 +11239,18 @@ export default function App() {
                       )
                     ) : collectionHitSource(browseDetail.hit) === "thunderstore" ? (
                       collectionFilesLoading && !tsDetail ? (
+                        <div className="page-scroll" ref={browseDetailScrollRef}>
                         <CollectionDetailSkeleton tab="files" />
+                        </div>
                       ) : (
-                        <div className="detail-body">
+                        <div className="detail-body page-view">
+                          <div className="page-chrome">
                           <h2>
                             Included mods (
                             {(tsDetail?.versions[0]?.dependencies.length ?? 0) + 1})
                           </h2>
+                          </div>
+                          <div className="page-scroll" ref={browseDetailScrollRef}>
                           <ul className="list">
                             <li>
                               <div>
@@ -11440,12 +11267,16 @@ export default function App() {
                               </li>
                             ))}
                           </ul>
+                          </div>
                         </div>
                       )
                     ) : collectionFilesLoading && groupedCollectionMods.length === 0 ? (
+                      <div className="page-scroll" ref={browseDetailScrollRef}>
                       <CollectionDetailSkeleton tab="files" />
+                      </div>
                     ) : (
-                      <div className="detail-body">
+                      <div className="detail-body page-view">
+                        <div className="page-chrome">
                         <h2>
                           Included mods ({groupedCollectionMods.length})
                           {collectionModFiles.length > 0 &&
@@ -11453,6 +11284,8 @@ export default function App() {
                             ? ` · ${collectionModFiles.length} files`
                             : ""}
                         </h2>
+                        </div>
+                        <div className="page-scroll" ref={browseDetailScrollRef}>
                         {groupedCollectionMods.length === 0 ? (
                           <ul className="list">
                             <li className="empty">No mods found in this collection.</li>
@@ -11460,7 +11293,7 @@ export default function App() {
                         ) : (
                           <BrowseVirtualList
                             items={groupedCollectionMods}
-                            scrollRef={mainScrollRef}
+                            scrollRef={browseDetailScrollRef}
                             active={tab === "browse"}
                             staggerEnter
                             estimateSize={estimateListRowHeight(false)}
@@ -11525,6 +11358,7 @@ export default function App() {
                             }}
                           />
                         )}
+                        </div>
                       </div>
                     )}
                   </>
@@ -11802,7 +11636,7 @@ export default function App() {
                       </div>
                       <button
                         type="button"
-                        className="icon-btn"
+                        className="mods-toolbar-icon-btn"
                         onClick={() => void search()}
                         aria-label="Search"
                         title="Search"
@@ -12443,8 +12277,13 @@ export default function App() {
           aria-hidden={tab !== "settings" ? true : undefined}
         >
           <ParkedTabGate active={tab === "settings"}>
-          <section className="panel">
-            <h1>Settings</h1>
+          <section className="panel page-panel">
+            <div className="page-chrome">
+            <div className="panel-head">
+              <h1>Settings</h1>
+            </div>
+            </div>
+            <div className="page-scroll">
             <SettingsSection title="App updates" defaultOpen>
               <p className="note">
                 Current version:{" "}
@@ -12945,6 +12784,7 @@ export default function App() {
             <SettingsSection title="Accounts">
               {accountConnections}
             </SettingsSection>
+            </div>
           </section>
           </ParkedTabGate>
         </div>
@@ -13451,6 +13291,9 @@ export default function App() {
                   showMods={showGameSavedMods}
                   scrollRef={mainScrollRef}
                   active={tab === "library"}
+                  onOpenMod={(hit) =>
+                    void openCollectionMod(hit, "library", libraryDetail.game.id)
+                  }
                 />
               </>
             ) : savedCollectionsReady ? (

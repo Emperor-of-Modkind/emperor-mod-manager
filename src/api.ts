@@ -11,6 +11,8 @@ import type {
   CatalogSuggestRequest,
   CatalogCoverHit,
   CatalogCoverRequest,
+  ShareModMetadataHit,
+  ShareModEntry,
   CollectionDetail,
   CollectionModFile,
   CollectionSearchPage,
@@ -129,6 +131,8 @@ export const api = {
   scanGames: () => invoke<DetectedGame[]>("scan_games"),
   resolveCatalogCovers: (requests: CatalogCoverRequest[]) =>
     invoke<CatalogCoverHit[]>("resolve_catalog_covers", { requests }),
+  resolveShareModMetadata: (mods: ShareModEntry[]) =>
+    invoke<ShareModMetadataHit[]>("resolve_share_mod_metadata", { mods }),
   getGameHealth: () => invoke<GameHealth[]>("get_game_health"),
   relinkManagedGame: (oldId: string, newId: string) =>
     invoke<ManagedGame>("relink_managed_game", { oldId, newId }),

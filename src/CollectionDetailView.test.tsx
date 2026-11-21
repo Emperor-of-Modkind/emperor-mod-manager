@@ -5,7 +5,7 @@ import {
   CollectionDetailView,
   EditableCollectionTitle,
 } from "./CollectionDetailView";
-import type { ManagedGame } from "./types";
+import type { ManagedGame, ShareModEntry } from "./types";
 
 const cyberpunk = {
   id: "cp2077",
@@ -130,6 +130,132 @@ describe("CollectionDetailView", () => {
       "Cyberpunk 2077",
       "Skyrim SE",
     ]);
+    cleanup();
+  });
+
+  it("renders contained mods as media cards and opens a mod on click", () => {
+    const onOpenMod = vi.fn();
+    const mods: ShareModEntry[] = [
+      {
+        s: "nexus",
+        domain: "cyberpunk2077",
+        mod_id: 2380,
+        file_id: 168077,
+        display_name: "RED4ext",
+        version: "1.31.0",
+        fomod: { selected: {} },
+      },
+      {
+        s: "thunderstore",
+        community: "riskofrain2",
+        namespace: "bbepis",
+        name: "BepInExPack",
+        display_name: "BepInExPack",
+        version: "5.4.2100",
+      },
+    ];
+    const { host, cleanup } = renderDetail({
+      mods,
+      showMods: true,
+      onOpenMod,
+    });
+
+    expect(host.querySelector(".media-grid.browse-grid")).toBeTruthy();
+    const cards = [...host.querySelectorAll(".media-card")];
+    expect(cards).toHaveLength(2);
+    expect(cards[0].textContent).toContain("RED4ext");
+    expect(cards[0].textContent).toContain("FOMOD Config");
+    expect(cards[0].querySelector(".media-badge")?.textContent).toBe(
+      "v1.31.0 · cyberpunk2077 2380/168077",
+    );
+    expect(cards[0].querySelector(".media-overlay")).toBeNull();
+    expect(cards[0].querySelector(".media-card-meta")).toBeNull();
+    expect(cards[1].textContent).toContain("BepInExPack");
+
+    act(() => {
+      (cards[0] as HTMLElement).click();
+    });
+    expect(onOpenMod).toHaveBeenCalledTimes(1);
+    expect(onOpenMod.mock.calls[0][0]).toMatchObject({
+      source: "nexus",
+      domain_name: "cyberpunk2077",
+      mod_id: 2380,
+      name: "RED4ext",
+    });
+    cleanup();
+  });
+
+  it("toggles the filter row and filters contained mods by query and source", async () => {
+    const mods: ShareModEntry[] = [
+      {
+        s: "nexus",
+        domain: "cyberpunk2077",
+        mod_id: 2380,
+        file_id: 168077,
+        display_name: "RED4ext",
+        version: "1.31.0",
+      },
+      {
+        s: "thunderstore",
+        community: "riskofrain2",
+        namespace: "bbepis",
+        name: "BepInExPack",
+        display_name: "BepInExPack",
+        version: "5.4.2100",
+      },
+    ];
+    const { host, cleanup } = renderDetail({
+      mods,
+      showMods: true,
+    });
+
+    const filterBtn = host.querySelector(
+      'button[aria-label="Filters"]',
+    ) as HTMLButtonElement | null;
+    expect(filterBtn).toBeTruthy();
+    expect(filterBtn!.getAttribute("aria-expanded")).toBe("false");
+
+    act(() => {
+      filterBtn!.click();
+    });
+    expect(filterBtn!.getAttribute("aria-expanded")).toBe("true");
+
+    const searchInput = host.querySelector(
+      'input[aria-label="Search contained mods"]',
+    ) as HTMLInputElement | null;
+    expect(searchInput).toBeTruthy();
+
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(
+        HTMLInputElement.prototype,
+        "value",
+      )!.set!;
+      setter.call(searchInput, "RED4");
+      searchInput!.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+
+    expect(host.querySelectorAll(".media-card")).toHaveLength(1);
+    expect(host.textContent).toContain("Showing 1 of 2");
+
+    const clearBtn = host.querySelector(
+      "button.filters-clear",
+    ) as HTMLButtonElement | null;
+    expect(clearBtn).toBeTruthy();
+    act(() => {
+      clearBtn!.click();
+    });
+    expect(host.querySelectorAll(".media-card")).toHaveLength(2);
+
+    const tsBtn = host.querySelector(
+      '.source-filter button[aria-label="Thunderstore"]',
+    ) as HTMLButtonElement | null;
+    expect(tsBtn).toBeTruthy();
+    act(() => {
+      tsBtn!.click();
+    });
+    expect(host.querySelectorAll(".media-card")).toHaveLength(1);
+    expect(host.querySelector(".media-card")?.textContent).toContain("BepInExPack");
+
     cleanup();
   });
 });

@@ -625,7 +625,7 @@ a {
   flex-direction: column;
   min-height: 0;
   padding: 1.25rem 1.5rem 2rem;
-  overflow: auto;
+  overflow: hidden;
 }
 
 .panel {
@@ -955,6 +955,7 @@ button.tag-picker-trigger[aria-expanded="true"] {
   position: relative;
   isolation: isolate;
   width: 100%;
+  overflow-anchor: none;
 }
 
 ul.list.browse-virtual {
@@ -1083,7 +1084,8 @@ button.collection-autosave-toggle[aria-checked="true"]:hover:not(:disabled) {
   margin-bottom: 0.85rem;
 }
 
-.mods-toolbar .filters {
+.mods-toolbar .filters,
+.detail-body .mods-toolbar .filters {
   margin-top: 0.55rem;
   margin-bottom: 0.35rem;
 }
@@ -1126,8 +1128,15 @@ button.collection-autosave-toggle[aria-checked="true"]:hover:not(:disabled) {
   height: 2.25rem;
   padding: 0;
   border: 0;
-  background: transparent;
   color: var(--ink);
+}
+
+.icon-btn {
+  background: transparent;
+}
+
+.mods-toolbar-icon-btn {
+  background: var(--surface-control);
 }
 
 .icon-btn svg,
@@ -1151,6 +1160,11 @@ button.linkish.icon-btn {
 button.mods-filters-toggle.active:hover:not(:disabled) {
   background-color: color-mix(in srgb, var(--accent) 18%, transparent);
   color: var(--accent-ink, var(--accent));
+}
+
+button.mods-filters-toggle.active:active:not(:disabled) {
+  background: var(--accent);
+  color: var(--on-accent, #fff);
 }
 
 .mods-actions-menu {
@@ -2140,13 +2154,12 @@ label.inline:has(input[type="checkbox"]):active {
   transform: scale(0.98);
 }
 
-button:hover:not(:disabled):not(.nav):not(.linkish):not(.icon-btn):not(.mods-toolbar-icon-btn):not(.accent):not(.friends-friend-card-main) {
+button:hover:not(:disabled):not(.nav):not(.linkish):not(.icon-btn):not(.accent):not(.friends-friend-card-main) {
   background-color: color-mix(in srgb, var(--ink) 12%, var(--bg));
   color: var(--ink);
 }
 
-button.icon-btn:hover:not(:disabled):not(.danger),
-button.mods-toolbar-icon-btn:hover:not(:disabled):not(.danger):not(.mods-filters-toggle.active) {
+button.icon-btn:hover:not(:disabled):not(.danger) {
   background-color: color-mix(in srgb, var(--ink) 7%, transparent);
   border-color: transparent;
   color: var(--ink);
@@ -2179,7 +2192,7 @@ button.tag-picker-trigger[aria-expanded="true"]:not(.nav) {
   color: var(--ink);
 }
 
-button:active:not(:disabled):not(.nav):not(.linkish):not(.icon-btn):not(.mods-toolbar-icon-btn):not(.danger):not(.accent):not(.tag-picker-trigger):not(.browse-nsfw-toggle):not(.collection-autosave-toggle):not(.accent-swatch):not(.mod-collection-chip):not(.detail-author-link):not(.detail-carousel-prev):not(.detail-carousel-next):not(.friends-friend-card-main),
+button:active:not(:disabled):not(.nav):not(.linkish):not(.icon-btn):not(.danger):not(.accent):not(.tag-picker-trigger):not(.browse-nsfw-toggle):not(.collection-autosave-toggle):not(.accent-swatch):not(.mod-collection-chip):not(.detail-author-link):not(.detail-carousel-prev):not(.detail-carousel-next):not(.friends-friend-card-main),
 button.active:not(:disabled):not(.nav):not(.linkish):not(.icon-btn):not(.mods-toolbar-icon-btn):not(.danger):not(.accent):not(.tag-picker-trigger):not(.browse-nsfw-toggle):not(.collection-autosave-toggle):not(.accent-swatch):not(.mod-collection-chip) {
   background: var(--accent);
   color: var(--on-accent, #fff);
@@ -2608,18 +2621,82 @@ button.linkish:hover:not(:disabled):not(.nav) {
   align-items: stretch;
 }
 
+.detail-collections-box {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 7.5rem;
+  min-width: 0;
+  margin-top: 0.25rem;
+  padding: 0.55rem 0.75rem;
+  border-radius: var(--shape-field);
+  border: 0;
+  outline: none;
+  background: color-mix(in srgb, var(--ink) 4%, transparent);
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  box-sizing: border-box;
+  cursor: pointer;
+  transition: background-color var(--motion-fast) var(--ease-out);
+}
+
+.detail-collections-box:hover,
+.detail-collections-box:focus-visible {
+  background: color-mix(in srgb, var(--ink) 6%, transparent);
+  outline: none;
+}
+
+.detail-collections-header {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 0.35rem;
+}
+
+.detail-collections-title {
+  font-size: 0.78rem;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+  color: var(--muted);
+  transition: color var(--motion-fast) var(--ease-out);
+}
+
+.detail-collections-box:hover .detail-collections-title,
+.detail-collections-box:focus-visible .detail-collections-title {
+  color: var(--ink);
+}
+
+.detail-collections-count {
+  font-size: 0.74rem;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.detail-collections-empty {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  font-size: 0.84rem;
+  text-align: center;
+}
+
 .detail-installed-collections {
+  flex: 1;
   display: flex;
   flex-wrap: nowrap;
   align-items: center;
   gap: 0.45rem;
-  margin-top: 0.25rem;
   overflow-x: auto;
   scrollbar-width: thin;
   max-width: 100%;
+  min-width: 0;
 }
 
 .installed-collection-card {
+  position: relative;
+  z-index: 1;
   flex: 0 0 auto;
   min-width: 11.5rem;
   min-height: 5.25rem;
@@ -3095,6 +3172,29 @@ button.detail-author-link:focus-visible {
 .detail-body h2 {
   margin: 0 0 0.65rem;
   font-size: 1.05rem;
+}
+
+.detail-section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin: 0 0 0.65rem;
+}
+
+.detail-section-header h2 {
+  margin: 0;
+}
+
+.detail-body .filters {
+  margin-top: 0;
+  margin-bottom: 0.75rem;
+}
+
+.detail-body .filters > .row {
+  flex: 1 1 100%;
+  margin: 0;
+  min-width: 12rem;
 }
 
 .detail-description {
@@ -4051,8 +4151,8 @@ button.path-link:focus-visible:not(:disabled):not(.nav) {
 .downloads-workspace {
   display: flex;
   flex-direction: column;
-  height: calc(100vh - 3rem);
-  max-height: calc(100vh - 3rem);
+  flex: 1 1 0;
+  min-height: 0;
   overflow: hidden;
 }
 
@@ -4510,7 +4610,21 @@ button.path-link:focus-visible:not(:disabled):not(.nav) {
 }
 
 .tab-kept:not(.tab-parked) {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 0;
+  min-height: 0;
+  overflow: hidden;
   animation: tab-enter var(--motion-fast) var(--ease-out);
+}
+
+.view-slot {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
 }
 
 @keyframes tab-enter {
@@ -4533,15 +4647,42 @@ button.path-link:focus-visible:not(:disabled):not(.nav) {
   z-index: -1;
 }
 
-/* Browse scrolls inside its results pane. Library and Collections keep scrolling main. */
+/* Shared contained-scroll page layout (matches .browse-workspace). */
 .main.main-browse-scroll {
   overflow: hidden;
 }
 
-.tab-kept-browse:not(.tab-parked) {
+.tab-kept-browse:not(.tab-parked),
+.page-panel,
+.page-view {
+  display: flex;
+  flex-direction: column;
   flex: 1 1 0;
+  min-width: 0;
   min-height: 0;
   overflow: hidden;
+}
+
+.page-chrome {
+  flex: 0 0 auto;
+}
+
+.page-scroll {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+.panel .page-scroll,
+.panel .browse-results {
+  margin-right: -1.35rem;
+  padding-right: 1.35rem;
+}
+
+.tools-workspace .page-scroll {
+  padding-right: 0.85rem;
 }
 
 .browse-workspace.view-enter {

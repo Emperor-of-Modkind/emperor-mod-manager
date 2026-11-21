@@ -66,6 +66,13 @@ describe("estimateGridRowHeight", () => {
     expect(height).toBeGreaterThan(160 * 1.5);
     expect(height).toBeLessThan(160 * 1.5 + 120);
   });
+
+  it("omits the meta line when hasMeta is false", () => {
+    const withMeta = estimateGridRowHeight(160, 16, true);
+    const withoutMeta = estimateGridRowHeight(160, 16, false);
+    expect(withoutMeta).toBeGreaterThan(160 * 1.5);
+    expect(withoutMeta).toBeLessThan(withMeta);
+  });
 });
 
 describe("sentinelContentTop", () => {

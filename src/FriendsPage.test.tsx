@@ -24,6 +24,7 @@ vi.mock("./api", () => ({
     finalizeFriendCollectionSync: vi.fn(),
     setFriendCollectionAutoSync: vi.fn(),
     listInstalledCollections: vi.fn().mockResolvedValue([]),
+    resolveCatalogCovers: vi.fn().mockResolvedValue([]),
   },
 }));
 
@@ -135,6 +136,8 @@ describe("FriendsPage", () => {
 
     const libraryActions = host.querySelector(".friends-library-head-actions");
     expect(libraryActions).toBeTruthy();
+    const titleHeading = host.querySelector(".detail-head-title h1");
+    expect(titleHeading?.textContent).toBe("Friends Collections");
     const actionChildren = [...(libraryActions?.children ?? [])];
     expect(actionChildren).toHaveLength(3);
     expect(actionChildren[0].classList.contains("friends-refresh-btn")).toBe(true);
@@ -489,6 +492,77 @@ describe("FriendsPage", () => {
     expect(refreshBtn!.disabled).toBe(false);
     expect(refreshBtn!.querySelector("svg")?.classList.contains("fa-spin")).toBe(
       false,
+    );
+
+    await act(async () => {
+      root.unmount();
+    });
+    host.remove();
+  });
+
+  it("resolves catalog posters for unmanaged friend collection games", async () => {
+    vi.mocked(api.decodeFriendShareCode).mockResolvedValueOnce({
+      name: "Cozy Farm",
+      game: {
+        nexus_domain: "stardewvalley",
+        title: "Stardew Valley",
+      },
+      mods: [],
+      nexus_count: 1,
+      thunderstore_count: 0,
+      modio_count: 0,
+      code_len: 16,
+      size_warning: false,
+    });
+    vi.mocked(api.resolveCatalogCovers).mockResolvedValueOnce([
+      {
+        id: "collection:nexus:stardewvalley",
+        cover_url: "https://images.nexusmods.com/images/games/v2/1303/tile.jpg",
+        title: "Stardew Valley",
+      },
+    ]);
+
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const root: Root = createRoot(host);
+
+    await act(async () => {
+      root.render(
+        <FriendsPage
+          active
+          managed={[]}
+          activeGameId={null}
+          onError={() => {}}
+          onNotice={() => {}}
+          onCollectionSynced={async () => {}}
+        />,
+      );
+    });
+    await flush();
+
+    const friendCard = Array.from(host.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("Alice"),
+    );
+    expect(friendCard).toBeTruthy();
+
+    await act(async () => {
+      friendCard!.click();
+    });
+    await flush();
+
+    expect(api.resolveCatalogCovers).toHaveBeenCalledWith([
+      {
+        id: "collection:nexus:stardewvalley",
+        nexus_domain: "stardewvalley",
+        modio_game_id: null,
+        icon_path: null,
+      },
+    ]);
+
+    const posterImg = host.querySelector<HTMLImageElement>(".list-poster img");
+    expect(posterImg).toBeTruthy();
+    expect(posterImg!.getAttribute("src")).toBe(
+      "https://images.nexusmods.com/images/games/v2/1303/tile.jpg",
     );
 
     await act(async () => {

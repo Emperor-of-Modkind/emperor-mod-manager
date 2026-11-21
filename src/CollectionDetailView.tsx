@@ -1,7 +1,9 @@
 import {
   memo,
   useCallback,
+  useDeferredValue,
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -9,13 +11,127 @@ import {
   type RefObject,
 } from "react";
 import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
-import { faCheck, faCopy, faPen } from "@fortawesome/free-solid-svg-icons";
-import { BrowseVirtualList } from "./BrowseResults";
-import { estimateListRowHeight } from "./browseVirtual";
+import { faCheck, faCopy, faFilter, faPen } from "@fortawesome/free-solid-svg-icons";
+import { api } from "./api";
+import { BrowseVirtualGrid } from "./BrowseResults";
+import { MediaCard } from "./MediaCard";
+import { Collapse, Segment, SegmentTab } from "./motion";
 import { ResultsReveal } from "./reveal";
 import { formatCollectionGameVersions } from "./savedCollectionGroups";
-import { BrowseListSkeleton } from "./Skeleton";
-import type { ManagedGame, ShareModEntry } from "./types";
+import { BrowseGridSkeleton } from "./Skeleton";
+import { SourceMark, sourceMarkName } from "./SourceMark";
+import type {
+  CatalogHit,
+  CatalogSource,
+  ManagedGame,
+  ShareModEntry,
+  ShareModMetadataHit,
+} from "./types";
+
+const SHARE_MOD_GRID_MIN_PX = 160;
+const shareModMetaCache = new Map<string, ShareModMetadataHit>();
+const shareModMetaPending = new Set<string>();
+
+export type ShareModSort = "order" | "nameAsc" | "nameDesc";
+
+export function shareModMetadataKey(m: ShareModEntry): string | null {
+  if (m.s === "nexus") {
+    const domain = m.domain?.trim().toLowerCase();
+    if (!domain || !m.mod_id) return null;
+    return `nexus:${domain}:${m.mod_id}`;
+  }
+  if (m.s === "thunderstore") {
+    const community = m.community?.trim().toLowerCase();
+    const namespace = m.namespace?.trim().toLowerCase();
+    const name = m.name?.trim().toLowerCase();
+    if (!community || !namespace || !name) return null;
+    return `thunderstore:${community}:${namespace}:${name}`;
+  }
+  if (m.s === "modio") {
+    if (!m.game_id || !m.mod_id) return null;
+    return `modio:${m.game_id}:${m.mod_id}`;
+  }
+  return null;
+}
+
+export function catalogHitFromShareMod(
+  m: ShareModEntry,
+  meta?: ShareModMetadataHit | null,
+): CatalogHit {
+  const label = shareModLabel(m);
+  const id =
+    shareModMetadataKey(m) ??
+    (m.s === "nexus"
+      ? `nexus:${m.domain ?? ""}:${m.mod_id ?? 0}`
+      : m.s === "thunderstore"
+        ? `thunderstore:${m.community ?? ""}:${m.namespace ?? ""}:${m.name ?? ""}`
+        : `modio:${m.game_id ?? 0}:${m.mod_id ?? 0}`);
+  return {
+    source: m.s,
+    id,
+    name: label,
+    summary: meta?.summary ?? null,
+    picture_url: meta?.picture_url ?? null,
+    author: meta?.author ?? (m.s === "thunderstore" ? m.namespace ?? null : null),
+    downloads: meta?.downloads ?? null,
+    endorsements: meta?.endorsements ?? null,
+    category: null,
+    tags: [],
+    mod_id: m.s === "nexus" ? (m.mod_id ?? null) : null,
+    domain_name: m.s === "nexus" ? (m.domain ?? null) : null,
+    community: m.s === "thunderstore" ? (m.community ?? null) : null,
+    namespace: m.s === "thunderstore" ? (m.namespace ?? null) : null,
+    package_name: m.s === "thunderstore" ? (m.name ?? null) : null,
+    full_name:
+      m.s === "thunderstore" && m.namespace && m.name
+        ? `${m.namespace}-${m.name}`
+        : null,
+    package_url: null,
+    rating_score: null,
+    latest_version: m.version ?? null,
+    modio_game_id: m.s === "modio" ? (m.game_id ?? null) : null,
+    modio_mod_id: m.s === "modio" ? (m.mod_id ?? null) : null,
+    profile_url: null,
+  };
+}
+
+export function filterAndSortShareMods(
+  mods: readonly ShareModEntry[],
+  opts: {
+    query: string;
+    source: "all" | CatalogSource;
+    sort: ShareModSort;
+  },
+): Array<{ mod: ShareModEntry; index: number }> {
+  const q = opts.query.trim().toLowerCase();
+  const rows: Array<{ mod: ShareModEntry; index: number }> = [];
+  for (let index = 0; index < mods.length; index++) {
+    const mod = mods[index];
+    if (opts.source !== "all" && mod.s !== opts.source) continue;
+    if (q) {
+      const label = shareModLabel(mod).toLowerCase();
+      const haystack = [
+        label,
+        mod.version ?? "",
+        mod.domain ?? "",
+        mod.community ?? "",
+        mod.namespace ?? "",
+        mod.name ?? "",
+        mod.mod_id != null ? String(mod.mod_id) : "",
+      ]
+        .join(" ")
+        .toLowerCase();
+      if (!haystack.includes(q)) continue;
+    }
+    rows.push({ mod, index });
+  }
+  if (opts.sort === "nameAsc") {
+    rows.sort((a, b) => shareModLabel(a.mod).localeCompare(shareModLabel(b.mod)));
+  } else if (opts.sort === "nameDesc") {
+    rows.sort((a, b) => shareModLabel(b.mod).localeCompare(shareModLabel(a.mod)));
+  }
+  return rows;
+}
 
 export function formatCollectionDate(iso: string | null | undefined): string | null {
   if (!iso) return null;
@@ -54,45 +170,120 @@ export function CollectionPlaceholderIcon() {
 
 export const ShareModList = memo(function ShareModList({
   mods,
+  rows: prefilteredRows,
   scrollRef,
   active = true,
+  onOpenMod,
 }: {
   mods: ShareModEntry[];
+  rows?: Array<{ mod: ShareModEntry; index: number }>;
   scrollRef?: RefObject<HTMLElement | null>;
   active?: boolean;
+  onOpenMod?: (hit: CatalogHit) => void;
 }) {
-  const rows = useMemo(() => mods.map((mod, index) => ({ mod, index })), [mods]);
+  const [, setMetaTick] = useState(0);
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!active || mods.length === 0) return;
+    const missing: ShareModEntry[] = [];
+    for (const m of mods) {
+      const key = shareModMetadataKey(m);
+      if (!key || shareModMetaCache.has(key) || shareModMetaPending.has(key)) continue;
+      shareModMetaPending.add(key);
+      missing.push(m);
+    }
+    if (missing.length === 0) return;
+    let cancelled = false;
+    void api
+      .resolveShareModMetadata(missing)
+      .then((hits) => {
+        for (const hit of hits) {
+          shareModMetaCache.set(hit.key, hit);
+        }
+        if (!cancelled && mountedRef.current && hits.length > 0) {
+          setMetaTick((t) => t + 1);
+        }
+      })
+      .catch(() => {
+        // Keep placeholder cards when offline or in unit tests without Tauri IPC.
+      })
+      .finally(() => {
+        for (const m of missing) {
+          const key = shareModMetadataKey(m);
+          if (key) shareModMetaPending.delete(key);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [active, mods]);
+
+  const rows = useMemo(
+    () => prefilteredRows ?? mods.map((mod, index) => ({ mod, index })),
+    [mods, prefilteredRows],
+  );
   const getKey = useCallback(
-    (row: { mod: ShareModEntry; index: number }) => `${row.mod.s}-${row.index}`,
+    (row: { mod: ShareModEntry; index: number }) =>
+      `${shareModMetadataKey(row.mod) ?? row.mod.s}-${row.index}`,
     [],
   );
-  const renderItem = useCallback((row: { mod: ShareModEntry; index: number }) => {
-    const m = row.mod;
-    return (
-      <div>
-        <strong>
-          {shareModLabel(m)}
-          {m.fomod ? (
-            <>
-              {" "}
-              <span className="pill ok">FOMOD Config</span>
-            </>
-          ) : null}
-        </strong>
-        <small>
-          {m.s}
-          {m.version ? ` · v${m.version}` : ""}
-          {m.s === "nexus" && m.mod_id != null
-            ? ` · ${m.domain} ${m.mod_id}/${m.file_id}`
-            : ""}
-          {m.s === "thunderstore"
-            ? ` · ${m.community}/${m.namespace}-${m.name}`
-            : ""}
-          {m.s === "modio" ? ` · game ${m.game_id} mod ${m.mod_id}` : ""}
-        </small>
+  const renderCard = useCallback(
+    (row: { mod: ShareModEntry; index: number }, plain: boolean) => {
+      const m = row.mod;
+      const key = shareModMetadataKey(m);
+      const meta = key ? shareModMetaCache.get(key) : undefined;
+      const detailParts: string[] = [];
+      if (m.version) {
+        detailParts.push(`v${m.version}`);
+      }
+      if (m.s === "nexus" && m.mod_id != null) {
+        detailParts.push(`${m.domain} ${m.mod_id}/${m.file_id}`);
+      } else if (m.s === "thunderstore") {
+        detailParts.push(`${m.community}/${m.namespace}-${m.name}`);
+      } else if (m.s === "modio") {
+        detailParts.push(`game ${m.game_id} mod ${m.mod_id}`);
+      }
+      const handleOpen = onOpenMod
+        ? () => onOpenMod(catalogHitFromShareMod(m, meta))
+        : undefined;
+
+      return (
+        <MediaCard
+          plain={plain}
+          title={shareModLabel(m)}
+          imageSrc={meta?.picture_url ?? null}
+          badge={detailParts.length > 0 ? detailParts.join(" · ") : undefined}
+          coverMarks={[{ source: m.s, label: sourceMarkName(m.s) }]}
+          tags={m.fomod ? ["FOMOD Config"] : undefined}
+          onClick={handleOpen}
+        />
+      );
+    },
+    [onOpenMod],
+  );
+  const renderGridItem = useCallback(
+    (row: { mod: ShareModEntry; index: number }) => renderCard(row, true),
+    [renderCard],
+  );
+  const renderGridSkeletonItem = useCallback(
+    () => (
+      <div className="media-card" aria-hidden="true">
+        <div className="media-cover-stack">
+          <div className="media-cover skeleton" />
+        </div>
+        <span className="skeleton skeleton-line skeleton-line-title" />
+        <span className="skeleton skeleton-line skeleton-line-meta" />
       </div>
-    );
-  }, []);
+    ),
+    [],
+  );
 
   if (mods.length === 0) {
     return (
@@ -102,29 +293,195 @@ export const ShareModList = memo(function ShareModList({
     );
   }
 
+  if (rows.length === 0) {
+    return <p className="note">No contained mods match the current filters.</p>;
+  }
+
   if (!scrollRef) {
     return (
-      <ul className="list">
+      <div
+        className="media-grid browse-grid"
+        style={{ "--browse-card-min": `${SHARE_MOD_GRID_MIN_PX}px` } as React.CSSProperties}
+      >
         {rows.map((row) => (
-          <li key={getKey(row)}>{renderItem(row)}</li>
+          <div key={getKey(row)}>{renderCard(row, true)}</div>
         ))}
-      </ul>
+      </div>
     );
   }
 
   return (
-    <BrowseVirtualList
+    <BrowseVirtualGrid
       items={rows}
       scrollRef={scrollRef}
       active={active}
       staggerEnter
-      estimateSize={estimateListRowHeight(false)}
+      minCardPx={SHARE_MOD_GRID_MIN_PX}
+      fixedRowHeight
+      trackScrollMargin
       getKey={getKey}
-      rowClassName=""
-      renderItem={renderItem}
+      renderItem={renderGridItem}
+      renderSkeletonItem={renderGridSkeletonItem}
     />
   );
 });
+
+export function ContainedModsSection({
+  mods,
+  showMods,
+  skeletonCount,
+  scrollRef,
+  active = true,
+  onOpenMod,
+  renderLayout,
+}: {
+  mods: ShareModEntry[];
+  showMods: boolean;
+  skeletonCount?: number;
+  scrollRef?: RefObject<HTMLElement | null>;
+  active?: boolean;
+  onOpenMod?: (hit: CatalogHit) => void;
+  renderLayout?: (controls: ReactNode, list: ReactNode) => ReactNode;
+}) {
+  const [filtersOpen, setFiltersOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const [sourceFilter, setSourceFilter] = useState<"all" | CatalogSource>("all");
+  const [sort, setSort] = useState<ShareModSort>("order");
+  const deferredQuery = useDeferredValue(query);
+  const segmentId = useId();
+
+  const filtersActive =
+    query.trim() !== "" || sourceFilter !== "all" || sort !== "order";
+
+  const filteredRows = useMemo(
+    () =>
+      filterAndSortShareMods(mods, {
+        query: deferredQuery,
+        source: sourceFilter,
+        sort,
+      }),
+    [deferredQuery, mods, sort, sourceFilter],
+  );
+
+  const controls = (
+    <>
+      <div className="detail-section-header">
+        <h2>Contained mods</h2>
+        <div className="mods-toolbar-actions-right">
+          <button
+            type="button"
+            className={
+              filtersActive
+                ? "mods-toolbar-icon-btn mods-filters-toggle active"
+                : "mods-toolbar-icon-btn mods-filters-toggle"
+            }
+            aria-label="Filters"
+            aria-expanded={filtersOpen}
+            aria-pressed={filtersActive}
+            onClick={() => setFiltersOpen((open) => !open)}
+          >
+            <FontAwesomeIcon icon={faFilter} />
+          </button>
+        </div>
+      </div>
+      <Collapse show={filtersOpen}>
+        <div className="filters">
+          <div className="row">
+            <input
+              placeholder="Search contained mods…"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              aria-label="Search contained mods"
+            />
+          </div>
+          <label>
+            Sort
+            <select
+              value={sort}
+              onChange={(e) => setSort(e.target.value as ShareModSort)}
+            >
+              <option value="order">Collection order</option>
+              <option value="nameAsc">Name (A–Z)</option>
+              <option value="nameDesc">Name (Z–A)</option>
+            </select>
+          </label>
+          <Segment className="source-filter">
+            {(
+              [
+                ["all", "All"] as const,
+                ["nexus", "Nexus"] as const,
+                ["thunderstore", "Thunderstore"] as const,
+                ["modio", "mod.io"] as const,
+              ] as const
+            ).map(([id, label]) => (
+              <SegmentTab
+                key={id}
+                layoutId={`${segmentId}-source`}
+                active={sourceFilter === id}
+                aria-label={label}
+                title={label}
+                onClick={() => setSourceFilter(id)}
+              >
+                {id === "all" ? label : <SourceMark source={id} decorative />}
+              </SegmentTab>
+            ))}
+          </Segment>
+          {filtersActive && (
+            <button
+              type="button"
+              className="filters-clear"
+              onClick={() => {
+                setQuery("");
+                setSourceFilter("all");
+                setSort("order");
+              }}
+            >
+              Clear filters
+            </button>
+          )}
+        </div>
+      </Collapse>
+      {filtersActive && showMods && mods.length > 0 && (
+        <p className="note">
+          Showing {filteredRows.length} of {mods.length}
+        </p>
+      )}
+    </>
+  );
+
+  const list = (
+      <ResultsReveal
+        show={showMods}
+        skeleton={
+          <BrowseGridSkeleton
+            count={Math.min(12, skeletonCount ?? 8)}
+            minCardPx={SHARE_MOD_GRID_MIN_PX}
+          />
+        }
+      >
+        {showMods ? (
+          <ShareModList
+            mods={mods}
+            rows={filteredRows}
+            scrollRef={scrollRef}
+            active={active}
+            onOpenMod={onOpenMod}
+          />
+        ) : null}
+      </ResultsReveal>
+  );
+
+  if (renderLayout) {
+    return <>{renderLayout(controls, list)}</>;
+  }
+
+  return (
+    <>
+      {controls}
+      {list}
+    </>
+  );
+}
 
 export type CollectionStatsSummary = {
   mod_count: number;
@@ -335,6 +692,7 @@ export type CollectionDetailViewProps = {
   active: boolean;
   loadingBody?: ReactNode;
   noGamesFallback?: ReactNode;
+  onOpenMod?: (hit: CatalogHit) => void;
 };
 
 export function CollectionDetailView({
@@ -365,8 +723,11 @@ export function CollectionDetailView({
   active,
   loadingBody,
   noGamesFallback,
+  onOpenMod,
 }: CollectionDetailViewProps) {
   const [copiedCode, setCopiedCode] = useState(false);
+  const bodyScrollRef = useRef<HTMLDivElement | null>(null);
+  const effectiveScrollRef = scrollRef ? bodyScrollRef : undefined;
 
   function handleCopyCode() {
     if (!code) return;
@@ -387,7 +748,8 @@ export function CollectionDetailView({
         : [];
 
   return (
-    <div>
+    <div className="page-view">
+      <div className="page-chrome">
       <div className="panel-head">
         <div className="detail-head-title">
           <button type="button" onClick={onBack}>
@@ -400,11 +762,15 @@ export function CollectionDetailView({
           <div className="panel-head-actions">{headerActions}</div>
         ) : null}
       </div>
+      </div>
 
       {loadingBody ? (
-        loadingBody
+        <div className="page-scroll" ref={bodyScrollRef}>
+          {loadingBody}
+        </div>
       ) : (
         <>
+          <div className="page-chrome">
           <div className="detail-hero">
             <div className="detail-cover">
               {coverSrc ? (
@@ -464,32 +830,34 @@ export function CollectionDetailView({
               {metaExtra}
             </div>
           </div>
+          </div>
 
-          <div className="detail-body">
-            {bodyTop}
-            <h2>Contained mods</h2>
-            <ResultsReveal
-              show={showMods}
-              skeleton={
-                <BrowseListSkeleton
-                  count={Math.min(12, skeletonCount ?? (stats.mod_count || 8))}
-                />
-              }
-            >
-              {showMods ? (
-                <ShareModList
-                  mods={mods}
-                  scrollRef={scrollRef}
-                  active={active}
-                />
-              ) : null}
-            </ResultsReveal>
-            <h2>Code</h2>
-            <textarea
-              className="saved-collection-code"
-              rows={4}
-              readOnly
-              value={code}
+          <div className="detail-body page-view">
+            <ContainedModsSection
+              mods={mods}
+              showMods={showMods}
+              skeletonCount={skeletonCount ?? (stats.mod_count || 8)}
+              scrollRef={effectiveScrollRef}
+              active={active}
+              onOpenMod={onOpenMod}
+              renderLayout={(controls, list) => (
+                <>
+                  <div className="page-chrome">
+                    {bodyTop}
+                    {controls}
+                  </div>
+                  <div className="page-scroll" ref={bodyScrollRef}>
+                    {list}
+                    <h2>Code</h2>
+                    <textarea
+                      className="saved-collection-code"
+                      rows={4}
+                      readOnly
+                      value={code}
+                    />
+                  </div>
+                </>
+              )}
             />
           </div>
         </>

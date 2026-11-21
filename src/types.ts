@@ -232,6 +232,15 @@ export type CatalogCoverHit = {
   title?: string | null;
 };
 
+export type ShareModMetadataHit = {
+  key: string;
+  picture_url?: string | null;
+  author?: string | null;
+  summary?: string | null;
+  downloads?: number | null;
+  endorsements?: number | null;
+};
+
 export type CatalogSource = "nexus" | "thunderstore" | "modio";
 
 export type CatalogHit = {

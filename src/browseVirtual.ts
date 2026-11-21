@@ -27,14 +27,22 @@ export function gridCardWidth(width: number, columns: number, gapPx: number): nu
 }
 
 /**
- * Row height for a browse card: 2/3 cover, two title lines, and one meta line.
- * Measured rows replace this when a title is only one line.
+ * Row height for a media card: 2/3 cover, two title lines, and optional meta line.
+ * Measured rows replace this when `fixedRowHeight` is false.
  */
-export function estimateGridRowHeight(cardWidth: number, rootPx: number): number {
+export function estimateGridRowHeight(
+  cardWidth: number,
+  rootPx: number,
+  hasMeta = true,
+): number {
   const rem = rootPx > 0 ? rootPx : 16;
   if (!(cardWidth > 0)) return Math.round(16 * rem);
   const cover = cardWidth * 1.5;
   const title = 2 * 0.95 * 1.25 * rem;
+  if (!hasMeta) {
+    const gap = 0.45 * rem;
+    return Math.round(cover + title + gap);
+  }
   const meta = 0.78 * 1.3 * rem;
   const gaps = 2 * 0.45 * rem;
   const metaPull = 0.15 * rem;

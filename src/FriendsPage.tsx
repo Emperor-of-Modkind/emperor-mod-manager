@@ -1,7 +1,9 @@
 import {
+  startTransition,
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
   type RefObject,
@@ -20,6 +22,12 @@ import {
 } from "@fortawesome/free-solid-svg-icons";
 import { api } from "./api";
 import {
+  catalogCoverRequestKey,
+  collectionCatalogCoverRequests,
+  mergeCollectionCatalogCovers,
+  mergeCollectionCatalogTitles,
+} from "./catalogCovers";
+import {
   CollectionDetailView,
   CollectionPlaceholderIcon,
   formatCollectionDate,
@@ -31,6 +39,7 @@ import { staggerStyle } from "./motion";
 import { groupSavedCollectionsByGame } from "./savedCollectionGroups";
 import { BrowseListSkeleton } from "./Skeleton";
 import type {
+  CatalogHit,
   DetectedGame,
   FriendRecord,
   FriendShareRef,
@@ -49,6 +58,7 @@ export type FriendsPageProps = {
   detected?: DetectedGame[];
   plugins?: GamePluginInfo[];
   catalogCovers?: Record<string, string | null>;
+  catalogTitles?: Record<string, string | null>;
   activeGameId: string | null;
   scrollRef?: RefObject<HTMLElement | null>;
   installedShareIds?: Set<string>;
@@ -71,6 +81,7 @@ export type FriendsPageProps = {
     result: FriendSyncResult,
     friendSync?: { peerId: string; friendCollectionId: string },
   ) => Promise<void> | void;
+  onOpenMod?: (hit: CatalogHit, targetGameId?: string | null) => void;
 };
 
 function gameMatchesHint(
@@ -120,6 +131,7 @@ export function FriendsPage({
   detected = EMPTY_DETECTED,
   plugins = EMPTY_PLUGINS,
   catalogCovers,
+  catalogTitles,
   activeGameId,
   scrollRef,
   installedShareIds,
@@ -130,6 +142,7 @@ export function FriendsPage({
   onInstallCollection,
   onSaveCollection,
   onCollectionSynced,
+  onOpenMod,
 }: FriendsPageProps) {
   const [state, setState] = useState<FriendsState | null>(null);
   const [loading, setLoading] = useState(true);
@@ -149,6 +162,13 @@ export function FriendsPage({
     Record<string, ShareDecodePreview>
   >({});
   const [decodingLibrary, setDecodingLibrary] = useState(false);
+  const [resolvedCatalogCovers, setResolvedCatalogCovers] = useState<
+    Record<string, string>
+  >({});
+  const [resolvedCatalogTitles, setResolvedCatalogTitles] = useState<
+    Record<string, string>
+  >({});
+  const coverAttemptedRef = useRef<Set<string>>(new Set());
   const [expandedFriendGameKey, setExpandedFriendGameKey] = useState<
     string | null
   >(null);
@@ -280,6 +300,22 @@ export function FriendsPage({
     });
   }, [selectedFriend, decodedByHash]);
 
+  const mergedCatalogCovers = useMemo(
+    () =>
+      catalogCovers
+        ? { ...catalogCovers, ...resolvedCatalogCovers }
+        : resolvedCatalogCovers,
+    [catalogCovers, resolvedCatalogCovers],
+  );
+
+  const mergedCatalogTitles = useMemo(
+    () =>
+      catalogTitles
+        ? { ...catalogTitles, ...resolvedCatalogTitles }
+        : resolvedCatalogTitles,
+    [catalogTitles, resolvedCatalogTitles],
+  );
+
   const friendGameGroups = useMemo(
     () =>
       groupSavedCollectionsByGame(
@@ -287,10 +323,51 @@ export function FriendsPage({
         managed,
         detected,
         plugins,
-        catalogCovers,
+        mergedCatalogCovers,
+        mergedCatalogTitles,
       ),
-    [friendSavedEntries, managed, detected, plugins, catalogCovers],
+    [
+      friendSavedEntries,
+      managed,
+      detected,
+      plugins,
+      mergedCatalogCovers,
+      mergedCatalogTitles,
+    ],
   );
+
+  useEffect(() => {
+    if (!active || !selectedFriend || friendGameGroups.length === 0) return;
+    const requests = collectionCatalogCoverRequests(
+      friendGameGroups,
+      plugins,
+      detected,
+    ).filter((req) => !coverAttemptedRef.current.has(catalogCoverRequestKey(req)));
+    if (requests.length === 0) return;
+    for (const req of requests) {
+      coverAttemptedRef.current.add(catalogCoverRequestKey(req));
+    }
+    let cancelled = false;
+    void api
+      .resolveCatalogCovers(requests)
+      .then((hits) => {
+        if (cancelled || hits.length === 0) return;
+        startTransition(() => {
+          setResolvedCatalogCovers((prev) =>
+            mergeCollectionCatalogCovers(prev, hits),
+          );
+          setResolvedCatalogTitles((prev) =>
+            mergeCollectionCatalogTitles(prev, hits),
+          );
+        });
+      })
+      .catch((e) => {
+        console.warn("resolve_catalog_covers (friends) failed", e);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [active, selectedFriend, friendGameGroups, plugins, detected]);
 
   const managedGroupIdsKey = useMemo(
     () =>
@@ -560,18 +637,23 @@ export function FriendsPage({
 
   if (loading && !state) {
     return (
-      <section className="panel">
+      <section className="panel page-panel">
+        <div className="page-chrome">
         <div className="panel-head">
           <h1>Friends</h1>
         </div>
+        </div>
+        <div className="page-scroll">
         <p className="muted">Starting P2P node...</p>
+        </div>
       </section>
     );
   }
 
   if (state && !state.display_name_set) {
     return (
-      <section className="panel friends-panel">
+      <section className="panel page-panel friends-panel">
+        <div className="page-scroll">
         <div className="card friends-card friends-onboarding-card">
           <h3>Set Your Display Name</h3>
           <p className="muted">
@@ -591,6 +673,7 @@ export function FriendsPage({
               Save Name
             </button>
           </form>
+        </div>
         </div>
       </section>
     );
@@ -622,7 +705,7 @@ export function FriendsPage({
           : "Install & Join Synced";
 
     return (
-      <section className="panel friends-panel">
+      <section className="panel page-panel friends-panel">
         <CollectionDetailView
           title={selectedCol.name}
           backLabel="Back"
@@ -741,6 +824,7 @@ export function FriendsPage({
           showMods={!decoding && Boolean(decodedPreview)}
           scrollRef={scrollRef}
           active={active}
+          onOpenMod={onOpenMod ? (hit) => onOpenMod(hit, targetGameId || null) : undefined}
           loadingBody={
             !decoding && !decodedPreview ? (
               <div className="card friends-card">
@@ -756,18 +840,22 @@ export function FriendsPage({
   }
 
   return (
-    <section className="panel friends-panel">
+    <section className="panel page-panel friends-panel">
+      <div className="page-chrome">
       <div className="panel-head">
         <div className="detail-head-title">
           {selectedFriend ? (
-            <button
-              type="button"
-              onClick={() => {
-                setSelectedPeerId(null);
-              }}
-            >
-              Back
-            </button>
+            <>
+              <button
+                type="button"
+                onClick={() => {
+                  setSelectedPeerId(null);
+                }}
+              >
+                Back
+              </button>
+              <h1>Friends Collections</h1>
+            </>
           ) : (
             <h1>
               <FontAwesomeIcon icon={faUsers} /> Friends
@@ -831,7 +919,9 @@ export function FriendsPage({
           )}
         </div>
       </div>
+      </div>
 
+      <div className="page-scroll">
       {!selectedFriend && (
         <>
           {state && state.pending_requests.length > 0 && (
@@ -1138,6 +1228,7 @@ export function FriendsPage({
           )}
         </div>
       )}
+      </div>
       {addFriendOpen && (
         <Modal
           title="Add a Friend"

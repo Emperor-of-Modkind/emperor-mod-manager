@@ -1304,6 +1304,190 @@ pub async fn resolve_catalog_covers(
     Ok(hits)
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ShareModMetadataHit {
+    pub key: String,
+    pub picture_url: Option<String>,
+    pub author: Option<String>,
+    pub summary: Option<String>,
+    pub downloads: Option<u64>,
+    pub endorsements: Option<u64>,
+}
+
+fn share_mod_metadata_key(m: &share::ShareModEntry) -> Option<String> {
+    match m.s {
+        share::ShareModSource::Nexus => {
+            let domain = m.domain.as_deref()?.trim();
+            let mod_id = m.mod_id?;
+            if domain.is_empty() || mod_id == 0 {
+                return None;
+            }
+            Some(format!("nexus:{}:{mod_id}", domain.to_ascii_lowercase()))
+        }
+        share::ShareModSource::Thunderstore => {
+            let community = m.community.as_deref()?.trim();
+            let namespace = m.namespace.as_deref()?.trim();
+            let name = m.name.as_deref()?.trim();
+            if community.is_empty() || namespace.is_empty() || name.is_empty() {
+                return None;
+            }
+            Some(format!(
+                "thunderstore:{}:{}:{}",
+                community.to_ascii_lowercase(),
+                namespace.to_ascii_lowercase(),
+                name.to_ascii_lowercase()
+            ))
+        }
+        share::ShareModSource::Modio => {
+            let game_id = m.game_id?;
+            let mod_id = m.mod_id?;
+            if game_id == 0 || mod_id == 0 {
+                return None;
+            }
+            Some(format!("modio:{game_id}:{mod_id}"))
+        }
+    }
+}
+
+/// Resolve cover art and basic catalog metadata for contained mods in a collection.
+#[tauri::command]
+pub async fn resolve_share_mod_metadata(
+    state: State<'_, AppState>,
+    mods: Vec<share::ShareModEntry>,
+) -> Result<Vec<ShareModMetadataHit>, String> {
+    use futures_util::StreamExt;
+
+    if mods.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut seen = HashSet::new();
+    let mut nexus_reqs: Vec<(String, String, u64)> = Vec::new();
+    let mut ts_by_community: HashMap<String, Vec<(String, String, String)>> = HashMap::new();
+    let mut modio_reqs: Vec<(String, u32, u64)> = Vec::new();
+
+    for m in &mods {
+        let Some(key) = share_mod_metadata_key(m) else {
+            continue;
+        };
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+        match m.s {
+            share::ShareModSource::Nexus => {
+                if let (Some(domain), Some(mod_id)) = (m.domain.as_deref(), m.mod_id) {
+                    nexus_reqs.push((key, domain.trim().to_string(), mod_id));
+                }
+            }
+            share::ShareModSource::Thunderstore => {
+                if let (Some(community), Some(namespace), Some(name)) = (
+                    m.community.as_deref(),
+                    m.namespace.as_deref(),
+                    m.name.as_deref(),
+                ) {
+                    ts_by_community
+                        .entry(community.trim().to_string())
+                        .or_default()
+                        .push((key, namespace.trim().to_string(), name.trim().to_string()));
+                }
+            }
+            share::ShareModSource::Modio => {
+                if let (Some(game_id), Some(mod_id)) = (m.game_id, m.mod_id) {
+                    modio_reqs.push((key, game_id, mod_id));
+                }
+            }
+        }
+    }
+
+    let mut hits = Vec::new();
+
+    for (community, items) in ts_by_community {
+        if let Ok(packages) = load_ts_packages_cached(&state, &community).await {
+            for (key, namespace, name) in items {
+                if let Some(pkg) = packages.iter().find(|p| {
+                    p.owner.eq_ignore_ascii_case(&namespace) && p.name.eq_ignore_ascii_case(&name)
+                }) {
+                    let detail = thunderstore::detail_from_package(&community, pkg.clone());
+                    hits.push(ShareModMetadataHit {
+                        key,
+                        picture_url: detail.icon_url,
+                        author: Some(pkg.owner.clone()),
+                        summary: detail.description,
+                        downloads: Some(detail.downloads),
+                        endorsements: None,
+                    });
+                }
+            }
+        }
+    }
+
+    if !nexus_reqs.is_empty() {
+        if let Ok(client) = state.client() {
+            let mut stream = futures_util::stream::iter(nexus_reqs)
+                .map(|(key, domain, mod_id)| {
+                    let client = client.clone();
+                    async move {
+                        let detail = client.get_mod(&domain, mod_id).await.ok()?;
+                        Some(ShareModMetadataHit {
+                            key,
+                            picture_url: detail.picture_url,
+                            author: detail.author,
+                            summary: detail.summary,
+                            downloads: detail.downloads,
+                            endorsements: detail.endorsements,
+                        })
+                    }
+                })
+                .buffer_unordered(6);
+            while let Some(hit) = stream.next().await {
+                if let Some(hit) = hit {
+                    hits.push(hit);
+                }
+            }
+        }
+    }
+
+    if !modio_reqs.is_empty() {
+        let modio_key = state
+            .modio_api_key
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone());
+        if let Some(api_key) = modio_key {
+            if let Ok(client) = ModioClient::new(&api_key) {
+                let client = Arc::new(client);
+                let mut stream = futures_util::stream::iter(modio_reqs)
+                    .map(|(key, game_id, mod_id)| {
+                        let client = Arc::clone(&client);
+                        async move {
+                            let detail = client.get_mod(game_id, mod_id).await.ok()?;
+                            Some(ShareModMetadataHit {
+                                key,
+                                picture_url: detail.picture_url,
+                                author: detail.author,
+                                summary: if detail.summary.trim().is_empty() {
+                                    None
+                                } else {
+                                    Some(detail.summary)
+                                },
+                                downloads: Some(detail.downloads),
+                                endorsements: None,
+                            })
+                        }
+                    })
+                    .buffer_unordered(6);
+                while let Some(hit) = stream.next().await {
+                    if let Some(hit) = hit {
+                        hits.push(hit);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(hits)
+}
+
 async fn modio_game_logos(
     state: &AppState,
     ids: &[u32],

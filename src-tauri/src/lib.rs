@@ -86,6 +86,7 @@ pub fn run() {
             app_update::install_app_update,
             commands::scan_games,
             commands::resolve_catalog_covers,
+            commands::resolve_share_mod_metadata,
             commands::list_plugins,
             commands::list_managed,
             commands::manage_game,

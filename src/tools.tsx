@@ -592,15 +592,19 @@ export const ToolsWorkspace = memo(function ToolsWorkspace({
 
   if (uiState === "error") {
     return (
-      <section className="panel">
+      <section className="panel page-panel">
+        <div className="page-chrome">
         <div className="panel-head">
           <h1>Tools</h1>
         </div>
+        </div>
+        <div className="page-scroll">
         <div className="detail-body">
           {error && <p className="error-banner">{error}</p>}
           <button type="button" onClick={() => void refresh()}>
             Retry
           </button>
+        </div>
         </div>
       </section>
     );
@@ -608,25 +612,32 @@ export const ToolsWorkspace = memo(function ToolsWorkspace({
 
   if (uiState === "not_linux" || !status) {
     return (
-      <section className="panel">
+      <section className="panel page-panel">
+        <div className="page-chrome">
         <div className="panel-head">
           <h1>Tools</h1>
         </div>
+        </div>
+        <div className="page-scroll">
         <div className="detail-body">
           <p>Vulkan tools (lsfg-vk, AutoHDR-VK) are only available on Linux.</p>
+        </div>
         </div>
       </section>
     );
   }
 
   return (
-    <section className="tools-workspace">
+    <section className="tools-workspace page-panel">
+      <div className="page-chrome">
       <div className="panel-head page-head">
         <h1>Tools</h1>
         <p className="muted">
           Install and configure lsfg-vk frame generation and AutoHDR-VK for all games.
         </p>
       </div>
+      </div>
+      <div className="page-scroll">
       {error && <p className="error-banner">{error}</p>}
       <div className="tools-grid">
         <ToolInstallCard
@@ -666,6 +677,7 @@ export const ToolsWorkspace = memo(function ToolsWorkspace({
           onSaved={setHdrConfig}
         />
       )}
+      </div>
     </section>
   );
 });
