@@ -136,6 +136,10 @@ pub struct AppState {
     pub last_emperor_mod_emit: Mutex<Option<(String, Instant)>>,
     /// Pending emperor:// mod open (cold start before the UI listens).
     pub pending_emperor_mod: Mutex<Option<crate::deep_link::EmperorOpenMod>>,
+    /// Debounce identical emperor:// friend deep-link emits.
+    pub last_emperor_friend_emit: Mutex<Option<(String, Instant)>>,
+    /// Pending emperor:// friend invite (cold start before the UI listens).
+    pub pending_emperor_friend: Mutex<Option<String>>,
     /// Last embedded assist panel bounds (logical px, relative to main window).
     pub assist_bounds: Mutex<AssistBounds>,
     /// True after the UI has pushed real host bounds at least once this session.
@@ -334,6 +338,8 @@ impl AppState {
             last_cdn_handled: Mutex::new(None),
             last_emperor_mod_emit: Mutex::new(None),
             pending_emperor_mod: Mutex::new(None),
+            last_emperor_friend_emit: Mutex::new(None),
+            pending_emperor_friend: Mutex::new(None),
             assist_bounds: Mutex::new(AssistBounds::default()),
             assist_bounds_synced: AtomicBool::new(false),
             assist_desired_visible: AtomicBool::new(false),

@@ -119,7 +119,7 @@ import { browseGameVersionOptions } from "./gameVersion";
 import {
   catalogHitFromModDeepLink,
   managedGameForModDeepLink,
-  modDeepLinkFromHit,
+  modShareUrlFromHit,
   type EmperorOpenMod,
 } from "./modDeepLink";
 import { chosenFileLabel, stagedModSourceLine } from "./stagedLabel";
@@ -2219,6 +2219,14 @@ export default function App() {
   const pendingDownloadPageRef = useRef<{ hit: CatalogHit; gameId: string } | null>(null);
   const pendingEmperorModRef = useRef<{ hit: CatalogHit; gameId: string } | null>(null);
   const openEmperorModLinkRef = useRef<(payload: EmperorOpenMod) => void>(() => {});
+  const [pendingFriendInviteCode, setPendingFriendInviteCode] = useState<string | null>(
+    null,
+  );
+  const openEmperorFriendLinkRef = useRef<(code: string) => void>(() => {});
+  openEmperorFriendLinkRef.current = (code: string) => {
+    setPendingFriendInviteCode(code);
+    setTab("friends");
+  };
   const lastEmperorOpenRef = useRef<{ key: string; at: number } | null>(null);
   const modUpdatesReqRef = useRef(0);
   const checkingModUpdatesTimerRef = useRef<number | null>(null);
@@ -3252,6 +3260,12 @@ export default function App() {
             if (pending) openEmperorModLinkRef.current(pending);
           } catch {
             /* cold-start deep link is best-effort */
+          }
+          try {
+            const pendingFriend = await api.takePendingEmperorFriendLink();
+            if (pendingFriend) openEmperorFriendLinkRef.current(pendingFriend);
+          } catch {
+            /* cold-start friend deep link is best-effort */
           }
         }
       } catch (e) {
@@ -4640,6 +4654,12 @@ export default function App() {
       });
       openEmperorModLinkRef.current(event.payload);
     });
+    const unlistenEmperorFriend = listen<string>("emperor-add-friend", (event) => {
+      void api.takePendingEmperorFriendLink().catch(() => {
+        /* clear cold-start stash so bootstrap take does not reopen */
+      });
+      openEmperorFriendLinkRef.current(event.payload);
+    });
     const unlistenAssist = listen<string>("assist-download-finished", async (event) => {
       const q = assistQueueRef.current;
       setBusy(
@@ -4967,6 +4987,7 @@ export default function App() {
       unlistenChanged.then((f) => f());
       unlistenNxm.then((f) => f());
       unlistenEmperorMod.then((f) => f());
+      unlistenEmperorFriend.then((f) => f());
       unlistenAssist.then((f) => f());
       unlistenOpened.then((f) => f());
       unlistenNeedsLogin.then((f) => f());
@@ -6082,7 +6103,7 @@ export default function App() {
   };
 
   async function copyModDeepLink(hit: CatalogHit) {
-    const link = modDeepLinkFromHit(hit);
+    const link = modShareUrlFromHit(hit);
     if (!link) {
       setNotice({
         kind: "warn",
@@ -10578,6 +10599,8 @@ export default function App() {
           <ParkedTabGate active={tab === "friends"}>
             <FriendsPage
               active={tab === "friends"}
+              pendingJoinCode={pendingFriendInviteCode}
+              onConsumePendingJoinCode={() => setPendingFriendInviteCode(null)}
               managed={managed}
               detected={detected}
               plugins={gamePlugins}
@@ -10870,7 +10893,7 @@ export default function App() {
                               Uninstall
                             </button>
                           ) : null}
-                          {modDeepLinkFromHit(browseDetail.hit) ? (
+                          {modShareUrlFromHit(browseDetail.hit) ? (
                             <button
                               type="button"
                               className="mods-toolbar-icon-btn"

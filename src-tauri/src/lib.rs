@@ -166,6 +166,7 @@ pub fn run() {
             commands::delete_saved_collection,
             commands::handle_nxm,
             deep_link::take_pending_emperor_mod_link,
+            deep_link::take_pending_emperor_friend_link,
             commands::import_mods,
             commands::import_assist_download,
             commands::scan_mod_orphans,
@@ -280,7 +281,7 @@ pub fn run() {
                     if s.starts_with("nxm://") {
                         assist::emit_nxm_url(&handle, &s);
                     } else if s.starts_with("emperor://") {
-                        deep_link::emit_emperor_mod_url(&handle, &s);
+                        deep_link::emit_emperor_url(&handle, &s);
                     }
                 }
             });
@@ -288,7 +289,7 @@ pub fn run() {
                 if arg.starts_with("nxm://") {
                     assist::emit_nxm_url(app.handle(), &arg);
                 } else if arg.starts_with("emperor://") {
-                    deep_link::emit_emperor_mod_url(app.handle(), &arg);
+                    deep_link::emit_emperor_url(app.handle(), &arg);
                 }
             }
             Ok(())

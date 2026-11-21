@@ -33,6 +33,7 @@ import {
   formatCollectionDate,
 } from "./CollectionDetailView";
 import { CollectionsGameList } from "./CollectionsGameList";
+import { extractFriendJoinCode, friendShareUrlFromCode } from "./modDeepLink";
 import { FriendAvatar } from "./FriendAvatar";
 import { Modal } from "./Modal";
 import { staggerStyle } from "./motion";
@@ -82,6 +83,8 @@ export type FriendsPageProps = {
     friendSync?: { peerId: string; friendCollectionId: string },
   ) => Promise<void> | void;
   onOpenMod?: (hit: CatalogHit, targetGameId?: string | null) => void;
+  pendingJoinCode?: string | null;
+  onConsumePendingJoinCode?: () => void;
 };
 
 function gameMatchesHint(
@@ -143,6 +146,8 @@ export function FriendsPage({
   onSaveCollection,
   onCollectionSynced,
   onOpenMod,
+  pendingJoinCode,
+  onConsumePendingJoinCode,
 }: FriendsPageProps) {
   const [state, setState] = useState<FriendsState | null>(null);
   const [loading, setLoading] = useState(true);
@@ -478,14 +483,26 @@ export function FriendsPage({
   async function handleCopyJoinCode() {
     if (!state?.join_code) return;
     try {
-      await navigator.clipboard.writeText(state.join_code);
+      const shareText = friendShareUrlFromCode(state.join_code) ?? state.join_code;
+      await navigator.clipboard.writeText(shareText);
       setCopiedCode(true);
-      onNotice("Friend code copied to clipboard.");
+      onNotice("Friend invite link copied to clipboard.");
       setTimeout(() => setCopiedCode(false), 2000);
     } catch (e) {
       onError(String(e));
     }
   }
+
+  useEffect(() => {
+    const code = pendingJoinCode?.trim();
+    if (!code) return;
+    onError(null);
+    setSelectedCol(null);
+    setSelectedPeerId(null);
+    setJoinCodeInput(code);
+    setAddFriendOpen(true);
+    onConsumePendingJoinCode?.();
+  }, [pendingJoinCode, onConsumePendingJoinCode, onError]);
 
   async function handleSaveDisplayName(e: React.FormEvent) {
     e.preventDefault();
@@ -502,10 +519,12 @@ export function FriendsPage({
   async function handleAddFriend(e: React.FormEvent) {
     e.preventDefault();
     onError(null);
-    if (!joinCodeInput.trim()) return;
+    const trimmed = joinCodeInput.trim();
+    if (!trimmed) return;
+    const normalized = extractFriendJoinCode(trimmed) ?? trimmed;
     setAddingFriend(true);
     try {
-      const next = await api.addFriendByCode(joinCodeInput.trim());
+      const next = await api.addFriendByCode(normalized);
       setState(next);
       setJoinCodeInput("");
       setAddFriendOpen(false);
@@ -1232,7 +1251,7 @@ export function FriendsPage({
       {addFriendOpen && (
         <Modal
           title="Add a Friend"
-          subtitle="Paste a friend's join code (emperor-friend1:...) to send a mutual connection request."
+          subtitle="Paste a friend's invite link or join code (emperor-friend1:...) to send a mutual connection request."
           onClose={() => setAddFriendOpen(false)}
           footer={
             <div className="modal-foot-actions">
@@ -1259,7 +1278,7 @@ export function FriendsPage({
               type="text"
               value={joinCodeInput}
               onChange={(e) => setJoinCodeInput(e.target.value)}
-              placeholder="emperor-friend1:..."
+              placeholder="https://emperor-of-modkind.github.io/open/?to=friend/... or emperor-friend1:..."
               aria-label="Friend join code"
               autoFocus
             />

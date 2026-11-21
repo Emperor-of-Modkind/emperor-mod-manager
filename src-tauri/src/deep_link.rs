@@ -1,9 +1,10 @@
-//! `emperor://` deep links that open a mod detail page in the app.
+//! `emperor://` deep links that open a mod detail page or friend invite in the app.
 //!
 //! Formats:
 //! - `emperor://mod/nexus/{domain}/{modId}`
 //! - `emperor://mod/thunderstore/{community}/{namespace}/{package}`
 //! - `emperor://mod/modio/{gameId}/{modId}`
+//! - `emperor://friend/{joinCode}` (`emperor-friend1:...`)
 
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
@@ -169,6 +170,108 @@ fn from_hex(b: u8) -> Option<u8> {
     }
 }
 
+/// Parse an `emperor://friend/{joinCode}` URL into the `emperor-friend1:...` join code.
+pub fn parse_emperor_friend_url(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if !raw.to_ascii_lowercase().starts_with("emperor://") {
+        return None;
+    }
+    let url = Url::parse(raw).ok()?;
+    if url.scheme() != "emperor" {
+        return None;
+    }
+
+    let host = url.host_str().unwrap_or("");
+    let mut segments: Vec<String> = url
+        .path_segments()?
+        .filter(|s| !s.is_empty())
+        .map(percent_decode_str)
+        .collect::<Option<Vec<_>>>()?;
+
+    if host.eq_ignore_ascii_case("friend") {
+        // emperor://friend/emperor-friend1:... → host=friend, path=/emperor-friend1:...
+    } else if host.is_empty() {
+        // emperor:///friend/emperor-friend1:... → path=/friend/emperor-friend1:...
+        if segments
+            .first()
+            .is_some_and(|s| s.eq_ignore_ascii_case("friend"))
+        {
+            segments.remove(0);
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    }
+
+    if segments.len() != 1 {
+        return None;
+    }
+    let code = segments[0].trim();
+    let payload = code.strip_prefix(crate::p2p::JOIN_CODE_PREFIX)?;
+    if payload.is_empty()
+        || !payload
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return None;
+    }
+    Some(code.to_string())
+}
+
+/// Dispatch any `emperor://` deep link (mod or friend invite).
+pub fn emit_emperor_url(app: &AppHandle, url: &str) {
+    let url = url.trim();
+    if parse_emperor_mod_url(url).is_some() {
+        emit_emperor_mod_url(app, url);
+    } else if parse_emperor_friend_url(url).is_some() {
+        emit_emperor_friend_url(app, url);
+    } else {
+        log::warn!("ignored unrecognized emperor deep link: {url}");
+    }
+}
+
+/// Store + emit `emperor-add-friend`, debouncing identical URLs within 1s.
+pub fn emit_emperor_friend_url(app: &AppHandle, url: &str) {
+    let url = url.trim();
+    let Some(code) = parse_emperor_friend_url(url) else {
+        log::warn!("ignored unrecognized emperor friend deep link: {url}");
+        return;
+    };
+
+    if let Some(state) = app.try_state::<AppState>() {
+        if let Ok(mut last) = state.last_emperor_friend_emit.lock() {
+            if let Some((ref prev, at)) = *last {
+                if prev == url && at.elapsed() < Duration::from_secs(1) {
+                    log::debug!("debounce duplicate emperor-add-friend emit");
+                    return;
+                }
+            }
+            *last = Some((url.to_string(), Instant::now()));
+        }
+        if let Ok(mut pending) = state.pending_emperor_friend.lock() {
+            *pending = Some(code.clone());
+        }
+    }
+
+    log::info!("emperor-add-friend deep link received");
+    let _ = app.emit("emperor-add-friend", code);
+}
+
+/// Take (and clear) any pending cold-start emperor friend invite link.
+pub fn take_pending_emperor_friend(state: &AppState) -> Option<String> {
+    state
+        .pending_emperor_friend
+        .lock()
+        .ok()
+        .and_then(|mut g| g.take())
+}
+
+#[tauri::command]
+pub fn take_pending_emperor_friend_link(state: tauri::State<'_, AppState>) -> Option<String> {
+    take_pending_emperor_friend(&state)
+}
+
 /// Store + emit `emperor-open-mod`, debouncing identical URLs within 1s.
 pub fn emit_emperor_mod_url(app: &AppHandle, url: &str) {
     let url = url.trim();
@@ -277,5 +380,18 @@ mod tests {
                 mod_id: 2400,
             }
         );
+    }
+
+    #[test]
+    fn parses_friend_join_code() {
+        let code = parse_emperor_friend_url("emperor://friend/emperor-friend1:abc_123-XYZ").unwrap();
+        assert_eq!(code, "emperor-friend1:abc_123-XYZ");
+        let triple_slash =
+            parse_emperor_friend_url("emperor:///friend/emperor-friend1:abc_123-XYZ").unwrap();
+        assert_eq!(triple_slash, "emperor-friend1:abc_123-XYZ");
+        assert!(parse_emperor_friend_url("emperor://friend/not-a-code").is_none());
+        assert!(parse_emperor_friend_url("emperor://friend/emperor-friend1:").is_none());
+        assert!(parse_emperor_friend_url("emperor://friend/emperor-friend1:bad!char").is_none());
+        assert!(parse_emperor_friend_url("emperor://mod/nexus/skyrim/1").is_none());
     }
 }

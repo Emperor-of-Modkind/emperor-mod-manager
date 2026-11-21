@@ -186,6 +186,7 @@ vi.mock("@tauri-apps/api/core", () => {
           install_via: null,
         });
       case "take_pending_emperor_mod_link":
+      case "take_pending_emperor_friend_link":
       case "set_active_game":
       case "wine_override_advice":
         return Promise.resolve(null);
