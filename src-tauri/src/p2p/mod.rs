@@ -230,7 +230,28 @@ pub fn encode_join_code(ticket: &FriendJoinTicket) -> Result<String> {
 
 pub fn decode_join_code(raw: &str) -> Result<FriendJoinTicket> {
     let trimmed = raw.trim();
-    let payload = trimmed
+    let normalized = if let Some(code) = crate::deep_link::parse_emperor_friend_url(trimmed) {
+        code
+    } else if let Ok(url) = url::Url::parse(trimmed) {
+        if matches!(url.scheme(), "https" | "http") {
+            let route = url
+                .query_pairs()
+                .find(|(k, _)| k == "to")
+                .map(|(_, v)| v.into_owned())
+                .or_else(|| url.fragment().map(|f| f.to_string()));
+            route
+                .as_deref()
+                .and_then(|r| r.trim().strip_prefix("friend/"))
+                .unwrap_or(trimmed)
+                .to_string()
+        } else {
+            trimmed.to_string()
+        }
+    } else {
+        trimmed.to_string()
+    };
+    let payload = normalized
+        .trim()
         .strip_prefix(JOIN_CODE_PREFIX)
         .ok_or_else(|| anyhow!("Join code must start with {JOIN_CODE_PREFIX}"))?;
     let compressed = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -1252,6 +1273,14 @@ mod tests {
         assert_eq!(decoded.name, "Alice");
         assert_eq!(decoded.addr.id, key.public());
         assert_eq!(decoded.addr.addrs.len(), 1);
+
+        let from_deep_link = decode_join_code(&format!("emperor://friend/{code}")).unwrap();
+        assert_eq!(from_deep_link.addr.id, key.public());
+        let from_share_url = decode_join_code(&format!(
+            "https://emperor-of-modkind.github.io/open/?to=friend/{code}"
+        ))
+        .unwrap();
+        assert_eq!(from_share_url.addr.id, key.public());
     }
 
     #[test]

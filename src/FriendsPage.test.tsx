@@ -394,7 +394,7 @@ describe("FriendsPage", () => {
     const avatarImg = card!.querySelector<HTMLImageElement>("img.friends-avatar-img");
     expect(avatarImg?.src).toBe("data:image/png;base64,iVBORw0KGgo=");
 
-    // Share Friend Code copies join code.
+    // Share Friend Code copies clickable HTTPS invite link.
     const shareBtn = [...host.querySelectorAll("button")].find((b) =>
       b.textContent?.includes("Share Friend Code"),
     );
@@ -403,9 +403,11 @@ describe("FriendsPage", () => {
       shareBtn!.click();
     });
     await flush();
-    expect(writeText).toHaveBeenCalledWith("emperor-friend1:abc");
+    expect(writeText).toHaveBeenCalledWith(
+      "https://emperor-of-modkind.github.io/open/?to=friend/emperor-friend1:abc",
+    );
 
-    // Add Friend opens modal and submits join code.
+    // Add Friend opens modal and submits join code (or pasted invite link).
     const addBtn = [...host.querySelectorAll("button")].find((b) =>
       b.textContent?.includes("Add Friend"),
     );
@@ -424,7 +426,10 @@ describe("FriendsPage", () => {
         HTMLInputElement.prototype,
         "value",
       )?.set;
-      setter?.call(modalInput, "emperor-friend1:xyz");
+      setter?.call(
+        modalInput,
+        "https://emperor-of-modkind.github.io/open/?to=friend/emperor-friend1:xyz",
+      );
       modalInput!.dispatchEvent(new Event("input", { bubbles: true }));
     });
     const modalForm = document.body.querySelector("#add-friend-modal-form");
@@ -435,6 +440,41 @@ describe("FriendsPage", () => {
     });
     await flush();
     expect(api.addFriendByCode).toHaveBeenCalledWith("emperor-friend1:xyz");
+
+    await act(async () => {
+      root.unmount();
+    });
+    host.remove();
+  });
+
+  it("opens the Add Friend modal prefilled when a friend deep link arrives", async () => {
+    vi.mocked(api.getFriendsState).mockResolvedValue(sampleState);
+    const onConsume = vi.fn();
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const root = createRoot(host);
+
+    await act(async () => {
+      root.render(
+        <FriendsPage
+          active
+          managed={[]}
+          activeGameId={null}
+          pendingJoinCode="emperor-friend1:deepLink123"
+          onConsumePendingJoinCode={onConsume}
+          onError={vi.fn()}
+          onNotice={vi.fn()}
+          onCollectionSynced={vi.fn()}
+        />,
+      );
+    });
+    await flush();
+
+    expect(onConsume).toHaveBeenCalledTimes(1);
+    const modalInput = document.body.querySelector<HTMLInputElement>(
+      'input[aria-label="Friend join code"]',
+    );
+    expect(modalInput?.value).toBe("emperor-friend1:deepLink123");
 
     await act(async () => {
       root.unmount();

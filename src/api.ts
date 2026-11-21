@@ -541,6 +541,8 @@ export const api = {
   handleNxm: (url: string) => invoke<DownloadItem>("handle_nxm", { url }),
   takePendingEmperorModLink: () =>
     invoke<EmperorOpenMod | null>("take_pending_emperor_mod_link"),
+  takePendingEmperorFriendLink: () =>
+    invoke<string | null>("take_pending_emperor_friend_link"),
   importMods: (args: { gameId: string; paths: string[] }) =>
     invoke<ImportResult>("import_mods", args),
   importAssistDownload: (path: string) =>
