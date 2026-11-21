@@ -24,6 +24,7 @@ import {
   faEyeSlash,
   faFileImport,
   faFilter,
+  faFloppyDisk,
   faGear,
   faLink,
   faMagnifyingGlass,
@@ -179,6 +180,7 @@ import {
 } from "./StatusBanner";
 import { WineOverrideNotice } from "./WineOverrideNotice";
 import { CollectionIntegrityDialog } from "./CollectionIntegrityDialog";
+import { CollectionConflictDialog } from "./CollectionConflictDialog";
 import {
   applyCatalogCovers,
   catalogCoverRequestKey,
@@ -195,11 +197,14 @@ import type {
   BrowseSearchOpts,
   CatalogHit,
   CatalogSuggestion,
+  CollectionConflictPlan,
   CollectionDetail,
   CollectionHit,
   CollectionIntegrityReport,
   CollectionModFile,
   CollectionModIssue,
+  CollectionPlanSource,
+  CollectionResolutionChoices,
   CollectionVisibility,
   DetectedGame,
   DownloadItem,
@@ -2018,6 +2023,13 @@ export default function App() {
   const [unmanageTarget, setUnmanageTarget] = useState<ManagedGame | null>(null);
   const [uninstallCollectionTarget, setUninstallCollectionTarget] =
     useState<InstalledCollection | null>(null);
+  const [conflictPrompt, setConflictPrompt] = useState<{
+    plan: CollectionConflictPlan;
+    resolve: (choices: CollectionResolutionChoices | null) => void;
+  } | null>(null);
+  const [togglingCollectionIds, setTogglingCollectionIds] = useState<
+    Record<string, boolean>
+  >({});
   const [unmanageStatus, setUnmanageStatus] = useState<{
     has_portable_mods: boolean;
     mod_count: number;
@@ -6676,13 +6688,78 @@ export default function App() {
     }
   }
 
+  const promptForConflictChoices = useCallback(
+    (plan: CollectionConflictPlan): Promise<CollectionResolutionChoices | null> =>
+      new Promise((resolve) => {
+        setConflictPrompt({ plan, resolve });
+      }),
+    [],
+  );
+
+  const resolveCollectionConflicts = useCallback(
+    async (
+      gameId: string,
+      source: CollectionPlanSource,
+    ): Promise<CollectionResolutionChoices | null> => {
+      const plan = await api.planCollectionResolution(gameId, source);
+      if (plan.conflicts.length === 0) {
+        return { disableCollectionIds: [], modActions: {} };
+      }
+      return promptForConflictChoices(plan);
+    },
+    [promptForConflictChoices],
+  );
+
+  async function toggleInstalledCollectionEnabled(
+    c: InstalledCollection,
+    enabled: boolean,
+  ) {
+    if (!activeGame) return;
+    const gameId = activeGame.id;
+    setError(null);
+    setTogglingCollectionIds((prev) => ({ ...prev, [c.id]: true }));
+    try {
+      const changed = await api.setCollectionEnabled(gameId, c.id, enabled);
+      await refreshMods(gameId);
+      await refreshCollections(gameId);
+      setNotice({
+        kind: "ok",
+        message: enabled
+          ? `Enabled ${c.name}${changed > 0 ? ` (${changed} mod${changed === 1 ? "" : "s"})` : ""}.`
+          : `Disabled ${c.name}${changed > 0 ? ` (${changed} mod${changed === 1 ? "" : "s"})` : ""}.`,
+      });
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setTogglingCollectionIds((prev) => {
+        const next = { ...prev };
+        delete next[c.id];
+        return next;
+      });
+    }
+  }
+
   async function installCollection(c: CollectionHit) {
     if (!activeGame) return;
     if (collectionHitSource(c) === "thunderstore") {
       if (!c.community || !c.namespace || !c.package_name) return;
+      setError(null);
+      let resolutions: CollectionResolutionChoices | null;
+      try {
+        resolutions = await resolveCollectionConflicts(activeGame.id, {
+          kind: "thunderstore_modpack",
+          community: c.community,
+          namespace: c.namespace,
+          name: c.package_name,
+          version: c.latest_version || tsVersion || null,
+        });
+      } catch (e) {
+        setError(String(e));
+        return;
+      }
+      if (!resolutions) return;
       goToDownloadsOnInstall();
       setBusy(`Installing modpack ${c.name}…`);
-      setError(null);
       try {
         await api.downloadThunderstoreMod({
           gameId: activeGame.id,
@@ -6691,6 +6768,7 @@ export default function App() {
           name: c.package_name,
           version: c.latest_version || tsVersion || null,
           recordAsModpack: true,
+          resolutions,
         });
         await refreshMods(activeGame.id);
         await refreshCollections(activeGame.id);
@@ -6705,9 +6783,23 @@ export default function App() {
       return;
     }
     if (isPremium) {
+      setError(null);
+      let resolutions: CollectionResolutionChoices | null;
+      try {
+        resolutions = await resolveCollectionConflicts(activeGame.id, {
+          kind: "nexus_collection",
+          slug: c.slug,
+          revision: c.revision_number,
+          includeOptional,
+          name: c.name,
+        });
+      } catch (e) {
+        setError(String(e));
+        return;
+      }
+      if (!resolutions) return;
       goToDownloadsOnInstall();
       setBusy(`Installing collection ${c.name}…`);
-      setError(null);
       try {
         await api.installCollection({
           gameId: activeGame.id,
@@ -6715,6 +6807,7 @@ export default function App() {
           revision: c.revision_number,
           includeOptional,
           name: c.name,
+          resolutions,
         });
         await refreshMods(activeGame.id);
         await refreshCollections(activeGame.id);
@@ -6731,15 +6824,116 @@ export default function App() {
     setError(null);
     try {
       const existingModIds = mods.map((m) => m.id);
-      const allFiles = await api.collectionFiles({
-        slug: c.slug,
-        revision: c.revision_number,
-      });
+      const [allFiles, plan] = await Promise.all([
+        api.collectionFiles({
+          slug: c.slug,
+          revision: c.revision_number,
+        }),
+        api.planCollectionResolution(activeGame.id, {
+          kind: "nexus_collection",
+          slug: c.slug,
+          revision: c.revision_number,
+          includeOptional,
+          name: c.name,
+        }),
+      ]);
       const filesToInstall = allFiles.filter((f) => includeOptional || !f.optional);
       if (filesToInstall.length === 0) {
         throw new Error("No mods to install in this collection (try including optional mods).");
       }
-      const entries = filesToInstall.map((f) =>
+
+      setBusy(null);
+      let resolutions: CollectionResolutionChoices | null = {
+        disableCollectionIds: [],
+        modActions: {},
+      };
+      if (plan.conflicts.length > 0) {
+        resolutions = await promptForConflictChoices(plan);
+        if (!resolutions) return;
+      }
+
+      const conflictByKey = new Map(
+        plan.conflicts.map((conf) => [conf.conflictKey, conf]),
+      );
+      const exactMatchIds = filesToInstall
+        .map((f) =>
+          mods.find(
+            (m) =>
+              m.source === "nexus" &&
+              m.nexus_mod_id === f.mod_id &&
+              m.nexus_file_id === f.file_id,
+          ),
+        )
+        .filter((m): m is StagedMod => Boolean(m))
+        .map((m) => m.id);
+
+      for (const colId of resolutions.disableCollectionIds) {
+        await api.setCollectionEnabled(activeGame.id, colId, false, exactMatchIds);
+      }
+
+      const filesForAssist: {
+        file: CollectionModFile;
+        replaceStagedId: string | null;
+      }[] = [];
+      for (const f of filesToInstall) {
+        const key = `nexus:${f.domain_name.toLowerCase()}:${f.mod_id}:${f.file_id}`;
+        const conflict = conflictByKey.get(key);
+        const action = conflict
+          ? (resolutions.modActions[key] ?? conflict.recommendedAction)
+          : null;
+        if (
+          conflict &&
+          (action === "disable_old_and_install_new" ||
+            action === "disable_other_collections")
+        ) {
+          await api.setModEnabled(activeGame.id, conflict.existingModId, false);
+        }
+        if (action === "keep_existing") {
+          continue;
+        }
+        const alreadyStaged = mods.find(
+          (m) =>
+            m.source === "nexus" &&
+            m.nexus_mod_id === f.mod_id &&
+            m.nexus_file_id === f.file_id,
+        );
+        if (alreadyStaged && plan.repairCount === 0) {
+          if (!alreadyStaged.enabled) {
+            await api.setModEnabled(activeGame.id, alreadyStaged.id, true);
+          }
+          continue;
+        }
+        filesForAssist.push({
+          file: f,
+          replaceStagedId:
+            conflict && action === "replace_existing"
+              ? conflict.existingModId
+              : null,
+        });
+      }
+
+      if (filesForAssist.length === 0) {
+        await api.recordNexusCollection({
+          gameId: activeGame.id,
+          slug: c.slug,
+          name: c.name,
+          revision: c.revision_number,
+          files: filesToInstall.map((f) => ({
+            modId: f.mod_id,
+            fileId: f.file_id,
+          })),
+          existingModIds,
+        });
+        await refreshMods(activeGame.id);
+        await refreshCollections(activeGame.id);
+        setNotice({
+          kind: "ok",
+          message: `Installed ${c.name} (all ${filesToInstall.length} mods already staged).`,
+        });
+        return;
+      }
+
+      const entries = filesForAssist.map(({ file: f, replaceStagedId }) =>
         createQueueEntry(
           activeGame.id,
           f.domain_name,
@@ -6747,7 +6941,7 @@ export default function App() {
           f.file_id,
           f.mod_name,
           f.version,
-          null,
+          replaceStagedId,
           chosenFileLabel(f.mod_name, { name: f.file_name }),
         ),
       );
@@ -6791,6 +6985,7 @@ export default function App() {
           f.file_id,
           f.name,
           f.version,
+          f.replace_staged_id ?? null,
         ),
       );
       await enqueueAssistEntries(entries, result.name, null, {
@@ -6835,10 +7030,17 @@ export default function App() {
     setSyncingCollectionIds((prev) => ({ ...prev, [c.id]: true }));
     try {
       if (c.friend_sync) {
+        const resolutions = await resolveCollectionConflicts(gameId, {
+          kind: "friend_sync",
+          peerId: c.friend_sync.friend_peer_id,
+          friendCollectionId: c.friend_sync.friend_collection_id,
+        });
+        if (!resolutions) return;
         const res = await api.joinOrSyncFriendCollection({
           gameId,
           peerId: c.friend_sync.friend_peer_id,
           friendCollectionId: c.friend_sync.friend_collection_id,
+          resolutions,
         });
         await handleShareImportResult(
           gameId,
@@ -6890,6 +7092,14 @@ export default function App() {
         c.namespace &&
         c.package_name
       ) {
+        const resolutions = await resolveCollectionConflicts(gameId, {
+          kind: "thunderstore_modpack",
+          community: c.community,
+          namespace: c.namespace,
+          name: c.package_name,
+          version: null,
+        });
+        if (!resolutions) return;
         await withBusy(`Updating modpack ${c.name}…`, async () => {
           await api.downloadThunderstoreMod({
             gameId,
@@ -6898,6 +7108,7 @@ export default function App() {
             name: c.package_name!,
             version: null,
             recordAsModpack: true,
+            resolutions,
           });
           await refreshMods(gameId);
           await refreshCollections(gameId);
@@ -6934,6 +7145,21 @@ export default function App() {
         if (autoSyncInFlightRef.current.has(key)) continue;
         autoSyncInFlightRef.current.add(key);
         try {
+          const plan = await api.planCollectionResolution(game.id, {
+            kind: "friend_sync",
+            peerId: st.peer_id,
+            friendCollectionId: st.friend_collection_id,
+          });
+          if (plan.conflicts.length > 0) {
+            if (autoSyncNotifiedHashRef.current.get(key) !== st.latest_hash) {
+              autoSyncNotifiedHashRef.current.set(key, st.latest_hash);
+              setNotice({
+                kind: "warn",
+                message: `${plan.targetCollectionName} has an update with ${plan.conflicts.length} version conflict${plan.conflicts.length === 1 ? "" : "s"}. Click Sync on the game page to resolve.`,
+              });
+            }
+            continue;
+          }
           const res = await api.joinOrSyncFriendCollection({
             gameId: game.id,
             peerId: st.peer_id,
@@ -7093,11 +7319,23 @@ export default function App() {
     code: string,
     name?: string | null,
   ) {
+    setError(null);
+    let resolutions: CollectionResolutionChoices | null;
+    try {
+      resolutions = await resolveCollectionConflicts(gameId, {
+        kind: "share_code",
+        code,
+        name: name ?? null,
+      });
+    } catch (e) {
+      setError(String(e));
+      return;
+    }
+    if (!resolutions) return;
     goToDownloadsOnInstall();
     setBusy("Importing code…");
-    setError(null);
     try {
-      const imported = await api.importCode(gameId, code, name);
+      const imported = await api.importCode(gameId, code, name, resolutions);
       if (imported.kind === "thunderstore_profile") {
         await refreshMods(gameId);
         await refreshCollections(gameId);
@@ -9508,7 +9746,18 @@ export default function App() {
                           const syncState = friendSyncStates[c.id];
                           const hasUpdate = Boolean(syncState?.has_update);
                           const isSyncing = Boolean(syncingCollectionIds[c.id]);
+                          const isSaving = Boolean(savingCollectionIds[c.id]);
                           const autoSyncOn = Boolean(c.friend_sync?.auto_sync);
+                          const autoSaveOn = Boolean(c.auto_save);
+                          const hasUnsaved = Boolean(c.has_unsaved_changes);
+                          const isUnsaved = hasUnsaved && !autoSaveOn;
+                          const savedStatusLabel = isSaving
+                            ? "Saving changes…"
+                            : isUnsaved
+                              ? "Unsaved changes"
+                              : autoSaveOn
+                                ? "Saved (auto-save enabled)"
+                                : "Saved";
                           const canUpdateSource = Boolean(
                             c.friend_sync ||
                               (c.source === "nexus" && c.slug) ||
@@ -9534,6 +9783,7 @@ export default function App() {
                                 ? "Update available"
                                 : "Synced"
                               : null,
+                            savedStatusLabel,
                             installedLabel,
                           ]
                             .filter(Boolean)
@@ -9581,6 +9831,22 @@ export default function App() {
                                   <strong className="installed-collection-card-name">
                                     {c.name}
                                   </strong>
+                                  <span
+                                    className={
+                                      isSaving
+                                        ? "installed-collection-save-status is-saving"
+                                        : isUnsaved
+                                          ? "installed-collection-save-status is-unsaved"
+                                          : "installed-collection-save-status is-saved"
+                                    }
+                                    title={savedStatusLabel}
+                                    aria-label={savedStatusLabel}
+                                  >
+                                    <FontAwesomeIcon
+                                      icon={faFloppyDisk}
+                                      aria-hidden="true"
+                                    />
+                                  </span>
                                 </div>
                                 <div className="installed-collection-card-actions">
                                   {canUpdateSource && (
@@ -10713,6 +10979,7 @@ export default function App() {
                   friendSync ?? null,
                 );
               }}
+              resolveCollectionConflicts={resolveCollectionConflicts}
               onOpenMod={(hit, targetGameId) =>
                 void openCollectionMod(hit, "friends", targetGameId)
               }
@@ -13427,12 +13694,21 @@ export default function App() {
                         const hasUpdate = Boolean(syncState?.has_update);
                         const isSyncing = Boolean(syncingCollectionIds[c.id]);
                         const isSaving = Boolean(savingCollectionIds[c.id]);
+                        const isToggling = Boolean(togglingCollectionIds[c.id]);
                         const autoSyncOn = Boolean(c.friend_sync?.auto_sync);
                         const autoSaveOn = Boolean(c.auto_save);
                         const hasUnsaved = Boolean(c.has_unsaved_changes);
-                        const installedMemberCount = mods.filter((m) =>
-                          (m.collection_ids ?? []).includes(c.id),
+                        const installedMembers = mods.filter(
+                          (m) =>
+                            (m.collection_ids ?? []).includes(c.id) ||
+                            c.mod_ids.includes(m.id),
+                        );
+                        const installedMemberCount = installedMembers.length;
+                        const enabledMemberCount = installedMembers.filter(
+                          (m) => m.enabled,
                         ).length;
+                        const isCollectionDisabled =
+                          installedMemberCount > 0 && enabledMemberCount === 0;
                         const modCount =
                           installedMemberCount > 0
                             ? installedMemberCount
@@ -13466,6 +13742,14 @@ export default function App() {
                                 {installedLabel
                                   ? ` · ${installedLabel}`
                                   : ""}
+                                {isCollectionDisabled ? (
+                                  <>
+                                    {" · "}
+                                    <span className="installed-collection-disabled-pill">
+                                      Disabled
+                                    </span>
+                                  </>
+                                ) : null}
                                 {hasUnsaved && !autoSaveOn ? (
                                   <>
                                     {" · "}
@@ -13584,6 +13868,29 @@ export default function App() {
                                   }
                                 >
                                   Auto
+                                </button>
+                              )}
+                              {installedMemberCount > 0 && (
+                                <button
+                                  type="button"
+                                  disabled={isToggling}
+                                  title={
+                                    isCollectionDisabled
+                                      ? `Enable all mods in ${c.name}`
+                                      : `Disable mods in ${c.name} without uninstalling`
+                                  }
+                                  onClick={() =>
+                                    void toggleInstalledCollectionEnabled(
+                                      c,
+                                      isCollectionDisabled,
+                                    )
+                                  }
+                                >
+                                  {isToggling
+                                    ? "Updating…"
+                                    : isCollectionDisabled
+                                      ? "Enable"
+                                      : "Disable"}
                                 </button>
                               )}
                               <button
@@ -14166,6 +14473,21 @@ export default function App() {
           }
           onClose={() => {
             if (!integrityRetrying) setIntegrityDialogReport(null);
+          }}
+        />
+      )}
+      {conflictPrompt && (
+        <CollectionConflictDialog
+          plan={conflictPrompt.plan}
+          onConfirm={(choices) => {
+            const { resolve } = conflictPrompt;
+            setConflictPrompt(null);
+            resolve(choices);
+          }}
+          onCancel={() => {
+            const { resolve } = conflictPrompt;
+            setConflictPrompt(null);
+            resolve(null);
           }}
         />
       )}

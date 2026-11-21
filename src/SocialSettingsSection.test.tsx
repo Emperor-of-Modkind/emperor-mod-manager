@@ -9,6 +9,8 @@ vi.mock("./api", () => ({
   api: {
     setP2pDisplayName: vi.fn(),
     setP2pProfilePicture: vi.fn(),
+    setFriendsListVisibility: vi.fn(),
+    setAllowMutualConnections: vi.fn(),
   },
 }));
 
@@ -97,6 +99,141 @@ describe("SocialSettingsSection", () => {
 
     expect(api.setP2pProfilePicture).toHaveBeenCalledWith(null);
     expect(onNotice).toHaveBeenCalledWith("Profile picture removed.");
+
+    await act(async () => {
+      root.unmount();
+    });
+    host.remove();
+  });
+
+  it("updates friends list privacy via the visibility modal", async () => {
+    const onFriendsStateChange = vi.fn();
+    const onNotice = vi.fn();
+    const onError = vi.fn();
+    const stateWithFriend: FriendsState = {
+      ...baseState,
+      friends_list_visibility: { mode: "all_friends" },
+      friends: [
+        {
+          peer_id: "peer_alice",
+          display_name: "Alice",
+          status: "connected",
+          online: true,
+        },
+      ],
+    };
+    vi.mocked(api.setFriendsListVisibility).mockResolvedValue({
+      ...stateWithFriend,
+      friends_list_visibility: {
+        mode: "specific_friends",
+        peer_ids: ["peer_alice"],
+      },
+    });
+
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const root: Root = createRoot(host);
+
+    await act(async () => {
+      root.render(
+        <SocialSettingsSection
+          friendsState={stateWithFriend}
+          onFriendsStateChange={onFriendsStateChange}
+          onNotice={onNotice}
+          onError={onError}
+        />,
+      );
+    });
+
+    expect(host.textContent).toContain("Friends list privacy");
+    expect(host.textContent).toContain("All friends");
+
+    const changeBtn = [...host.querySelectorAll("button")].find(
+      (b) => b.textContent?.trim() === "Change Privacy",
+    );
+    expect(changeBtn).toBeTruthy();
+    await act(async () => {
+      changeBtn!.click();
+    });
+
+    const specificRadio = document.querySelector<HTMLInputElement>(
+      'input[type="radio"][value="specific_friends"]',
+    );
+    expect(specificRadio).toBeTruthy();
+    await act(async () => {
+      specificRadio!.click();
+    });
+
+    const aliceCheckbox = document.querySelector<HTMLInputElement>(
+      '.collection-sharing-friend-row input[type="checkbox"]',
+    );
+    expect(aliceCheckbox).toBeTruthy();
+    await act(async () => {
+      aliceCheckbox!.click();
+    });
+
+    const modalSaveBtn = [
+      ...document.querySelectorAll<HTMLButtonElement>(".modal-foot-actions button"),
+    ].find((b) => b.textContent?.trim() === "Save");
+    expect(modalSaveBtn).toBeTruthy();
+    await act(async () => {
+      modalSaveBtn!.click();
+    });
+    await flush();
+
+    expect(api.setFriendsListVisibility).toHaveBeenCalledWith({
+      mode: "specific_friends",
+      peer_ids: ["peer_alice"],
+    });
+    expect(onNotice).toHaveBeenCalledWith("Friends list privacy updated.");
+
+    await act(async () => {
+      root.unmount();
+    });
+    host.remove();
+  });
+
+  it("toggles allow mutual connections setting", async () => {
+    const onFriendsStateChange = vi.fn();
+    const onNotice = vi.fn();
+    const onError = vi.fn();
+    vi.mocked(api.setAllowMutualConnections).mockResolvedValue({
+      ...baseState,
+      allow_mutual_connections: false,
+    });
+
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const root: Root = createRoot(host);
+
+    await act(async () => {
+      root.render(
+        <SocialSettingsSection
+          friendsState={baseState}
+          onFriendsStateChange={onFriendsStateChange}
+          onNotice={onNotice}
+          onError={onError}
+        />,
+      );
+    });
+
+    const checkbox = host.querySelector<HTMLInputElement>(
+      'input[type="checkbox"]',
+    );
+    expect(checkbox).toBeTruthy();
+    expect(checkbox?.checked).toBe(true);
+
+    await act(async () => {
+      checkbox!.click();
+    });
+    await flush();
+
+    expect(api.setAllowMutualConnections).toHaveBeenCalledWith(false);
+    expect(onFriendsStateChange).toHaveBeenCalledWith({
+      ...baseState,
+      allow_mutual_connections: false,
+    });
+    expect(onNotice).toHaveBeenCalledWith("Mutual connections disabled.");
 
     await act(async () => {
       root.unmount();

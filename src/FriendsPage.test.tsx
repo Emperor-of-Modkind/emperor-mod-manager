@@ -16,9 +16,12 @@ vi.mock("./api", () => ({
     setP2pDisplayName: vi.fn(),
     setCollectionVisibility: vi.fn(),
     addFriendByCode: vi.fn(),
+    addFriendByPeer: vi.fn(),
     respondFriendRequest: vi.fn(),
     removeFriend: vi.fn(),
     refreshFriends: vi.fn(),
+    markFriendFeedRead: vi.fn(),
+    clearFriendFeed: vi.fn(),
     decodeFriendShareCode: vi.fn(),
     joinOrSyncFriendCollection: vi.fn(),
     finalizeFriendCollectionSync: vi.fn(),
@@ -71,6 +74,17 @@ async function flush() {
   });
 }
 
+async function clickFriendsTab(host: HTMLElement, label: string) {
+  const btn = [
+    ...host.querySelectorAll<HTMLButtonElement>(".friends-tabs-row button"),
+  ].find((b) => b.textContent?.trim().startsWith(label));
+  expect(btn, `expected tab button "${label}"`).toBeTruthy();
+  await act(async () => {
+    btn!.click();
+  });
+  await flush();
+}
+
 describe("FriendsPage", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -115,6 +129,11 @@ describe("FriendsPage", () => {
     });
     await flush();
 
+    // Friend Feed is the default tab; switch to Friends to inspect friend cards.
+    expect(host.textContent).toContain("Friend Feed");
+    expect(host.textContent).not.toContain("Find Players");
+    await clickFriendsTab(host, "Friends");
+
     expect(host.textContent).toContain("Alice");
     expect(host.textContent).not.toContain("Sharing Privacy");
     expect(host.textContent).not.toContain("Shared with Friends");
@@ -144,6 +163,10 @@ describe("FriendsPage", () => {
     expect(actionChildren[1].tagName).toBe("H1");
     expect(actionChildren[1].textContent).toContain("Alice");
     expect(actionChildren[2].classList.contains("friends-avatar-md")).toBe(true);
+
+    // Friend profile defaults to Feed tab; switch to Collections.
+    expect(host.textContent).toContain("Alice's Feed");
+    await clickFriendsTab(host, "Collections");
 
     expect(host.textContent).toContain("Skyrim SE");
     expect(host.textContent).toContain("1 collection");
@@ -219,6 +242,7 @@ describe("FriendsPage", () => {
     });
     await flush();
 
+    await clickFriendsTab(host, "Friends");
     const aliceBtn = [...host.querySelectorAll("button")].find((b) =>
       b.textContent?.includes("Alice"),
     );
@@ -226,6 +250,7 @@ describe("FriendsPage", () => {
       aliceBtn!.click();
     });
     await flush();
+    await clickFriendsTab(host, "Collections");
 
     const gameHeader = host.querySelector(".collections-game-header") as HTMLElement;
     expect(gameHeader).toBeTruthy();
@@ -352,7 +377,7 @@ describe("FriendsPage", () => {
     await flush();
 
     expect(api.setP2pDisplayName).toHaveBeenCalledWith("ChosenName");
-    expect(host.textContent).toContain("Connected Friends");
+    expect(host.textContent).toContain("Friend Feed");
     expect(host.textContent).toContain("Share Friend Code");
     expect(host.querySelector('input[aria-label="Your display name"]')).toBeNull();
 
@@ -387,6 +412,9 @@ describe("FriendsPage", () => {
 
     // No raw join code box on page.
     expect(host.querySelector(".friends-join-code")).toBeNull();
+
+    // Switch to Friends tab to inspect friend cards.
+    await clickFriendsTab(host, "Friends");
 
     // Friend card renders with avatar image.
     const card = host.querySelector(".friends-friend-card");
@@ -580,6 +608,7 @@ describe("FriendsPage", () => {
     });
     await flush();
 
+    await clickFriendsTab(host, "Friends");
     const friendCard = Array.from(host.querySelectorAll("button")).find((b) =>
       b.textContent?.includes("Alice"),
     );
@@ -589,6 +618,7 @@ describe("FriendsPage", () => {
       friendCard!.click();
     });
     await flush();
+    await clickFriendsTab(host, "Collections");
 
     expect(api.resolveCatalogCovers).toHaveBeenCalledWith([
       {
@@ -604,6 +634,321 @@ describe("FriendsPage", () => {
     expect(posterImg!.getAttribute("src")).toBe(
       "https://images.nexusmods.com/images/games/v2/1303/tile.jpg",
     );
+
+    await act(async () => {
+      root.unmount();
+    });
+    host.remove();
+  });
+
+  it("switches to Friend Feed tab, shows unread badge & mod diffs, marks read, and opens collection detail", async () => {
+    const feedState: FriendsState = {
+      ...sampleState,
+      feed_last_read_at: "2026-11-20T12:00:00Z",
+      feed_events: [
+        {
+          id: "ev_1",
+          peer_id: "peer_alice",
+          friend_display_name: "Alice",
+          kind: "collection_updated",
+          collection_id: "active:skyrim",
+          collection_kind: "active_loadout",
+          collection_name: "Skyrim Loadout",
+          game_title: "Skyrim SE",
+          mod_count: 2,
+          share_hash: "hash1",
+          diff: {
+            mods_added: ["USSEP"],
+            mods_added_count: 1,
+            mods_removed: ["OldMod"],
+            mods_removed_count: 1,
+            mods_updated: ["SkyUI"],
+            mods_updated_count: 1,
+          },
+          occurred_at: "2026-11-21T12:00:00Z",
+        },
+        {
+          id: "ev_hidden",
+          peer_id: "peer_alice",
+          friend_display_name: "Alice",
+          kind: "collection_added",
+          collection_id: "saved:revoked",
+          collection_kind: "saved_collection",
+          collection_name: "Secret Pack",
+          game_title: "Skyrim SE",
+          mod_count: 5,
+          share_hash: "hash_secret",
+          occurred_at: "2026-11-21T12:05:00Z",
+        },
+      ],
+    };
+    const markedState: FriendsState = {
+      ...feedState,
+      feed_last_read_at: "2026-11-21T12:10:00Z",
+    };
+    const clearedState: FriendsState = {
+      ...markedState,
+      feed_events: [],
+    };
+    vi.mocked(api.getFriendsState).mockResolvedValue(feedState);
+    vi.mocked(api.markFriendFeedRead).mockResolvedValue(markedState);
+    vi.mocked(api.clearFriendFeed).mockResolvedValue(clearedState);
+
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const root: Root = createRoot(host);
+
+    await act(async () => {
+      root.render(
+        <FriendsPage
+          active={true}
+          managed={[]}
+          activeGameId={null}
+          onError={() => {}}
+          onNotice={() => {}}
+          onCollectionSynced={() => {}}
+        />,
+      );
+    });
+    await flush();
+
+    // Friend Feed is active by default, immediately marks read, and filters out revoked/hidden items.
+    expect(api.markFriendFeedRead).toHaveBeenCalledTimes(1);
+    expect(host.textContent).toContain("Skyrim Loadout");
+    expect(host.textContent).toContain("+1 added: USSEP");
+    expect(host.textContent).toContain("-1 removed: OldMod");
+    expect(host.textContent).toContain("~1 updated: SkyUI");
+    expect(host.textContent).not.toContain("Secret Pack");
+
+    // Clicking the feed item opens CollectionDetailView.
+    const itemBtn = host.querySelector<HTMLButtonElement>(".friends-feed-item-btn");
+    expect(itemBtn).toBeTruthy();
+    await act(async () => {
+      itemBtn!.click();
+    });
+    await flush();
+
+    expect(host.textContent).toContain("Contained mods");
+    expect(host.textContent).toContain("SkyUI");
+
+    // Clicking Back returns straight to the Friend Feed tab.
+    const backBtn = [...host.querySelectorAll("button")].find(
+      (b) => b.textContent?.trim() === "Back",
+    );
+    expect(backBtn).toBeTruthy();
+    await act(async () => {
+      backBtn!.click();
+    });
+    await flush();
+
+    expect(host.querySelector(".friends-feed-list")).toBeTruthy();
+
+    // Clear Feed clears the list and renders the empty state.
+    const clearBtn = [...host.querySelectorAll("button")].find(
+      (b) => b.textContent?.trim() === "Clear Feed",
+    );
+    expect(clearBtn).toBeTruthy();
+    await act(async () => {
+      clearBtn!.click();
+    });
+    await flush();
+
+    expect(api.clearFriendFeed).toHaveBeenCalledTimes(1);
+    expect(host.textContent).toContain("No recent activity yet.");
+
+    await act(async () => {
+      root.unmount();
+    });
+    host.remove();
+  });
+
+  it("omits Find Players tab, shows mutual friends and friend detail Feed (default) and Friends tabs", async () => {
+    const carolId = "c".repeat(64);
+    const mutualState: FriendsState = {
+      ...sampleState,
+      pending_requests: [
+        {
+          peer_id: "peer_eve",
+          display_name: "Eve",
+          received_at: "2026-11-21T00:00:00Z",
+        },
+      ],
+      feed_last_read_at: "2026-11-21T12:10:00Z",
+      feed_events: [
+        {
+          id: "ev_alice",
+          peer_id: "peer_alice",
+          friend_display_name: "Alice",
+          kind: "collection_added",
+          collection_id: "active:skyrim",
+          collection_kind: "active_loadout",
+          collection_name: "Skyrim Loadout",
+          game_title: "Skyrim SE",
+          mod_count: 1,
+          share_hash: "hash1",
+          occurred_at: "2026-11-21T12:00:00Z",
+        },
+        {
+          id: "ev_bob",
+          peer_id: "peer_bob",
+          friend_display_name: "Bob",
+          kind: "collection_added",
+          collection_id: "saved:bobpack",
+          collection_kind: "saved_collection",
+          collection_name: "Bob Pack",
+          game_title: "Baldur's Gate 3",
+          mod_count: 3,
+          share_hash: "hash_bob",
+          occurred_at: "2026-11-21T12:01:00Z",
+        },
+      ],
+      friends: [
+        {
+          ...sampleState.friends[0],
+          cached_profile: {
+            ...sampleState.friends[0].cached_profile!,
+            friends: [
+              { peer_id: "peer_bob", display_name: "Bob" },
+              { peer_id: carolId, display_name: "Carol" },
+            ],
+          },
+        },
+        {
+          peer_id: "peer_bob",
+          display_name: "Bob",
+          status: "connected",
+          online: true,
+          cached_profile: {
+            peer_id: "peer_bob",
+            display_name: "Bob",
+            updated_at: "2026-11-21T00:00:00Z",
+            collections: [
+              {
+                id: "saved:bobpack",
+                kind: "saved_collection",
+                name: "Bob Pack",
+                share_code: "#emperor1bob",
+                share_hash: "hash_bob",
+                updated_at: "2026-11-21T12:01:00Z",
+              },
+            ],
+            friends: null,
+          },
+        },
+      ],
+    };
+    vi.mocked(api.getFriendsState).mockResolvedValue(mutualState);
+    vi.mocked(api.addFriendByPeer).mockResolvedValue({
+      ...mutualState,
+      friends: [
+        ...mutualState.friends,
+        {
+          peer_id: carolId,
+          display_name: "Carol",
+          status: "pending_outgoing",
+          online: false,
+        },
+      ],
+    });
+
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const root: Root = createRoot(host);
+
+    await act(async () => {
+      root.render(
+        <FriendsPage
+          active={true}
+          managed={[]}
+          activeGameId={null}
+          onError={() => {}}
+          onNotice={() => {}}
+          onCollectionSynced={() => {}}
+        />,
+      );
+    });
+    await flush();
+
+    // Find Players tab is removed; Friends tab shows pending request badge.
+    expect(host.textContent).not.toContain("Find Players");
+    const pendingBadge = host.querySelector(
+      '.friends-tabs-row [aria-label="1 pending"]',
+    );
+    expect(pendingBadge?.textContent?.trim()).toBe("1");
+
+    // Switch to Friends tab.
+    await clickFriendsTab(host, "Friends");
+
+    // Alice's card shows 1 mutual friend (Bob).
+    expect(host.textContent).toContain("1 mutual");
+
+    const aliceCard = [
+      ...host.querySelectorAll<HTMLButtonElement>(".friends-friend-card-main"),
+    ].find((b) => b.textContent?.includes("Alice"));
+    await act(async () => {
+      aliceCard!.click();
+    });
+    await flush();
+
+    // Alice's profile opens on Feed tab by default, showing only Alice's events (not Bob's).
+    expect(host.textContent).toContain("Alice's Feed");
+    expect(host.textContent).toContain("Skyrim Loadout");
+    expect(host.textContent).not.toContain("Bob Pack");
+
+    // Clicking a feed item on Alice's profile opens CollectionDetailView and Back returns to Alice's Feed.
+    const aliceFeedItem = host.querySelector<HTMLButtonElement>(
+      ".friends-feed-item-btn",
+    );
+    expect(aliceFeedItem).toBeTruthy();
+    await act(async () => {
+      aliceFeedItem!.click();
+    });
+    await flush();
+    expect(host.textContent).toContain("Contained mods");
+
+    const backBtn = [...host.querySelectorAll("button")].find(
+      (b) => b.textContent?.trim() === "Back",
+    );
+    await act(async () => {
+      backBtn!.click();
+    });
+    await flush();
+    expect(host.textContent).toContain("Alice's Feed");
+
+    // Switch to Alice's Friends sub-tab -> shows Bob (Mutual) and Carol (Add Friend).
+    await clickFriendsTab(host, "Friends");
+    expect(host.textContent).toContain("Bob");
+    expect(host.textContent).toContain("Mutual");
+    expect(host.textContent).toContain("Carol");
+
+    // Add Carol directly from Alice's Friends sub-tab.
+    const addCarolBtn = [...host.querySelectorAll("button")].find((b) =>
+      b.textContent?.includes("Add Friend"),
+    );
+    expect(addCarolBtn).toBeTruthy();
+    await act(async () => {
+      addCarolBtn!.click();
+    });
+    await flush();
+    expect(api.addFriendByPeer).toHaveBeenCalledWith(carolId, "Carol");
+
+    // Click View Profile on mutual friend Bob -> opens on Bob's Feed tab by default.
+    const viewBobBtn = [...host.querySelectorAll("button")].find(
+      (b) => b.textContent?.trim() === "View Profile",
+    );
+    expect(viewBobBtn).toBeTruthy();
+    await act(async () => {
+      viewBobBtn!.click();
+    });
+    await flush();
+
+    expect(host.textContent).toContain("Bob's Feed");
+    expect(host.textContent).toContain("Bob Pack");
+    expect(host.textContent).not.toContain("Skyrim Loadout");
+
+    // Switch to Bob's Friends sub-tab -> shows private notice.
+    await clickFriendsTab(host, "Friends");
+    expect(host.textContent).toContain("Bob's friends list is private.");
 
     await act(async () => {
       root.unmount();

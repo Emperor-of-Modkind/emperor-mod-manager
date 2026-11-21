@@ -83,6 +83,9 @@ import type {
   FriendsState,
   FriendSyncResult,
   FriendCollectionSyncStatus,
+  CollectionConflictPlan,
+  CollectionPlanSource,
+  CollectionResolutionChoices,
 } from "./types";
 
 export const api = {
@@ -248,6 +251,7 @@ export const api = {
     name: string;
     version?: string | null;
     recordAsModpack?: boolean | null;
+    resolutions?: CollectionResolutionChoices | null;
   }) => invoke<StagedMod[]>("download_thunderstore_mod", args),
   getModioMod: (gameId: number, modId: number) =>
     invoke<ModioModDetail>("get_modio_mod", { gameId, modId }),
@@ -403,11 +407,17 @@ export const api = {
     revision?: number | null;
     includeOptional: boolean;
     name?: string | null;
+    resolutions?: CollectionResolutionChoices | null;
   }) => invoke<number>("install_collection", args),
-  importThunderstoreProfile: (gameId: string, code: string) =>
+  importThunderstoreProfile: (
+    gameId: string,
+    code: string,
+    resolutions?: CollectionResolutionChoices | null,
+  ) =>
     invoke<ThunderstoreProfileImportResult>("import_thunderstore_profile", {
       gameId,
       code,
+      resolutions: resolutions ?? null,
     }),
   exportShareCode: (gameId: string, name?: string | null) =>
     invoke<ExportShareResult>("export_share_code", {
@@ -421,17 +431,29 @@ export const api = {
     invoke<ShareDecodePreview>("decode_share_code", { code }),
   detectImportCode: (code: string) =>
     invoke<DetectImportResult>("detect_import_code", { code }),
-  importCode: (gameId: string, code: string, name?: string | null) =>
+  importCode: (
+    gameId: string,
+    code: string,
+    name?: string | null,
+    resolutions?: CollectionResolutionChoices | null,
+  ) =>
     invoke<ImportCodeResult>("import_code", {
       gameId,
       code,
       name: name ?? null,
+      resolutions: resolutions ?? null,
     }),
-  importShareCode: (gameId: string, code: string, name?: string | null) =>
+  importShareCode: (
+    gameId: string,
+    code: string,
+    name?: string | null,
+    resolutions?: CollectionResolutionChoices | null,
+  ) =>
     invoke<ShareImportResult>("import_share_code", {
       gameId,
       code,
       name: name ?? null,
+      resolutions: resolutions ?? null,
     }),
   recordEmperorShare: (args: {
     gameId: string;
@@ -658,24 +680,37 @@ export const api = {
     invoke<FriendsState>("set_collection_visibility", { collectionId, hidden }),
   setCollectionSharing: (collectionId: string, visibility: CollectionVisibility) =>
     invoke<FriendsState>("set_collection_sharing", { collectionId, visibility }),
+  setFriendsListVisibility: (visibility: CollectionVisibility) =>
+    invoke<FriendsState>("set_friends_list_visibility", { visibility }),
+  setAllowMutualConnections: (allow: boolean) =>
+    invoke<FriendsState>("set_allow_mutual_connections", { allow }),
   addFriendByCode: (code: string) =>
     invoke<FriendsState>("add_friend_by_code", { code }),
+  addFriendByPeer: (peerId: string, displayName?: string | null) =>
+    invoke<FriendsState>("add_friend_by_peer", {
+      peerId,
+      displayName: displayName ?? null,
+    }),
   respondFriendRequest: (peerId: string, accept: boolean) =>
     invoke<FriendsState>("respond_friend_request", { peerId, accept }),
   removeFriend: (peerId: string) =>
     invoke<FriendsState>("remove_friend", { peerId }),
   refreshFriends: () => invoke<FriendsState>("refresh_friends"),
+  markFriendFeedRead: () => invoke<FriendsState>("mark_friend_feed_read"),
+  clearFriendFeed: () => invoke<FriendsState>("clear_friend_feed"),
   decodeFriendShareCode: (code: string) =>
     invoke<ShareDecodePreview>("decode_friend_share_code", { code }),
   joinOrSyncFriendCollection: (args: {
     gameId: string;
     peerId: string;
     friendCollectionId: string;
+    resolutions?: CollectionResolutionChoices | null;
   }) =>
     invoke<FriendSyncResult>("join_or_sync_friend_collection", {
       gameId: args.gameId,
       peerId: args.peerId,
       friendCollectionId: args.friendCollectionId,
+      resolutions: args.resolutions ?? null,
     }),
   finalizeFriendCollectionSync: (args: {
     gameId: string;
@@ -702,5 +737,22 @@ export const api = {
   getFriendCollectionSyncStates: (gameId: string) =>
     invoke<FriendCollectionSyncStatus[]>("get_friend_collection_sync_states", {
       gameId,
+    }),
+  planCollectionResolution: (gameId: string, source: CollectionPlanSource) =>
+    invoke<CollectionConflictPlan>("plan_collection_resolution", {
+      gameId,
+      source,
+    }),
+  setCollectionEnabled: (
+    gameId: string,
+    collectionId: string,
+    enabled: boolean,
+    protectModIds?: string[] | null,
+  ) =>
+    invoke<number>("set_collection_enabled", {
+      gameId,
+      collectionId,
+      enabled,
+      protectModIds: protectModIds ?? null,
     }),
 };

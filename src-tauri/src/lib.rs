@@ -246,15 +246,22 @@ pub fn run() {
             commands::set_p2p_appear_offline,
             commands::set_collection_visibility,
             commands::set_collection_sharing,
+            commands::set_friends_list_visibility,
+            commands::set_allow_mutual_connections,
             commands::add_friend_by_code,
+            commands::add_friend_by_peer,
             commands::respond_friend_request,
             commands::remove_friend,
             commands::refresh_friends,
+            commands::mark_friend_feed_read,
+            commands::clear_friend_feed,
             commands::decode_friend_share_code,
             commands::join_or_sync_friend_collection,
             commands::finalize_friend_collection_sync,
             commands::set_friend_collection_auto_sync,
             commands::get_friend_collection_sync_states,
+            commands::plan_collection_resolution,
+            commands::set_collection_enabled,
         ])
         .setup(|app| {
             {

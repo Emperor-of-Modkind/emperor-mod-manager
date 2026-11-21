@@ -655,7 +655,87 @@ export type ShareAssistFile = {
   file_id: number;
   name: string;
   version?: string | null;
+  replace_staged_id?: string | null;
 };
+
+export type ModSource = "nexus" | "thunderstore" | "modio";
+
+export type ConflictAction =
+  | "disable_other_collections"
+  | "disable_old_and_install_new"
+  | "replace_existing"
+  | "keep_existing"
+  | "keep_both_enabled";
+
+export type ConflictingCollectionRef = {
+  id: string;
+  name: string;
+  isSynced: boolean;
+  enabledModCount: number;
+};
+
+export type ConflictingCollectionSummary = {
+  id: string;
+  name: string;
+  isSynced: boolean;
+  enabledModCount: number;
+  conflictCount: number;
+  conflictKeys: string[];
+};
+
+export type ModVersionConflict = {
+  conflictKey: string;
+  source: ModSource;
+  incomingName: string;
+  incomingVersion?: string | null;
+  incomingFileId?: number | null;
+  incomingFileName?: string | null;
+  existingModId: string;
+  existingName: string;
+  existingVersion?: string | null;
+  existingFileId?: number | null;
+  existingFileName?: string | null;
+  existingEnabled: boolean;
+  existingIndependent: boolean;
+  conflictingCollections: ConflictingCollectionRef[];
+  recommendedAction: ConflictAction;
+};
+
+export type CollectionConflictPlan = {
+  targetCollectionId?: string | null;
+  targetCollectionName: string;
+  isSyncedTarget: boolean;
+  exactMatchCount: number;
+  repairCount: number;
+  installCount: number;
+  autoUpdateCount: number;
+  conflicts: ModVersionConflict[];
+  conflictingCollections: ConflictingCollectionSummary[];
+};
+
+export type CollectionResolutionChoices = {
+  disableCollectionIds: string[];
+  modActions: Record<string, ConflictAction>;
+};
+
+export type CollectionPlanSource =
+  | { kind: "friend_sync"; peerId: string; friendCollectionId: string }
+  | { kind: "share_code"; code: string; name?: string | null }
+  | {
+      kind: "nexus_collection";
+      slug: string;
+      revision?: number | null;
+      includeOptional?: boolean;
+      name?: string | null;
+    }
+  | { kind: "thunderstore_profile"; code: string }
+  | {
+      kind: "thunderstore_modpack";
+      community: string;
+      namespace: string;
+      name: string;
+      version?: string | null;
+    };
 
 export type ShareImportResult = {
   collection_id: string;
@@ -868,12 +948,19 @@ export type FriendShareRef = {
   updated_at: string;
 };
 
+export type SharedFriendRef = {
+  peer_id: string;
+  display_name: string;
+};
+
 export type PeerProfileSummary = {
   peer_id: string;
   display_name: string;
   profile_picture?: string | null;
   updated_at: string;
   collections: FriendShareRef[];
+  friends?: SharedFriendRef[] | null;
+  allow_mutual_connections?: boolean;
 };
 
 export type FriendStatus = "connected" | "pending_outgoing";
@@ -910,6 +997,36 @@ export type LocalShareableCollection = {
   visibility?: CollectionVisibility;
 };
 
+export type FriendFeedEventKind =
+  | "collection_added"
+  | "collection_updated"
+  | "collection_renamed";
+
+export type FriendFeedDiff = {
+  mods_added: string[];
+  mods_added_count: number;
+  mods_removed: string[];
+  mods_removed_count: number;
+  mods_updated: string[];
+  mods_updated_count: number;
+};
+
+export type FriendFeedEvent = {
+  id: string;
+  peer_id: string;
+  friend_display_name: string;
+  kind: FriendFeedEventKind;
+  collection_id: string;
+  collection_kind: FriendCollectionKind;
+  collection_name: string;
+  previous_name?: string | null;
+  game_title?: string | null;
+  mod_count?: number | null;
+  share_hash: string;
+  diff?: FriendFeedDiff | null;
+  occurred_at: string;
+};
+
 export type FriendsState = {
   endpoint_ready: boolean;
   appear_offline?: boolean;
@@ -918,9 +1035,13 @@ export type FriendsState = {
   display_name: string;
   display_name_set: boolean;
   profile_picture?: string | null;
+  friends_list_visibility?: CollectionVisibility;
+  allow_mutual_connections?: boolean;
   friends: FriendRecord[];
   pending_requests: PendingFriendRequest[];
   local_collections: LocalShareableCollection[];
+  feed_events?: FriendFeedEvent[];
+  feed_last_read_at?: string | null;
 };
 
 export type FriendSyncResult = {

@@ -25,6 +25,10 @@ use crate::{
         self,
         fomod::{self, FomodInstallerView, FomodSelection},
         options::{self, ModOptionSelection, ModOptionSet},
+        resolution::{
+            self, CollectionConflictPlan, CollectionResolutionChoices, IncomingModSpec,
+            ModExecutionPlan,
+        },
         CollectionKind, CollectionSource, InstalledCollection, ModSource, StagedMod,
         StagedModUpdate,
     },
@@ -4034,6 +4038,7 @@ enum StagePolicy {
 }
 
 /// Stage `pkg` at its first listed version.
+#[allow(clippy::too_many_arguments)]
 async fn stage_thunderstore_package(
     app: &tauri::AppHandle,
     state: &AppState,
@@ -4046,6 +4051,38 @@ async fn stage_thunderstore_package(
     reuse_dl_id: Option<String>,
     policy: StagePolicy,
 ) -> Result<StagedMod, String> {
+    stage_thunderstore_package_inner(
+        app,
+        state,
+        client,
+        game_id,
+        community,
+        pkg,
+        display_name,
+        enabled,
+        reuse_dl_id,
+        policy,
+        true,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stage_thunderstore_package_inner(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    client: &ThunderstoreClient,
+    game_id: &str,
+    community: &str,
+    pkg: &TsPackageDetail,
+    display_name: &str,
+    enabled: Option<bool>,
+    reuse_dl_id: Option<String>,
+    policy: StagePolicy,
+    replace_existing: bool,
+    replace_id: Option<&str>,
+) -> Result<StagedMod, String> {
     let ns = pkg.namespace.clone();
     let pkg_name = pkg.name.clone();
     let ver = pkg
@@ -4054,16 +4091,33 @@ async fn stage_thunderstore_package(
         .ok_or_else(|| format!("No versions for {}", pkg.full_name))?;
     let incoming_ver = &ver.version_number;
     let order = mods::load_loadorder(&state.paths, game_id).map_err(|e| e.to_string())?;
-    if let Some(existing) = mods::find_thunderstore_package(&order, &ns, &pkg_name) {
-        let keep_existing = match policy {
-            StagePolicy::KeepNewer => {
-                !mods::incoming_is_newer(existing.version.as_deref(), incoming_ver)
-            }
-            StagePolicy::MatchResolved => {
-                existing.version.as_deref() == Some(incoming_ver.as_str())
-            }
-            StagePolicy::Force => false,
-        };
+    let candidate = mods::find_thunderstore_package_version(
+        &order,
+        &ns,
+        &pkg_name,
+        Some(incoming_ver.as_str()),
+    )
+    .or_else(|| {
+        if replace_existing {
+            mods::find_thunderstore_package(&order, &ns, &pkg_name)
+        } else {
+            None
+        }
+    });
+    if let Some(existing) = candidate {
+        let intact = mods::check_staged_mod_integrity(existing).is_none();
+        let keep_existing = intact
+            && match policy {
+                StagePolicy::KeepNewer => {
+                    !mods::incoming_is_newer(existing.version.as_deref(), incoming_ver)
+                }
+                StagePolicy::MatchResolved => existing
+                    .version
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|v| v.eq_ignore_ascii_case(incoming_ver.trim())),
+                StagePolicy::Force => false,
+            };
         if keep_existing {
             let id = existing.id.clone();
             let apply_enabled = match enabled {
@@ -4144,7 +4198,7 @@ async fn stage_thunderstore_package(
                 crate::nexus::filename_from_url(&ver.download_url).as_deref(),
             );
             assign_download_file_name(state, &dl_id, ts_file_name.as_deref());
-            match mods::stage_thunderstore_mod(
+            match mods::stage_thunderstore_mod_with_mode(
                 &state.paths,
                 game_id,
                 community,
@@ -4156,6 +4210,8 @@ async fn stage_thunderstore_package(
                 ts_file_name,
                 Some(ver.icon.clone()).filter(|icon| !icon.trim().is_empty()),
                 &dest,
+                replace_existing,
+                replace_id,
             ) {
                 Ok(staged) => {
                     if let Some(false) = enabled {
@@ -4208,7 +4264,8 @@ pub async fn get_thunderstore_package(
 
 /// Resolve and stage a Thunderstore package plus its full dependency closure.
 /// Returns staged mods (deps first) and the resolved package details for `depends_on` wiring.
-async fn stage_thunderstore_with_deps(
+#[allow(clippy::too_many_arguments)]
+async fn stage_thunderstore_with_deps_resolved(
     app: &tauri::AppHandle,
     state: &AppState,
     client: &ThunderstoreClient,
@@ -4219,12 +4276,16 @@ async fn stage_thunderstore_with_deps(
     version: Option<&str>,
     root_enabled: Option<bool>,
     root_display: Option<&str>,
+    root_policy: StagePolicy,
+    root_replace_existing: bool,
+    root_replace_id: Option<&str>,
 ) -> Result<(Vec<StagedMod>, Vec<TsPackageDetail>), String> {
     let order = load_ts_install_order(state, community, namespace, name, version).await?;
 
     let mut staged_all = Vec::new();
     for pkg in &order {
-        let is_root = pkg.name == name && pkg.namespace == namespace;
+        let is_root = pkg.name.eq_ignore_ascii_case(name)
+            && pkg.namespace.eq_ignore_ascii_case(namespace);
         let display = if is_root {
             root_display
                 .map(|s| s.to_string())
@@ -4233,7 +4294,7 @@ async fn stage_thunderstore_with_deps(
             format!("{} (dependency)", pkg.name)
         };
         let enabled = if is_root { root_enabled } else { None };
-        let staged = stage_thunderstore_package(
+        let staged = stage_thunderstore_package_inner(
             app,
             state,
             client,
@@ -4243,18 +4304,44 @@ async fn stage_thunderstore_with_deps(
             &display,
             enabled,
             None,
-            // Never downgrade the package the user asked for, only its deps.
             if is_root {
-                StagePolicy::KeepNewer
+                root_policy
             } else {
                 StagePolicy::MatchResolved
             },
+            if is_root { root_replace_existing } else { true },
+            if is_root { root_replace_id } else { None },
         )
         .await?;
         staged_all.push(staged);
     }
     apply_ts_depends_on(&state.paths, game_id, &order)?;
     Ok((staged_all, order))
+}
+
+fn disable_staged_mod_ids(paths: &Paths, game_id: &str, ids: &[String]) {
+    for id in ids {
+        let _ = mods::set_enabled(paths, game_id, id, false);
+    }
+}
+
+fn apply_pre_resolution_disables(
+    paths: &Paths,
+    game_id: &str,
+    order: &mods::LoadOrder,
+    incoming: &[IncomingModSpec],
+    choices: Option<&CollectionResolutionChoices>,
+) {
+    let Some(choices) = choices else {
+        return;
+    };
+    if choices.disable_collection_ids.is_empty() {
+        return;
+    }
+    let protect_ids = resolution::collect_exact_match_ids(order, incoming);
+    for col_id in &choices.disable_collection_ids {
+        let _ = mods::set_collection_enabled(paths, game_id, col_id, false, &protect_ids);
+    }
 }
 
 #[tauri::command]
@@ -4267,38 +4354,203 @@ pub async fn download_thunderstore_mod(
     name: String,
     version: Option<String>,
     record_as_modpack: Option<bool>,
+    resolutions: Option<CollectionResolutionChoices>,
 ) -> Result<Vec<StagedMod>, String> {
     let client = ThunderstoreClient::new().map_err(|e| e.to_string())?;
     let before = snapshot_mod_ids(&state.paths, &game_id)?;
-    let (staged_all, order) = stage_thunderstore_with_deps(
-        &app,
+    let is_modpack = record_as_modpack.unwrap_or(false);
+    let target_col_id = is_modpack.then(|| mods::thunderstore_modpack_id(&community, &namespace, &name));
+    let install_order = load_ts_install_order(
         &state,
-        &client,
-        &game_id,
         &community,
         &namespace,
         &name,
         version.as_deref(),
-        None,
-        None,
     )
     .await?;
 
-    if record_as_modpack.unwrap_or(false) {
-        let member_ids: Vec<String> = order
-            .iter()
-            .map(|p| mods::thunderstore_mod_id(&p.namespace, &p.name))
-            .collect();
+    let incoming_specs: Vec<IncomingModSpec> = install_order
+        .iter()
+        .map(|pkg| IncomingModSpec::Thunderstore {
+            community: community.clone(),
+            namespace: pkg.namespace.clone(),
+            name: pkg.name.clone(),
+            version: pkg
+                .versions
+                .first()
+                .map(|v| v.version_number.clone())
+                .or_else(|| pkg.latest_version.clone()),
+            display_name: pkg.name.clone(),
+        })
+        .collect();
+
+    if is_modpack {
+        let initial_order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
+        apply_pre_resolution_disables(
+            &state.paths,
+            &game_id,
+            &initial_order,
+            &incoming_specs,
+            resolutions.as_ref(),
+        );
+    }
+
+    let mut staged_all = Vec::new();
+    for (idx, pkg) in install_order.iter().enumerate() {
+        let is_root = pkg.name.eq_ignore_ascii_case(&name)
+            && pkg.namespace.eq_ignore_ascii_case(&namespace);
+        let display = if is_root {
+            pkg.name.clone()
+        } else {
+            format!("{} (dependency)", pkg.name)
+        };
+        let current_order =
+            mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
+        let staged = if is_modpack {
+            match resolution::resolve_mod_execution(
+                &current_order,
+                target_col_id.as_deref(),
+                &incoming_specs,
+                &incoming_specs[idx],
+                resolutions.as_ref(),
+            ) {
+                ModExecutionPlan::ReuseExact {
+                    staged_id,
+                    disable_other_ids,
+                } => {
+                    disable_staged_mod_ids(&state.paths, &game_id, &disable_other_ids);
+                    mods::merge_mod_meta(
+                        &state.paths,
+                        &game_id,
+                        &staged_id,
+                        &[],
+                        &[],
+                        None,
+                        Some(true),
+                    )
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| format!("Missing staged package {staged_id}"))?
+                }
+                ModExecutionPlan::KeepExisting { staged_id } => mods::merge_mod_meta(
+                    &state.paths,
+                    &game_id,
+                    &staged_id,
+                    &[],
+                    &[],
+                    None,
+                    Some(true),
+                )
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("Missing staged package {staged_id}"))?,
+                ModExecutionPlan::RepairExact {
+                    staged_id,
+                    disable_other_ids,
+                } => {
+                    disable_staged_mod_ids(&state.paths, &game_id, &disable_other_ids);
+                    stage_thunderstore_package_inner(
+                        &app,
+                        &state,
+                        &client,
+                        &game_id,
+                        &community,
+                        pkg,
+                        &display,
+                        Some(true),
+                        None,
+                        StagePolicy::Force,
+                        true,
+                        Some(&staged_id),
+                    )
+                    .await?
+                }
+                ModExecutionPlan::ReplaceStaged { replace_id } => {
+                    stage_thunderstore_package_inner(
+                        &app,
+                        &state,
+                        &client,
+                        &game_id,
+                        &community,
+                        pkg,
+                        &display,
+                        Some(true),
+                        None,
+                        StagePolicy::Force,
+                        true,
+                        Some(&replace_id),
+                    )
+                    .await?
+                }
+                ModExecutionPlan::DisableOldAndInstallNew { disable_ids } => {
+                    disable_staged_mod_ids(&state.paths, &game_id, &disable_ids);
+                    stage_thunderstore_package_inner(
+                        &app,
+                        &state,
+                        &client,
+                        &game_id,
+                        &community,
+                        pkg,
+                        &display,
+                        Some(true),
+                        None,
+                        StagePolicy::MatchResolved,
+                        false,
+                        None,
+                    )
+                    .await?
+                }
+                ModExecutionPlan::InstallFresh | ModExecutionPlan::KeepBothEnabled => {
+                    stage_thunderstore_package_inner(
+                        &app,
+                        &state,
+                        &client,
+                        &game_id,
+                        &community,
+                        pkg,
+                        &display,
+                        Some(true),
+                        None,
+                        StagePolicy::MatchResolved,
+                        false,
+                        None,
+                    )
+                    .await?
+                }
+            }
+        } else {
+            stage_thunderstore_package(
+                &app,
+                &state,
+                &client,
+                &game_id,
+                &community,
+                pkg,
+                &display,
+                None,
+                None,
+                if is_root {
+                    StagePolicy::KeepNewer
+                } else {
+                    StagePolicy::MatchResolved
+                },
+            )
+            .await?
+        };
+        staged_all.push(staged);
+    }
+    apply_ts_depends_on(&state.paths, &game_id, &install_order)?;
+
+    if is_modpack {
+        let member_ids: Vec<String> = staged_all.iter().map(|s| s.id.clone()).collect();
         let new_ids: Vec<String> = member_ids
             .iter()
             .filter(|id| !before.contains(*id))
             .cloned()
             .collect();
-        let root = order
+        let root = install_order
             .iter()
             .find(|p| p.namespace == namespace && p.name == name);
         let collection = InstalledCollection {
-            id: mods::thunderstore_modpack_id(&community, &namespace, &name),
+            id: target_col_id.unwrap_or_else(|| mods::thunderstore_modpack_id(&community, &namespace, &name)),
             source: CollectionSource::Thunderstore,
             kind: CollectionKind::Modpack,
             name: root.map(|p| p.name.clone()).unwrap_or_else(|| name.clone()),
@@ -4312,7 +4564,8 @@ pub async fn download_thunderstore_mod(
             mod_ids: member_ids,
             installed_at: String::new(),
             game_versions: None,
-            friend_sync: None, ..Default::default()
+            friend_sync: None,
+            ..Default::default()
         };
         mods::record_installed_collection(&state.paths, &game_id, collection, &new_ids)
             .map_err(|e| e.to_string())?;
@@ -4334,6 +4587,7 @@ pub async fn import_thunderstore_profile(
     state: State<'_, AppState>,
     game_id: String,
     code: String,
+    resolutions: Option<CollectionResolutionChoices>,
 ) -> Result<ThunderstoreProfileImportResult, String> {
     let community = {
         let cfg = state.config.lock().map_err(|e| e.to_string())?;
@@ -4378,6 +4632,35 @@ pub async fn import_thunderstore_profile(
         .map(|p| (format!("{}-{}", p.owner, p.name).to_lowercase(), p))
         .collect();
 
+    let target_col_id = mods::thunderstore_profile_id(&code);
+    let incoming_specs: Vec<IncomingModSpec> = manifest
+        .mods
+        .iter()
+        .filter_map(|m| {
+            let (ns, pkg_name) = thunderstore::parse_package_ident(&m.name)?;
+            let key = format!("{ns}-{pkg_name}").to_lowercase();
+            if !by_key.contains_key(&key) {
+                return None;
+            }
+            Some(IncomingModSpec::Thunderstore {
+                community: community.clone(),
+                namespace: ns,
+                name: pkg_name.clone(),
+                version: Some(m.version.as_string()),
+                display_name: pkg_name,
+            })
+        })
+        .collect();
+
+    let initial_order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
+    apply_pre_resolution_disables(
+        &state.paths,
+        &game_id,
+        &initial_order,
+        &incoming_specs,
+        resolutions.as_ref(),
+    );
+
     let before = snapshot_mod_ids(&state.paths, &game_id)?;
     let mut member_ids = Vec::new();
     let mut seen_pkg_ids: HashSet<String> = HashSet::new();
@@ -4399,8 +4682,77 @@ pub async fn import_thunderstore_profile(
             continue;
         }
         let ver = m.version.as_string();
-        let enabled = if m.enabled { None } else { Some(false) };
-        match stage_thunderstore_with_deps(
+        let enabled = if m.enabled { Some(true) } else { Some(false) };
+        let spec = IncomingModSpec::Thunderstore {
+            community: community.clone(),
+            namespace: ns.clone(),
+            name: pkg_name.clone(),
+            version: Some(ver.clone()),
+            display_name: pkg_name.clone(),
+        };
+        let current_order =
+            mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
+        let (root_policy, root_replace, root_replace_id) = match resolution::resolve_mod_execution(
+            &current_order,
+            Some(&target_col_id),
+            &incoming_specs,
+            &spec,
+            resolutions.as_ref(),
+        ) {
+            ModExecutionPlan::ReuseExact {
+                staged_id,
+                disable_other_ids,
+            } => {
+                disable_staged_mod_ids(&state.paths, &game_id, &disable_other_ids);
+                let _ = mods::merge_mod_meta(
+                    &state.paths,
+                    &game_id,
+                    &staged_id,
+                    &[],
+                    &[],
+                    None,
+                    enabled,
+                );
+                if seen_pkg_ids.insert(staged_id.clone()) {
+                    member_ids.push(staged_id);
+                }
+                continue;
+            }
+            ModExecutionPlan::KeepExisting { staged_id } => {
+                let _ = mods::merge_mod_meta(
+                    &state.paths,
+                    &game_id,
+                    &staged_id,
+                    &[],
+                    &[],
+                    None,
+                    enabled,
+                );
+                if seen_pkg_ids.insert(staged_id.clone()) {
+                    member_ids.push(staged_id);
+                }
+                continue;
+            }
+            ModExecutionPlan::RepairExact {
+                staged_id,
+                disable_other_ids,
+            } => {
+                disable_staged_mod_ids(&state.paths, &game_id, &disable_other_ids);
+                (StagePolicy::Force, true, Some(staged_id))
+            }
+            ModExecutionPlan::ReplaceStaged { replace_id } => {
+                (StagePolicy::Force, true, Some(replace_id))
+            }
+            ModExecutionPlan::DisableOldAndInstallNew { disable_ids } => {
+                disable_staged_mod_ids(&state.paths, &game_id, &disable_ids);
+                (StagePolicy::MatchResolved, false, None)
+            }
+            ModExecutionPlan::InstallFresh | ModExecutionPlan::KeepBothEnabled => {
+                (StagePolicy::MatchResolved, false, None)
+            }
+        };
+
+        match stage_thunderstore_with_deps_resolved(
             &app,
             &state,
             &client,
@@ -4411,6 +4763,9 @@ pub async fn import_thunderstore_profile(
             Some(&ver),
             enabled,
             Some(&pkg_name),
+            root_policy,
+            root_replace,
+            root_replace_id.as_deref(),
         )
         .await
         {
@@ -5999,6 +6354,7 @@ pub async fn install_collection(
     revision: Option<i64>,
     include_optional: bool,
     name: Option<String>,
+    resolutions: Option<CollectionResolutionChoices>,
 ) -> Result<usize, String> {
     if !state.ensure_premium_status().await {
         return Err("Collection batch install requires Nexus Premium. \
@@ -6016,16 +6372,39 @@ pub async fn install_collection(
         .await
         .map_err(|e| e.to_string())?;
 
+    let target_col_id = mods::nexus_collection_id(&slug);
+    let included_files: Vec<CollectionModFile> = files
+        .into_iter()
+        .filter(|f| !f.optional || include_optional)
+        .collect();
+    let incoming_specs: Vec<IncomingModSpec> = included_files
+        .iter()
+        .map(|f| IncomingModSpec::Nexus {
+            domain: f.domain_name.clone(),
+            mod_id: f.mod_id,
+            file_id: f.file_id,
+            name: f.mod_name.clone(),
+            version: f.version.clone(),
+            file_name: Some(f.file_name.clone()).filter(|s| !s.is_empty()),
+        })
+        .collect();
+
+    let initial_order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
+    apply_pre_resolution_disables(
+        &state.paths,
+        &game_id,
+        &initial_order,
+        &incoming_specs,
+        resolutions.as_ref(),
+    );
+
     let batch_id = uuid::Uuid::new_v4().to_string();
     let before = snapshot_mod_ids(&state.paths, &game_id)?;
     let mut installed = 0usize;
     let mut member_ids = Vec::new();
     let mut failed_mods: Vec<String> = Vec::new();
     let mut download_index = 0usize;
-    for file in files {
-        if file.optional && !include_optional {
-            continue;
-        }
+    for (idx, file) in included_files.into_iter().enumerate() {
         // If the whole batch was cancelled, stop installing further mods.
         let batch_cancelled = state
             .download_jobs
@@ -6041,6 +6420,64 @@ pub async fn install_collection(
         if batch_cancelled {
             break;
         }
+        let current_order =
+            mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
+        let replace_staged_id = match resolution::resolve_mod_execution(
+            &current_order,
+            Some(&target_col_id),
+            &incoming_specs,
+            &incoming_specs[idx],
+            resolutions.as_ref(),
+        ) {
+            ModExecutionPlan::ReuseExact {
+                staged_id,
+                disable_other_ids,
+            } => {
+                disable_staged_mod_ids(&state.paths, &game_id, &disable_other_ids);
+                let _ = mods::merge_mod_meta(
+                    &state.paths,
+                    &game_id,
+                    &staged_id,
+                    &[],
+                    &[],
+                    None,
+                    Some(true),
+                );
+                if !member_ids.contains(&staged_id) {
+                    member_ids.push(staged_id);
+                }
+                continue;
+            }
+            ModExecutionPlan::KeepExisting { staged_id } => {
+                let _ = mods::merge_mod_meta(
+                    &state.paths,
+                    &game_id,
+                    &staged_id,
+                    &[],
+                    &[],
+                    None,
+                    Some(true),
+                );
+                if !member_ids.contains(&staged_id) {
+                    member_ids.push(staged_id);
+                }
+                continue;
+            }
+            ModExecutionPlan::RepairExact {
+                staged_id,
+                disable_other_ids,
+            } => {
+                disable_staged_mod_ids(&state.paths, &game_id, &disable_other_ids);
+                Some(staged_id)
+            }
+            ModExecutionPlan::ReplaceStaged { replace_id } => Some(replace_id),
+            ModExecutionPlan::DisableOldAndInstallNew { disable_ids } => {
+                disable_staged_mod_ids(&state.paths, &game_id, &disable_ids);
+                None
+            }
+            ModExecutionPlan::InstallFresh | ModExecutionPlan::KeepBothEnabled => None,
+        };
+
         if !state
             .rate_limit
             .pace_batch_item(download_index, None, None)
@@ -6063,13 +6500,15 @@ pub async fn install_collection(
             None,
             None,
             Some(batch_id.clone()),
-            None,
+            replace_staged_id,
             Some(file.file_name),
         )
         .await
         {
             Ok(staged) => {
-                member_ids.push(staged.id);
+                if !member_ids.contains(&staged.id) {
+                    member_ids.push(staged.id);
+                }
                 installed += 1;
             }
             Err(e) if is_cancel_err(&e) || is_pause_err(&e) => break,
@@ -8775,6 +9214,78 @@ pub enum ImportCodeResult {
     },
 }
 
+fn share_manifest_to_incoming_specs(
+    manifest: &share::ShareManifest,
+    game: &ManagedGame,
+) -> Vec<IncomingModSpec> {
+    let mut specs = Vec::new();
+    for entry in &manifest.mods {
+        match entry.s {
+            ShareModSource::Nexus => {
+                let domain = entry
+                    .domain
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(game.nexus_domain.as_str());
+                let mod_id = entry.mod_id.unwrap_or(0);
+                let file_id = entry.file_id.unwrap_or(0);
+                if mod_id == 0 || file_id == 0 {
+                    continue;
+                }
+                specs.push(IncomingModSpec::Nexus {
+                    domain: domain.to_string(),
+                    mod_id,
+                    file_id,
+                    name: share::mod_label(entry),
+                    version: entry.version.clone(),
+                    file_name: None,
+                });
+            }
+            ShareModSource::Thunderstore => {
+                let Some(community) = entry
+                    .community
+                    .as_deref()
+                    .or(game.thunderstore_community.as_deref())
+                    .filter(|s| !s.is_empty())
+                else {
+                    continue;
+                };
+                let (Some(ns), Some(pkg_name)) =
+                    (entry.namespace.as_deref(), entry.name.as_deref())
+                else {
+                    continue;
+                };
+                specs.push(IncomingModSpec::Thunderstore {
+                    community: community.to_string(),
+                    namespace: ns.to_string(),
+                    name: pkg_name.to_string(),
+                    version: entry
+                        .version
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string),
+                    display_name: share::mod_label(entry),
+                });
+            }
+            ShareModSource::Modio => {
+                let gid = entry.game_id.or(game.modio_game_id).unwrap_or(0);
+                let mid = entry.mod_id.unwrap_or(0);
+                if gid == 0 || mid == 0 {
+                    continue;
+                }
+                specs.push(IncomingModSpec::Modio {
+                    modio_game_id: gid,
+                    modio_mod_id: mid,
+                    file_id: entry.file_id,
+                    name: share::mod_label(entry),
+                    version: entry.version.clone(),
+                });
+            }
+        }
+    }
+    specs
+}
+
 #[tauri::command]
 pub async fn import_code(
     app: tauri::AppHandle,
@@ -8782,15 +9293,18 @@ pub async fn import_code(
     game_id: String,
     code: String,
     name: Option<String>,
+    resolutions: Option<CollectionResolutionChoices>,
 ) -> Result<ImportCodeResult, String> {
     let code = code.trim().to_string();
     match share::detect_code_kind(&code) {
         ImportCodeKind::Emperor => {
-            let result = import_share_code(app, state, game_id, code, name).await?;
+            let result =
+                import_share_code(app, state, game_id, code, name, resolutions).await?;
             Ok(ImportCodeResult::Emperor { result })
         }
         ImportCodeKind::ThunderstoreProfile => {
-            let imported = import_thunderstore_profile(app, state, game_id, code).await?;
+            let imported =
+                import_thunderstore_profile(app, state, game_id, code, resolutions).await?;
             Ok(ImportCodeResult::ThunderstoreProfile {
                 collection: imported.collection,
                 warnings: imported.warnings,
@@ -8810,6 +9324,21 @@ pub async fn import_share_code(
     game_id: String,
     code: String,
     name: Option<String>,
+    resolutions: Option<CollectionResolutionChoices>,
+) -> Result<ShareImportResult, String> {
+    import_share_code_inner(app, state, game_id, code, name, resolutions, None, true).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn import_share_code_inner(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    game_id: String,
+    code: String,
+    name: Option<String>,
+    resolutions: Option<CollectionResolutionChoices>,
+    target_collection_id_override: Option<String>,
+    record_collection: bool,
 ) -> Result<ShareImportResult, String> {
     let game = managed_game(&state, &game_id)?;
     let code = code.trim().to_string();
@@ -8824,7 +9353,18 @@ pub async fn import_share_code(
         .or(manifest.name.clone())
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "Shared loadout".into());
-    let collection_id = share::emperor_share_id(&code);
+    let collection_id = target_collection_id_override
+        .unwrap_or_else(|| share::emperor_share_id(&code));
+    let incoming_specs = share_manifest_to_incoming_specs(&manifest, &game);
+    let initial_order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
+    apply_pre_resolution_disables(
+        &state.paths,
+        &game_id,
+        &initial_order,
+        &incoming_specs,
+        resolutions.as_ref(),
+    );
+
     let before = snapshot_mod_ids(&state.paths, &game_id)?;
     let is_premium = state.ensure_premium_status().await;
     let modio_key = state
@@ -8837,7 +9377,6 @@ pub async fn import_share_code(
     let mut needs_assist = Vec::new();
     let mut modio_failures = 0usize;
     let ts_client = ThunderstoreClient::new().map_err(|e| e.to_string())?;
-    let order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
     let mut download_index = 0usize;
 
     for entry in &manifest.mods {
@@ -8857,11 +9396,68 @@ pub async fn import_share_code(
                     ));
                     continue;
                 }
-                if let Some(existing) = mods::find_nexus_file(&order, mod_id, file_id) {
-                    member_ids.push(existing.id.clone());
-                    continue;
-                }
                 let label = share::mod_label(entry);
+                let spec = IncomingModSpec::Nexus {
+                    domain: domain.to_string(),
+                    mod_id,
+                    file_id,
+                    name: label.clone(),
+                    version: entry.version.clone(),
+                    file_name: None,
+                };
+                let order =
+                    mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
+                let replace_staged_id = match resolution::resolve_mod_execution(
+                    &order,
+                    Some(&collection_id),
+                    &incoming_specs,
+                    &spec,
+                    resolutions.as_ref(),
+                ) {
+                    ModExecutionPlan::ReuseExact {
+                        staged_id,
+                        disable_other_ids,
+                    } => {
+                        disable_staged_mod_ids(&state.paths, &game_id, &disable_other_ids);
+                        let _ = mods::merge_mod_meta(
+                            &state.paths,
+                            &game_id,
+                            &staged_id,
+                            &[],
+                            &[],
+                            None,
+                            entry.enabled.or(Some(true)),
+                        );
+                        member_ids.push(staged_id);
+                        continue;
+                    }
+                    ModExecutionPlan::KeepExisting { staged_id } => {
+                        let _ = mods::merge_mod_meta(
+                            &state.paths,
+                            &game_id,
+                            &staged_id,
+                            &[],
+                            &[],
+                            None,
+                            entry.enabled.or(Some(true)),
+                        );
+                        member_ids.push(staged_id);
+                        continue;
+                    }
+                    ModExecutionPlan::RepairExact {
+                        staged_id,
+                        disable_other_ids,
+                    } => {
+                        disable_staged_mod_ids(&state.paths, &game_id, &disable_other_ids);
+                        Some(staged_id)
+                    }
+                    ModExecutionPlan::ReplaceStaged { replace_id } => Some(replace_id),
+                    ModExecutionPlan::DisableOldAndInstallNew { disable_ids } => {
+                        disable_staged_mod_ids(&state.paths, &game_id, &disable_ids);
+                        None
+                    }
+                    ModExecutionPlan::InstallFresh | ModExecutionPlan::KeepBothEnabled => None,
+                };
                 if is_premium {
                     let _ = state
                         .rate_limit
@@ -8881,7 +9477,7 @@ pub async fn import_share_code(
                         None,
                         None,
                         None,
-                        None,
+                        replace_staged_id,
                         None,
                     )
                     .await
@@ -8898,6 +9494,7 @@ pub async fn import_share_code(
                         file_id,
                         name: label,
                         version: entry.version.clone(),
+                        replace_staged_id,
                     });
                 }
             }
@@ -8921,12 +9518,81 @@ pub async fn import_share_code(
                     .ok_or_else(|| "Thunderstore entry missing package name".to_string())?;
                 let label = share::mod_label(entry);
                 let version = entry.version.as_deref().filter(|s| !s.is_empty());
+                let spec = IncomingModSpec::Thunderstore {
+                    community: community.to_string(),
+                    namespace: ns.to_string(),
+                    name: pkg_name.to_string(),
+                    version: version.map(str::to_string),
+                    display_name: label.clone(),
+                };
+                let order =
+                    mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
+                let (root_policy, root_replace, root_replace_id) =
+                    match resolution::resolve_mod_execution(
+                        &order,
+                        Some(&collection_id),
+                        &incoming_specs,
+                        &spec,
+                        resolutions.as_ref(),
+                    ) {
+                        ModExecutionPlan::ReuseExact {
+                            staged_id,
+                            disable_other_ids,
+                        } => {
+                            disable_staged_mod_ids(&state.paths, &game_id, &disable_other_ids);
+                            let _ = mods::merge_mod_meta(
+                                &state.paths,
+                                &game_id,
+                                &staged_id,
+                                &[],
+                                &[],
+                                None,
+                                entry.enabled.or(Some(true)),
+                            );
+                            if !member_ids.contains(&staged_id) {
+                                member_ids.push(staged_id);
+                            }
+                            continue;
+                        }
+                        ModExecutionPlan::KeepExisting { staged_id } => {
+                            let _ = mods::merge_mod_meta(
+                                &state.paths,
+                                &game_id,
+                                &staged_id,
+                                &[],
+                                &[],
+                                None,
+                                entry.enabled.or(Some(true)),
+                            );
+                            if !member_ids.contains(&staged_id) {
+                                member_ids.push(staged_id);
+                            }
+                            continue;
+                        }
+                        ModExecutionPlan::RepairExact {
+                            staged_id,
+                            disable_other_ids,
+                        } => {
+                            disable_staged_mod_ids(&state.paths, &game_id, &disable_other_ids);
+                            (StagePolicy::Force, true, Some(staged_id))
+                        }
+                        ModExecutionPlan::ReplaceStaged { replace_id } => {
+                            (StagePolicy::Force, true, Some(replace_id))
+                        }
+                        ModExecutionPlan::DisableOldAndInstallNew { disable_ids } => {
+                            disable_staged_mod_ids(&state.paths, &game_id, &disable_ids);
+                            (StagePolicy::MatchResolved, false, None)
+                        }
+                        ModExecutionPlan::InstallFresh | ModExecutionPlan::KeepBothEnabled => {
+                            (StagePolicy::MatchResolved, false, None)
+                        }
+                    };
                 let _ = state
                     .rate_limit
                     .pace_batch_item(download_index, None, None)
                     .await;
                 download_index += 1;
-                match stage_thunderstore_with_deps(
+                match stage_thunderstore_with_deps_resolved(
                     &app,
                     &state,
                     &ts_client,
@@ -8935,8 +9601,11 @@ pub async fn import_share_code(
                     ns,
                     pkg_name,
                     version,
-                    None,
+                    entry.enabled.or(Some(true)),
                     Some(&label),
+                    root_policy,
+                    root_replace,
+                    root_replace_id.as_deref(),
                 )
                 .await
                 {
@@ -8968,10 +9637,69 @@ pub async fn import_share_code(
                     ));
                     continue;
                 }
-                if let Some(existing) = mods::find_modio_mod(&order, gid, mid) {
-                    member_ids.push(existing.id.clone());
-                    continue;
-                }
+                let label = share::mod_label(entry);
+                let spec = IncomingModSpec::Modio {
+                    modio_game_id: gid,
+                    modio_mod_id: mid,
+                    file_id: entry.file_id,
+                    name: label.clone(),
+                    version: entry.version.clone(),
+                };
+                let order =
+                    mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
+                let (modio_replace, modio_replace_id) = match resolution::resolve_mod_execution(
+                    &order,
+                    Some(&collection_id),
+                    &incoming_specs,
+                    &spec,
+                    resolutions.as_ref(),
+                ) {
+                    ModExecutionPlan::ReuseExact {
+                        staged_id,
+                        disable_other_ids,
+                    } => {
+                        disable_staged_mod_ids(&state.paths, &game_id, &disable_other_ids);
+                        let _ = mods::merge_mod_meta(
+                            &state.paths,
+                            &game_id,
+                            &staged_id,
+                            &[],
+                            &[],
+                            None,
+                            entry.enabled.or(Some(true)),
+                        );
+                        member_ids.push(staged_id);
+                        continue;
+                    }
+                    ModExecutionPlan::KeepExisting { staged_id } => {
+                        let _ = mods::merge_mod_meta(
+                            &state.paths,
+                            &game_id,
+                            &staged_id,
+                            &[],
+                            &[],
+                            None,
+                            entry.enabled.or(Some(true)),
+                        );
+                        member_ids.push(staged_id);
+                        continue;
+                    }
+                    ModExecutionPlan::RepairExact {
+                        staged_id,
+                        disable_other_ids,
+                    } => {
+                        disable_staged_mod_ids(&state.paths, &game_id, &disable_other_ids);
+                        (true, Some(staged_id))
+                    }
+                    ModExecutionPlan::ReplaceStaged { replace_id } => (true, Some(replace_id)),
+                    ModExecutionPlan::DisableOldAndInstallNew { disable_ids } => {
+                        disable_staged_mod_ids(&state.paths, &game_id, &disable_ids);
+                        (false, None)
+                    }
+                    ModExecutionPlan::InstallFresh | ModExecutionPlan::KeepBothEnabled => {
+                        (false, None)
+                    }
+                };
                 let _ = state
                     .rate_limit
                     .pace_batch_item(download_index, None, None)
@@ -8983,7 +9711,6 @@ pub async fn import_share_code(
                     .file_id
                     .or(detail.primary_file_id)
                     .ok_or_else(|| format!("No downloadable file for mod.io mod {mid}"))?;
-                let label = share::mod_label(entry);
                 let dl_id = uuid::Uuid::new_v4().to_string();
                 let dest = state.paths.downloads_dir().join(format!(
                     "modio_{}_{}_{}.zip",
@@ -9035,7 +9762,7 @@ pub async fn import_share_code(
                         )
                         .await;
                         assign_download_file_name(&state, &dl_id, modio_label.as_deref());
-                        match mods::stage_modio_mod(
+                        match mods::stage_modio_mod_with_mode(
                             &state.paths,
                             &game_id,
                             gid,
@@ -9046,6 +9773,8 @@ pub async fn import_share_code(
                             modio_label,
                             detail.picture_url.clone(),
                             &dest,
+                            modio_replace,
+                            modio_replace_id.as_deref(),
                         ) {
                             Ok(staged) => {
                                 member_ids.push(staged.id);
@@ -9096,7 +9825,7 @@ pub async fn import_share_code(
     let mut seen = HashSet::new();
     member_ids.retain(|id| seen.insert(id.clone()));
 
-    let collection = if needs_assist.is_empty() {
+    let collection = if needs_assist.is_empty() && record_collection {
         let new_ids: Vec<String> = member_ids
             .iter()
             .filter(|id| !before.contains(*id))
@@ -9125,7 +9854,8 @@ pub async fn import_share_code(
             mod_ids: final_member_ids,
             installed_at: String::new(),
             game_versions: manifest.game_versions.clone(),
-            friend_sync: None, ..Default::default()
+            friend_sync: None,
+            ..Default::default()
         };
         Some(
             mods::record_installed_collection(&state.paths, &game_id, col, &new_ids)
@@ -11578,22 +12308,41 @@ fn match_manifest_entry_to_staged<'a>(
         ShareModSource::Nexus => {
             let mid = entry.mod_id.unwrap_or(0);
             let fid = entry.file_id.unwrap_or(0);
-            mods::find_nexus_file(order, mid, fid).or_else(|| {
-                order
-                    .mods
-                    .iter()
-                    .find(|m| m.source == ModSource::Nexus && m.nexus_mod_id == mid)
-            })
+            mods::find_nexus_file(order, mid, fid)
+                .or_else(|| {
+                    order
+                        .mods
+                        .iter()
+                        .find(|m| m.source == ModSource::Nexus && m.nexus_mod_id == mid && m.enabled)
+                })
+                .or_else(|| {
+                    order
+                        .mods
+                        .iter()
+                        .find(|m| m.source == ModSource::Nexus && m.nexus_mod_id == mid)
+                })
         }
-        ShareModSource::Thunderstore => order.mods.iter().find(|m| {
-            m.source == ModSource::Thunderstore
-                && m.ts_namespace.as_deref() == entry.namespace.as_deref()
-                && m.ts_name.as_deref() == entry.name.as_deref()
-        }),
+        ShareModSource::Thunderstore => {
+            let ns = entry.namespace.as_deref()?;
+            let name = entry.name.as_deref()?;
+            mods::find_thunderstore_package_version(order, ns, name, entry.version.as_deref())
+                .or_else(|| {
+                    mods::find_all_thunderstore_packages(order, ns, name)
+                        .into_iter()
+                        .find(|m| m.enabled)
+                })
+                .or_else(|| mods::find_thunderstore_package(order, ns, name))
+        }
         ShareModSource::Modio => {
             let gid = entry.game_id.unwrap_or(0);
             let mid = entry.mod_id.unwrap_or(0);
-            mods::find_modio_mod(order, gid, mid)
+            mods::find_modio_file(order, gid, mid, entry.file_id, entry.version.as_deref())
+                .or_else(|| {
+                    mods::find_all_modio_mods(order, gid, mid)
+                        .into_iter()
+                        .find(|m| m.enabled)
+                })
+                .or_else(|| mods::find_modio_mod(order, gid, mid))
         }
     }
 }
@@ -11687,6 +12436,28 @@ pub fn set_collection_sharing(
 }
 
 #[tauri::command]
+pub fn set_friends_list_visibility(
+    state: State<'_, AppState>,
+    visibility: crate::p2p::CollectionVisibility,
+) -> Result<crate::p2p::FriendsState, String> {
+    state
+        .p2p
+        .set_friends_list_visibility(visibility)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn set_allow_mutual_connections(
+    state: State<'_, AppState>,
+    allow: bool,
+) -> Result<crate::p2p::FriendsState, String> {
+    state
+        .p2p
+        .set_allow_mutual_connections(allow)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn add_friend_by_code(
     state: State<'_, AppState>,
     code: String,
@@ -11694,6 +12465,19 @@ pub async fn add_friend_by_code(
     state
         .p2p
         .add_friend_by_code(code)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn add_friend_by_peer(
+    state: State<'_, AppState>,
+    peer_id: String,
+    display_name: Option<String>,
+) -> Result<crate::p2p::FriendsState, String> {
+    state
+        .p2p
+        .add_friend_by_peer(peer_id, display_name)
         .await
         .map_err(|e| e.to_string())
 }
@@ -11731,6 +12515,20 @@ pub async fn refresh_friends(
 }
 
 #[tauri::command]
+pub fn mark_friend_feed_read(
+    state: State<'_, AppState>,
+) -> Result<crate::p2p::FriendsState, String> {
+    state.p2p.mark_feed_read().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn clear_friend_feed(
+    state: State<'_, AppState>,
+) -> Result<crate::p2p::FriendsState, String> {
+    state.p2p.clear_feed().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub fn decode_friend_share_code(code: String) -> Result<ShareDecodePreview, String> {
     let manifest = crate::p2p::decode_friend_share(&code).map_err(|e| e.to_string())?;
     Ok(share::preview_from_manifest(&manifest, code.len()))
@@ -11755,6 +12553,7 @@ pub async fn join_or_sync_friend_collection(
     game_id: String,
     peer_id: String,
     friend_collection_id: String,
+    resolutions: Option<CollectionResolutionChoices>,
 ) -> Result<FriendSyncResult, String> {
     let share_code = state
         .p2p
@@ -11762,17 +12561,20 @@ pub async fn join_or_sync_friend_collection(
         .map_err(|e| e.to_string())?;
     let share_hash = share::share_hash(&share_code);
     let manifest = share::decode_share_code(&share_code).map_err(|e| e.to_string())?;
+    let local_col_id = friend_collection_local_id(&peer_id, &friend_collection_id);
 
-    let mut result = import_share_code(
+    let mut result = import_share_code_inner(
         app,
         state.clone(),
         game_id.clone(),
         share_code.clone(),
         manifest.name.clone(),
+        resolutions,
+        Some(local_col_id.clone()),
+        false,
     )
     .await?;
 
-    let local_col_id = friend_collection_local_id(&peer_id, &friend_collection_id);
     if result.needs_assist.is_empty() {
         let recorded = record_synced_friend_collection(
             &state.paths,
@@ -11939,6 +12741,276 @@ pub fn set_friend_collection_auto_sync(
     auto_sync: bool,
 ) -> Result<(), String> {
     mods::set_friend_collection_auto_sync(&state.paths, &game_id, &collection_id, auto_sync)
+        .map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CollectionPlanSource {
+    FriendSync {
+        #[serde(rename = "peerId")]
+        peer_id: String,
+        #[serde(rename = "friendCollectionId")]
+        friend_collection_id: String,
+    },
+    ShareCode {
+        code: String,
+        #[serde(default)]
+        name: Option<String>,
+    },
+    NexusCollection {
+        slug: String,
+        #[serde(default)]
+        revision: Option<i64>,
+        #[serde(rename = "includeOptional", default)]
+        include_optional: bool,
+        #[serde(default)]
+        name: Option<String>,
+    },
+    ThunderstoreProfile {
+        code: String,
+    },
+    ThunderstoreModpack {
+        community: String,
+        namespace: String,
+        name: String,
+        #[serde(default)]
+        version: Option<String>,
+    },
+}
+
+#[tauri::command]
+pub async fn plan_collection_resolution(
+    state: State<'_, AppState>,
+    game_id: String,
+    source: CollectionPlanSource,
+) -> Result<CollectionConflictPlan, String> {
+    let game = managed_game(&state, &game_id)?;
+    let order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
+    let collections =
+        mods::load_collections(&state.paths, &game_id).map_err(|e| e.to_string())?;
+
+    let (target_col_id, target_name, is_synced_target, incoming) = match source {
+        CollectionPlanSource::FriendSync {
+            peer_id,
+            friend_collection_id,
+        } => {
+            let share_code = state
+                .p2p
+                .get_friend_share_code(&peer_id, &friend_collection_id)
+                .map_err(|e| e.to_string())?;
+            let manifest = share::decode_share_code(&share_code).map_err(|e| e.to_string())?;
+            let name = manifest
+                .name
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "Friend Collection".into());
+            let specs = share_manifest_to_incoming_specs(&manifest, &game);
+            (
+                Some(friend_collection_local_id(&peer_id, &friend_collection_id)),
+                name,
+                true,
+                specs,
+            )
+        }
+        CollectionPlanSource::ShareCode { code, name } => {
+            let trimmed = code.trim();
+            match share::detect_code_kind(trimmed) {
+                ImportCodeKind::Emperor => {
+                    let manifest =
+                        share::decode_share_code(trimmed).map_err(|e| e.to_string())?;
+                    share::catalogs_overlap(&manifest.game, &game)?;
+                    let col_name = name
+                        .or(manifest.name.clone())
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or_else(|| "Shared loadout".into());
+                    let specs = share_manifest_to_incoming_specs(&manifest, &game);
+                    (
+                        Some(share::emperor_share_id(trimmed)),
+                        col_name,
+                        false,
+                        specs,
+                    )
+                }
+                ImportCodeKind::ThunderstoreProfile => {
+                    let community = game
+                        .thunderstore_community
+                        .clone()
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| {
+                            "Set a Thunderstore community for this game first.".to_string()
+                        })?;
+                    let client = ThunderstoreClient::new().map_err(|e| e.to_string())?;
+                    let bytes = client
+                        .fetch_legacy_profile(trimmed)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let temp = state.paths.downloads_dir().join(format!(
+                        "ts_profile_plan_{}",
+                        sanitize_filename::sanitize(trimmed)
+                    ));
+                    let manifest = thunderstore::extract_profile_zip(&bytes, &temp)
+                        .map_err(|e| e.to_string())?;
+                    let _ = std::fs::remove_dir_all(&temp);
+                    let specs: Vec<IncomingModSpec> = manifest
+                        .mods
+                        .iter()
+                        .filter_map(|m| {
+                            let (ns, pkg_name) = thunderstore::parse_package_ident(&m.name)?;
+                            Some(IncomingModSpec::Thunderstore {
+                                community: community.clone(),
+                                namespace: ns,
+                                name: pkg_name.clone(),
+                                version: Some(m.version.as_string()),
+                                display_name: pkg_name,
+                            })
+                        })
+                        .collect();
+                    (
+                        Some(mods::thunderstore_profile_id(trimmed)),
+                        manifest.profile_name,
+                        false,
+                        specs,
+                    )
+                }
+                ImportCodeKind::Unknown => {
+                    return Err(
+                        "Unrecognized code. Paste an Emperor share (#emperor1) or r2modman / Gale profile code."
+                            .into(),
+                    );
+                }
+            }
+        }
+        CollectionPlanSource::NexusCollection {
+            slug,
+            revision,
+            include_optional,
+            name,
+        } => {
+            let adult = state
+                .config
+                .lock()
+                .map_err(|e| e.to_string())?
+                .adult_content;
+            let client = state.client()?;
+            let files = client
+                .collection_mod_files(&slug, revision, adult)
+                .await
+                .map_err(|e| e.to_string())?;
+            let specs: Vec<IncomingModSpec> = files
+                .into_iter()
+                .filter(|f| !f.optional || include_optional)
+                .map(|f| IncomingModSpec::Nexus {
+                    domain: f.domain_name,
+                    mod_id: f.mod_id,
+                    file_id: f.file_id,
+                    name: f.mod_name,
+                    version: f.version,
+                    file_name: Some(f.file_name).filter(|s| !s.is_empty()),
+                })
+                .collect();
+            let col_name = name
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| slug.clone());
+            (Some(mods::nexus_collection_id(&slug)), col_name, false, specs)
+        }
+        CollectionPlanSource::ThunderstoreProfile { code } => {
+            let trimmed = code.trim();
+            let community = game
+                .thunderstore_community
+                .clone()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "Set a Thunderstore community for this game first.".to_string())?;
+            let client = ThunderstoreClient::new().map_err(|e| e.to_string())?;
+            let bytes = client
+                .fetch_legacy_profile(trimmed)
+                .await
+                .map_err(|e| e.to_string())?;
+            let temp = state.paths.downloads_dir().join(format!(
+                "ts_profile_plan_{}",
+                sanitize_filename::sanitize(trimmed)
+            ));
+            let manifest =
+                thunderstore::extract_profile_zip(&bytes, &temp).map_err(|e| e.to_string())?;
+            let _ = std::fs::remove_dir_all(&temp);
+            let specs: Vec<IncomingModSpec> = manifest
+                .mods
+                .iter()
+                .filter_map(|m| {
+                    let (ns, pkg_name) = thunderstore::parse_package_ident(&m.name)?;
+                    Some(IncomingModSpec::Thunderstore {
+                        community: community.clone(),
+                        namespace: ns,
+                        name: pkg_name.clone(),
+                        version: Some(m.version.as_string()),
+                        display_name: pkg_name,
+                    })
+                })
+                .collect();
+            (
+                Some(mods::thunderstore_profile_id(trimmed)),
+                manifest.profile_name,
+                false,
+                specs,
+            )
+        }
+        CollectionPlanSource::ThunderstoreModpack {
+            community,
+            namespace,
+            name,
+            version,
+        } => {
+            let install_order = load_ts_install_order(
+                &state,
+                &community,
+                &namespace,
+                &name,
+                version.as_deref(),
+            )
+            .await?;
+            let specs: Vec<IncomingModSpec> = install_order
+                .iter()
+                .map(|pkg| IncomingModSpec::Thunderstore {
+                    community: community.clone(),
+                    namespace: pkg.namespace.clone(),
+                    name: pkg.name.clone(),
+                    version: pkg
+                        .versions
+                        .first()
+                        .map(|v| v.version_number.clone())
+                        .or_else(|| pkg.latest_version.clone()),
+                    display_name: pkg.name.clone(),
+                })
+                .collect();
+            (
+                Some(mods::thunderstore_modpack_id(&community, &namespace, &name)),
+                name,
+                false,
+                specs,
+            )
+        }
+    };
+
+    Ok(resolution::plan_collection_conflicts(
+        &order,
+        &collections,
+        target_col_id.as_deref(),
+        &target_name,
+        is_synced_target,
+        &incoming,
+    ))
+}
+
+#[tauri::command]
+pub fn set_collection_enabled(
+    state: State<'_, AppState>,
+    game_id: String,
+    collection_id: String,
+    enabled: bool,
+    protect_mod_ids: Option<Vec<String>>,
+) -> Result<usize, String> {
+    let protect = protect_mod_ids.unwrap_or_default();
+    mods::set_collection_enabled(&state.paths, &game_id, &collection_id, enabled, &protect)
         .map_err(|e| e.to_string())
 }
 

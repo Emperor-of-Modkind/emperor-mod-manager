@@ -1,7 +1,13 @@
 import { useEffect, useRef, useState, type ChangeEvent, type FormEvent } from "react";
+import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
 import { api } from "./api";
+import {
+  CollectionSharingModal,
+  formatVisibilityLabel,
+  visibilityIcon,
+} from "./CollectionSharingModal";
 import { FriendAvatar, resizeProfilePicture } from "./FriendAvatar";
-import type { FriendsState } from "./types";
+import type { CollectionVisibility, FriendsState } from "./types";
 
 export type SocialSettingsSectionProps = {
   friendsState: FriendsState | null;
@@ -19,7 +25,13 @@ export function SocialSettingsSection({
   const [nameInput, setNameInput] = useState(friendsState?.display_name ?? "");
   const [savingName, setSavingName] = useState(false);
   const [savingPicture, setSavingPicture] = useState(false);
+  const [savingMutuals, setSavingMutuals] = useState(false);
+  const [privacyModalOpen, setPrivacyModalOpen] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const friendsListVisibility: CollectionVisibility =
+    friendsState?.friends_list_visibility ?? { mode: "all_friends" };
+  const allowMutualConnections = friendsState?.allow_mutual_connections !== false;
 
   useEffect(() => {
     setNameInput(friendsState?.display_name ?? "");
@@ -70,6 +82,36 @@ export function SocialSettingsSection({
       onError(String(err));
     } finally {
       setSavingPicture(false);
+    }
+  }
+
+  async function handleSaveFriendsListVisibility(nextVis: CollectionVisibility) {
+    onError(null);
+    try {
+      const next = await api.setFriendsListVisibility(nextVis);
+      onFriendsStateChange(next);
+      onNotice("Friends list privacy updated.");
+    } catch (err) {
+      onError(String(err));
+      throw err;
+    }
+  }
+
+  async function handleToggleMutualConnections(allow: boolean) {
+    onError(null);
+    setSavingMutuals(true);
+    try {
+      const next = await api.setAllowMutualConnections(allow);
+      onFriendsStateChange(next);
+      onNotice(
+        allow
+          ? "Mutual connections enabled."
+          : "Mutual connections disabled.",
+      );
+    } catch (err) {
+      onError(String(err));
+    } finally {
+      setSavingMutuals(false);
     }
   }
 
@@ -137,6 +179,59 @@ export function SocialSettingsSection({
           Optional. Resized automatically and shared with connected friends.
         </p>
       </div>
+
+      <div className="setting-block">
+        <span>Friends list privacy</span>
+        <div className="social-settings-privacy-row">
+          <span className="pill">
+            <FontAwesomeIcon icon={visibilityIcon(friendsListVisibility)} />{" "}
+            {formatVisibilityLabel(friendsListVisibility)}
+          </span>
+          <button
+            type="button"
+            onClick={() => setPrivacyModalOpen(true)}
+          >
+            Change Privacy
+          </button>
+        </div>
+        <p className="note">
+          Controls who can see your connected friends list and discover mutual
+          connections.
+        </p>
+      </div>
+
+      <div className="setting-block">
+        <span>Allow mutual connections</span>
+        <label className="inline">
+          <input
+            type="checkbox"
+            checked={allowMutualConnections}
+            disabled={savingMutuals}
+            onChange={(e) => void handleToggleMutualConnections(e.target.checked)}
+          />
+          Let friends of friends see me in mutual friends lists
+        </label>
+        <p className="note">
+          When turned off, your friends will not include you in their shared
+          friends lists.
+        </p>
+      </div>
+
+      {privacyModalOpen && (
+        <CollectionSharingModal
+          collectionId="friends_list"
+          collectionName="Friends List"
+          modalTitle="Friends list privacy"
+          legend="Friends list visibility"
+          allFriendsDescription="All connected friends can view your friends list and see mutual connections."
+          specificFriendsDescription="Only selected friends can view your friends list and discover mutual connections."
+          privateDescription="Your friends list is hidden from all friends."
+          initialVisibility={friendsListVisibility}
+          friends={friendsState?.friends ?? []}
+          onSave={handleSaveFriendsListVisibility}
+          onClose={() => setPrivacyModalOpen(false)}
+        />
+      )}
     </>
   );
 }

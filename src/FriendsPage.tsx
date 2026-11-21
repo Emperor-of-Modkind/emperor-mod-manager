@@ -13,7 +13,9 @@ import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
 import {
   faCheck,
   faCopy,
+  faLock,
   faRotate,
+  faRss,
   faShareNodes,
   faTrash,
   faUserPlus,
@@ -21,6 +23,11 @@ import {
   faXmark,
 } from "@fortawesome/free-solid-svg-icons";
 import { api } from "./api";
+import {
+  formatMutualSummary,
+  getMutualFriends,
+  getMutualFriendsForPeerId,
+} from "./friendConnections";
 import {
   catalogCoverRequestKey,
   collectionCatalogCoverRequests,
@@ -36,12 +43,16 @@ import { CollectionsGameList } from "./CollectionsGameList";
 import { extractFriendJoinCode, friendShareUrlFromCode } from "./modDeepLink";
 import { FriendAvatar } from "./FriendAvatar";
 import { Modal } from "./Modal";
-import { staggerStyle } from "./motion";
+import { Segment, SegmentTab, staggerStyle } from "./motion";
 import { groupSavedCollectionsByGame } from "./savedCollectionGroups";
 import { BrowseListSkeleton } from "./Skeleton";
 import type {
   CatalogHit,
+  CollectionPlanSource,
+  CollectionResolutionChoices,
   DetectedGame,
+  FriendFeedDiff,
+  FriendFeedEvent,
   FriendRecord,
   FriendShareRef,
   FriendsState,
@@ -82,6 +93,10 @@ export type FriendsPageProps = {
     result: FriendSyncResult,
     friendSync?: { peerId: string; friendCollectionId: string },
   ) => Promise<void> | void;
+  resolveCollectionConflicts?: (
+    gameId: string,
+    source: CollectionPlanSource,
+  ) => Promise<CollectionResolutionChoices | null>;
   onOpenMod?: (hit: CatalogHit, targetGameId?: string | null) => void;
   pendingJoinCode?: string | null;
   onConsumePendingJoinCode?: () => void;
@@ -125,6 +140,35 @@ function formatLastSeen(iso?: string | null): string {
   return d.toLocaleString();
 }
 
+function formatRelativeTime(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const diffSec = Math.floor((Date.now() - d.getTime()) / 1000);
+  if (diffSec < 60) return "Just now";
+  const diffMin = Math.floor(diffSec / 60);
+  if (diffMin < 60) return `${diffMin}m ago`;
+  const diffHr = Math.floor(diffMin / 60);
+  if (diffHr < 24) return `${diffHr}h ago`;
+  const diffDays = Math.floor(diffHr / 24);
+  if (diffDays < 7) return `${diffDays}d ago`;
+  return d.toLocaleDateString();
+}
+
+function formatDiffNames(names: string[], total: number): string {
+  if (names.length === 0) return "";
+  const extra = total - names.length;
+  return extra > 0 ? `${names.join(", ")} +${extra} more` : names.join(", ");
+}
+
+function hasFeedDiffDetails(diff?: FriendFeedDiff | null): diff is FriendFeedDiff {
+  if (!diff) return false;
+  return (
+    diff.mods_added_count > 0 ||
+    diff.mods_removed_count > 0 ||
+    diff.mods_updated_count > 0
+  );
+}
+
 const EMPTY_DETECTED: DetectedGame[] = [];
 const EMPTY_PLUGINS: GamePluginInfo[] = [];
 
@@ -145,6 +189,7 @@ export function FriendsPage({
   onInstallCollection,
   onSaveCollection,
   onCollectionSynced,
+  resolveCollectionConflicts,
   onOpenMod,
   pendingJoinCode,
   onConsumePendingJoinCode,
@@ -160,6 +205,15 @@ export function FriendsPage({
   const [copiedCode, setCopiedCode] = useState(false);
   const [selectedPeerId, setSelectedPeerId] = useState<string | null>(null);
   const [selectedCol, setSelectedCol] = useState<FriendShareRef | null>(null);
+  const [friendsTab, setFriendsTab] = useState<"feed" | "friends">("feed");
+  const [friendDetailTab, setFriendDetailTab] = useState<
+    "feed" | "collections" | "friends"
+  >("feed");
+  const [addingPeerId, setAddingPeerId] = useState<string | null>(null);
+  const [openedColFromFeed, setOpenedColFromFeed] = useState(false);
+  const [feedFriendFilter, setFeedFriendFilter] = useState<string>("all");
+  const [clearingFeed, setClearingFeed] = useState(false);
+  const lastMarkedFeedTsRef = useRef<string | null>(null);
   const [decodedPreview, setDecodedPreview] =
     useState<ShareDecodePreview | null>(null);
   const [decoding, setDecoding] = useState(false);
@@ -233,6 +287,95 @@ export function FriendsPage({
     if (!state || !selectedPeerId) return null;
     return state.friends.find((f) => f.peer_id === selectedPeerId) ?? null;
   }, [state, selectedPeerId]);
+
+  useEffect(() => {
+    setFriendDetailTab("feed");
+  }, [selectedPeerId]);
+
+  const friendsById = useMemo(() => {
+    const map = new Map<string, FriendRecord>();
+    for (const f of state?.friends ?? []) {
+      map.set(f.peer_id, f);
+    }
+    return map;
+  }, [state]);
+
+  const feedEvents: FriendFeedEvent[] = useMemo(() => {
+    const raw = state?.feed_events ?? [];
+    if (raw.length === 0) return [];
+    return raw.filter((ev) => {
+      const friend = friendsById.get(ev.peer_id);
+      if (!friend) return false;
+      // Ensure collection is still currently visible in the friend's cached profile.
+      const cols = friend.cached_profile?.collections;
+      if (cols && !cols.some((c) => c.id === ev.collection_id)) {
+        return false;
+      }
+      return true;
+    });
+  }, [state, friendsById]);
+
+  const feedLastReadAt = state?.feed_last_read_at ?? null;
+
+  const unreadFeedCount = useMemo(() => {
+    if (feedEvents.length === 0) return 0;
+    if (!feedLastReadAt) return feedEvents.length;
+    return feedEvents.filter((ev) => ev.occurred_at > feedLastReadAt).length;
+  }, [feedEvents, feedLastReadAt]);
+
+  const feedFilterFriends = useMemo(() => {
+    const seen = new Map<string, string>();
+    for (const ev of feedEvents) {
+      if (!seen.has(ev.peer_id)) {
+        const live = friendsById.get(ev.peer_id);
+        seen.set(ev.peer_id, live?.display_name ?? ev.friend_display_name);
+      }
+    }
+    return Array.from(seen.entries()).map(([peer_id, display_name]) => ({
+      peer_id,
+      display_name,
+    }));
+  }, [feedEvents, friendsById]);
+
+  const filteredFeedEvents = useMemo(() => {
+    if (feedFriendFilter === "all") return feedEvents;
+    return feedEvents.filter((ev) => ev.peer_id === feedFriendFilter);
+  }, [feedEvents, feedFriendFilter]);
+
+  const selectedFriendFeedEvents = useMemo(() => {
+    if (!selectedFriend) return [];
+    return feedEvents.filter((ev) => ev.peer_id === selectedFriend.peer_id);
+  }, [feedEvents, selectedFriend]);
+
+  useEffect(() => {
+    if (
+      feedFriendFilter !== "all" &&
+      !feedFilterFriends.some((f) => f.peer_id === feedFriendFilter)
+    ) {
+      setFeedFriendFilter("all");
+    }
+  }, [feedFriendFilter, feedFilterFriends]);
+
+  useEffect(() => {
+    if (
+      !active ||
+      friendsTab !== "feed" ||
+      selectedFriend ||
+      selectedCol ||
+      unreadFeedCount === 0
+    ) {
+      return;
+    }
+    const latestTs = feedEvents[0]?.occurred_at ?? null;
+    if (!latestTs || lastMarkedFeedTsRef.current === latestTs) return;
+    lastMarkedFeedTsRef.current = latestTs;
+    void api
+      .markFriendFeedRead()
+      .then((next) => setState(next))
+      .catch(() => {
+        lastMarkedFeedTsRef.current = null;
+      });
+  }, [active, friendsTab, selectedFriend, selectedCol, unreadFeedCount, feedEvents]);
 
   useEffect(() => {
     const cols = selectedFriend?.cached_profile?.collections ?? [];
@@ -546,6 +689,27 @@ export function FriendsPage({
     }
   }
 
+  async function handleAddFriendByPeer(peerId: string, displayName?: string) {
+    onError(null);
+    setAddingPeerId(peerId);
+    try {
+      const wasIncoming = Boolean(
+        state?.pending_requests.some((r) => r.peer_id === peerId),
+      );
+      const next = await api.addFriendByPeer(peerId, displayName);
+      setState(next);
+      onNotice(
+        wasIncoming
+          ? "Friend request accepted! Connecting via P2P..."
+          : "Friend request sent! Connecting via P2P...",
+      );
+    } catch (err) {
+      onError(String(err));
+    } finally {
+      setAddingPeerId(null);
+    }
+  }
+
   async function handleRemoveFriend(peerId: string) {
     onError(null);
     try {
@@ -573,15 +737,188 @@ export function FriendsPage({
     }
   }
 
+  async function handleClearFeed() {
+    onError(null);
+    setClearingFeed(true);
+    try {
+      const next = await api.clearFriendFeed();
+      setState(next);
+      setFeedFriendFilter("all");
+    } catch (err) {
+      onError(String(err));
+    } finally {
+      setClearingFeed(false);
+    }
+  }
+
+  function handleOpenFeedEvent(ev: FriendFeedEvent, fromGlobalFeed: boolean) {
+    const friend = friendsById.get(ev.peer_id);
+    if (!friend) return;
+    const liveCol =
+      friend.cached_profile?.collections.find((c) => c.id === ev.collection_id) ??
+      null;
+    setSelectedPeerId(friend.peer_id);
+    if (liveCol) {
+      setOpenedColFromFeed(fromGlobalFeed);
+      setSelectedCol(liveCol);
+    } else {
+      setOpenedColFromFeed(false);
+      setSelectedCol(null);
+      setExpandedFriendGameKey(null);
+    }
+  }
+
+  function renderFeedList(events: FriendFeedEvent[], fromGlobalFeed: boolean) {
+    return (
+      <ul className="friends-feed-list">
+        {events.map((ev, idx) => {
+          const liveFriend = friendsById.get(ev.peer_id);
+          const friendName = liveFriend?.display_name ?? ev.friend_display_name;
+          const avatarSrc =
+            liveFriend?.profile_picture ??
+            liveFriend?.cached_profile?.profile_picture;
+          const isUnread = !feedLastReadAt || ev.occurred_at > feedLastReadAt;
+          const diff = hasFeedDiffDetails(ev.diff) ? ev.diff : null;
+
+          return (
+            <li
+              key={ev.id}
+              className={`friends-feed-item stagger-item${
+                isUnread ? " unread" : ""
+              }`}
+              style={staggerStyle(idx)}
+            >
+              <button
+                type="button"
+                className="friends-feed-item-btn"
+                onClick={() => handleOpenFeedEvent(ev, fromGlobalFeed)}
+              >
+                <FriendAvatar
+                  name={friendName}
+                  src={avatarSrc}
+                  online={liveFriend?.online ?? false}
+                  size="md"
+                  showStatus={Boolean(liveFriend)}
+                />
+                <div className="friends-feed-item-body">
+                  <div className="friends-feed-item-headline">
+                    <span className="friends-feed-item-text">
+                      <strong>{friendName}</strong>{" "}
+                      {ev.kind === "collection_added" ? (
+                        <>
+                          shared a new collection{" "}
+                          <strong>{ev.collection_name}</strong>
+                        </>
+                      ) : ev.kind === "collection_renamed" ? (
+                        <>
+                          renamed{" "}
+                          <strong>{ev.previous_name ?? "a collection"}</strong>{" "}
+                          to <strong>{ev.collection_name}</strong>
+                        </>
+                      ) : (
+                        <>
+                          updated <strong>{ev.collection_name}</strong>
+                          {ev.previous_name ? (
+                            <>
+                              {" "}
+                              <span className="muted">
+                                (renamed from {ev.previous_name})
+                              </span>
+                            </>
+                          ) : null}
+                        </>
+                      )}
+                    </span>
+                    <time
+                      className="muted friends-feed-time"
+                      dateTime={ev.occurred_at}
+                      title={formatLastSeen(ev.occurred_at)}
+                    >
+                      {formatRelativeTime(ev.occurred_at)}
+                    </time>
+                  </div>
+
+                  <div className="friends-feed-meta">
+                    <span className="pill">
+                      {ev.collection_kind === "active_loadout"
+                        ? "Active Loadout"
+                        : "Saved Collection"}
+                    </span>
+                    {ev.game_title ? (
+                      <span className="pill">{ev.game_title}</span>
+                    ) : null}
+                    {ev.mod_count != null ? (
+                      <span className="muted">
+                        {ev.mod_count} {ev.mod_count === 1 ? "mod" : "mods"}
+                      </span>
+                    ) : null}
+                  </div>
+
+                  {diff && (
+                    <div className="friends-feed-diff">
+                      {diff.mods_added_count > 0 && (
+                        <div className="friends-feed-diff-line added">
+                          +{diff.mods_added_count} added
+                          {diff.mods_added.length > 0
+                            ? `: ${formatDiffNames(
+                                diff.mods_added,
+                                diff.mods_added_count,
+                              )}`
+                            : ""}
+                        </div>
+                      )}
+                      {diff.mods_removed_count > 0 && (
+                        <div className="friends-feed-diff-line removed">
+                          -{diff.mods_removed_count} removed
+                          {diff.mods_removed.length > 0
+                            ? `: ${formatDiffNames(
+                                diff.mods_removed,
+                                diff.mods_removed_count,
+                              )}`
+                            : ""}
+                        </div>
+                      )}
+                      {diff.mods_updated_count > 0 && (
+                        <div className="friends-feed-diff-line updated">
+                          ~{diff.mods_updated_count} updated
+                          {diff.mods_updated.length > 0
+                            ? `: ${formatDiffNames(
+                                diff.mods_updated,
+                                diff.mods_updated_count,
+                              )}`
+                            : ""}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+    );
+  }
+
   async function handleJoinOrSync() {
     if (!selectedFriend || !selectedCol || !targetGameId) return;
     onError(null);
     setSyncing(true);
     try {
+      let resolutions: CollectionResolutionChoices | null = null;
+      if (resolveCollectionConflicts) {
+        resolutions = await resolveCollectionConflicts(targetGameId, {
+          kind: "friend_sync",
+          peerId: selectedFriend.peer_id,
+          friendCollectionId: selectedCol.id,
+        });
+        if (!resolutions) return;
+      }
       const res = await api.joinOrSyncFriendCollection({
         gameId: targetGameId,
         peerId: selectedFriend.peer_id,
         friendCollectionId: selectedCol.id,
+        ...(resolutions ? { resolutions } : {}),
       });
       await onCollectionSynced(targetGameId, res, {
         peerId: selectedFriend.peer_id,
@@ -728,7 +1065,13 @@ export function FriendsPage({
         <CollectionDetailView
           title={selectedCol.name}
           backLabel="Back"
-          onBack={() => setSelectedCol(null)}
+          onBack={() => {
+            setSelectedCol(null);
+            if (openedColFromFeed) {
+              setSelectedPeerId(null);
+              setOpenedColFromFeed(false);
+            }
+          }}
           headerPills={
             <span className="pill">
               {selectedCol.kind === "active_loadout"
@@ -938,16 +1281,90 @@ export function FriendsPage({
           )}
         </div>
       </div>
+      {!selectedFriend && (
+        <div className="friends-tabs-row">
+          <Segment>
+            <SegmentTab
+              layoutId="friends-page-tabs"
+              active={friendsTab === "feed"}
+              onClick={() => setFriendsTab("feed")}
+            >
+              <FontAwesomeIcon icon={faRss} /> Friend Feed
+              {unreadFeedCount > 0 ? (
+                <span
+                  className="pill friends-feed-badge"
+                  aria-label={`${unreadFeedCount} unread`}
+                >
+                  {unreadFeedCount}
+                </span>
+              ) : null}
+            </SegmentTab>
+            <SegmentTab
+              layoutId="friends-page-tabs"
+              active={friendsTab === "friends"}
+              onClick={() => setFriendsTab("friends")}
+            >
+              <FontAwesomeIcon icon={faUsers} /> Friends
+              {(state?.pending_requests.length ?? 0) > 0 ? (
+                <span
+                  className="pill friends-feed-badge"
+                  aria-label={`${state!.pending_requests.length} pending`}
+                >
+                  {state!.pending_requests.length}
+                </span>
+              ) : null}
+            </SegmentTab>
+          </Segment>
+        </div>
+      )}
+      {selectedFriend && !selectedCol && (
+        <div className="friends-tabs-row">
+          <Segment>
+            <SegmentTab
+              layoutId="friend-detail-tabs"
+              active={friendDetailTab === "feed"}
+              onClick={() => setFriendDetailTab("feed")}
+            >
+              <FontAwesomeIcon icon={faRss} /> Feed
+            </SegmentTab>
+            <SegmentTab
+              layoutId="friend-detail-tabs"
+              active={friendDetailTab === "collections"}
+              onClick={() => setFriendDetailTab("collections")}
+            >
+              Collections
+            </SegmentTab>
+            <SegmentTab
+              layoutId="friend-detail-tabs"
+              active={friendDetailTab === "friends"}
+              onClick={() => setFriendDetailTab("friends")}
+            >
+              <FontAwesomeIcon icon={faUsers} /> Friends
+              {Array.isArray(selectedFriend.cached_profile?.friends) ? (
+                <span className="pill friends-feed-badge">
+                  {
+                    selectedFriend.cached_profile.friends.filter(
+                      (sf) => sf.peer_id !== state?.peer_id,
+                    ).length
+                  }
+                </span>
+              ) : null}
+            </SegmentTab>
+          </Segment>
+        </div>
+      )}
       </div>
 
       <div className="page-scroll">
-      {!selectedFriend && (
+      {!selectedFriend && friendsTab === "friends" && (
         <>
           {state && state.pending_requests.length > 0 && (
             <div className="card friends-card">
               <h3>Pending Friend Requests</h3>
               <div className="friends-list">
-                {state.pending_requests.map((req) => (
+                {state.pending_requests.map((req) => {
+                  const reqMutuals = getMutualFriendsForPeerId(state, req.peer_id);
+                  return (
                   <div key={req.peer_id} className="friends-row">
                     <div className="friends-row-identity">
                       <FriendAvatar
@@ -957,6 +1374,11 @@ export function FriendsPage({
                       />
                       <div>
                         <strong>{req.display_name}</strong>
+                        {reqMutuals.length > 0 && (
+                          <div className="muted friends-mutual-label">
+                            {formatMutualSummary(reqMutuals)}
+                          </div>
+                        )}
                         <div className="muted friends-peer-id">{req.peer_id}</div>
                       </div>
                     </div>
@@ -976,7 +1398,8 @@ export function FriendsPage({
                       </button>
                     </div>
                   </div>
-                ))}
+                  );
+                })}
               </div>
             </div>
           )}
@@ -992,8 +1415,11 @@ export function FriendsPage({
               <div className="friends-cards-grid">
                 {state.friends.map((f) => {
                   const colCount = f.cached_profile?.collections.length ?? 0;
+                  const mutualCount = getMutualFriends(state, f).length;
                   const avatarSrc =
                     f.profile_picture ?? f.cached_profile?.profile_picture;
+                  const mutualSuffix =
+                    mutualCount > 0 ? ` · ${mutualCount} mutual` : "";
                   return (
                     <div key={f.peer_id} className="friends-friend-card">
                       <button
@@ -1020,8 +1446,8 @@ export function FriendsPage({
                             {f.status === "pending_outgoing"
                               ? "Waiting for friend to accept"
                               : f.online
-                                ? `Online · ${colCount} collection(s)`
-                                : `Offline · ${colCount} collection(s)`}
+                                ? `Online · ${colCount} collection(s)${mutualSuffix}`
+                                : `Offline · ${colCount} collection(s)${mutualSuffix}`}
                           </div>
                           {f.status !== "pending_outgoing" && !f.online && (
                             <div className="muted friends-friend-card-seen">
@@ -1051,7 +1477,213 @@ export function FriendsPage({
         </>
       )}
 
-      {selectedFriend && !selectedCol && (
+      {!selectedFriend && friendsTab === "feed" && (
+        <div className="card friends-card friends-feed-panel">
+          <div className="friends-feed-toolbar">
+            <div>
+              <h3>Friend Feed</h3>
+              <p className="muted friends-feed-subtitle">
+                Recent collection updates and new shares from your friends.
+              </p>
+            </div>
+            {feedEvents.length > 0 && (
+              <div className="friends-feed-controls">
+                {feedFilterFriends.length > 1 && (
+                  <select
+                    aria-label="Filter feed by friend"
+                    value={feedFriendFilter}
+                    onChange={(e) => setFeedFriendFilter(e.target.value)}
+                  >
+                    <option value="all">All friends</option>
+                    {feedFilterFriends.map((f) => (
+                      <option key={f.peer_id} value={f.peer_id}>
+                        {f.display_name}
+                      </option>
+                    ))}
+                  </select>
+                )}
+                <button
+                  type="button"
+                  disabled={clearingFeed}
+                  onClick={() => void handleClearFeed()}
+                >
+                  {clearingFeed ? "Clearing..." : "Clear Feed"}
+                </button>
+              </div>
+            )}
+          </div>
+
+          {!state || state.friends.length === 0 ? (
+            <p className="muted">
+              No friends connected yet. Add friends to see their collection
+              updates here.
+            </p>
+          ) : filteredFeedEvents.length === 0 ? (
+            <p className="muted">
+              No recent activity yet. New collections, updates, and renames from
+              friends&apos; shared collections will appear here automatically.
+            </p>
+          ) : (
+            renderFeedList(filteredFeedEvents, true)
+          )}
+        </div>
+      )}
+
+      {selectedFriend && !selectedCol && friendDetailTab === "feed" && (
+        <div className="card friends-card friends-feed-panel">
+          <div className="friends-feed-toolbar">
+            <div>
+              <h3>{selectedFriend.display_name}&apos;s Feed</h3>
+              <p className="muted friends-feed-subtitle">
+                Recent collection updates and new shares from{" "}
+                {selectedFriend.display_name}.{" "}
+                <span className={`pill ${selectedFriend.online ? "ok" : ""}`}>
+                  {selectedFriend.online
+                    ? "Online"
+                    : `Offline · Cached (${formatLastSeen(selectedFriend.last_seen_at)})`}
+                </span>
+              </p>
+            </div>
+          </div>
+
+          {selectedFriendFeedEvents.length === 0 ? (
+            <p className="muted">
+              No recent activity from {selectedFriend.display_name} yet. New
+              collections, updates, and renames will appear here automatically.
+            </p>
+          ) : (
+            renderFeedList(selectedFriendFeedEvents, false)
+          )}
+        </div>
+      )}
+
+      {selectedFriend && !selectedCol && friendDetailTab === "friends" && (
+        <div className="card friends-card">
+          <h3>{selectedFriend.display_name}&apos;s Friends</h3>
+          {!selectedFriend.cached_profile ? (
+            <p className="muted">
+              Waiting to sync {selectedFriend.display_name}&apos;s profile.
+            </p>
+          ) : selectedFriend.cached_profile.friends == null ? (
+            <p className="muted friends-private-notice">
+              <FontAwesomeIcon icon={faLock} />{" "}
+              {selectedFriend.display_name}&apos;s friends list is private.
+            </p>
+          ) : (() => {
+              const visibleFriends = selectedFriend.cached_profile.friends.filter(
+                (sf) => sf.peer_id !== state?.peer_id,
+              );
+              const mutualFriends = getMutualFriends(state, selectedFriend);
+              const mutualIds = new Set(mutualFriends.map((m) => m.peer_id));
+              if (visibleFriends.length === 0) {
+                return (
+                  <p className="muted">
+                    {selectedFriend.display_name} has no other connected friends
+                    yet.
+                  </p>
+                );
+              }
+              return (
+                <>
+                  <p className="muted friends-feed-subtitle">
+                    {visibleFriends.length}{" "}
+                    {visibleFriends.length === 1 ? "friend" : "friends"}
+                    {mutualFriends.length > 0
+                      ? ` · ${mutualFriends.length} mutual`
+                      : ""}
+                  </p>
+                  <div className="friends-list">
+                    {visibleFriends.map((sf) => {
+                      const localFriend = state?.friends.find(
+                        (f) => f.peer_id === sf.peer_id,
+                      );
+                      const isMutual = mutualIds.has(sf.peer_id);
+                      const isPendingOut =
+                        localFriend?.status === "pending_outgoing";
+                      const isPendingIn = Boolean(
+                        state?.pending_requests.some(
+                          (r) => r.peer_id === sf.peer_id,
+                        ),
+                      );
+                      const busy = addingPeerId === sf.peer_id;
+                      const avatarSrc =
+                        localFriend?.profile_picture ??
+                        localFriend?.cached_profile?.profile_picture;
+                      return (
+                        <div key={sf.peer_id} className="friends-row">
+                          <div className="friends-row-identity">
+                            <FriendAvatar
+                              name={localFriend?.display_name ?? sf.display_name}
+                              src={avatarSrc}
+                              online={localFriend?.online}
+                              showStatus={isMutual}
+                              size="sm"
+                            />
+                            <div>
+                              <strong>
+                                {localFriend?.display_name ?? sf.display_name}
+                                {isMutual && (
+                                  <>
+                                    {" "}
+                                    <span className="pill ok">Mutual</span>
+                                  </>
+                                )}
+                              </strong>
+                            </div>
+                          </div>
+                          <div className="friends-row-actions">
+                            {isMutual && localFriend ? (
+                              <button
+                                type="button"
+                                className="linkish"
+                                onClick={() => {
+                                  setSelectedPeerId(localFriend.peer_id);
+                                  setSelectedCol(null);
+                                  setExpandedFriendGameKey(null);
+                                }}
+                              >
+                                View Profile
+                              </button>
+                            ) : isPendingOut ? (
+                              <span className="pill">Request Sent</span>
+                            ) : isPendingIn ? (
+                              <button
+                                type="button"
+                                disabled={busy}
+                                onClick={() =>
+                                  void handleRespondRequest(sf.peer_id, true)
+                                }
+                              >
+                                <FontAwesomeIcon icon={faCheck} /> Accept
+                                Request
+                              </button>
+                            ) : (
+                              <button
+                                type="button"
+                                disabled={busy}
+                                onClick={() =>
+                                  void handleAddFriendByPeer(
+                                    sf.peer_id,
+                                    sf.display_name,
+                                  )
+                                }
+                              >
+                                <FontAwesomeIcon icon={faUserPlus} />{" "}
+                                {busy ? "Sending..." : "Add Friend"}
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </>
+              );
+            })()}
+        </div>
+      )}
+
+      {selectedFriend && !selectedCol && friendDetailTab === "collections" && (
         <div>
           <p className="note">
             Shared collections and active loadouts from {selectedFriend.display_name},
@@ -1125,7 +1757,10 @@ export function FriendsPage({
                     key={col.id}
                     className="list-row-clickable stagger-item"
                     style={staggerStyle(childIdx)}
-                    onClick={() => setSelectedCol(col)}
+                    onClick={() => {
+                      setOpenedColFromFeed(false);
+                      setSelectedCol(col);
+                    }}
                   >
                     <div className="list-row-main">
                       <strong>
@@ -1204,10 +1839,24 @@ export function FriendsPage({
                             onError(null);
                             setRowBusyKey(col.id);
                             try {
+                              let resolutions: CollectionResolutionChoices | null =
+                                null;
+                              if (resolveCollectionConflicts) {
+                                resolutions = await resolveCollectionConflicts(
+                                  group.managed.id,
+                                  {
+                                    kind: "friend_sync",
+                                    peerId: selectedFriend.peer_id,
+                                    friendCollectionId: col.id,
+                                  },
+                                );
+                                if (!resolutions) return;
+                              }
                               const res = await api.joinOrSyncFriendCollection({
                                 gameId: group.managed.id,
                                 peerId: selectedFriend.peer_id,
                                 friendCollectionId: col.id,
+                                ...(resolutions ? { resolutions } : {}),
                               });
                               await onCollectionSynced(group.managed.id, res);
                               const updated =

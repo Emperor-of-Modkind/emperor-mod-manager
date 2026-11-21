@@ -53,6 +53,11 @@ export type CollectionSharingModalProps = {
   friends: FriendRecord[];
   onSave: (visibility: CollectionVisibility) => Promise<void>;
   onClose: () => void;
+  modalTitle?: string;
+  legend?: string;
+  allFriendsDescription?: string;
+  specificFriendsDescription?: string;
+  privateDescription?: string;
 };
 
 export function CollectionSharingModal({
@@ -61,6 +66,11 @@ export function CollectionSharingModal({
   friends,
   onSave,
   onClose,
+  modalTitle,
+  legend = "Collection visibility",
+  allFriendsDescription = "Visible to all connected P2P friends.",
+  specificFriendsDescription = "Only selected friends can see and sync this collection.",
+  privateDescription = "Hidden from all friends.",
 }: CollectionSharingModalProps) {
   const [mode, setMode] = useState<CollectionVisibility["mode"]>(
     initialVisibility.mode,
@@ -110,7 +120,7 @@ export function CollectionSharingModal({
   return (
     <Modal
       className="modal-collection-sharing"
-      title={`Sharing — ${collectionName}`}
+      title={modalTitle ?? `Sharing — ${collectionName}`}
       onClose={onClose}
       footer={
         <div className="modal-foot-actions">
@@ -133,7 +143,7 @@ export function CollectionSharingModal({
       }
     >
       <fieldset className="collection-sharing-options">
-        <legend className="sr-only">Collection visibility</legend>
+        <legend className="sr-only">{legend}</legend>
         <label className="collection-sharing-option">
           <input
             type="radio"
@@ -145,7 +155,7 @@ export function CollectionSharingModal({
           <FontAwesomeIcon icon={faUsers} />
           <div>
             <strong>All friends</strong>
-            <small>Visible to all connected P2P friends.</small>
+            <small>{allFriendsDescription}</small>
           </div>
         </label>
 
@@ -160,7 +170,7 @@ export function CollectionSharingModal({
           <FontAwesomeIcon icon={faUserCheck} />
           <div>
             <strong>Specific friends</strong>
-            <small>Only selected friends can see and sync this collection.</small>
+            <small>{specificFriendsDescription}</small>
           </div>
         </label>
 
@@ -175,7 +185,7 @@ export function CollectionSharingModal({
           <FontAwesomeIcon icon={faLock} />
           <div>
             <strong>Private</strong>
-            <small>Hidden from all friends.</small>
+            <small>{privateDescription}</small>
           </div>
         </label>
       </fieldset>

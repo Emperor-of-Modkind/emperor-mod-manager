@@ -132,6 +132,8 @@ pub struct ShareAssistFile {
     pub file_id: u64,
     pub name: String,
     pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replace_staged_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

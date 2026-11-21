@@ -3,6 +3,7 @@
 pub mod fomod;
 pub mod game_version;
 pub mod options;
+pub mod resolution;
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -418,8 +419,16 @@ pub fn thunderstore_mod_id(namespace: &str, name: &str) -> String {
     format!("ts_{namespace}_{name}")
 }
 
+pub fn thunderstore_mod_versioned_id(namespace: &str, name: &str, version: &str) -> String {
+    format!("ts_{namespace}_{name}@{version}")
+}
+
 pub fn modio_identity_id(modio_game_id: u32, modio_mod_id: u64) -> String {
     format!("modio_{modio_game_id}_{modio_mod_id}")
+}
+
+pub fn modio_file_identity_id(modio_game_id: u32, modio_mod_id: u64, modio_file_id: u64) -> String {
+    format!("modio_{modio_game_id}_{modio_mod_id}_{modio_file_id}")
 }
 
 pub fn nexus_collection_id(slug: &str) -> String {
@@ -968,9 +977,52 @@ pub fn find_thunderstore_package<'a>(
 ) -> Option<&'a StagedMod> {
     order.mods.iter().find(|m| {
         m.source == ModSource::Thunderstore
-            && m.ts_namespace.as_deref() == Some(namespace)
-            && m.ts_name.as_deref() == Some(name)
+            && m.ts_namespace
+                .as_deref()
+                .is_some_and(|ns| ns.eq_ignore_ascii_case(namespace))
+            && m.ts_name
+                .as_deref()
+                .is_some_and(|n| n.eq_ignore_ascii_case(name))
     })
+}
+
+pub fn find_all_thunderstore_packages<'a>(
+    order: &'a LoadOrder,
+    namespace: &str,
+    name: &str,
+) -> Vec<&'a StagedMod> {
+    order
+        .mods
+        .iter()
+        .filter(|m| {
+            m.source == ModSource::Thunderstore
+                && m.ts_namespace
+                    .as_deref()
+                    .is_some_and(|ns| ns.eq_ignore_ascii_case(namespace))
+                && m.ts_name
+                    .as_deref()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(name))
+        })
+        .collect()
+}
+
+pub fn find_thunderstore_package_version<'a>(
+    order: &'a LoadOrder,
+    namespace: &str,
+    name: &str,
+    version: Option<&str>,
+) -> Option<&'a StagedMod> {
+    let want_ver = version.map(str::trim).filter(|s| !s.is_empty());
+    let matches = find_all_thunderstore_packages(order, namespace, name);
+    match want_ver {
+        Some(v) => matches.into_iter().find(|m| {
+            m.version
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|mv| mv.eq_ignore_ascii_case(v))
+        }),
+        None => matches.into_iter().next(),
+    }
 }
 
 pub fn find_modio_mod<'a>(
@@ -983,6 +1035,47 @@ pub fn find_modio_mod<'a>(
             && m.modio_game_id == Some(modio_game_id)
             && m.modio_mod_id == Some(modio_mod_id)
     })
+}
+
+pub fn find_all_modio_mods<'a>(
+    order: &'a LoadOrder,
+    modio_game_id: u32,
+    modio_mod_id: u64,
+) -> Vec<&'a StagedMod> {
+    order
+        .mods
+        .iter()
+        .filter(|m| {
+            m.source == ModSource::Modio
+                && m.modio_game_id == Some(modio_game_id)
+                && m.modio_mod_id == Some(modio_mod_id)
+        })
+        .collect()
+}
+
+pub fn find_modio_file<'a>(
+    order: &'a LoadOrder,
+    modio_game_id: u32,
+    modio_mod_id: u64,
+    modio_file_id: Option<u64>,
+    version: Option<&str>,
+) -> Option<&'a StagedMod> {
+    let matches = find_all_modio_mods(order, modio_game_id, modio_mod_id);
+    if let Some(fid) = modio_file_id.filter(|&id| id > 0) {
+        if let Some(found) = matches.iter().copied().find(|m| m.modio_file_id == Some(fid)) {
+            return Some(found);
+        }
+        return None;
+    }
+    if let Some(want_ver) = version.map(str::trim).filter(|s| !s.is_empty()) {
+        return matches.into_iter().find(|m| {
+            m.version
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|mv| mv.eq_ignore_ascii_case(want_ver))
+        });
+    }
+    matches.into_iter().next()
 }
 
 pub fn find_nexus_file<'a>(
@@ -1006,8 +1099,24 @@ pub fn find_nexus_mod<'a>(
     order.mods.iter().find(|m| {
         m.source == ModSource::Nexus
             && m.nexus_mod_id == nexus_mod_id
-            && m.domain.eq_ignore_ascii_case(domain)
+            && (domain.is_empty() || m.domain.eq_ignore_ascii_case(domain))
     })
+}
+
+pub fn find_all_nexus_mod<'a>(
+    order: &'a LoadOrder,
+    domain: &str,
+    nexus_mod_id: u64,
+) -> Vec<&'a StagedMod> {
+    order
+        .mods
+        .iter()
+        .filter(|m| {
+            m.source == ModSource::Nexus
+                && m.nexus_mod_id == nexus_mod_id
+                && (domain.is_empty() || m.domain.eq_ignore_ascii_case(domain))
+        })
+        .collect()
 }
 
 pub fn merge_mod_meta(
@@ -2549,6 +2658,7 @@ pub fn damaged_staging(order: &LoadOrder) -> Vec<&StagedMod> {
         .collect()
 }
 
+#[allow(dead_code, clippy::too_many_arguments)]
 pub fn stage_thunderstore_mod(
     paths: &Paths,
     game_id: &str,
@@ -2561,6 +2671,39 @@ pub fn stage_thunderstore_mod(
     file_name: Option<String>,
     picture_url: Option<String>,
     archive: &Path,
+) -> Result<StagedMod> {
+    stage_thunderstore_mod_with_mode(
+        paths,
+        game_id,
+        community,
+        namespace,
+        name,
+        version,
+        package_uuid,
+        display_name,
+        file_name,
+        picture_url,
+        archive,
+        true,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn stage_thunderstore_mod_with_mode(
+    paths: &Paths,
+    game_id: &str,
+    community: &str,
+    namespace: &str,
+    name: &str,
+    version: &str,
+    package_uuid: Option<String>,
+    display_name: &str,
+    file_name: Option<String>,
+    picture_url: Option<String>,
+    archive: &Path,
+    replace_existing: bool,
+    replace_id: Option<&str>,
 ) -> Result<StagedMod> {
     crate::config::ensure_game_dirs(paths, game_id)?;
     let safe = sanitize_filename::sanitize(display_name);
@@ -2576,10 +2719,66 @@ pub fn stage_thunderstore_mod(
         return Err(e);
     }
 
-    let id = thunderstore_mod_id(namespace, name);
+    let base_id = thunderstore_mod_id(namespace, name);
+    let versioned_id = thunderstore_mod_versioned_id(namespace, name, version);
     let committed = mutate_load_order(paths, game_id, |order| {
         swap_extracted_dir(&temp, &staging)?;
-        let removed = take_rows(order, |m| m.id == id);
+        let (id, removed) = if replace_existing {
+            let mut removed = Vec::new();
+            if let Some(rid) = replace_id {
+                if let Some(row) = take_row_by_id(order, rid) {
+                    removed.push(row);
+                }
+            }
+            removed.extend(take_rows(order, |m| m.id == base_id || m.id == versioned_id));
+            if removed.is_empty() {
+                removed.extend(take_rows(order, |m| {
+                    m.source == ModSource::Thunderstore
+                        && m.ts_namespace
+                            .as_deref()
+                            .is_some_and(|ns| ns.eq_ignore_ascii_case(namespace))
+                        && m.ts_name
+                            .as_deref()
+                            .is_some_and(|n| n.eq_ignore_ascii_case(name))
+                }));
+            }
+            (base_id.clone(), removed)
+        } else {
+            let other_exists = order.mods.iter().any(|m| {
+                m.source == ModSource::Thunderstore
+                    && m.ts_namespace
+                        .as_deref()
+                        .is_some_and(|ns| ns.eq_ignore_ascii_case(namespace))
+                    && m.ts_name
+                        .as_deref()
+                        .is_some_and(|n| n.eq_ignore_ascii_case(name))
+                    && !m
+                        .version
+                        .as_deref()
+                        .map(str::trim)
+                        .is_some_and(|v| v.eq_ignore_ascii_case(version.trim()))
+            });
+            let chosen_id = if other_exists {
+                versioned_id.clone()
+            } else {
+                base_id.clone()
+            };
+            let removed = take_rows(order, |m| {
+                m.id == chosen_id
+                    || (m.source == ModSource::Thunderstore
+                        && m.ts_namespace
+                            .as_deref()
+                            .is_some_and(|ns| ns.eq_ignore_ascii_case(namespace))
+                        && m.ts_name
+                            .as_deref()
+                            .is_some_and(|n| n.eq_ignore_ascii_case(name))
+                        && m.version
+                            .as_deref()
+                            .map(str::trim)
+                            .is_some_and(|v| v.eq_ignore_ascii_case(version.trim())))
+            });
+            (chosen_id, removed)
+        };
         let same_version = removed
             .first()
             .is_some_and(|old| old.version.as_deref() == Some(version));
@@ -2635,6 +2834,37 @@ pub fn stage_modio_mod(
     picture_url: Option<String>,
     archive: &Path,
 ) -> Result<StagedMod> {
+    stage_modio_mod_with_mode(
+        paths,
+        game_id,
+        modio_game_id,
+        modio_mod_id,
+        modio_file_id,
+        name,
+        version,
+        file_name,
+        picture_url,
+        archive,
+        true,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn stage_modio_mod_with_mode(
+    paths: &Paths,
+    game_id: &str,
+    modio_game_id: u32,
+    modio_mod_id: u64,
+    modio_file_id: u64,
+    name: &str,
+    version: Option<String>,
+    file_name: Option<String>,
+    picture_url: Option<String>,
+    archive: &Path,
+    replace_existing: bool,
+    replace_id: Option<&str>,
+) -> Result<StagedMod> {
     crate::config::ensure_game_dirs(paths, game_id)?;
     let safe = sanitize_filename::sanitize(name);
     let staging = paths.mods_dir(game_id).join(format!(
@@ -2646,15 +2876,45 @@ pub fn stage_modio_mod(
         return Err(e);
     }
 
-    let id = modio_identity_id(modio_game_id, modio_mod_id);
+    let base_id = modio_identity_id(modio_game_id, modio_mod_id);
+    let file_id_str = modio_file_identity_id(modio_game_id, modio_mod_id, modio_file_id);
     let committed = mutate_load_order(paths, game_id, |order| {
         swap_extracted_dir(&temp, &staging)?;
-        let mut removed = take_rows(order, |m| m.id == id);
-        removed.extend(take_rows(order, |m| {
-            m.source == ModSource::Modio
-                && m.modio_game_id == Some(modio_game_id)
-                && m.modio_mod_id == Some(modio_mod_id)
-        }));
+        let (id, removed) = if replace_existing {
+            let mut removed = Vec::new();
+            if let Some(rid) = replace_id {
+                if let Some(row) = take_row_by_id(order, rid) {
+                    removed.push(row);
+                }
+            }
+            removed.extend(take_rows(order, |m| m.id == base_id || m.id == file_id_str));
+            removed.extend(take_rows(order, |m| {
+                m.source == ModSource::Modio
+                    && m.modio_game_id == Some(modio_game_id)
+                    && m.modio_mod_id == Some(modio_mod_id)
+            }));
+            (base_id.clone(), removed)
+        } else {
+            let other_exists = order.mods.iter().any(|m| {
+                m.source == ModSource::Modio
+                    && m.modio_game_id == Some(modio_game_id)
+                    && m.modio_mod_id == Some(modio_mod_id)
+                    && m.modio_file_id != Some(modio_file_id)
+            });
+            let chosen_id = if other_exists {
+                file_id_str.clone()
+            } else {
+                base_id.clone()
+            };
+            let removed = take_rows(order, |m| {
+                m.id == chosen_id
+                    || (m.source == ModSource::Modio
+                        && m.modio_game_id == Some(modio_game_id)
+                        && m.modio_mod_id == Some(modio_mod_id)
+                        && m.modio_file_id == Some(modio_file_id))
+            });
+            (chosen_id, removed)
+        };
         let same_file = removed
             .first()
             .is_some_and(|old| old.modio_file_id == Some(modio_file_id));
@@ -2752,6 +3012,74 @@ pub fn set_enabled(paths: &Paths, game_id: &str, mod_uid: &str, enabled: bool) -
         };
         m.enabled = enabled;
         Ok(())
+    })
+}
+
+/// Enable or disable all staged mods belonging to `collection_id`.
+/// When disabling, mods listed in `protect_mod_ids` or shared with another
+/// collection that still has enabled mods are left enabled.
+pub fn set_collection_enabled(
+    paths: &Paths,
+    game_id: &str,
+    collection_id: &str,
+    enabled: bool,
+    protect_mod_ids: &[String],
+) -> Result<usize> {
+    let collections = load_collections(paths, game_id)?;
+    let Some(target) = collections.collections.iter().find(|c| c.id == collection_id) else {
+        bail!("collection not found: {collection_id}");
+    };
+    let target_member_ids: HashSet<String> = target.mod_ids.iter().cloned().collect();
+    let protected: HashSet<&str> = protect_mod_ids.iter().map(|s| s.as_str()).collect();
+
+    mutate_load_order(paths, game_id, |order| {
+        let mut active_other_mod_ids: HashSet<String> = HashSet::new();
+        if !enabled {
+            let enabled_ids: HashSet<&str> = order
+                .mods
+                .iter()
+                .filter(|m| m.enabled)
+                .map(|m| m.id.as_str())
+                .collect();
+            for other in &collections.collections {
+                if other.id == collection_id {
+                    continue;
+                }
+                let other_has_enabled = other
+                    .mod_ids
+                    .iter()
+                    .any(|id| enabled_ids.contains(id.as_str()));
+                if other_has_enabled {
+                    for id in &other.mod_ids {
+                        active_other_mod_ids.insert(id.clone());
+                    }
+                }
+            }
+        }
+
+        let mut changed = 0usize;
+        for m in &mut order.mods {
+            let belongs = target_member_ids.contains(&m.id)
+                || m.collection_ids.iter().any(|cid| cid == collection_id);
+            if !belongs {
+                continue;
+            }
+            if enabled {
+                if !m.enabled {
+                    m.enabled = true;
+                    changed += 1;
+                }
+            } else {
+                if protected.contains(m.id.as_str()) || active_other_mod_ids.contains(&m.id) {
+                    continue;
+                }
+                if m.enabled {
+                    m.enabled = false;
+                    changed += 1;
+                }
+            }
+        }
+        Ok(changed)
     })
 }
 
@@ -6954,5 +7282,147 @@ mod tests {
         assert!(!after.mods[0].enabled);
         assert_eq!(after.mods[1].id, "a");
         assert!(after.mods[1].enabled);
+    }
+
+    #[test]
+    fn set_collection_enabled_disables_exclusive_mods_and_preserves_protected_or_shared() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_dir: dir.path().join("cfg"),
+            data_dir: dir.path().join("data"),
+            cache_dir: dir.path().join("cache"),
+        };
+        let game_id = "skyrim_1";
+        let mk = |id: &str, cols: Vec<&str>| StagedMod {
+            id: id.into(),
+            name: id.into(),
+            domain: "skyrimspecialedition".into(),
+            staging_path: paths.mods_dir(game_id).join(id).to_string_lossy().into(),
+            enabled: true,
+            order: 1,
+            collection_ids: cols.into_iter().map(String::from).collect(),
+            independent: false,
+            ..Default::default()
+        };
+        save_loadorder(
+            &paths,
+            game_id,
+            &LoadOrder {
+                mods: vec![
+                    mk("exclusive", vec!["col_a"]),
+                    mk("shared_active", vec!["col_a", "col_b"]),
+                    mk("protected_incoming", vec!["col_a"]),
+                ],
+            },
+        )
+        .unwrap();
+        save_collections(
+            &paths,
+            game_id,
+            &InstalledCollections {
+                collections: vec![
+                    InstalledCollection {
+                        id: "col_a".into(),
+                        name: "Collection A".into(),
+                        mod_ids: vec![
+                            "exclusive".into(),
+                            "shared_active".into(),
+                            "protected_incoming".into(),
+                        ],
+                        ..Default::default()
+                    },
+                    InstalledCollection {
+                        id: "col_b".into(),
+                        name: "Collection B".into(),
+                        mod_ids: vec!["shared_active".into()],
+                        ..Default::default()
+                    },
+                ],
+            },
+        )
+        .unwrap();
+
+        let changed = set_collection_enabled(
+            &paths,
+            game_id,
+            "col_a",
+            false,
+            &["protected_incoming".into()],
+        )
+        .unwrap();
+        assert_eq!(changed, 1);
+
+        let after = load_loadorder(&paths, game_id).unwrap();
+        assert!(!after.mods.iter().find(|m| m.id == "exclusive").unwrap().enabled);
+        assert!(after.mods.iter().find(|m| m.id == "shared_active").unwrap().enabled);
+        assert!(after.mods.iter().find(|m| m.id == "protected_incoming").unwrap().enabled);
+
+        // Re-enabling turns exclusive back on.
+        let reenabled = set_collection_enabled(&paths, game_id, "col_a", true, &[]).unwrap();
+        assert_eq!(reenabled, 1);
+        let after_re = load_loadorder(&paths, game_id).unwrap();
+        assert!(after_re.mods.iter().find(|m| m.id == "exclusive").unwrap().enabled);
+    }
+
+    #[test]
+    fn stage_thunderstore_mod_alongside_keeps_both_versions_coexisting() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_dir: dir.path().join("cfg"),
+            data_dir: dir.path().join("data"),
+            cache_dir: dir.path().join("cache"),
+        };
+        let game_id = "lc_1";
+        let zip1 = dir.path().join("v1.zip");
+        let zip2 = dir.path().join("v2.zip");
+        for (p, content) in [(&zip1, b"v1" as &[u8]), (&zip2, b"v2" as &[u8])] {
+            let f = fs::File::create(p).unwrap();
+            let mut z = zip::ZipWriter::new(f);
+            let opts = zip::write::SimpleFileOptions::default();
+            z.start_file("plugin.dll", opts).unwrap();
+            std::io::Write::write_all(&mut z, content).unwrap();
+            z.finish().unwrap();
+        }
+
+        let first = stage_thunderstore_mod_with_mode(
+            &paths,
+            game_id,
+            "lethal-company",
+            "Owner",
+            "Pkg",
+            "1.0.0",
+            None,
+            "Pkg",
+            None,
+            None,
+            &zip1,
+            true,
+            None,
+        )
+        .unwrap();
+        assert_eq!(first.id, "ts_Owner_Pkg");
+
+        let second = stage_thunderstore_mod_with_mode(
+            &paths,
+            game_id,
+            "lethal-company",
+            "Owner",
+            "Pkg",
+            "2.0.0",
+            None,
+            "Pkg",
+            None,
+            None,
+            &zip2,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(second.id, "ts_Owner_Pkg@2.0.0");
+
+        let order = load_loadorder(&paths, game_id).unwrap();
+        assert_eq!(order.mods.len(), 2);
+        assert!(find_thunderstore_package_version(&order, "Owner", "Pkg", Some("1.0.0")).is_some());
+        assert!(find_thunderstore_package_version(&order, "Owner", "Pkg", Some("2.0.0")).is_some());
     }
 }
