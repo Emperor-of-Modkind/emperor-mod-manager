@@ -2079,8 +2079,10 @@ export default function App() {
   const assistActiveRef = useRef(false);
   const nexusLoginHostRef = useRef<HTMLDivElement | null>(null);
   const nexusLoginOpenRef = useRef(false);
+  const nexusLoginAlreadyOpenRef = useRef(false);
   const nexusLoginGenRef = useRef(0);
   const [nexusLoginOpen, setNexusLoginOpen] = useState(false);
+  const [webLoginProvider, setWebLoginProvider] = useState<"nexus" | "modio" | "nexus-key">("nexus");
   const [nexusLoginConfirming, setNexusLoginConfirming] = useState(false);
   const tabRef = useRef(tab);
   tabRef.current = tab;
@@ -4109,8 +4111,16 @@ export default function App() {
       if (!stillOpen()) return;
       await syncNexusLoginHost();
       if (!stillOpen()) return;
+      if (nexusLoginAlreadyOpenRef.current) {
+        nexusLoginAlreadyOpenRef.current = false;
+        return;
+      }
       try {
-        await api.openNexusWebsiteLogin();
+        if (webLoginProvider === "modio") {
+          await api.openModioWebsiteLogin();
+        } else {
+          await api.openNexusWebsiteLogin();
+        }
         // Open can finish after the user dismissed the modal; destroy the orphan.
         if (!stillOpen()) {
           await api.closeDownloadAssist().catch(() => {});
@@ -4147,24 +4157,59 @@ export default function App() {
         api.closeDownloadAssist().catch(() => {});
       }
     };
-  }, [nexusLoginOpen, syncNexusLoginHost]);
+  }, [nexusLoginOpen, webLoginProvider, syncNexusLoginHost]);
 
   useEffect(() => {
-    const unlisten = listen("nexus-login-complete", () => {
+    const unlistenLogin = listen("nexus-login-complete", () => {
       if (!nexusLoginOpenRef.current) return;
       nexusLoginGenRef.current += 1;
       nexusLoginOpenRef.current = false;
       setNexusLoginConfirming(false);
       setNexusLoginOpen(false);
-      api.closeDownloadAssist().catch(() => {});
+      // Do not close the assist webview here: Rust hides it and reuses the
+      // authenticated session in the background to capture the API key.
       void refreshSettings();
       setNotice({
         kind: "ok",
-        message: "Nexus website session saved.",
+        message: "Nexus website session saved. Syncing API key in background…",
+      });
+    });
+    const unlistenPrompt = listen("nexus-api-key-prompt", () => {
+      nexusLoginAlreadyOpenRef.current = true;
+      setWebLoginProvider("nexus-key");
+      setNexusLoginOpen(true);
+    });
+    const unlistenKey = listen("nexus-api-key-captured", () => {
+      if (nexusLoginOpenRef.current) {
+        nexusLoginGenRef.current += 1;
+        nexusLoginOpenRef.current = false;
+        setNexusLoginConfirming(false);
+        setNexusLoginOpen(false);
+      }
+      void refreshSettings();
+      setNotice({
+        kind: "ok",
+        message: "Nexus account connected and API key saved.",
+      });
+    });
+    const unlistenModio = listen("modio-api-key-captured", () => {
+      if (nexusLoginOpenRef.current) {
+        nexusLoginGenRef.current += 1;
+        nexusLoginOpenRef.current = false;
+        setNexusLoginConfirming(false);
+        setNexusLoginOpen(false);
+      }
+      void refreshSettings();
+      setNotice({
+        kind: "ok",
+        message: "mod.io account connected and API key saved.",
       });
     });
     return () => {
-      unlisten.then((drop) => drop());
+      unlistenLogin.then((drop) => drop());
+      unlistenPrompt.then((drop) => drop());
+      unlistenKey.then((drop) => drop());
+      unlistenModio.then((drop) => drop());
     };
   }, [refreshSettings]);
 
@@ -8931,7 +8976,14 @@ export default function App() {
         })
       }
       signInDisabled={nexusSignInBlocked}
-      onSignIn={() => setNexusLoginOpen(true)}
+      onSignIn={() => {
+        setWebLoginProvider("nexus");
+        setNexusLoginOpen(true);
+      }}
+      onModioSignIn={() => {
+        setWebLoginProvider("modio");
+        setNexusLoginOpen(true);
+      }}
       onClearWebsiteSession={() => void clearNexusWebsiteSession()}
     />
   );
@@ -10552,21 +10604,20 @@ export default function App() {
             </div>
             <div className="page-scroll">
             <p>
-              A Nexus API key and a Nexus website sign-in are both required before
-              the rest of the app opens. Use Stay signed in. The website session
-              is saved separately from the API key. Premium and free accounts
-              both need the sign-in. mod.io is optional.
+              Sign in with your Nexus Mods account (use <strong>Stay signed in</strong>)
+              to enable downloads. Your API key is retrieved automatically in the
+              background after signing in. mod.io is optional.
             </p>
             <div className="status-card">
-              <span className={settings?.has_api_key ? "pill ok" : "pill warn"}>
-                {settings?.has_api_key ? "Nexus API key saved" : "Nexus API key required"}
-              </span>
               <span
                 className={settings?.nexus_website_signed_in ? "pill ok" : "pill warn"}
               >
                 {settings?.nexus_website_signed_in
                   ? "Website sign-in saved"
                   : "Website sign-in required"}
+              </span>
+              <span className={settings?.has_api_key ? "pill ok" : "pill warn"}>
+                {settings?.has_api_key ? "Nexus API key saved" : "API key pending"}
               </span>
             </div>
             {accountConnections}
@@ -10577,7 +10628,7 @@ export default function App() {
                 title={
                   canFinishSetup
                     ? undefined
-                    : "Save a Nexus API key and finish website sign-in first."
+                    : "Sign in to Nexus (or save a personal API key) first."
                 }
                 onClick={() => void finishSetup()}
               >
@@ -13001,8 +13052,20 @@ export default function App() {
       {nexusLoginOpen && (
         <Modal
           className="modal-nexus-login"
-          title="Log in to Nexus"
-          subtitle="Use Stay signed in. This window closes after Nexus accepts the login."
+          title={
+            webLoginProvider === "modio"
+              ? "Log in to mod.io"
+              : webLoginProvider === "nexus-key"
+                ? "Complete Nexus API key"
+                : "Log in to Nexus"
+          }
+          subtitle={
+            webLoginProvider === "modio"
+              ? "Sign in to your mod.io account. This window closes automatically once your API key is retrieved."
+              : webLoginProvider === "nexus-key"
+                ? "Complete any prompt below (e.g. cookie accept or key confirmation) — this window will close automatically once your key appears."
+                : "Use Stay signed in. This window closes after Nexus accepts the login."
+          }
           onClose={closeNexusLogin}
           footer={
             <div className="modal-foot-actions">
@@ -13014,18 +13077,22 @@ export default function App() {
               >
                 Cancel
               </button>
-              <button
-                type="button"
-                onClick={() => void confirmNexusLogin()}
-                disabled={nexusLoginConfirming}
-              >
-                {nexusLoginConfirming ? "Checking…" : "I've signed in"}
-              </button>
+              {webLoginProvider === "nexus" && (
+                <button
+                  type="button"
+                  onClick={() => void confirmNexusLogin()}
+                  disabled={nexusLoginConfirming}
+                >
+                  {nexusLoginConfirming ? "Checking…" : "I've signed in"}
+                </button>
+              )}
             </div>
           }
         >
           <div ref={nexusLoginHostRef} className="nexus-login-host">
-            <p className="note">Opening Nexus…</p>
+            <p className="note">
+              {webLoginProvider === "modio" ? "Opening mod.io…" : "Opening Nexus…"}
+            </p>
           </div>
         </Modal>
       )}

@@ -61,6 +61,7 @@ pub struct NexusClient {
     /// not carry the API key.
     page_http: wreq::Client,
     rate_limit: Arc<RateLimitGate>,
+    is_anonymous: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -308,14 +309,32 @@ impl NexusClient {
         rate_limit: Arc<RateLimitGate>,
     ) -> Result<Self> {
         let api_key = api_key.into();
-        if api_key.trim().is_empty() {
+        let trimmed = api_key.trim();
+        if trimmed.is_empty() {
             bail!("API key is empty");
         }
+        Self::build_client(Some(trimmed), rate_limit)
+    }
+
+    /// Build an unauthenticated client for public Nexus GraphQL v2 browsing
+    /// and public mod page fetches. REST v1 endpoints and downloads are disabled.
+    pub fn new_anonymous(rate_limit: Arc<RateLimitGate>) -> Result<Self> {
+        Self::build_client(None, rate_limit)
+    }
+
+    #[cfg(test)]
+    pub fn is_anonymous(&self) -> bool {
+        self.is_anonymous
+    }
+
+    fn build_client(api_key: Option<&str>, rate_limit: Arc<RateLimitGate>) -> Result<Self> {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            "apikey",
-            HeaderValue::from_str(api_key.trim()).context("invalid API key header")?,
-        );
+        if let Some(key) = api_key {
+            headers.insert(
+                "apikey",
+                HeaderValue::from_str(key).context("invalid API key header")?,
+            );
+        }
         headers.insert("Application-Name", HeaderValue::from_static(APP_NAME));
         headers.insert(
             "Application-Version",
@@ -345,10 +364,14 @@ impl NexusClient {
             http,
             page_http,
             rate_limit,
+            is_anonymous: api_key.is_none(),
         })
     }
 
     pub async fn validate(&self) -> Result<NexusUser> {
+        if self.is_anonymous {
+            bail!("AUTH_REQUIRED: Nexus API key is not set.");
+        }
         let url = format!("{REST_BASE}/users/validate.json");
         let resp = self
             .send_with_retry(None, || self.http.get(&url))
@@ -448,8 +471,10 @@ impl NexusClient {
         };
         let offset = opts.offset;
 
-        // Unpaged REST trending shortcut only for the first empty trending page.
-        if query.trim().is_empty()
+        // Unpaged REST trending shortcut only for the first empty trending page
+        // when authenticated with an API key.
+        if !self.is_anonymous
+            && query.trim().is_empty()
             && sort_key == "trending"
             && !has_extra_filters(opts)
             && offset == 0
@@ -521,8 +546,8 @@ impl NexusClient {
                 })
             }
             Err(e) => {
-                // REST fallback cannot honor offset / tag filters.
-                if offset > 0 || has_extra_filters(opts) {
+                // REST fallback requires an API key and cannot honor offset / tag filters.
+                if self.is_anonymous || offset > 0 || has_extra_filters(opts) {
                     return Err(e);
                 }
                 log::warn!("GraphQL search failed, falling back to REST: {e}");
@@ -653,6 +678,9 @@ impl NexusClient {
     }
 
     pub async fn get_game(&self, domain: &str) -> Result<GameInfo> {
+        if self.is_anonymous {
+            return self.get_game_graphql(domain).await;
+        }
         let url = format!("{REST_BASE}/games/{domain}.json");
         let resp = self.send_with_retry(None, || self.http.get(&url)).await?;
         if !resp.status().is_success() {
@@ -704,12 +732,165 @@ impl NexusClient {
         })
     }
 
+    async fn get_game_graphql(&self, domain: &str) -> Result<GameInfo> {
+        let gql = r#"
+        query GameInfo($domainName: String!) {
+          game(domainName: $domainName) {
+            id
+            name
+            domainName
+            genre
+          }
+        }
+        "#;
+        let data = self.graphql(gql, json!({ "domainName": domain })).await?;
+        let g = data.get("game").cloned().unwrap_or(Value::Null);
+        if g.is_null() {
+            bail!("get game failed: game '{domain}' not found");
+        }
+        let id = g
+            .get("id")
+            .and_then(|v| v.as_u64())
+            .or_else(|| g.get("id").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()))
+            .unwrap_or(0);
+        Ok(GameInfo {
+            id,
+            name: g
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or(domain)
+                .to_string(),
+            domain_name: g
+                .get("domainName")
+                .and_then(|v| v.as_str())
+                .unwrap_or(domain)
+                .to_string(),
+            genre: g.get("genre").and_then(|v| v.as_str()).map(str::to_string),
+            forum_url: None,
+            nexusmods_url: Some(format!("https://www.nexusmods.com/{domain}")),
+            mods: None,
+            file_count: None,
+            downloads: None,
+            categories: Vec::new(),
+        })
+    }
+
     pub async fn get_mod(&self, domain: &str, mod_id: u64) -> Result<ModDetail> {
+        if self.is_anonymous {
+            return self.get_mod_graphql(domain, mod_id).await;
+        }
         let url = format!("{REST_BASE}/games/{domain}/mods/{mod_id}.json");
         let resp = self.send_with_retry(None, || self.http.get(&url)).await?;
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         detail_from_mod_response(status, &body, domain, mod_id)
+    }
+
+    async fn get_mod_graphql(&self, domain: &str, mod_id: u64) -> Result<ModDetail> {
+        let gql = r#"
+        query ModDetail($filter: ModsFilter!) {
+          mods(filter: $filter, count: 1) {
+            nodes {
+              modId
+              name
+              summary
+              description
+              pictureUrl
+              author
+              version
+              downloads
+              endorsements
+              createdAt
+              updatedAt
+              category
+              status
+              adultContent
+              uploader {
+                name
+                memberId
+              }
+              game {
+                domainName
+              }
+            }
+          }
+        }
+        "#;
+        let filter = json!({
+            "gameDomainName": [{ "value": domain, "op": "EQUALS" }],
+            "modId": [{ "value": mod_id.to_string(), "op": "EQUALS" }],
+        });
+        let data = self.graphql(gql, json!({ "filter": filter })).await?;
+        let node = data
+            .pointer("/mods/nodes/0")
+            .cloned()
+            .unwrap_or(Value::Null);
+        if node.is_null() {
+            return Ok(unavailable_mod_detail(domain, mod_id));
+        }
+        let status = node
+            .get("status")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let available = Some(!matches!(
+            status.as_deref().map(str::to_ascii_lowercase).as_deref(),
+            Some("removed" | "hidden" | "under_moderation" | "not_published" | "deleted")
+        ));
+        Ok(ModDetail {
+            mod_id: node.get("modId").and_then(|v| v.as_u64()).unwrap_or(mod_id),
+            name: node
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown mod")
+                .to_string(),
+            summary: node
+                .get("summary")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            description: node
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            picture_url: node
+                .get("pictureUrl")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            image_urls: Vec::new(),
+            author: node
+                .get("author")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            version: node
+                .get("version")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            downloads: node.get("downloads").and_then(|v| v.as_u64()),
+            endorsements: node.get("endorsements").and_then(|v| v.as_u64()),
+            created_timestamp: None,
+            updated_timestamp: None,
+            domain_name: node
+                .pointer("/game/domainName")
+                .and_then(|v| v.as_str())
+                .unwrap_or(domain)
+                .to_string(),
+            category_id: None,
+            category: node
+                .get("category")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            uploaded_by: node
+                .pointer("/uploader/name")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            status,
+            contains_adult_content: node
+                .get("adultContent")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            uploaded_users_profile_url: None,
+            available,
+            availability_note: None,
+        })
     }
 
     /// Author image carousel and hidden/removed notice from the public mod
@@ -729,6 +910,9 @@ impl NexusClient {
     }
 
     pub async fn list_mod_files(&self, domain: &str, mod_id: u64) -> Result<Vec<ModFileInfo>> {
+        if self.is_anonymous {
+            return self.list_mod_files_graphql(domain, mod_id).await;
+        }
         let url = format!("{REST_BASE}/games/{domain}/mods/{mod_id}/files.json");
         let resp = self.send_with_retry(None, || self.http.get(&url)).await?;
         if !resp.status().is_success() {
@@ -766,6 +950,74 @@ impl NexusClient {
                         .get("is_primary")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false),
+                    description: n
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            b.uploaded_timestamp
+                .cmp(&a.uploaded_timestamp)
+                .then_with(|| b.file_id.cmp(&a.file_id))
+        });
+        Ok(out)
+    }
+
+    async fn list_mod_files_graphql(&self, domain: &str, mod_id: u64) -> Result<Vec<ModFileInfo>> {
+        let game = self.get_game_graphql(domain).await?;
+        let gql = r#"
+        query ModFiles($modId: ID!, $gameId: ID!) {
+          modFiles(modId: $modId, gameId: $gameId) {
+            fileId
+            name
+            uri
+            version
+            category
+            size
+            date
+            primary
+            description
+          }
+        }
+        "#;
+        let data = self
+            .graphql(
+                gql,
+                json!({
+                    "modId": mod_id.to_string(),
+                    "gameId": game.id.to_string(),
+                }),
+            )
+            .await?;
+        let files = data
+            .get("modFiles")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let mut out: Vec<ModFileInfo> = files
+            .into_iter()
+            .filter_map(|n| {
+                let file_id = n.get("fileId")?.as_u64()?;
+                let name = n.get("name")?.as_str()?.to_string();
+                let size_kb = n.get("size").and_then(|v| v.as_u64());
+                let uploaded_timestamp = n.get("date").and_then(|v| v.as_u64());
+                Some(ModFileInfo {
+                    file_id,
+                    name,
+                    file_name: n.get("uri").and_then(|v| v.as_str()).map(str::to_string),
+                    version: n
+                        .get("version")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    category_name: n
+                        .get("category")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    size_kb,
+                    uploaded_timestamp,
+                    is_primary: n.get("primary").and_then(|v| v.as_bool()).unwrap_or(false),
                     description: n
                         .get("description")
                         .and_then(|v| v.as_str())
@@ -3504,5 +3756,16 @@ mod tests {
 
         assert_eq!(std::fs::read(&dest).unwrap(), payload);
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn anonymous_client_omits_apikey_and_blocks_validate() {
+        let client = NexusClient::new_anonymous(Arc::new(RateLimitGate::new())).unwrap();
+        assert!(client.is_anonymous());
+        let err = client.validate().await.unwrap_err().to_string();
+        assert!(err.contains("AUTH_REQUIRED"));
+
+        let authed = NexusClient::new("test-key").unwrap();
+        assert!(!authed.is_anonymous());
     }
 }

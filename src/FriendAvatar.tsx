@@ -8,6 +8,15 @@ function getInitials(name: string): string {
   return `${parts[0][0]}${parts[1][0]}`.toUpperCase();
 }
 
+const MAX_AVATAR_DATA_URL_LEN = 262_144;
+const SAFE_AVATAR_DATA_URL_RE =
+  /^data:image\/(?:png|jpeg|webp|gif);base64,[A-Za-z0-9+/]+=*$/;
+
+export function isSafeAvatarSrc(src?: string | null): src is string {
+  if (!src || src.length > MAX_AVATAR_DATA_URL_LEN) return false;
+  return SAFE_AVATAR_DATA_URL_RE.test(src);
+}
+
 export function FriendAvatar({
   name,
   src,
@@ -22,10 +31,11 @@ export function FriendAvatar({
   showStatus?: boolean;
 }) {
   const initials = getInitials(name);
+  const safeSrc = isSafeAvatarSrc(src) ? src : null;
   return (
     <span className={`friends-avatar friends-avatar-${size}`}>
-      {src ? (
-        <img className="friends-avatar-img" src={src} alt={name || "Avatar"} />
+      {safeSrc ? (
+        <img className="friends-avatar-img" src={safeSrc} alt={name || "Avatar"} />
       ) : (
         <span className="friends-avatar-fallback" aria-hidden="true">
           {initials || <FontAwesomeIcon icon={faUser} />}

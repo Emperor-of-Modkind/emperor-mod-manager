@@ -44,6 +44,321 @@ impl Default for AssistBounds {
 const NXM_SENTINEL_HOST: &str = "emperor-mod-manager.invalid";
 const NXM_SENTINEL_PATH: &str = "/capture-nxm";
 const CDN_SENTINEL_PATH: &str = "/capture-download";
+const API_KEY_SENTINEL_PATH: &str = "/capture-api-key";
+const MODIO_KEY_SENTINEL_PATH: &str = "/capture-modio-key";
+const NEXUS_API_KEY_PAGE_URL: &str = "https://www.nexusmods.com/users/myaccount?tab=api";
+const MODIO_ACCESS_PAGE_URL: &str = "https://mod.io/me/access";
+
+/// Scrapes or requests the user's personal API key on the Nexus API Access page
+/// and hands it back to Rust via an intercepted sentinel navigation.
+const API_KEY_CAPTURE_JS: &str = r#"
+(function () {
+  if (window.__emmApiKeyCaptureRunning) return;
+  window.__emmApiKeyCaptureRunning = true;
+  try { window.confirm = function () { return true; }; } catch (e) {}
+  var deadline = Date.now() + 60000;
+  var lastActionAt = 0;
+  var sent = false;
+
+  function sendKey(key) {
+    if (sent || !key) return;
+    sent = true;
+    clearInterval(timer);
+    window.location.href = 'https://emperor-mod-manager.invalid/capture-api-key?key=' + encodeURIComponent(key);
+  }
+
+  function looksLikeApiKey(raw) {
+    if (typeof raw !== 'string') return false;
+    var s = raw.trim();
+    if (s.length < 24 || s.length > 256) return false;
+    if (/\s/.test(s) || /^[•*]+$/.test(s)) return false;
+    return /^[A-Za-z0-9+/_=-]+$/.test(s);
+  }
+
+  function isVisible(el) {
+    if (!el || el.disabled) return false;
+    try {
+      var st = window.getComputedStyle(el);
+      if (st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') === 0) return false;
+      var r = el.getBoundingClientRect();
+      return r.width > 2 && r.height > 2;
+    } catch (e) { return false; }
+  }
+
+  function collectRoots(root, out) {
+    out.push(root);
+    try {
+      var all = root.querySelectorAll('*');
+      for (var i = 0; i < all.length; i++) {
+        if (all[i].shadowRoot) collectRoots(all[i].shadowRoot, out);
+      }
+    } catch (e) {}
+  }
+
+  function allRoots() {
+    var out = [];
+    collectRoots(document, out);
+    return out;
+  }
+
+  function dismissCookieBanners(roots) {
+    for (var r = 0; r < roots.length; r++) {
+      var oneTrust = roots[r].querySelector('#onetrust-accept-btn-handler, .cc-accept, .cc-allow');
+      if (isVisible(oneTrust)) { oneTrust.click(); return true; }
+      var containers = roots[r].querySelectorAll('[id*="cookie" i], [class*="cookie" i], [class*="consent" i], [aria-label*="cookie" i], [role="dialog"]');
+      for (var c = 0; c < containers.length; c++) {
+        var ctx = ((containers[c].id || '') + ' ' + (containers[c].className || '') + ' ' + (containers[c].innerText || '')).toLowerCase();
+        if (ctx.indexOf('cookie') === -1 && ctx.indexOf('consent') === -1 && ctx.indexOf('privacy') === -1) continue;
+        var btns = containers[c].querySelectorAll('button, a[role="button"], input[type="button"], input[type="submit"]');
+        for (var b = 0; b < btns.length; b++) {
+          if (!isVisible(btns[b])) continue;
+          var lbl = ((btns[b].innerText || btns[b].textContent || btns[b].value || '') + '').toLowerCase().trim();
+          if (/^(accept( all)?( cookies)?|allow all|agree|i agree|got it|ok)$/.test(lbl)) {
+            btns[b].click();
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
+  function findPersonalKey(roots) {
+    for (var r = 0; r < roots.length; r++) {
+      var clipEls = roots[r].querySelectorAll('[data-clipboard-text], [data-value]');
+      for (var c = 0; c < clipEls.length; c++) {
+        var cv = (clipEls[c].getAttribute('data-clipboard-text') || clipEls[c].getAttribute('data-value') || '').trim();
+        if (looksLikeApiKey(cv)) return cv;
+      }
+      var inputs = roots[r].querySelectorAll('input[readonly], input[type="text"], textarea[readonly], code, pre');
+      for (var j = 0; j < inputs.length; j++) {
+        var el = inputs[j];
+        var val = (el.value !== undefined ? el.value : el.textContent || '').trim();
+        if (looksLikeApiKey(val)) return val;
+      }
+    }
+    return null;
+  }
+
+  function clickConfirmDialogIfPresent(roots) {
+    for (var r = 0; r < roots.length; r++) {
+      var dialogs = roots[r].querySelectorAll('[role="dialog"], .modal, [class*="modal" i], [class*="dialog" i]');
+      for (var d = 0; d < dialogs.length; d++) {
+        if (!isVisible(dialogs[d])) continue;
+        var btns = dialogs[d].querySelectorAll('button, input[type="submit"], input[type="button"], a[role="button"]');
+        for (var b = 0; b < btns.length; b++) {
+          if (!isVisible(btns[b])) continue;
+          var lbl = ((btns[b].innerText || btns[b].textContent || btns[b].value || '') + '').toLowerCase().trim();
+          if (/^(confirm|yes|continue|proceed|generate|create|request|accept|ok)$/.test(lbl) || lbl.indexOf('confirm') !== -1) {
+            btns[b].click();
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
+  function clickRevealOrRequestIfPresent(roots) {
+    for (var r = 0; r < roots.length; r++) {
+      var buttons = roots[r].querySelectorAll('button, input[type="submit"], input[type="button"], a[role="button"]');
+      for (var i = 0; i < buttons.length; i++) {
+        var el = buttons[i];
+        if (!isVisible(el)) continue;
+        var label = ((el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || '') + '').toLowerCase().trim();
+        if (label === 'show' || label === 'reveal' || label.indexOf('show key') !== -1 || label.indexOf('reveal') !== -1) {
+          el.click();
+          return true;
+        }
+      }
+      for (var j = 0; j < buttons.length; j++) {
+        var el2 = buttons[j];
+        if (!isVisible(el2)) continue;
+        var lbl2 = ((el2.innerText || el2.textContent || el2.value || '') + '').toLowerCase().trim();
+        if (lbl2.indexOf('request') !== -1 && lbl2.indexOf('key') !== -1) {
+          el2.click();
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  var timer = setInterval(function () {
+    if (sent || Date.now() > deadline) {
+      clearInterval(timer);
+      return;
+    }
+    var roots = allRoots();
+    dismissCookieBanners(roots);
+    var key = findPersonalKey(roots);
+    if (key) {
+      sendKey(key);
+      return;
+    }
+    var now = Date.now();
+    if (now - lastActionAt < 1500) return;
+    if (clickConfirmDialogIfPresent(roots) || clickRevealOrRequestIfPresent(roots)) {
+      lastActionAt = now;
+    }
+  }, 400);
+})();
+"#;
+
+/// Scrapes or generates the user's read-only 32-char hex API key on mod.io/me/access
+/// and hands it back to Rust via an intercepted sentinel navigation.
+const MODIO_API_KEY_CAPTURE_JS: &str = r#"
+(function () {
+  if (window.__emmModioKeyCaptureRunning) return;
+  window.__emmModioKeyCaptureRunning = true;
+  try { window.confirm = function () { return true; }; } catch (e) {}
+  var deadline = Date.now() + 60000;
+  var lastActionAt = 0;
+  var sent = false;
+
+  function sendKey(key) {
+    if (sent || !key) return;
+    sent = true;
+    clearInterval(timer);
+    window.location.href = 'https://emperor-mod-manager.invalid/capture-modio-key?key=' + encodeURIComponent(key);
+  }
+
+  function looksLikeModioKey(raw) {
+    if (typeof raw !== 'string') return false;
+    var s = raw.trim();
+    return /^[a-f0-9]{32}$/i.test(s);
+  }
+
+  function isVisible(el) {
+    if (!el || el.disabled) return false;
+    try {
+      var st = window.getComputedStyle(el);
+      if (st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') === 0) return false;
+      var r = el.getBoundingClientRect();
+      return r.width > 2 && r.height > 2;
+    } catch (e) { return false; }
+  }
+
+  function collectRoots(root, out) {
+    out.push(root);
+    try {
+      var all = root.querySelectorAll('*');
+      for (var i = 0; i < all.length; i++) {
+        if (all[i].shadowRoot) collectRoots(all[i].shadowRoot, out);
+      }
+    } catch (e) {}
+  }
+
+  function allRoots() {
+    var out = [];
+    collectRoots(document, out);
+    return out;
+  }
+
+  function dismissCookieBanners(roots) {
+    for (var r = 0; r < roots.length; r++) {
+      var oneTrust = roots[r].querySelector('#onetrust-accept-btn-handler, .cc-accept, .cc-allow');
+      if (isVisible(oneTrust)) { oneTrust.click(); return true; }
+      var containers = roots[r].querySelectorAll('[id*="cookie" i], [class*="cookie" i], [class*="consent" i], [aria-label*="cookie" i], [role="dialog"]');
+      for (var c = 0; c < containers.length; c++) {
+        var ctx = ((containers[c].id || '') + ' ' + (containers[c].className || '') + ' ' + (containers[c].innerText || '')).toLowerCase();
+        if (ctx.indexOf('cookie') === -1 && ctx.indexOf('consent') === -1 && ctx.indexOf('privacy') === -1) continue;
+        var btns = containers[c].querySelectorAll('button, a[role="button"], input[type="button"], input[type="submit"]');
+        for (var b = 0; b < btns.length; b++) {
+          if (!isVisible(btns[b])) continue;
+          var lbl = ((btns[b].innerText || btns[b].textContent || btns[b].value || '') + '').toLowerCase().trim();
+          if (/^(accept( all)?( cookies)?|allow all|agree|i agree|got it|ok)$/.test(lbl)) {
+            btns[b].click();
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
+  function findModioKey(roots) {
+    for (var r = 0; r < roots.length; r++) {
+      var clipEls = roots[r].querySelectorAll('[data-clipboard-text], [data-value]');
+      for (var c = 0; c < clipEls.length; c++) {
+        var cv = (clipEls[c].getAttribute('data-clipboard-text') || clipEls[c].getAttribute('data-value') || '').trim();
+        if (looksLikeModioKey(cv)) return cv;
+      }
+      var inputs = roots[r].querySelectorAll('input[readonly], input[type="text"], textarea[readonly], code, pre, span, div');
+      for (var i = 0; i < inputs.length; i++) {
+        var el = inputs[i];
+        if (el.children && el.children.length > 0 && el.tagName !== 'CODE' && el.tagName !== 'PRE') continue;
+        var val = (el.value !== undefined ? el.value : el.textContent || '').trim();
+        if (looksLikeModioKey(val)) return val;
+      }
+    }
+    return null;
+  }
+
+  function clickConfirmDialogIfPresent(roots) {
+    for (var r = 0; r < roots.length; r++) {
+      var dialogs = roots[r].querySelectorAll('[role="dialog"], .modal, [class*="modal" i], [class*="dialog" i]');
+      for (var d = 0; d < dialogs.length; d++) {
+        if (!isVisible(dialogs[d])) continue;
+        var btns = dialogs[d].querySelectorAll('button, input[type="submit"], input[type="button"], a[role="button"]');
+        for (var b = 0; b < btns.length; b++) {
+          if (!isVisible(btns[b])) continue;
+          var lbl = ((btns[b].innerText || btns[b].textContent || btns[b].value || '') + '').toLowerCase().trim();
+          if (/^(confirm|yes|continue|proceed|generate|create|accept|ok)$/.test(lbl) || lbl.indexOf('confirm') !== -1) {
+            btns[b].click();
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
+  function clickCreateOrRevealIfPresent(roots) {
+    for (var r = 0; r < roots.length; r++) {
+      var buttons = roots[r].querySelectorAll('button, input[type="submit"], input[type="button"], a[role="button"]');
+      for (var i = 0; i < buttons.length; i++) {
+        var el = buttons[i];
+        if (!isVisible(el)) continue;
+        var label = ((el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || '') + '').toLowerCase().trim();
+        if (label === 'show' || label === 'reveal' || label.indexOf('show key') !== -1 || label.indexOf('reveal') !== -1) {
+          el.click();
+          return true;
+        }
+      }
+      for (var j = 0; j < buttons.length; j++) {
+        var el2 = buttons[j];
+        if (!isVisible(el2)) continue;
+        var lbl2 = ((el2.innerText || el2.textContent || el2.value || '') + '').toLowerCase().trim();
+        if ((lbl2.indexOf('generate') !== -1 || lbl2.indexOf('create') !== -1) && lbl2.indexOf('key') !== -1) {
+          el2.click();
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  var timer = setInterval(function () {
+    if (sent || Date.now() > deadline) {
+      clearInterval(timer);
+      return;
+    }
+    var roots = allRoots();
+    dismissCookieBanners(roots);
+    var key = findModioKey(roots);
+    if (key) {
+      sendKey(key);
+      return;
+    }
+    var now = Date.now();
+    if (now - lastActionAt < 1500) return;
+    if (clickConfirmDialogIfPresent(roots) || clickCreateOrRevealIfPresent(roots)) {
+      lastActionAt = now;
+    }
+  }, 400);
+})();
+"#;
 
 /// Two-phase free download autoclick: open Free/Premium dialog, then click Slow download.
 const AUTOCLICK_JS: &str = r#"
@@ -852,6 +1167,10 @@ pub enum AssistPurpose {
     },
     /// Sign in on the Nexus website so later downloads reuse the session cookie.
     WebsiteLogin,
+    /// Hidden follow-up step after WebsiteLogin that reads the personal API key.
+    ApiKeyCapture,
+    /// Sign in on mod.io and capture the read-only API key from /me/access.
+    ModioLogin,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1173,12 +1492,98 @@ fn download_assist_in_use(state: &AppState) -> bool {
     )
 }
 
-fn intercept_login_navigation(nav_url: &url::Url) -> bool {
+fn parse_sentinel_key(nav_url: &url::Url, expected_path: &str) -> Option<String> {
+    if nav_url.host_str() != Some(NXM_SENTINEL_HOST) || nav_url.path() != expected_path {
+        return None;
+    }
+    nav_url
+        .query_pairs()
+        .find(|(k, _)| k == "key")
+        .map(|(_, v)| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn parse_captured_api_key(nav_url: &url::Url) -> Option<String> {
+    parse_sentinel_key(nav_url, API_KEY_SENTINEL_PATH)
+}
+
+fn parse_captured_modio_key(nav_url: &url::Url) -> Option<String> {
+    parse_sentinel_key(nav_url, MODIO_KEY_SENTINEL_PATH)
+}
+
+fn is_modio_access_url(raw: &str) -> bool {
+    let Ok(url) = url::Url::parse(raw) else {
+        return false;
+    };
+    let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+    (host == "mod.io" || host == "www.mod.io")
+        && url.path().trim_end_matches('/').eq_ignore_ascii_case("/me/access")
+}
+
+fn intercept_login_navigation(app: &tauri::AppHandle, nav_url: &url::Url) -> bool {
+    if let Some(key) = parse_captured_api_key(nav_url) {
+        let handle = app.clone();
+        tauri::async_runtime::spawn(async move {
+            complete_api_key_capture(handle, key).await;
+        });
+        return false;
+    }
+    if let Some(key) = parse_captured_modio_key(nav_url) {
+        let handle = app.clone();
+        tauri::async_runtime::spawn(async move {
+            complete_modio_key_capture(handle, key).await;
+        });
+        return false;
+    }
     let s = nav_url.as_str();
     if s.starts_with("nxm://") || is_nexus_cdn_download(nav_url) {
         return false;
     }
     nav_url.host_str() != Some(NXM_SENTINEL_HOST)
+}
+
+async fn complete_modio_key_capture(app: tauri::AppHandle, key: String) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    let in_modio = peek_assist_context(&state)
+        .is_some_and(|c| matches!(c.purpose, AssistPurpose::ModioLogin));
+    if !in_modio {
+        return;
+    }
+    state.assist_desired_visible.store(false, Ordering::SeqCst);
+    let _ = apply_assist_desired_visible(&app, &state);
+    match crate::commands::save_and_validate_modio_key(&state, key).await {
+        Ok(()) => {
+            log::info!("mod.io api key captured via webview");
+            let _ = app.emit("modio-api-key-captured", ());
+        }
+        Err(e) => {
+            log::warn!("mod.io api key capture validation failed: {e}");
+        }
+    }
+    let _ = close_assist_intentionally(&app, &state);
+}
+
+async fn complete_api_key_capture(app: tauri::AppHandle, key: String) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    let in_capture = peek_assist_context(&state)
+        .is_some_and(|c| matches!(c.purpose, AssistPurpose::ApiKeyCapture));
+    if !in_capture {
+        return;
+    }
+    match crate::commands::save_and_validate_nexus_key(&state, key).await {
+        Ok(user) => {
+            log::info!("nexus api key captured silently for {}", user.name);
+            let _ = app.emit("nexus-api-key-captured", &user);
+        }
+        Err(e) => {
+            log::warn!("nexus api key capture validation failed: {e}");
+        }
+    }
+    let _ = close_assist_intentionally(&app, &state);
 }
 
 fn schedule_nexus_login_close(app: tauri::AppHandle, generation: u64) {
@@ -1197,7 +1602,63 @@ fn schedule_nexus_login_close(app: tauri::AppHandle, generation: u64) {
             log::warn!("nexus website sign-in flag: {e}");
         }
         let _ = app.emit("nexus-login-complete", ());
-        let _ = close_assist_intentionally(&app, &state);
+
+        let has_key = state
+            .api_key
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .is_some_and(|k| !k.trim().is_empty());
+        if has_key {
+            let _ = close_assist_intentionally(&app, &state);
+            return;
+        }
+
+        // Hide the WebView immediately so the user sees login finish, then reuse
+        // the authenticated session in the background to grab the API key.
+        state.assist_desired_visible.store(false, Ordering::SeqCst);
+        let _ = apply_assist_desired_visible(&app, &state);
+        if let Ok(mut lock) = state.assist.lock() {
+            if let Some(ctx) = lock.as_mut() {
+                if ctx.generation == generation {
+                    ctx.purpose = AssistPurpose::ApiKeyCapture;
+                    ctx.label = "Nexus API key".into();
+                }
+            }
+        }
+        if let (Some(webview), Ok(url)) = (
+            app.get_webview(ASSIST_LABEL),
+            NEXUS_API_KEY_PAGE_URL.parse::<url::Url>(),
+        ) {
+            if let Err(e) = webview.navigate(url) {
+                log::warn!("nexus api key capture navigate failed: {e}");
+                let _ = close_assist_intentionally(&app, &state);
+                return;
+            }
+        } else {
+            let _ = close_assist_intentionally(&app, &state);
+            return;
+        }
+
+        // If silent background capture hasn't completed after 6s (e.g., an extra
+        // confirmation modal, cookie prompt, or challenge), reveal the WebView
+        // so the user can finish it while auto-capture keeps listening.
+        let reveal_app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            let Some(state) = reveal_app.try_state::<AppState>() else {
+                return;
+            };
+            let still_capturing = peek_assist_context(&state).is_some_and(|c| {
+                c.generation == generation && matches!(c.purpose, AssistPurpose::ApiKeyCapture)
+            });
+            if still_capturing {
+                log::info!("nexus api key capture needs user interaction; revealing webview");
+                state.assist_desired_visible.store(true, Ordering::SeqCst);
+                let _ = apply_assist_desired_visible(&reveal_app, &state);
+                let _ = reveal_app.emit("nexus-api-key-prompt", ());
+            }
+        });
     });
 }
 
@@ -1809,29 +2270,66 @@ pub async fn open_nexus_website_login(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    if download_assist_in_use(&state) {
+    let parsed = nexus_sign_in_url()?;
+    open_login_webview(
+        app,
+        &state,
+        "Nexus sign-in".into(),
+        parsed,
+        AssistPurpose::WebsiteLogin,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn open_modio_website_login(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let parsed: url::Url = MODIO_ACCESS_PAGE_URL
+        .parse()
+        .map_err(|e: url::ParseError| e.to_string())?;
+    open_login_webview(
+        app,
+        &state,
+        "mod.io sign-in".into(),
+        parsed,
+        AssistPurpose::ModioLogin,
+    )
+    .await
+}
+
+async fn open_login_webview(
+    app: tauri::AppHandle,
+    state: &AppState,
+    label: String,
+    parsed: url::Url,
+    purpose: AssistPurpose,
+) -> Result<(), String> {
+    if download_assist_in_use(state) {
         return Err(
             "Download Assist is in use. Finish or cancel the queue before signing in.".into(),
         );
     }
 
     if app.get_webview(ASSIST_LABEL).is_some() {
-        let gen = peek_assist_context(&state)
+        let gen = peek_assist_context(state)
             .map(|c| c.generation)
             .unwrap_or_else(|| state.assist_window_gen.load(Ordering::SeqCst));
         state.assist_closed_gen.store(gen, Ordering::SeqCst);
-        let _ = take_assist_context(&state);
+        let _ = take_assist_context(state);
         let _ = close_assist_webview(&app);
         wait_assist_webview_gone(&app).await;
     }
 
     let generation = state.assist_window_gen.fetch_add(1, Ordering::SeqCst) + 1;
-    let bounds = stored_bounds(&state);
+    let bounds = stored_bounds(state);
+    let is_nexus = matches!(purpose, AssistPurpose::WebsiteLogin);
     set_assist_context(
-        &state,
+        state,
         AssistContext {
             game_id: String::new(),
-            label: "Nexus sign-in".into(),
+            label,
             domain: String::new(),
             mod_id: 0,
             file_id: 0,
@@ -1840,11 +2338,10 @@ pub async fn open_nexus_website_login(
             replace_staged_id: None,
             version: None,
             file_name: None,
-            purpose: AssistPurpose::WebsiteLogin,
+            purpose,
         },
     );
 
-    let parsed = nexus_sign_in_url()?;
     let assist_dir = state.paths.assist_webview_dir();
     fs::create_dir_all(&assist_dir).map_err(|e| e.to_string())?;
     let window = main_window(&app)?;
@@ -1870,9 +2367,10 @@ pub async fn open_nexus_website_login(
     )))]
     let initial_url = WebviewUrl::External(parsed.clone());
 
+    let handle_nav = app.clone();
     let mut builder = WebviewBuilder::new(ASSIST_LABEL, initial_url)
         .data_directory(assist_dir)
-        .on_navigation(|nav_url| intercept_login_navigation(nav_url));
+        .on_navigation(move |nav_url| intercept_login_navigation(&handle_nav, nav_url));
 
     let handle_new = app.clone();
     builder = builder.on_new_window(move |url, _features| {
@@ -1886,13 +2384,38 @@ pub async fn open_nexus_website_login(
 
     let handle_load = app.clone();
     let done = Arc::new(AtomicBool::new(false));
-    // One watcher for the whole WebsiteLogin lifetime; page-load only does an immediate check.
-    watch_nexus_login_cookie(app.clone(), generation, done.clone());
+    if is_nexus {
+        // One watcher for the whole WebsiteLogin lifetime; page-load only does an immediate check.
+        watch_nexus_login_cookie(app.clone(), generation, done.clone());
+    }
     builder = builder.on_page_load(move |webview, payload| {
         if payload.event() != PageLoadEvent::Finished {
             return;
         }
         let href = payload.url().as_str().to_string();
+        if let Some(state) = handle_load.try_state::<AppState>() {
+            let current_purpose = peek_assist_context(&state)
+                .filter(|c| c.generation == generation)
+                .map(|c| c.purpose);
+            match current_purpose {
+                Some(AssistPurpose::ApiKeyCapture) => {
+                    if href.to_ascii_lowercase().contains("nexusmods.com")
+                        && !is_nexus_login_url(&href)
+                    {
+                        let _ = webview.eval(API_KEY_CAPTURE_JS);
+                    }
+                    return;
+                }
+                Some(AssistPurpose::ModioLogin) => {
+                    note_assist_document_ready(&handle_load, &href);
+                    if is_modio_access_url(&href) {
+                        let _ = webview.eval(MODIO_API_KEY_CAPTURE_JS);
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
         note_assist_document_ready(&handle_load, &href);
         if is_nexus_login_url(&href) || !href.to_ascii_lowercase().contains("nexusmods.com") {
             return;
@@ -1919,7 +2442,7 @@ pub async fn open_nexus_website_login(
     ) {
         Ok(webview) => webview,
         Err(e) => {
-            let _ = take_assist_context(&state);
+            let _ = take_assist_context(state);
             return Err(e.to_string());
         }
     };
@@ -1936,15 +2459,15 @@ pub async fn open_nexus_website_login(
     {
         state.assist_hide_until_loaded.store(true, Ordering::SeqCst);
         if let Err(e) = crate::linux_embed::attach_assist(&window, bounds, false) {
-            release_assist_load_hold(&state);
-            let _ = take_assist_context(&state);
+            release_assist_load_hold(state);
+            let _ = take_assist_context(state);
             let _ = close_assist_webview(&app);
             return Err(e);
         }
     }
 
     if let Err(e) = apply_assist_bounds(&app, &webview, bounds) {
-        let _ = take_assist_context(&state);
+        let _ = take_assist_context(state);
         let _ = close_assist_webview(&app);
         return Err(e);
     }
@@ -1956,8 +2479,8 @@ pub async fn open_nexus_website_login(
         target_os = "netbsd",
         target_os = "openbsd"
     ))]
-    store_pending_assist_url(&state, &parsed);
-    apply_assist_desired_visible(&app, &state)?;
+    store_pending_assist_url(state, &parsed);
+    apply_assist_desired_visible(&app, state)?;
     Ok(())
 }
 
@@ -2226,5 +2749,58 @@ mod tests {
             "https://www.nexusmods.com/",
             &["other_cookie".to_string()]
         ));
+    }
+
+    #[test]
+    fn captured_api_key_sentinel_parses_only_valid_sentinel_urls() {
+        let valid: url::Url =
+            "https://emperor-mod-manager.invalid/capture-api-key?key=abc123XYZ=="
+                .parse()
+                .unwrap();
+        assert_eq!(
+            parse_captured_api_key(&valid).as_deref(),
+            Some("abc123XYZ==")
+        );
+
+        let empty: url::Url =
+            "https://emperor-mod-manager.invalid/capture-api-key?key=%20%20"
+                .parse()
+                .unwrap();
+        assert_eq!(parse_captured_api_key(&empty), None);
+
+        let wrong_path: url::Url =
+            "https://emperor-mod-manager.invalid/capture-nxm?key=abc123"
+                .parse()
+                .unwrap();
+        assert_eq!(parse_captured_api_key(&wrong_path), None);
+
+        let wrong_host: url::Url =
+            "https://www.nexusmods.com/capture-api-key?key=abc123"
+                .parse()
+                .unwrap();
+        assert_eq!(parse_captured_api_key(&wrong_host), None);
+    }
+
+    #[test]
+    fn captured_modio_key_and_access_url_parsing() {
+        let valid: url::Url =
+            "https://emperor-mod-manager.invalid/capture-modio-key?key=0123456789abcdef0123456789abcdef"
+                .parse()
+                .unwrap();
+        assert_eq!(
+            parse_captured_modio_key(&valid).as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(parse_captured_api_key(&valid), None);
+
+        assert!(is_modio_access_url("https://mod.io/me/access"));
+        assert!(is_modio_access_url("https://www.mod.io/me/access/"));
+        assert!(!is_modio_access_url("https://mod.io/login"));
+        assert!(!is_modio_access_url("https://example.com/me/access"));
+
+        assert!(API_KEY_CAPTURE_JS.contains("dismissCookieBanners"));
+        assert!(API_KEY_CAPTURE_JS.contains("clickConfirmDialogIfPresent"));
+        assert!(MODIO_API_KEY_CAPTURE_JS.contains("dismissCookieBanners"));
+        assert!(MODIO_API_KEY_CAPTURE_JS.contains("clickConfirmDialogIfPresent"));
     }
 }

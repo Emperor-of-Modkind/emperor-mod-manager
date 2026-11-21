@@ -6,12 +6,12 @@
 //! (`#emperor1...`) to keep wire payloads tiny.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     fs,
     io::{Read, Write},
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -19,11 +19,11 @@ use base64::Engine;
 use flate2::{read::DeflateDecoder, write::DeflateEncoder, Compression};
 use iroh::{
     endpoint::{presets, Incoming},
-    Endpoint, EndpointAddr, SecretKey,
+    Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, Semaphore};
 
 use crate::{
     config::{load_config, Paths},
@@ -35,6 +35,22 @@ pub const P2P_ALPN: &[u8] = b"emperor-p2p/1";
 pub const JOIN_CODE_PREFIX: &str = "emperor-friend1:";
 const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+const STREAM_IO_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_CONCURRENT_INCOMING: usize = 32;
+const MAX_STREAMS_PER_CONN: usize = 8;
+const MAX_PENDING_REQUESTS: usize = 50;
+const MAX_JOIN_CODE_LEN: usize = 16 * 1024;
+const MAX_JOIN_TICKET_BYTES: usize = 64 * 1024;
+const MAX_DISPLAY_NAME_CHARS: usize = 64;
+const MAX_REMOTE_COLLECTIONS: usize = 128;
+const MAX_COLLECTION_ID_CHARS: usize = 128;
+const MAX_COLLECTION_NAME_CHARS: usize = 128;
+const MAX_SHARE_HASH_CHARS: usize = 128;
+const MAX_PEER_RELAY_ADDRS: usize = 2;
+const MAX_PEER_IP_ADDRS: usize = 8;
+const HELLO_PER_PEER_COOLDOWN: Duration = Duration::from_secs(5);
+const HELLO_GLOBAL_WINDOW: Duration = Duration::from_secs(60);
+const HELLO_GLOBAL_MAX_PER_WINDOW: usize = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -127,19 +143,42 @@ pub struct FriendsStore {
 }
 
 fn default_display_name() -> String {
-    std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "Emperor User".to_string())
+    "Emperor User".to_string()
+}
+
+fn is_disallowed_ui_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+        )
+}
+
+fn sanitize_short_text(raw: &str, max_chars: usize) -> String {
+    raw.chars()
+        .filter(|&c| !is_disallowed_ui_char(c))
+        .collect::<String>()
+        .trim()
+        .chars()
+        .take(max_chars)
+        .collect()
+}
+
+fn sanitize_display_name(raw: &str, fallback: &str) -> String {
+    let cleaned = sanitize_short_text(raw, MAX_DISPLAY_NAME_CHARS);
+    if cleaned.is_empty() {
+        fallback.to_string()
+    } else {
+        cleaned
+    }
 }
 
 fn effective_display_name(store: &FriendsStore) -> String {
-    let trimmed = store.display_name.trim();
+    let trimmed = sanitize_short_text(&store.display_name, MAX_DISPLAY_NAME_CHARS);
     if trimmed.is_empty() {
         default_display_name()
     } else {
-        trimmed.to_string()
+        trimmed
     }
 }
 
@@ -149,14 +188,114 @@ fn validate_profile_picture(data_url: &str) -> Result<()> {
     if data_url.len() > MAX_PROFILE_PICTURE_BYTES {
         bail!("Profile picture exceeds 256 KB limit");
     }
-    let valid_prefix = data_url.starts_with("data:image/png;base64,")
-        || data_url.starts_with("data:image/jpeg;base64,")
-        || data_url.starts_with("data:image/webp;base64,")
-        || data_url.starts_with("data:image/gif;base64,");
-    if !valid_prefix {
-        bail!("Profile picture must be a PNG, JPEG, WebP, or GIF image");
+    let b64_payload = data_url
+        .strip_prefix("data:image/png;base64,")
+        .or_else(|| data_url.strip_prefix("data:image/jpeg;base64,"))
+        .or_else(|| data_url.strip_prefix("data:image/webp;base64,"))
+        .or_else(|| data_url.strip_prefix("data:image/gif;base64,"))
+        .ok_or_else(|| anyhow!("Profile picture must be a PNG, JPEG, WebP, or GIF image"))?;
+    if b64_payload.is_empty() {
+        bail!("Profile picture payload is empty");
     }
+    base64::engine::general_purpose::STANDARD
+        .decode(b64_payload.as_bytes())
+        .context("Profile picture contains invalid base64 data")?;
     Ok(())
+}
+
+/// Validates that a peer-supplied `EndpointAddr` matches the cryptographically
+/// verified `expected_id` and filters out unsafe/excessive transport addresses.
+fn sanitize_peer_addr(expected_id: EndpointId, addr: &EndpointAddr) -> Result<EndpointAddr> {
+    if addr.id != expected_id {
+        bail!("Peer address EndpointId does not match authenticated peer");
+    }
+    let mut filtered = BTreeSet::new();
+    let mut relay_count = 0usize;
+    let mut ip_count = 0usize;
+    for ta in &addr.addrs {
+        match ta {
+            TransportAddr::Relay(url) => {
+                let scheme = url.scheme();
+                let allowed_scheme = scheme == "https" || (cfg!(test) && scheme == "http");
+                if allowed_scheme && relay_count < MAX_PEER_RELAY_ADDRS {
+                    filtered.insert(TransportAddr::Relay(url.clone()));
+                    relay_count += 1;
+                }
+            }
+            TransportAddr::Ip(sock) => {
+                let ip = sock.ip();
+                let allowed_ip = !ip.is_unspecified()
+                    && !ip.is_multicast()
+                    && (!ip.is_loopback() || cfg!(test));
+                if allowed_ip && ip_count < MAX_PEER_IP_ADDRS {
+                    filtered.insert(TransportAddr::Ip(*sock));
+                    ip_count += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(EndpointAddr {
+        id: expected_id,
+        addrs: filtered,
+    })
+}
+
+/// Builds the `EndpointAddr` embedded in shareable join codes.
+/// When at least one relay URL is present, raw IP addresses are stripped so
+/// pasting join codes in public chat does not leak LAN/home IPs; `iroh` still
+/// connects immediately via the relay and upgrades to direct UDP holepunching.
+/// When no relay is available (e.g. relay-less LAN or tests), direct IPs are kept.
+fn join_ticket_addr(addr: &EndpointAddr) -> EndpointAddr {
+    let relays: BTreeSet<TransportAddr> = addr
+        .addrs
+        .iter()
+        .filter(|ta| matches!(ta, TransportAddr::Relay(_)))
+        .take(MAX_PEER_RELAY_ADDRS)
+        .cloned()
+        .collect();
+    if !relays.is_empty() {
+        EndpointAddr {
+            id: addr.id,
+            addrs: relays,
+        }
+    } else {
+        addr.clone()
+    }
+}
+
+#[derive(Default)]
+struct HelloRateLimiter {
+    per_peer: HashMap<String, Instant>,
+    global: VecDeque<Instant>,
+}
+
+impl HelloRateLimiter {
+    fn allow(&mut self, peer_id: &str) -> bool {
+        let now = Instant::now();
+        while let Some(&front) = self.global.front() {
+            if now.duration_since(front) >= HELLO_GLOBAL_WINDOW {
+                self.global.pop_front();
+            } else {
+                break;
+            }
+        }
+        if self.global.len() >= HELLO_GLOBAL_MAX_PER_WINDOW {
+            return false;
+        }
+        if let Some(&last) = self.per_peer.get(peer_id) {
+            if now.duration_since(last) < HELLO_PER_PEER_COOLDOWN {
+                return false;
+            }
+        }
+        if self.per_peer.len() > 512 {
+            self.per_peer
+                .retain(|_, ts| now.duration_since(*ts) < HELLO_GLOBAL_WINDOW);
+        }
+        self.per_peer.insert(peer_id.to_string(), now);
+        self.global.push_back(now);
+        true
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -254,16 +393,25 @@ pub fn decode_join_code(raw: &str) -> Result<FriendJoinTicket> {
         .trim()
         .strip_prefix(JOIN_CODE_PREFIX)
         .ok_or_else(|| anyhow!("Join code must start with {JOIN_CODE_PREFIX}"))?;
+    if payload.len() > MAX_JOIN_CODE_LEN {
+        bail!("Join code exceeds maximum allowed length");
+    }
     let compressed = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload.trim())
         .context("invalid base64 in join code")?;
-    let mut decoder = DeflateDecoder::new(&compressed[..]);
+    let decoder = DeflateDecoder::new(&compressed[..]);
     let mut json = Vec::new();
     decoder
+        .take((MAX_JOIN_TICKET_BYTES + 1) as u64)
         .read_to_end(&mut json)
         .context("failed to decompress join code")?;
-    let ticket: FriendJoinTicket =
+    if json.len() > MAX_JOIN_TICKET_BYTES {
+        bail!("Decompressed join code exceeds maximum allowed size");
+    }
+    let mut ticket: FriendJoinTicket =
         serde_json::from_slice(&json).context("invalid join ticket payload")?;
+    ticket.name = sanitize_display_name(&ticket.name, "Friend");
+    ticket.addr = sanitize_peer_addr(ticket.addr.id, &ticket.addr)?;
     Ok(ticket)
 }
 
@@ -280,7 +428,15 @@ pub fn load_friends_store(paths: &Paths) -> FriendsStore {
     let Ok(raw) = fs::read_to_string(&path) else {
         return FriendsStore::default();
     };
-    let mut store: FriendsStore = serde_json::from_str(&raw).unwrap_or_default();
+    let mut store: FriendsStore = match serde_json::from_str(&raw) {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("Failed to parse friends_store.json ({e}); backing up corrupt file");
+            let backup = path.with_extension("json.corrupt");
+            let _ = fs::copy(&path, &backup);
+            return FriendsStore::default();
+        }
+    };
     // Migrate existing stores written before `display_name_set` was tracked.
     if !store.display_name_set && !store.display_name.trim().is_empty() {
         let has_flag = serde_json::from_str::<serde_json::Value>(&raw)
@@ -304,7 +460,21 @@ pub fn save_friends_store(paths: &Paths, store: &FriendsStore) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
     let json = serde_json::to_string_pretty(store).context("serialize friends store")?;
-    fs::write(&path, json).context("write friends store")
+    let tmp_path = path.with_extension("json.tmp");
+    {
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(&tmp_path).context("open temp friends store")?;
+        file.write_all(json.as_bytes())
+            .context("write temp friends store")?;
+        let _ = file.sync_all();
+    }
+    fs::rename(&tmp_path, &path).context("rename temp friends store")
 }
 
 fn load_or_create_secret_key(paths: &Paths) -> Result<SecretKey> {
@@ -319,7 +489,16 @@ fn load_or_create_secret_key(paths: &Paths) -> Result<SecretKey> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&path, key.to_bytes()).context("write p2p identity key")?;
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(&path).context("open p2p identity key")?;
+    file.write_all(&key.to_bytes())
+        .context("write p2p identity key")?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -491,24 +670,41 @@ async fn write_frame<T: Serialize>(send: &mut iroh::endpoint::SendStream, msg: &
         bail!("p2p frame too large");
     }
     let len = (data.len() as u32).to_be_bytes();
-    send.write_all(&len).await?;
-    send.write_all(&data).await?;
-    send.finish()?;
+    tokio::time::timeout(STREAM_IO_TIMEOUT, async {
+        send.write_all(&len).await?;
+        send.write_all(&data).await?;
+        send.finish()?;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .map_err(|_| anyhow!("p2p frame write timed out"))??;
     Ok(())
 }
 
 async fn read_frame<T: for<'de> Deserialize<'de>>(
     recv: &mut iroh::endpoint::RecvStream,
 ) -> Result<T> {
-    let mut len_buf = [0u8; 4];
-    recv.read_exact(&mut len_buf).await?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    if len > MAX_FRAME_BYTES {
-        bail!("incoming p2p frame exceeds max size");
-    }
-    let mut buf = vec![0u8; len];
-    recv.read_exact(&mut buf).await?;
-    serde_json::from_slice(&buf).context("decode p2p frame")
+    tokio::time::timeout(STREAM_IO_TIMEOUT, async {
+        let mut len_buf = [0u8; 4];
+        recv.read_exact(&mut len_buf).await?;
+        let len = u32::from_be_bytes(len_buf) as usize;
+        if len > MAX_FRAME_BYTES {
+            bail!("incoming p2p frame exceeds max size");
+        }
+        // Allocate incrementally so a 4-byte length prefix cannot trigger an upfront 4 MB allocation.
+        let mut buf = Vec::with_capacity(len.min(64 * 1024));
+        let mut chunk = [0u8; 16 * 1024];
+        while buf.len() < len {
+            let to_read = (len - buf.len()).min(chunk.len());
+            match recv.read(&mut chunk[..to_read]).await? {
+                Some(0) | None => bail!("unexpected EOF while reading p2p frame"),
+                Some(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+        }
+        serde_json::from_slice(&buf).context("decode p2p frame")
+    })
+    .await
+    .map_err(|_| anyhow!("p2p frame read timed out"))?
 }
 
 struct CheckingGuard<'a>(&'a P2pService);
@@ -531,6 +727,8 @@ pub struct P2pService {
     store: Arc<Mutex<FriendsStore>>,
     endpoint: OnceCell<Endpoint>,
     app: Mutex<Option<AppHandle>>,
+    incoming_sem: Arc<Semaphore>,
+    hello_limiter: Mutex<HelloRateLimiter>,
 }
 
 impl P2pService {
@@ -541,6 +739,8 @@ impl P2pService {
             store: Arc::new(Mutex::new(store)),
             endpoint: OnceCell::new(),
             app: Mutex::new(None),
+            incoming_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_INCOMING)),
+            hello_limiter: Mutex::new(HelloRateLimiter::default()),
         })
     }
 
@@ -581,8 +781,14 @@ impl P2pService {
         });
 
         while let Some(incoming) = ep.accept().await {
+            let Ok(permit) = self.incoming_sem.clone().try_acquire_owned() else {
+                log::debug!("P2P incoming connection dropped: concurrency limit reached");
+                drop(incoming);
+                continue;
+            };
             let svc = Arc::clone(&self);
             tauri::async_runtime::spawn(async move {
+                let _permit = permit;
                 if let Err(e) = svc.handle_incoming(incoming).await {
                     log::debug!("P2P incoming connection error: {e:#}");
                 }
@@ -619,10 +825,21 @@ impl P2pService {
             drop(incoming);
             return Ok(());
         }
-        let conn = incoming.await?;
-        let remote_id = conn.remote_id().to_string();
+        let conn = tokio::time::timeout(DIAL_TIMEOUT, incoming)
+            .await
+            .map_err(|_| anyhow!("incoming handshake timed out"))??;
+        let remote_endpoint_id = conn.remote_id();
+        let remote_id = remote_endpoint_id.to_string();
 
-        while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+        let mut stream_count = 0usize;
+        while stream_count < MAX_STREAMS_PER_CONN {
+            let Ok(Ok((mut send, mut recv))) =
+                tokio::time::timeout(STREAM_IO_TIMEOUT, conn.accept_bi()).await
+            else {
+                break;
+            };
+            stream_count += 1;
+
             let req: P2pRequest = match read_frame(&mut recv).await {
                 Ok(r) => r,
                 Err(_) => break,
@@ -636,7 +853,42 @@ impl P2pService {
 
             match req {
                 P2pRequest::Hello { display_name, addr } => {
-                    let (accepted, needs_profile_pull, local_name) = {
+                    let sanitized_addr = match sanitize_peer_addr(remote_endpoint_id, &addr) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            log::debug!("Rejected P2P Hello with invalid addr from {remote_id}: {e}");
+                            let _ = write_frame(
+                                &mut send,
+                                &P2pResponse::Denied("Invalid peer address".into()),
+                            )
+                            .await;
+                            break;
+                        }
+                    };
+                    let sanitized_name = sanitize_display_name(&display_name, "Friend");
+
+                    let is_known_friend = self
+                        .store
+                        .lock()
+                        .map(|store| store.friends.iter().any(|f| f.peer_id == remote_id))
+                        .unwrap_or(false);
+                    if !is_known_friend {
+                        let allowed = self
+                            .hello_limiter
+                            .lock()
+                            .map(|mut lim| lim.allow(&remote_id))
+                            .unwrap_or(true);
+                        if !allowed {
+                            let _ = write_frame(
+                                &mut send,
+                                &P2pResponse::Denied("Too many requests".into()),
+                            )
+                            .await;
+                            break;
+                        }
+                    }
+
+                    let (accepted, needs_profile_pull, local_name, should_save) = {
                         let mut store = self.store.lock().map_err(|e| anyhow!("{e}"))?;
                         let local_name = effective_display_name(&store);
                         if let Some(friend) = store.friends.iter_mut().find(|f| f.peer_id == remote_id)
@@ -644,35 +896,44 @@ impl P2pService {
                             let was_pending = friend.status == FriendStatus::PendingOutgoing;
                             let missing_profile = friend.cached_profile.is_none();
                             friend.status = FriendStatus::Connected;
-                            friend.display_name = display_name;
-                            friend.addr = addr;
+                            friend.display_name = sanitized_name;
+                            friend.addr = sanitized_addr;
                             friend.online = true;
                             friend.last_seen_at = Some(now_rfc3339());
-                            (true, was_pending || missing_profile, local_name)
+                            (true, was_pending || missing_profile, local_name, true)
                         } else {
-                            if let Some(existing) = store
+                            let mutated = if let Some(existing) = store
                                 .pending_requests
                                 .iter_mut()
                                 .find(|r| r.peer_id == remote_id)
                             {
-                                existing.display_name = display_name;
-                                existing.addr = addr;
-                            } else {
+                                existing.display_name = sanitized_name;
+                                existing.addr = sanitized_addr;
+                                true
+                            } else if store.pending_requests.len() < MAX_PENDING_REQUESTS {
                                 store.pending_requests.push(PendingFriendRequest {
                                     peer_id: remote_id.clone(),
-                                    display_name,
+                                    display_name: sanitized_name,
                                     profile_picture: None,
-                                    addr,
+                                    addr: sanitized_addr,
                                     received_at: now_rfc3339(),
                                 });
-                            }
-                            (false, false, local_name)
+                                true
+                            } else {
+                                log::debug!(
+                                    "Ignored incoming friend request from {remote_id}: pending queue full ({MAX_PENDING_REQUESTS})"
+                                );
+                                false
+                            };
+                            (false, false, local_name, mutated)
                         }
                     };
-                    if let Ok(store) = self.store.lock() {
-                        let _ = save_friends_store(&self.paths, &store);
+                    if should_save {
+                        if let Ok(store) = self.store.lock() {
+                            let _ = save_friends_store(&self.paths, &store);
+                        }
+                        self.emit_changed();
                     }
-                    self.emit_changed();
                     write_frame(
                         &mut send,
                         &P2pResponse::HelloAck {
@@ -692,7 +953,7 @@ impl P2pService {
                     }
                 }
                 P2pRequest::GetProfile { known_hashes } => {
-                    let (snapshot, status_flipped) = {
+                    let (store_snapshot, status_flipped) = {
                         let mut store = self.store.lock().map_err(|e| anyhow!("{e}"))?;
                         let is_friend = store
                             .friends
@@ -709,22 +970,28 @@ impl P2pService {
                                 f.online = true;
                                 f.last_seen_at = Some(now_rfc3339());
                             }
-                            let local_id = ep.id().to_string();
-                            let profile = build_local_profile(
-                                &self.paths,
-                                &local_id,
-                                &store,
-                                Some(&known_hashes),
-                                Some(&remote_id),
-                            );
-                            (Some(profile), flipped)
+                            (Some(store.clone()), flipped)
                         }
                     };
                     if status_flipped {
                         self.emit_changed();
                     }
-                    match snapshot {
-                        Some(profile) => {
+                    match store_snapshot {
+                        Some(snapshot_store) => {
+                            let paths = self.paths.clone();
+                            let local_id = ep.id().to_string();
+                            let viewer = remote_id.clone();
+                            let profile = tokio::task::spawn_blocking(move || {
+                                build_local_profile(
+                                    &paths,
+                                    &local_id,
+                                    &snapshot_store,
+                                    Some(&known_hashes),
+                                    Some(&viewer),
+                                )
+                            })
+                            .await
+                            .context("build local profile task failed")?;
                             write_frame(&mut send, &P2pResponse::Profile(profile)).await?;
                         }
                         None => {
@@ -745,7 +1012,7 @@ impl P2pService {
         let store = self.store.lock().map_err(|e| anyhow!("{e}"))?;
         let (endpoint_ready, peer_id, join_code) = match self.endpoint.get() {
             Some(ep) => {
-                let addr = ep.addr();
+                let addr = join_ticket_addr(&ep.addr());
                 let pid = ep.id().to_string();
                 let ticket = FriendJoinTicket {
                     addr,
@@ -772,7 +1039,7 @@ impl P2pService {
     }
 
     pub fn set_display_name(&self, name: String) -> Result<FriendsState> {
-        let trimmed = name.trim().to_string();
+        let trimmed = sanitize_short_text(&name, MAX_DISPLAY_NAME_CHARS);
         if trimmed.is_empty() {
             bail!("Display name cannot be empty");
         }
@@ -1030,6 +1297,28 @@ impl P2pService {
     }
 
     fn apply_fetched_profile(&self, peer_id: &str, mut profile: PeerProfileSummary) -> Result<bool> {
+        if profile.peer_id != peer_id {
+            bail!("Remote profile peer_id does not match authenticated peer");
+        }
+        profile.display_name = sanitize_display_name(&profile.display_name, "Friend");
+        if let Some(ref pic) = profile.profile_picture {
+            if let Err(e) = validate_profile_picture(pic) {
+                log::warn!("Dropped invalid remote profile picture from {peer_id}: {e}");
+                profile.profile_picture = None;
+            }
+        }
+        profile.collections.truncate(MAX_REMOTE_COLLECTIONS);
+        for col in &mut profile.collections {
+            col.id = sanitize_short_text(&col.id, MAX_COLLECTION_ID_CHARS);
+            col.name = sanitize_short_text(&col.name, MAX_COLLECTION_NAME_CHARS);
+            col.share_hash = sanitize_short_text(&col.share_hash, MAX_SHARE_HASH_CHARS);
+            if col.share_code.len() > share::MAX_SHARE_CODE_BYTES {
+                log::warn!("Dropped oversized share_code from {peer_id} for collection {}", col.id);
+                col.share_code.clear();
+            }
+        }
+        profile.collections.retain(|c| !c.id.is_empty());
+
         let mut store = self.store.lock().map_err(|e| anyhow!("{e}"))?;
         let mut changed = false;
         if let Some(f) = store.friends.iter_mut().find(|f| f.peer_id == peer_id) {
@@ -1169,17 +1458,27 @@ impl P2pService {
                 },
                 profile_resp,
             ))) => {
+                let sanitized_name = sanitize_display_name(&display_name, "Friend");
+                let sanitized_addr = match sanitize_peer_addr(addr.id, &remote_addr) {
+                    Ok(a) => Some(a),
+                    Err(e) => {
+                        log::warn!("Ignored invalid remote_addr in HelloAck from {peer_id}: {e}");
+                        None
+                    }
+                };
                 let mut hello_changed = false;
                 {
                     let mut store = self.store.lock().map_err(|e| anyhow!("{e}"))?;
                     if let Some(f) = store.friends.iter_mut().find(|f| f.peer_id == peer_id) {
-                        if !f.online || f.display_name != display_name {
+                        if !f.online || f.display_name != sanitized_name {
                             hello_changed = true;
                         }
                         f.online = true;
                         f.last_seen_at = Some(now_rfc3339());
-                        f.display_name = display_name;
-                        f.addr = remote_addr;
+                        f.display_name = sanitized_name;
+                        if let Some(valid_addr) = sanitized_addr {
+                            f.addr = valid_addr;
+                        }
                         if accepted && f.status != FriendStatus::Connected {
                             f.status = FriendStatus::Connected;
                             hello_changed = true;
@@ -1733,5 +2032,179 @@ mod tests {
 
         let online = reloaded.set_appear_offline(false).unwrap();
         assert!(!online.appear_offline);
+    }
+
+    #[test]
+    fn join_code_rejects_decompression_bomb() {
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::best());
+        let chunk = vec![0u8; 16 * 1024];
+        for _ in 0..8 {
+            encoder.write_all(&chunk).unwrap();
+        }
+        let compressed = encoder.finish().unwrap();
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(compressed);
+        let code = format!("{JOIN_CODE_PREFIX}{encoded}");
+        let err = decode_join_code(&code).unwrap_err();
+        assert!(err.to_string().contains("exceeds maximum allowed size"));
+    }
+
+    #[test]
+    fn sanitize_peer_addr_enforces_identity_and_filters_unsafe_addrs() {
+        let key_a = SecretKey::generate();
+        let key_b = SecretKey::generate();
+
+        let mut addrs = BTreeSet::new();
+        addrs.insert(TransportAddr::Ip(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
+            1234,
+        )));
+        addrs.insert(TransportAddr::Ip(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1)),
+            1234,
+        )));
+        addrs.insert(TransportAddr::Ip(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
+            41234,
+        )));
+
+        // Mismatched EndpointId must be rejected.
+        let wrong_id = EndpointAddr {
+            id: key_b.public(),
+            addrs: addrs.clone(),
+        };
+        assert!(sanitize_peer_addr(key_a.public(), &wrong_id).is_err());
+
+        // Valid EndpointId filters out unspecified and multicast IPs.
+        let right_id = EndpointAddr {
+            id: key_a.public(),
+            addrs,
+        };
+        let sanitized = sanitize_peer_addr(key_a.public(), &right_id).unwrap();
+        assert_eq!(sanitized.id, key_a.public());
+        assert_eq!(sanitized.addrs.len(), 1);
+    }
+
+    #[test]
+    fn join_ticket_addr_strips_ips_when_relay_present_and_keeps_fallback() {
+        let key = SecretKey::generate();
+        let relay: iroh::RelayUrl = "https://use1-1.relay.n0.iroh-canary.iroh.link.".parse().unwrap();
+
+        let mut with_relay = BTreeSet::new();
+        with_relay.insert(TransportAddr::Relay(relay.clone()));
+        with_relay.insert(TransportAddr::Ip(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)),
+            41234,
+        )));
+        let stripped = join_ticket_addr(&EndpointAddr {
+            id: key.public(),
+            addrs: with_relay,
+        });
+        assert_eq!(stripped.addrs.len(), 1);
+        assert!(stripped.addrs.contains(&TransportAddr::Relay(relay)));
+
+        let mut ip_only = BTreeSet::new();
+        let sock = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)), 41234);
+        ip_only.insert(TransportAddr::Ip(sock));
+        let fallback = join_ticket_addr(&EndpointAddr {
+            id: key.public(),
+            addrs: ip_only,
+        });
+        assert_eq!(fallback.addrs.len(), 1);
+        assert!(fallback.addrs.contains(&TransportAddr::Ip(sock)));
+    }
+
+    #[test]
+    fn apply_fetched_profile_rejects_mismatched_peer_and_sanitizes_fields() {
+        let dir = tempdir().unwrap();
+        let paths = Paths {
+            config_dir: dir.path().join("cfg"),
+            data_dir: dir.path().join("data"),
+            cache_dir: dir.path().join("cache"),
+        };
+        fs::create_dir_all(&paths.data_dir).unwrap();
+
+        let key = SecretKey::generate();
+        let other = SecretKey::generate();
+        let peer_id = key.public().to_string();
+        let svc = P2pService::new(paths);
+        {
+            let mut store = svc.store.lock().unwrap();
+            store.friends.push(FriendRecord {
+                peer_id: peer_id.clone(),
+                display_name: "Bob".into(),
+                profile_picture: None,
+                addr: EndpointAddr::new(key.public()),
+                status: FriendStatus::Connected,
+                online: false,
+                last_seen_at: None,
+                cached_profile: None,
+            });
+        }
+
+        // Mismatched peer_id must fail.
+        let wrong_peer = PeerProfileSummary {
+            peer_id: other.public().to_string(),
+            display_name: "Mallory".into(),
+            profile_picture: None,
+            updated_at: "t1".into(),
+            collections: vec![],
+        };
+        assert!(svc.apply_fetched_profile(&peer_id, wrong_peer).is_err());
+
+        // Malicious SVG/asset avatar & bidi control chars are stripped/sanitized.
+        let malicious = PeerProfileSummary {
+            peer_id: peer_id.clone(),
+            display_name: "Bob\u{202E}\x07Evil".into(),
+            profile_picture: Some("data:image/svg+xml;base64,PHN2Zz4=".into()),
+            updated_at: "t2".into(),
+            collections: vec![],
+        };
+        assert!(svc.apply_fetched_profile(&peer_id, malicious).unwrap());
+        let state = svc.get_state().unwrap();
+        assert_eq!(state.friends[0].display_name, "BobEvil");
+        assert!(state.friends[0].profile_picture.is_none());
+
+        // asset:// URL avatar is also stripped.
+        let asset_avatar = PeerProfileSummary {
+            peer_id: peer_id.clone(),
+            display_name: "Bob".into(),
+            profile_picture: Some("asset://localhost/home/user/.ssh/id_rsa".into()),
+            updated_at: "t3".into(),
+            collections: vec![],
+        };
+        let _ = svc.apply_fetched_profile(&peer_id, asset_avatar).unwrap();
+        assert!(svc.get_state().unwrap().friends[0].profile_picture.is_none());
+    }
+
+    #[test]
+    fn default_display_name_does_not_leak_os_user() {
+        assert_eq!(default_display_name(), "Emperor User");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_key_and_store_created_with_0600_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let paths = Paths {
+            config_dir: dir.path().join("cfg"),
+            data_dir: dir.path().join("data"),
+            cache_dir: dir.path().join("cache"),
+        };
+        let _ = load_or_create_secret_key(&paths).unwrap();
+        let key_mode = fs::metadata(identity_key_path(&paths))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(key_mode, 0o600);
+
+        save_friends_store(&paths, &FriendsStore::default()).unwrap();
+        let store_mode = fs::metadata(store_path(&paths))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(store_mode, 0o600);
     }
 }

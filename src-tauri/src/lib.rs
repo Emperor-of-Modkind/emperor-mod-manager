@@ -218,6 +218,7 @@ pub fn run() {
             commands::force_reset_download,
             assist::open_download_assist,
             assist::open_nexus_website_login,
+            assist::open_modio_website_login,
             assist::confirm_nexus_website_login,
             assist::close_download_assist,
             assist::clear_assist_session,

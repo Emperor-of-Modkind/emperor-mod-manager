@@ -387,6 +387,7 @@ export const api = {
     invoke<void>("set_assist_visible", { visible }),
   closeDownloadAssist: () => invoke<void>("close_download_assist"),
   openNexusWebsiteLogin: () => invoke<void>("open_nexus_website_login"),
+  openModioWebsiteLogin: () => invoke<void>("open_modio_website_login"),
   confirmNexusWebsiteLogin: () => invoke<void>("confirm_nexus_website_login"),
   clearAssistSession: () => invoke<void>("clear_assist_session"),
   collectionFiles: (args: { slug: string; revision?: number | null }) =>

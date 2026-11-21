@@ -14,6 +14,8 @@ use crate::{
 };
 
 pub const SHARE_PREFIX: &str = "#emperor1\n";
+pub const MAX_SHARE_CODE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_SHARE_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 /// Chat apps (Discord ~2K) often mangle or truncate pastes above this size.
 const SOFT_SIZE_WARN: usize = 2 * 1024;
 const ALTERED_SHARE_HINT: &str = "Share code looks altered or damaged (often by Discord/chat paste). Re-copy from Emperor or send an .emperor-share / text file instead.";
@@ -215,6 +217,9 @@ fn compact_base64_payload(encoded: &str) -> String {
 
 pub fn decode_share_code(raw: &str) -> Result<ShareManifest> {
     let trimmed = strip_bom(raw).trim();
+    if trimmed.len() > MAX_SHARE_CODE_BYTES {
+        bail!("share code exceeds maximum allowed size");
+    }
     let encoded = trimmed
         .strip_prefix(SHARE_PREFIX)
         .or_else(|| {
@@ -228,13 +233,17 @@ pub fn decode_share_code(raw: &str) -> Result<ShareManifest> {
         .decode(compact.as_bytes())
         .or_else(|_| base64::engine::general_purpose::STANDARD.decode(compact.as_bytes()))
         .context("decode share payload")?;
-    let mut decoder = DeflateDecoder::new(compressed.as_slice());
+    let decoder = DeflateDecoder::new(compressed.as_slice());
     let mut json = Vec::new();
     // Discord truncation often still base64-decodes; inflate may fail, or yield
     // partial bytes that then fail JSON parse — treat both as altered paste.
     decoder
+        .take((MAX_SHARE_MANIFEST_BYTES + 1) as u64)
         .read_to_end(&mut json)
         .map_err(|_| anyhow!(ALTERED_SHARE_HINT))?;
+    if json.len() > MAX_SHARE_MANIFEST_BYTES {
+        bail!("decompressed share manifest exceeds maximum allowed size");
+    }
     let manifest: ShareManifest =
         serde_json::from_slice(&json).map_err(|_| anyhow!(ALTERED_SHARE_HINT))?;
     if manifest.v != 1 {
@@ -1358,5 +1367,21 @@ mod tests {
         let code_disabled = encode_share_manifest(&m_one_disabled).unwrap();
 
         assert_ne!(share_hash(&code_enabled), share_hash(&code_disabled));
+    }
+
+    #[test]
+    fn decode_share_code_rejects_decompression_bomb() {
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::best());
+        // Compress 5 MB of zeroes (~5 KB compressed) to exceed MAX_SHARE_MANIFEST_BYTES.
+        let chunk = vec![0u8; 64 * 1024];
+        for _ in 0..80 {
+            encoder.write_all(&chunk).unwrap();
+        }
+        let compressed = encoder.finish().unwrap();
+        assert!(compressed.len() < 32 * 1024);
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(compressed);
+        let bomb_code = format!("{SHARE_PREFIX}{encoded}");
+        let err = decode_share_code(&bomb_code).unwrap_err();
+        assert!(err.to_string().contains("exceeds maximum allowed size"));
     }
 }

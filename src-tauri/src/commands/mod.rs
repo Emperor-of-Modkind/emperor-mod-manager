@@ -378,7 +378,7 @@ impl AppState {
         {
             return Ok(cached);
         }
-        let client = self.client()?;
+        let client = self.browse_client()?;
         let info = client.get_game(domain).await.map_err(|e| e.to_string())?;
         self.game_info_cache
             .lock()
@@ -411,8 +411,24 @@ impl AppState {
             .lock()
             .map_err(|e| e.to_string())?
             .clone()
-            .ok_or_else(|| "No API key set. Add one in Setup.".to_string())?;
+            .ok_or_else(|| "No API key set. Sign in to Nexus or add one in Settings.".to_string())?;
         NexusClient::new_with_gate(key, self.rate_limit.clone()).map_err(|e| e.to_string())
+    }
+
+    /// Returns an authenticated client when an API key is configured, or an
+    /// anonymous client for public GraphQL v2 browsing and mod page fetches.
+    pub fn browse_client(&self) -> Result<NexusClient, String> {
+        if let Some(key) = self
+            .api_key
+            .lock()
+            .map_err(|e| e.to_string())?
+            .clone()
+            .filter(|k| !k.trim().is_empty())
+        {
+            return NexusClient::new_with_gate(key, self.rate_limit.clone())
+                .map_err(|e| e.to_string());
+        }
+        NexusClient::new_anonymous(self.rate_limit.clone()).map_err(|e| e.to_string())
     }
 
     /// Acquires download semaphore permits respecting adaptive concurrency
@@ -2659,22 +2675,29 @@ pub fn set_active_game(state: State<'_, AppState>, id: String) -> Result<(), Str
     config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-pub async fn set_api_key(state: State<'_, AppState>, key: String) -> Result<NexusUser, String> {
+pub async fn save_and_validate_nexus_key(
+    state: &AppState,
+    key: String,
+) -> Result<NexusUser, String> {
     let key = key.trim().to_string();
     if key.is_empty() {
         return Err("API key cannot be empty".into());
     }
+    let client = NexusClient::new(key.clone()).map_err(|e| e.to_string())?;
+    let user = client.validate().await.map_err(|e| e.to_string())?;
     if let Err(e) = nexus::store_api_key(&key) {
         log::warn!("keyring store failed: {e}");
         let file = state.paths.config_dir.join("nexus_api_key");
         nexus::store_api_key_file(&file, &key).map_err(|e| e.to_string())?;
     }
-    *state.api_key.lock().map_err(|e| e.to_string())? = Some(key.clone());
-    let client = NexusClient::new(key).map_err(|e| e.to_string())?;
-    let user = client.validate().await.map_err(|e| e.to_string())?;
+    *state.api_key.lock().map_err(|e| e.to_string())? = Some(key);
     *state.user.lock().map_err(|e| e.to_string())? = Some(user.clone());
     Ok(user)
+}
+
+#[tauri::command]
+pub async fn set_api_key(state: State<'_, AppState>, key: String) -> Result<NexusUser, String> {
+    save_and_validate_nexus_key(&state, key).await
 }
 
 #[tauri::command]
@@ -2695,8 +2718,7 @@ pub fn clear_api_key(state: State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
-pub async fn set_modio_api_key(state: State<'_, AppState>, key: String) -> Result<(), String> {
+pub async fn save_and_validate_modio_key(state: &AppState, key: String) -> Result<(), String> {
     let key = key.trim().to_string();
     if key.is_empty() {
         return Err("mod.io API key cannot be empty".into());
@@ -2716,6 +2738,11 @@ pub async fn set_modio_api_key(state: State<'_, AppState>, key: String) -> Resul
         .map_err(|e| e.to_string())?
         .clear();
     Ok(())
+}
+
+#[tauri::command]
+pub async fn set_modio_api_key(state: State<'_, AppState>, key: String) -> Result<(), String> {
+    save_and_validate_modio_key(&state, key).await
 }
 
 #[tauri::command]
@@ -2752,7 +2779,7 @@ pub async fn search_mods(
         .lock()
         .map_err(|e| e.to_string())?
         .adult_content;
-    let client = state.client()?;
+    let client = state.browse_client()?;
     let opts = nexus::BrowseSearchOpts {
         sort: sort.unwrap_or_else(|| "endorsements".into()),
         category,
@@ -3147,7 +3174,7 @@ pub async fn suggest_authors(
     let mut seen: HashSet<String> = HashSet::new();
 
     if nexus_domain.is_some() {
-        match state.client() {
+        match state.browse_client() {
             Ok(client) => match client
                 .search_users(&query, AUTHOR_SUGGEST_LIMIT as u32)
                 .await
@@ -3249,7 +3276,7 @@ async fn search_nexus_catalog(
     let Some(domain) = domain else {
         return (Vec::new(), 0, false);
     };
-    let client = match state.client() {
+    let client = match state.browse_client() {
         Ok(client) => client,
         Err(e) => {
             log::warn!("Nexus client unavailable for catalog: {e}");
@@ -4972,7 +4999,7 @@ pub async fn get_mod(
     domain: String,
     mod_id: u64,
 ) -> Result<ModDetail, String> {
-    let client = state.client()?;
+    let client = state.browse_client()?;
     let mut detail = client
         .get_mod(&domain, mod_id)
         .await
@@ -5017,7 +5044,7 @@ pub async fn mod_files(
     domain: String,
     mod_id: u64,
 ) -> Result<Vec<ModFileInfo>, String> {
-    let client = state.client()?;
+    let client = state.browse_client()?;
     client
         .list_mod_files(&domain, mod_id)
         .await
@@ -5043,7 +5070,7 @@ pub async fn search_collections(
         .lock()
         .map_err(|e| e.to_string())?
         .adult_content;
-    let client = state.client()?;
+    let client = state.browse_client()?;
     let opts = nexus::BrowseSearchOpts {
         sort: sort.unwrap_or_else(|| "endorsements".into()),
         category,
@@ -5154,7 +5181,7 @@ pub async fn search_collection_catalog(
     let mut nexus_available = false;
     if want_nexus {
         if let Some(domain) = &nexus_domain {
-            match state.client() {
+            match state.browse_client() {
                 Ok(client) => {
                     nexus_available = true;
                     let opts = nexus::BrowseSearchOpts {
@@ -5226,7 +5253,7 @@ pub async fn browse_meta(
         .lock()
         .map_err(|e| e.to_string())?
         .adult_content;
-    let client = state.client()?;
+    let client = state.browse_client()?;
     client
         .browse_meta(&domain, adult)
         .await
@@ -5244,7 +5271,7 @@ pub async fn get_collection(
         .lock()
         .map_err(|e| e.to_string())?
         .adult_content;
-    let client = state.client()?;
+    let client = state.browse_client()?;
     client
         .get_collection(&slug, domain.as_deref(), adult)
         .await
@@ -5262,7 +5289,7 @@ pub async fn collection_files(
         .lock()
         .map_err(|e| e.to_string())?
         .adult_content;
-    let client = state.client()?;
+    let client = state.browse_client()?;
     client
         .collection_mod_files(&slug, revision, adult)
         .await
@@ -6199,8 +6226,10 @@ pub async fn start_assist_cdn_download(
             install_path,
         } => Some((plugin_id.clone(), install_path.clone())),
         crate::assist::AssistPurpose::StageMod => None,
-        crate::assist::AssistPurpose::WebsiteLogin => {
-            return Err("Nexus website login is not a download".into());
+        crate::assist::AssistPurpose::WebsiteLogin
+        | crate::assist::AssistPurpose::ApiKeyCapture
+        | crate::assist::AssistPurpose::ModioLogin => {
+            return Err("Website login is not a download".into());
         }
     };
 
