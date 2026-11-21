@@ -34,7 +34,7 @@ pub enum ShareModSource {
     Modio,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ShareGameHint {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -79,6 +79,8 @@ pub struct ShareModEntry {
     pub fomod: Option<crate::mods::fomod::FomodSelection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub options: Option<crate::mods::options::ModOptionSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -405,7 +407,7 @@ pub fn build_manifest_from_loadorder(
     game: &ManagedGame,
     name: Option<String>,
 ) -> (ShareManifest, Vec<String>, Vec<String>) {
-    build_manifest_from_loadorder_with_selections(order, game, name, false)
+    build_manifest_from_loadorder_with_selections(order, game, name, true)
 }
 
 pub fn build_manifest_from_loadorder_with_selections(
@@ -414,11 +416,37 @@ pub fn build_manifest_from_loadorder_with_selections(
     name: Option<String>,
     include_selections: bool,
 ) -> (ShareManifest, Vec<String>, Vec<String>) {
+    build_manifest_inner(order, game, name, include_selections, None)
+}
+
+pub fn build_manifest_for_collection(
+    order: &LoadOrder,
+    game: &ManagedGame,
+    collection_id: &str,
+    name: Option<String>,
+) -> (ShareManifest, Vec<String>, Vec<String>) {
+    build_manifest_inner(order, game, name, true, Some(collection_id))
+}
+
+fn build_manifest_inner(
+    order: &LoadOrder,
+    game: &ManagedGame,
+    name: Option<String>,
+    include_selections: bool,
+    collection_id: Option<&str>,
+) -> (ShareManifest, Vec<String>, Vec<String>) {
     let mut mods = Vec::new();
     let mut skipped = Vec::new();
     let mut member_ids = Vec::new();
 
-    let mut enabled: Vec<&StagedMod> = order.mods.iter().filter(|m| m.enabled).collect();
+    let mut enabled: Vec<&StagedMod> = order
+        .mods
+        .iter()
+        .filter(|m| match collection_id {
+            Some(cid) => m.collection_ids.iter().any(|id| id == cid),
+            None => m.enabled,
+        })
+        .collect();
     enabled.sort_by_key(|m| m.order);
 
     for m in enabled {
@@ -426,6 +454,7 @@ pub fn build_manifest_from_loadorder_with_selections(
             skipped.push(format!("{} (config overlay)", display_name(m)));
             continue;
         }
+        let mod_enabled = collection_id.and_then(|_| (!m.enabled).then_some(false));
         match m.source {
             ModSource::Nexus => {
                 if m.nexus_mod_id == 0 || m.nexus_file_id == 0 {
@@ -448,6 +477,7 @@ pub fn build_manifest_from_loadorder_with_selections(
                     version: m.version.clone(),
                     fomod: include_selections.then(|| m.fomod_selection.clone()).flatten(),
                     options: include_selections.then(|| m.option_selection.clone()).flatten(),
+                    enabled: mod_enabled,
                 });
                 member_ids.push(m.id.clone());
             }
@@ -470,6 +500,7 @@ pub fn build_manifest_from_loadorder_with_selections(
                     version: m.version.clone(),
                     fomod: include_selections.then(|| m.fomod_selection.clone()).flatten(),
                     options: include_selections.then(|| m.option_selection.clone()).flatten(),
+                    enabled: mod_enabled,
                 });
                 member_ids.push(m.id.clone());
             }
@@ -491,6 +522,7 @@ pub fn build_manifest_from_loadorder_with_selections(
                     version: m.version.clone(),
                     fomod: include_selections.then(|| m.fomod_selection.clone()).flatten(),
                     options: include_selections.then(|| m.option_selection.clone()).flatten(),
+                    enabled: mod_enabled,
                 });
                 member_ids.push(m.id.clone());
             }
@@ -571,22 +603,107 @@ pub fn add_saved_collection(
     Ok(entry)
 }
 
+pub struct RenamedSavedCollection {
+    pub entry: SavedCollectionEntry,
+    pub old_code: String,
+}
+
 pub fn rename_saved_collection(
     paths: &Paths,
     id: &str,
     name: &str,
-) -> Result<SavedCollectionEntry> {
+) -> Result<RenamedSavedCollection> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("Name cannot be empty."));
+    }
     let mut store = load_saved_collections(paths)?;
     let entry = store
         .collections
         .iter_mut()
         .find(|c| c.id == id)
         .ok_or_else(|| anyhow!("saved collection not found"))?;
-    entry.name = name.trim().to_string();
+    let old_code = entry.code.clone();
+    if entry.share_id.is_none() {
+        entry.share_id = Some(emperor_share_id(old_code.trim()));
+    }
+    entry.name = trimmed.to_string();
+    if let Ok(mut manifest) = decode_share_code(&old_code) {
+        manifest.name = Some(trimmed.to_string());
+        entry.code = encode_share_manifest(&manifest)?;
+    }
     entry.updated_at = now_rfc3339();
     let cloned = entry.clone();
     save_saved_collections(paths, &store)?;
-    Ok(cloned)
+    Ok(RenamedSavedCollection {
+        entry: cloned,
+        old_code,
+    })
+}
+
+pub fn rename_saved_collection_by_share(
+    paths: &Paths,
+    share_id: &str,
+    old_code: Option<&str>,
+    name: &str,
+    new_code: Option<&str>,
+) -> Result<Option<SavedCollectionEntry>> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("Name cannot be empty."));
+    }
+    let mut store = load_saved_collections(paths)?;
+    let Some(entry) = store.collections.iter_mut().find(|c| {
+        c.share_id.as_deref() == Some(share_id)
+            || old_code.is_some_and(|code| c.code.trim() == code.trim())
+    }) else {
+        return Ok(None);
+    };
+    if entry.share_id.is_none() {
+        entry.share_id = Some(share_id.to_string());
+    }
+    entry.name = trimmed.to_string();
+    if let Some(code) = new_code {
+        entry.code = code.to_string();
+    } else if let Ok(mut manifest) = decode_share_code(&entry.code) {
+        manifest.name = Some(trimmed.to_string());
+        entry.code = encode_share_manifest(&manifest)?;
+    }
+    entry.updated_at = now_rfc3339();
+    let cloned = entry.clone();
+    save_saved_collections(paths, &store)?;
+    Ok(Some(cloned))
+}
+
+pub fn update_saved_collection_snapshot(
+    paths: &Paths,
+    share_id: &str,
+    old_code: Option<&str>,
+    new_code: &str,
+    game_versions: Option<Vec<String>>,
+) -> Result<Option<SavedCollectionEntry>> {
+    let manifest = decode_share_code(new_code)?;
+    let preview = preview_from_manifest(&manifest, new_code.len());
+    let mut store = load_saved_collections(paths)?;
+    let Some(entry) = store.collections.iter_mut().find(|c| {
+        c.share_id.as_deref() == Some(share_id)
+            || old_code.is_some_and(|code| c.code == code)
+    }) else {
+        return Ok(None);
+    };
+    entry.code = new_code.to_string();
+    entry.mod_count = preview.mods.len();
+    entry.nexus_count = preview.nexus_count;
+    entry.thunderstore_count = preview.thunderstore_count;
+    entry.modio_count = preview.modio_count;
+    if game_versions.is_some() {
+        entry.game_versions = game_versions;
+    }
+    entry.share_id = Some(share_id.to_string());
+    entry.updated_at = now_rfc3339();
+    let cloned = entry.clone();
+    save_saved_collections(paths, &store)?;
+    Ok(Some(cloned))
 }
 
 pub fn delete_saved_collection(paths: &Paths, id: &str) -> Result<()> {
@@ -728,6 +845,7 @@ mod tests {
                     version: Some("1.0".into()),
                     fomod: None,
                     options: None,
+                    enabled: None,
                 },
                 ShareModEntry {
                     s: ShareModSource::Thunderstore,
@@ -742,6 +860,7 @@ mod tests {
                     version: Some("2.0.0".into()),
                     fomod: None,
                     options: None,
+                    enabled: None,
                 },
                 ShareModEntry {
                     s: ShareModSource::Modio,
@@ -756,6 +875,7 @@ mod tests {
                     version: None,
                     fomod: None,
                     options: None,
+                    enabled: None,
                 },
             ],
         }
@@ -875,6 +995,7 @@ mod tests {
             custom_env_vars: Vec::new(),
             custom_wrapper: None,
             custom_launch_args: None,
+            wine_overrides_dismissed: false,
         };
         let order = LoadOrder {
             mods: vec![
@@ -952,6 +1073,7 @@ mod tests {
             custom_env_vars: Vec::new(),
             custom_wrapper: None,
             custom_launch_args: None,
+            wine_overrides_dismissed: false,
         };
         let hint = sample_manifest().game;
         assert!(catalogs_overlap(&hint, &game).is_ok());
@@ -979,6 +1101,7 @@ mod tests {
             custom_env_vars: Vec::new(),
             custom_wrapper: None,
             custom_launch_args: None,
+            wine_overrides_dismissed: false,
         };
         let hint = ShareGameHint {
             id: None,
@@ -1020,6 +1143,7 @@ mod tests {
             custom_env_vars: Vec::new(),
             custom_wrapper: None,
             custom_launch_args: None,
+            wine_overrides_dismissed: false,
         };
         let manifest = sample_manifest();
         let code = encode_share_manifest(&manifest).unwrap();
@@ -1053,5 +1177,186 @@ mod tests {
         let decoded = decode_share_code(&code).unwrap();
         assert_eq!(decoded.mods[0].fomod, Some(fomod));
         assert!(decoded.mods[1].fomod.is_none());
+    }
+
+    #[test]
+    fn build_manifest_from_loadorder_includes_fomod_options_and_order() {
+        let game = ManagedGame {
+            id: "g".into(),
+            title: "G".into(),
+            nexus_domain: "skyrimspecialedition".into(),
+            install_path: "/tmp".into(),
+            launcher: "steam".into(),
+            plugin_id: "p".into(),
+            cover_path: None,
+            cover_url: None,
+            project_name: None,
+            thunderstore_community: None,
+            modio_game_id: None,
+            tool_overrides: None,
+            game_version: None,
+            ignored_requirements: Vec::new(),
+            launch_executable: None,
+            launch_command_source: Default::default(),
+            custom_env_vars: Vec::new(),
+            custom_wrapper: None,
+            custom_launch_args: None,
+            wine_overrides_dismissed: false,
+        };
+        let mut selected = std::collections::BTreeMap::new();
+        selected.insert("step_1".to_string(), vec!["opt_b".to_string()]);
+        let fomod = crate::mods::fomod::FomodSelection { selected };
+        let mut sub_choice = std::collections::BTreeMap::new();
+        sub_choice.insert("group_1".to_string(), "choice_a".to_string());
+        let options = crate::mods::options::ModOptionSelection {
+            enabled_options: vec!["group_1".to_string()],
+            sub_choice,
+        };
+
+        let order = LoadOrder {
+            mods: vec![
+                StagedMod {
+                    id: "20_2".into(),
+                    name: "Second In Vec, First In Order".into(),
+                    source: ModSource::Nexus,
+                    nexus_mod_id: 20,
+                    nexus_file_id: 2,
+                    enabled: true,
+                    order: 1,
+                    domain: "skyrimspecialedition".into(),
+                    fomod_selection: Some(fomod.clone()),
+                    ..Default::default()
+                },
+                StagedMod {
+                    id: "10_1".into(),
+                    name: "First In Vec, Second In Order".into(),
+                    source: ModSource::Nexus,
+                    nexus_mod_id: 10,
+                    nexus_file_id: 1,
+                    enabled: true,
+                    order: 2,
+                    domain: "skyrimspecialedition".into(),
+                    option_selection: Some(options.clone()),
+                    ..Default::default()
+                },
+            ],
+        };
+        // Reverse vec order to confirm sorting by `m.order`.
+        let mut reversed = order;
+        reversed.mods.reverse();
+
+        let (manifest, skipped, member_ids) =
+            build_manifest_from_loadorder(&reversed, &game, Some("Pack".into()));
+        assert!(skipped.is_empty());
+        assert_eq!(member_ids, vec!["20_2".to_string(), "10_1".to_string()]);
+        assert_eq!(manifest.mods.len(), 2);
+        assert_eq!(manifest.mods[0].mod_id, Some(20));
+        assert_eq!(manifest.mods[0].fomod, Some(fomod));
+        assert_eq!(manifest.mods[1].mod_id, Some(10));
+        assert_eq!(manifest.mods[1].options, Some(options));
+    }
+
+    #[test]
+    fn rename_saved_collection_updates_code_and_preserves_share_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_dir: dir.path().join("cfg"),
+            data_dir: dir.path().join("data"),
+            cache_dir: dir.path().join("cache"),
+        };
+        let manifest = sample_manifest();
+        let initial_code = encode_share_manifest(&manifest).unwrap();
+        let initial_share_id = emperor_share_id(&initial_code);
+        let entry = entry_from_code(&initial_code, None, Some("g".into())).unwrap();
+        let saved = add_saved_collection(&paths, entry).unwrap();
+
+        let renamed = rename_saved_collection(&paths, &saved.id, "  Renamed Pack  ").unwrap();
+        assert_eq!(renamed.old_code, initial_code);
+        assert_eq!(renamed.entry.name, "Renamed Pack");
+        assert_eq!(renamed.entry.share_id.as_deref(), Some(initial_share_id.as_str()));
+        let decoded = decode_share_code(&renamed.entry.code).unwrap();
+        assert_eq!(decoded.name.as_deref(), Some("Renamed Pack"));
+
+        let via_share = rename_saved_collection_by_share(
+            &paths,
+            &initial_share_id,
+            Some(&renamed.entry.code),
+            "Synced Name",
+            None,
+        )
+        .unwrap()
+        .expect("saved entry matched by share_id");
+        assert_eq!(via_share.name, "Synced Name");
+        let decoded2 = decode_share_code(&via_share.code).unwrap();
+        assert_eq!(decoded2.name.as_deref(), Some("Synced Name"));
+    }
+
+    #[test]
+    fn build_manifest_for_collection_records_disabled_mods_and_changes_hash() {
+        let game = ManagedGame {
+            id: "skyrim_1".into(),
+            plugin_id: "skyrimse".into(),
+            title: "Skyrim SE".into(),
+            nexus_domain: "skyrimspecialedition".into(),
+            install_path: String::new(),
+            launcher: "steam".into(),
+            cover_path: None,
+            cover_url: None,
+            project_name: None,
+            thunderstore_community: None,
+            modio_game_id: None,
+            tool_overrides: None,
+            game_version: None,
+            ignored_requirements: Vec::new(),
+            launch_executable: None,
+            launch_command_source: Default::default(),
+            custom_env_vars: Vec::new(),
+            custom_wrapper: None,
+            custom_launch_args: None,
+            wine_overrides_dismissed: false,
+        };
+        let mut order = LoadOrder {
+            mods: vec![
+                StagedMod {
+                    id: "m1".into(),
+                    name: "Mod One".into(),
+                    source: ModSource::Nexus,
+                    domain: "skyrimspecialedition".into(),
+                    nexus_mod_id: 1,
+                    nexus_file_id: 10,
+                    enabled: true,
+                    order: 1,
+                    collection_ids: vec!["col-1".into()],
+                    ..Default::default()
+                },
+                StagedMod {
+                    id: "m2".into(),
+                    name: "Mod Two".into(),
+                    source: ModSource::Nexus,
+                    domain: "skyrimspecialedition".into(),
+                    nexus_mod_id: 2,
+                    nexus_file_id: 20,
+                    enabled: true,
+                    order: 2,
+                    collection_ids: vec!["col-1".into()],
+                    ..Default::default()
+                },
+            ],
+        };
+
+        let (m_all_enabled, _, _) =
+            build_manifest_for_collection(&order, &game, "col-1", Some("Pack".into()));
+        assert_eq!(m_all_enabled.mods[0].enabled, None);
+        assert_eq!(m_all_enabled.mods[1].enabled, None);
+        let code_enabled = encode_share_manifest(&m_all_enabled).unwrap();
+
+        order.mods[1].enabled = false;
+        let (m_one_disabled, _, _) =
+            build_manifest_for_collection(&order, &game, "col-1", Some("Pack".into()));
+        assert_eq!(m_one_disabled.mods[0].enabled, None);
+        assert_eq!(m_one_disabled.mods[1].enabled, Some(false));
+        let code_disabled = encode_share_manifest(&m_one_disabled).unwrap();
+
+        assert_ne!(share_hash(&code_enabled), share_hash(&code_disabled));
     }
 }

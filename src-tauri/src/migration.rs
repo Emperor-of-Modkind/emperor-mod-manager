@@ -256,6 +256,7 @@ mod tests {
             custom_env_vars: Vec::new(),
             custom_wrapper: None,
             custom_launch_args: None,
+            wine_overrides_dismissed: false,
         }
     }
 

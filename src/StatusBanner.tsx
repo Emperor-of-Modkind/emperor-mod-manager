@@ -3,9 +3,16 @@ import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
 import { faXmark } from "@fortawesome/free-solid-svg-icons";
 
 import { requirementsNeedAttention } from "./RequirementsDialog";
-import type { BannerTimeouts, DeployResult, MissingRequirements, Settings } from "./types";
+import type {
+  BannerPersistence,
+  BannerTimeouts,
+  DeployResult,
+  MissingRequirements,
+  PersistedBanner,
+  Settings,
+} from "./types";
 
-export type BannerAction = { label: string; run: () => void };
+export type BannerAction = { label: string; run: () => void; dismiss?: boolean };
 
 export type BannerKind = "error" | "warn" | "info";
 
@@ -36,7 +43,66 @@ export type StackedBanner = {
   message: string;
   details?: string[];
   action?: BannerAction | null;
+  downloadId?: string | null;
+  createdAt?: number;
 };
+
+export function bannerPersistenceFor(
+  settings: Settings | null | undefined,
+): BannerPersistence {
+  return settings?.banner_persistence ?? "errors";
+}
+
+export function filterPersistableBanners(
+  stack: StackedBanner[],
+  persistence: BannerPersistence,
+): PersistedBanner[] {
+  if (persistence === "off") return [];
+  return stack
+    .filter((b) =>
+      persistence === "errors_and_warnings"
+        ? b.kind === "error" || b.kind === "warn"
+        : b.kind === "error",
+    )
+    .map((b) => ({
+      id: b.id,
+      kind: b.kind as "error" | "warn",
+      message: b.message,
+      details: b.details,
+      download_id: b.downloadId ?? null,
+      created_at: b.createdAt ?? Date.now(),
+    }));
+}
+
+export function remainingBannerTimeoutSeconds(
+  banner: Pick<StackedBanner, "kind" | "createdAt">,
+  settings: Settings | null | undefined,
+  referenceNowMs = Date.now(),
+): number | null {
+  const configured = bannerTimeoutFor(banner.kind, settings);
+  if (configured == null) return null;
+  if (banner.createdAt == null) return configured;
+  const effectiveNow = Math.max(banner.createdAt, referenceNowMs);
+  const remainingMs = banner.createdAt + configured * 1000 - effectiveNow;
+  return Math.max(0, Math.ceil(remainingMs / 1000));
+}
+
+export function pruneExpiredBanners<
+  T extends Pick<StackedBanner, "kind" | "createdAt">,
+>(banners: T[], settings: Settings | null | undefined, nowMs = Date.now()): T[] {
+  return banners.filter((b) => {
+    const configured = bannerTimeoutFor(b.kind, settings);
+    if (configured == null || b.createdAt == null) return true;
+    return b.createdAt + configured * 1000 > nowMs;
+  });
+}
+
+export function dismissBannersForDownload(
+  stack: StackedBanner[],
+  downloadId: string,
+): StackedBanner[] {
+  return stack.filter((b) => b.downloadId !== downloadId);
+}
 
 function sameBannerContent(
   a: Pick<StackedBanner, "kind" | "message" | "details">,
@@ -59,11 +125,16 @@ export function pushBanner(
   id: number,
   maxStacked = 10,
 ): StackedBanner[] {
-  if (next.kind === "info") {
-    return [{ ...next, id }, ...stack.filter((b) => b.kind !== "info")];
+  const entry: StackedBanner = {
+    ...next,
+    id,
+    createdAt: next.createdAt ?? Date.now(),
+  };
+  if (entry.kind === "info") {
+    return [entry, ...stack.filter((b) => b.kind !== "info")];
   }
-  const withoutDup = stack.filter((b) => !sameBannerContent(b, next));
-  const combined = [{ ...next, id }, ...withoutDup];
+  const withoutDup = stack.filter((b) => !sameBannerContent(b, entry));
+  const combined = [entry, ...withoutDup];
   let keptStacked = 0;
   return combined.filter((b) => {
     if (b.kind === "info") return true;
@@ -190,7 +261,14 @@ export function StatusBanner({
       </div>
       <span className="banner-actions">
         {action ? (
-          <button className="linkish" type="button" onClick={() => action.run()}>
+          <button
+            className="linkish"
+            type="button"
+            onClick={() => {
+              action.run();
+              if (action.dismiss) onDismissRef.current();
+            }}
+          >
             {action.label}
           </button>
         ) : null}

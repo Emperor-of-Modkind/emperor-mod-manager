@@ -23,6 +23,7 @@ type Props = {
   onEnable: (stagedIds: string[]) => void;
   onDisable: (stagedIds: string[]) => void;
   onIgnore?: (row: IgnoredRequirement) => void;
+  onIgnoreMany?: (rows: IgnoredRequirement[]) => void;
 };
 
 export type DisabledRequirementWarning = {
@@ -325,6 +326,7 @@ export function RequirementsDialog({
   onEnable,
   onDisable,
   onIgnore,
+  onIgnoreMany,
 }: Props) {
   const visibleRequirements = useMemo(
     () => withoutIgnoredRequirements(requirements, ignored),
@@ -356,6 +358,34 @@ export function RequirementsDialog({
 
   function toggleAll() {
     setSelected(allSelected ? new Set() : new Set(nexusKeys));
+  }
+
+  const canIgnore = Boolean(onIgnore || onIgnoreMany);
+  const hasMissingRequirements =
+    visibleRequirements.nexus.length +
+      visibleRequirements.external.length +
+      visibleRequirements.dlc.length >
+    0;
+
+  function ignoreAllRequirements() {
+    const candidates = [
+      ...visibleRequirements.nexus.map((row) => ignoreEntry(nexusIgnoreKey(row), row.name)),
+      ...visibleRequirements.external.map((row) => ignoreEntry(externalIgnoreKey(row), row.name)),
+      ...visibleRequirements.dlc.map((row) => ignoreEntry(dlcIgnoreKey(row), row.name)),
+    ].filter((entry): entry is IgnoredRequirement => entry !== null);
+    const seen = new Set<string>();
+    const entries = candidates.filter((entry) => {
+      if (seen.has(entry.key)) return false;
+      seen.add(entry.key);
+      return true;
+    });
+    if (entries.length === 0) return;
+    if (onIgnoreMany) {
+      onIgnoreMany(entries);
+    } else if (onIgnore) {
+      for (const entry of entries) onIgnore(entry);
+    }
+    setSelected(new Set());
   }
 
   const chosen = visibleRequirements.nexus.filter((row) =>
@@ -398,9 +428,9 @@ export function RequirementsDialog({
       }
     >
       {requirements.error && <p className="note">{requirements.error}</p>}
-      {visibleRequirements.nexus.length > 0 && (
-        <>
-          <div className="requirements-select-all">
+      {(visibleRequirements.nexus.length > 0 || (canIgnore && hasMissingRequirements)) && (
+        <div className="requirements-select-all">
+          {visibleRequirements.nexus.length > 0 && (
             <label className="check">
               <input
                 type="checkbox"
@@ -410,8 +440,20 @@ export function RequirementsDialog({
               />
               Select all
             </label>
-          </div>
-          <ul className="list requirements-list">
+          )}
+          {canIgnore && hasMissingRequirements && (
+            <button
+              type="button"
+              disabled={busy}
+              onClick={ignoreAllRequirements}
+            >
+              Ignore all
+            </button>
+          )}
+        </div>
+      )}
+      {visibleRequirements.nexus.length > 0 && (
+        <ul className="list requirements-list">
             {visibleRequirements.nexus.map((row) => {
               const key = requirementKey(row);
               const by = requiredBy(row.required_by_names);
@@ -455,8 +497,7 @@ export function RequirementsDialog({
                 </li>
               );
             })}
-          </ul>
-        </>
+        </ul>
       )}
       {visibleRequirements.external.length > 0 && (
         <>

@@ -599,6 +599,180 @@ describe("RequirementsDialog", () => {
     });
     host.remove();
   });
+
+  it("ignores all Nexus requirements from the select-all bar", async () => {
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const root: Root = createRoot(host);
+    const twoNexus = {
+      ...sample,
+      external: [],
+      dlc: [],
+      nexus: [
+        sample.nexus[0],
+        {
+          ...sample.nexus[0],
+          mod_id: 99999,
+          file_id: 88888,
+          name: "SkyUI",
+        },
+      ],
+    };
+    const batches: IgnoredRequirement[][] = [];
+    function Harness() {
+      const [ignored, setIgnored] = useState<IgnoredRequirement[]>([]);
+      return (
+        <RequirementsDialog
+          requirements={twoNexus}
+          disabled={[]}
+          ignored={ignored}
+          isPremium
+          busy={false}
+          onClose={() => {}}
+          onAddSelected={() => {}}
+          onEnable={() => {}}
+          onDisable={() => {}}
+          onIgnore={(row) => setIgnored((prev) => [...prev, row])}
+          onIgnoreMany={(rows) => {
+            batches.push(rows);
+            setIgnored((prev) => [...prev, ...rows]);
+          }}
+        />
+      );
+    }
+    await act(async () => {
+      root.render(<Harness />);
+    });
+    const selectAllBar = document.querySelector(".requirements-select-all") as HTMLElement;
+    const ignoreAll = [...selectAllBar.querySelectorAll("button")].find(
+      (el) => el.textContent === "Ignore all",
+    ) as HTMLButtonElement;
+    expect(ignoreAll).toBeDefined();
+    await act(async () => {
+      ignoreAll.click();
+    });
+    expect(batches).toEqual([
+      [
+        { key: nexusIgnoreKey(twoNexus.nexus[0]), name: "Address Library" },
+        { key: nexusIgnoreKey(twoNexus.nexus[1]), name: "SkyUI" },
+      ],
+    ]);
+    expect(document.querySelector(".requirements-select-all")).toBeNull();
+    expect(document.body.textContent).toContain("No missing requirements");
+    await act(async () => {
+      root.unmount();
+    });
+    host.remove();
+  });
+
+  it("ignores Nexus, Outside Nexus, and DLC requirements together with Ignore all", async () => {
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const root: Root = createRoot(host);
+    const batches: IgnoredRequirement[][] = [];
+    function Harness() {
+      const [ignored, setIgnored] = useState<IgnoredRequirement[]>([]);
+      return (
+        <RequirementsDialog
+          requirements={sample}
+          disabled={[]}
+          ignored={ignored}
+          isPremium
+          busy={false}
+          onClose={() => {}}
+          onAddSelected={() => {}}
+          onEnable={() => {}}
+          onDisable={() => {}}
+          onIgnore={(row) => setIgnored((prev) => [...prev, row])}
+          onIgnoreMany={(rows) => {
+            batches.push(rows);
+            setIgnored((prev) => [...prev, ...rows]);
+          }}
+        />
+      );
+    }
+    await act(async () => {
+      root.render(<Harness />);
+    });
+    const selectAllBar = document.querySelector(".requirements-select-all") as HTMLElement;
+    const ignoreAll = [...selectAllBar.querySelectorAll("button")].find(
+      (el) => el.textContent === "Ignore all",
+    ) as HTMLButtonElement;
+    expect(ignoreAll).toBeDefined();
+    await act(async () => {
+      ignoreAll.click();
+    });
+    expect(batches).toEqual([
+      [
+        { key: nexusIgnoreKey(sample.nexus[0]), name: "Address Library" },
+        { key: externalIgnoreKey(sample.external[0]), name: "SKSE" },
+        { key: dlcIgnoreKey(sample.dlc[0]), name: "Far Harbor" },
+      ],
+    ]);
+    expect(document.querySelector(".requirements-select-all")).toBeNull();
+    expect(document.body.textContent).toContain("No missing requirements");
+    await act(async () => {
+      root.unmount();
+    });
+    host.remove();
+  });
+
+  it("renders Ignore all and ignores offsite and DLC requirements when no Nexus requirements exist", async () => {
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const root: Root = createRoot(host);
+    const nonNexusOnly = {
+      ...sample,
+      nexus: [],
+    };
+    const batches: IgnoredRequirement[][] = [];
+    function Harness() {
+      const [ignored, setIgnored] = useState<IgnoredRequirement[]>([]);
+      return (
+        <RequirementsDialog
+          requirements={nonNexusOnly}
+          disabled={[]}
+          ignored={ignored}
+          isPremium
+          busy={false}
+          onClose={() => {}}
+          onAddSelected={() => {}}
+          onEnable={() => {}}
+          onDisable={() => {}}
+          onIgnore={(row) => setIgnored((prev) => [...prev, row])}
+          onIgnoreMany={(rows) => {
+            batches.push(rows);
+            setIgnored((prev) => [...prev, ...rows]);
+          }}
+        />
+      );
+    }
+    await act(async () => {
+      root.render(<Harness />);
+    });
+    const selectAllBar = document.querySelector(".requirements-select-all") as HTMLElement;
+    expect(selectAllBar).not.toBeNull();
+    expect(selectAllBar.querySelector('input[type="checkbox"]')).toBeNull();
+    const ignoreAll = [...selectAllBar.querySelectorAll("button")].find(
+      (el) => el.textContent === "Ignore all",
+    ) as HTMLButtonElement;
+    expect(ignoreAll).toBeDefined();
+    await act(async () => {
+      ignoreAll.click();
+    });
+    expect(batches).toEqual([
+      [
+        { key: externalIgnoreKey(sample.external[0]), name: "SKSE" },
+        { key: dlcIgnoreKey(sample.dlc[0]), name: "Far Harbor" },
+      ],
+    ]);
+    expect(document.querySelector(".requirements-select-all")).toBeNull();
+    expect(document.body.textContent).toContain("No missing requirements");
+    await act(async () => {
+      root.unmount();
+    });
+    host.remove();
+  });
 });
 
 describe("IgnoredRequirementsDialog", () => {

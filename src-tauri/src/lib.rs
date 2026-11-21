@@ -24,6 +24,7 @@ mod modio_api;
 mod mods;
 mod nexus;
 mod p2p;
+mod rate_limit;
 mod share;
 mod system_theme;
 mod thunderstore;
@@ -91,6 +92,7 @@ pub fn run() {
             commands::update_managed_game,
             commands::set_game_version,
             commands::set_ignored_requirements,
+            commands::set_wine_overrides_dismissed,
             commands::detect_ue_layout,
             commands::suggest_catalog_ids,
             commands::suggest_catalog_ids_batch,
@@ -111,6 +113,10 @@ pub fn run() {
             commands::set_install_click_behavior,
             commands::set_recent_downloads_limit,
             commands::set_banner_timeouts,
+            commands::set_banner_persistence,
+            commands::set_dismiss_banner_on_retry,
+            commands::get_persisted_banners,
+            commands::save_persisted_banners,
             commands::set_browse_grid_size,
             commands::set_active_game,
             commands::set_api_key,
@@ -155,11 +161,11 @@ pub fn run() {
             commands::save_collection_code,
             commands::get_saved_collection,
             commands::rename_saved_collection,
+            commands::rename_installed_collection,
             commands::delete_saved_collection,
             commands::handle_nxm,
             deep_link::take_pending_emperor_mod_link,
-            commands::import_mod_archive,
-            commands::import_mod_folder,
+            commands::import_mods,
             commands::import_assist_download,
             commands::scan_mod_orphans,
             commands::clear_download_cache,
@@ -172,7 +178,13 @@ pub fn run() {
             commands::update_staged_mod,
             commands::list_installed_collections,
             commands::uninstall_collection,
+            commands::set_mod_collections,
+            commands::save_collection_changes,
+            commands::set_collection_auto_save,
             commands::record_nexus_collection,
+            commands::check_installed_collections_local,
+            commands::check_collection_integrity,
+            commands::retry_collection_mods,
             commands::set_mod_enabled,
             commands::set_load_order,
             commands::get_mod_options,
@@ -225,7 +237,10 @@ pub fn run() {
             tools::sync_game_tools,
             commands::get_friends_state,
             commands::set_p2p_display_name,
+            commands::set_p2p_profile_picture,
+            commands::set_p2p_appear_offline,
             commands::set_collection_visibility,
+            commands::set_collection_sharing,
             commands::add_friend_by_code,
             commands::respond_friend_request,
             commands::remove_friend,
@@ -234,6 +249,7 @@ pub fn run() {
             commands::join_or_sync_friend_collection,
             commands::finalize_friend_collection_sync,
             commands::set_friend_collection_auto_sync,
+            commands::get_friend_collection_sync_states,
         ])
         .setup(|app| {
             {

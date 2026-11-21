@@ -2,7 +2,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { act, type ReactElement } from "react";
 import { describe, expect, it } from "vitest";
 
-import { CheckingUpdatesToast, UpdateToast } from "./UpdateToast";
+import { CheckingFriendUpdatesToast, CheckingUpdatesToast, UpdateToast } from "./UpdateToast";
 
 async function render(ui: ReactElement) {
   const host = document.createElement("div");
@@ -132,6 +132,18 @@ describe("CheckingUpdatesToast", () => {
     const view = await render(<CheckingUpdatesToast show stagedCount={null} />);
     expect(view.host.textContent).toContain("Checking for mod updates…");
     expect(view.host.textContent).not.toContain("staged");
+    await view.unmount();
+  });
+});
+
+describe("CheckingFriendUpdatesToast", () => {
+  it("shows checking for friend updates status", async () => {
+    const view = await render(<CheckingFriendUpdatesToast show />);
+    expect(view.host.querySelector("[role='status']")?.textContent).toContain(
+      "Checking for friend updates…",
+    );
+    expect(view.host.querySelector(".throbber")).not.toBeNull();
+    expect(view.host.querySelector("button")).toBeNull();
     await view.unmount();
   });
 });

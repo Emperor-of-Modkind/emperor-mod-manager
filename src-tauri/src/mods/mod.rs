@@ -200,7 +200,7 @@ pub struct FriendSyncMetadata {
     pub auto_sync: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct InstalledCollection {
     pub id: String,
     pub source: CollectionSource,
@@ -230,6 +230,15 @@ pub struct InstalledCollection {
     /// Synced friend collection metadata when joined from a P2P friend.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub friend_sync: Option<FriendSyncMetadata>,
+    /// Automatically save changes to load order, member mods, and FOMOD options.
+    #[serde(default)]
+    pub auto_save: bool,
+    /// Snapshot hash of the last saved collection state (order, members, FOMOD/options).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_snapshot_hash: Option<String>,
+    /// Computed on load: whether the collection has unsaved changes since last save.
+    #[serde(default)]
+    pub has_unsaved_changes: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -295,6 +304,7 @@ impl GameOrderLocks {
 }
 
 static ORDER_LOCKS: OnceLock<GameOrderLocks> = OnceLock::new();
+static COLLECTIONS_LOCKS: OnceLock<GameOrderLocks> = OnceLock::new();
 
 pub fn shared_order_locks() -> GameOrderLocks {
     ORDER_LOCKS
@@ -306,6 +316,20 @@ pub fn shared_order_locks() -> GameOrderLocks {
 
 pub fn with_game_order<T>(game_id: &str, f: impl FnOnce() -> T) -> T {
     shared_order_locks().with_game(game_id, f)
+}
+
+fn shared_collections_locks() -> GameOrderLocks {
+    COLLECTIONS_LOCKS
+        .get_or_init(|| GameOrderLocks {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+        })
+        .clone()
+}
+
+/// Serialize `collections.json` read-modify-write per game.
+/// Always acquire `with_game_order` *before* `with_game_collections` when both are needed.
+pub fn with_game_collections<T>(game_id: &str, f: impl FnOnce() -> T) -> T {
+    shared_collections_locks().with_game(game_id, f)
 }
 
 fn read_loadorder(paths: &Paths, game_id: &str) -> Result<LoadOrder> {
@@ -355,7 +379,7 @@ fn mutate_load_order<T>(
     })
 }
 
-pub fn load_collections(paths: &Paths, game_id: &str) -> Result<InstalledCollections> {
+fn read_collections(paths: &Paths, game_id: &str) -> Result<InstalledCollections> {
     let file = paths.collections_file(game_id);
     if !file.exists() {
         return Ok(InstalledCollections::default());
@@ -364,7 +388,7 @@ pub fn load_collections(paths: &Paths, game_id: &str) -> Result<InstalledCollect
     Ok(serde_json::from_str(&raw)?)
 }
 
-pub fn save_collections(
+fn write_collections(
     paths: &Paths,
     game_id: &str,
     collections: &InstalledCollections,
@@ -372,8 +396,22 @@ pub fn save_collections(
     crate::config::ensure_game_dirs(paths, game_id)?;
     let file = paths.collections_file(game_id);
     let raw = serde_json::to_string_pretty(collections)?;
-    fs::write(file, raw)?;
+    let tmp = file.with_extension("json.tmp");
+    fs::write(&tmp, &raw)?;
+    fs::rename(&tmp, &file)?;
     Ok(())
+}
+
+pub fn load_collections(paths: &Paths, game_id: &str) -> Result<InstalledCollections> {
+    with_game_collections(game_id, || read_collections(paths, game_id))
+}
+
+pub fn save_collections(
+    paths: &Paths,
+    game_id: &str,
+    collections: &InstalledCollections,
+) -> Result<()> {
+    with_game_collections(game_id, || write_collections(paths, game_id, collections))
 }
 
 pub fn thunderstore_mod_id(namespace: &str, name: &str) -> String {
@@ -677,30 +715,32 @@ fn rewrite_collection_mod_id(
     if old_id == new_id || old_id.is_empty() {
         return Ok(());
     }
-    let mut store = load_collections(paths, game_id)?;
-    let mut changed = false;
-    for collection in &mut store.collections {
-        let mut seen = HashSet::new();
-        let mut next = Vec::new();
-        for id in collection.mod_ids.drain(..) {
-            let id = if id == old_id {
-                changed = true;
-                new_id.to_string()
-            } else {
-                id
-            };
-            if seen.insert(id.clone()) {
-                next.push(id);
-            } else {
-                changed = true;
+    with_game_collections(game_id, || {
+        let mut store = read_collections(paths, game_id)?;
+        let mut changed = false;
+        for collection in &mut store.collections {
+            let mut seen = HashSet::new();
+            let mut next = Vec::new();
+            for id in collection.mod_ids.drain(..) {
+                let id = if id == old_id {
+                    changed = true;
+                    new_id.to_string()
+                } else {
+                    id
+                };
+                if seen.insert(id.clone()) {
+                    next.push(id);
+                } else {
+                    changed = true;
+                }
             }
+            collection.mod_ids = next;
         }
-        collection.mod_ids = next;
-    }
-    if changed {
-        save_collections(paths, game_id, &store)?;
-    }
-    Ok(())
+        if changed {
+            write_collections(paths, game_id, &store)?;
+        }
+        Ok(())
+    })
 }
 
 fn nexus_file_key(staged: &StagedMod) -> Option<(String, u64, u64)> {
@@ -1002,46 +1042,83 @@ pub fn merge_mod_meta(
 pub fn record_installed_collection(
     paths: &Paths,
     game_id: &str,
+    collection: InstalledCollection,
+    new_mod_ids: &[String],
+) -> Result<InstalledCollection> {
+    record_installed_collection_inner(paths, game_id, collection, new_mod_ids, false)
+}
+
+/// Record or update an installed collection, replacing its member list and
+/// detaching/disabling any mods that were removed from the collection.
+pub fn sync_installed_collection(
+    paths: &Paths,
+    game_id: &str,
+    collection: InstalledCollection,
+    new_mod_ids: &[String],
+) -> Result<InstalledCollection> {
+    record_installed_collection_inner(paths, game_id, collection, new_mod_ids, true)
+}
+
+fn record_installed_collection_inner(
+    paths: &Paths,
+    game_id: &str,
     mut collection: InstalledCollection,
     new_mod_ids: &[String],
+    replace_members: bool,
 ) -> Result<InstalledCollection> {
     if collection.installed_at.is_empty() {
         collection.installed_at = chrono::Utc::now().to_rfc3339();
     }
     let new_set: HashSet<&str> = new_mod_ids.iter().map(|s| s.as_str()).collect();
+    let member_set: HashSet<&str> = collection.mod_ids.iter().map(|s| s.as_str()).collect();
     let collection_id = collection.id.clone();
-    let member_ids = collection.mod_ids.clone();
-    with_game_order(game_id, || {
+    let snapshot_sig = with_game_order(game_id, || {
         let mut order = read_loadorder(paths, game_id)?;
         collapse_load_order(paths, game_id, &mut order)?;
         for m in &mut order.mods {
-            if member_ids.iter().any(|id| id == &m.id) {
+            if member_set.contains(m.id.as_str()) {
                 push_unique(&mut m.collection_ids, collection_id.clone());
                 if new_set.contains(m.id.as_str()) {
                     m.independent = false;
                 }
+            } else if replace_members && m.collection_ids.iter().any(|id| id == &collection_id) {
+                m.collection_ids.retain(|id| id != &collection_id);
+                if !m.independent && m.collection_ids.is_empty() {
+                    m.enabled = false;
+                }
             }
         }
         write_loadorder(paths, game_id, &order)?;
-        Ok::<(), anyhow::Error>(())
+        Ok::<String, anyhow::Error>(collection_snapshot_signature(&collection_id, &order))
     })?;
 
-    let mut store = load_collections(paths, game_id)?;
-    if let Some(existing) = store.collections.iter_mut().find(|c| c.id == collection.id) {
-        if collection.game_versions.is_none() && existing.revision == collection.revision {
-            collection.game_versions = existing.game_versions.clone();
+    with_game_collections(game_id, || {
+        let mut store = read_collections(paths, game_id)?;
+        if let Some(existing) = store.collections.iter_mut().find(|c| c.id == collection.id) {
+            if collection.game_versions.is_none() && existing.revision == collection.revision {
+                collection.game_versions = existing.game_versions.clone();
+            }
+            if !collection.auto_save {
+                collection.auto_save = existing.auto_save;
+            }
+            if !replace_members {
+                let mut ids = existing.mod_ids.clone();
+                for id in &collection.mod_ids {
+                    push_unique(&mut ids, id.clone());
+                }
+                collection.mod_ids = ids;
+            }
+            collection.saved_snapshot_hash = Some(snapshot_sig);
+            collection.has_unsaved_changes = false;
+            *existing = collection.clone();
+        } else {
+            collection.saved_snapshot_hash = Some(snapshot_sig);
+            collection.has_unsaved_changes = false;
+            store.collections.push(collection.clone());
         }
-        let mut ids = existing.mod_ids.clone();
-        for id in &collection.mod_ids {
-            push_unique(&mut ids, id.clone());
-        }
-        collection.mod_ids = ids;
-        *existing = collection.clone();
-    } else {
-        store.collections.push(collection.clone());
-    }
-    save_collections(paths, game_id, &store)?;
-    Ok(collection)
+        write_collections(paths, game_id, &store)?;
+        Ok(collection)
+    })
 }
 
 fn drop_collection_from_mods(order: &mut LoadOrder, collection_id: &str) {
@@ -1090,31 +1167,33 @@ pub fn uninstall_collection(paths: &Paths, game_id: &str, collection_id: &str) -
     with_game_order(game_id, || {
         let mut order = read_loadorder(paths, game_id)?;
         collapse_load_order(paths, game_id, &mut order)?;
-        let mut store = load_collections(paths, game_id)?;
-        if !store.collections.iter().any(|c| c.id == collection_id) {
-            bail!("collection not found: {collection_id}");
-        }
-        store.collections.retain(|c| c.id != collection_id);
-        drop_collection_from_mods(&mut order, collection_id);
-        let keep = reachable_mod_ids(&order, &store);
-        let mut removed = 0usize;
-        let mut remaining = Vec::new();
-        for m in order.mods.drain(..) {
-            if keep.contains(&m.id) {
-                remaining.push(m);
-            } else {
-                delete_staged_row(&m)?;
-                removed += 1;
+        with_game_collections(game_id, || {
+            let mut store = read_collections(paths, game_id)?;
+            if !store.collections.iter().any(|c| c.id == collection_id) {
+                bail!("collection not found: {collection_id}");
             }
-        }
-        order.mods = remaining;
-        for c in &mut store.collections {
-            c.mod_ids
-                .retain(|id| order.mods.iter().any(|m| &m.id == id));
-        }
-        write_loadorder(paths, game_id, &order)?;
-        save_collections(paths, game_id, &store)?;
-        Ok(removed)
+            store.collections.retain(|c| c.id != collection_id);
+            drop_collection_from_mods(&mut order, collection_id);
+            let keep = reachable_mod_ids(&order, &store);
+            let mut removed = 0usize;
+            let mut remaining = Vec::new();
+            for m in order.mods.drain(..) {
+                if keep.contains(&m.id) {
+                    remaining.push(m);
+                } else {
+                    delete_staged_row(&m)?;
+                    removed += 1;
+                }
+            }
+            order.mods = remaining;
+            for c in &mut store.collections {
+                c.mod_ids
+                    .retain(|id| order.mods.iter().any(|m| &m.id == id));
+            }
+            write_loadorder(paths, game_id, &order)?;
+            write_collections(paths, game_id, &store)?;
+            Ok(removed)
+        })
     })
 }
 
@@ -1126,22 +1205,73 @@ pub fn forget_installed_collection(
     collection_id: &str,
 ) -> Result<()> {
     with_game_order(game_id, || {
-        let mut store = load_collections(paths, game_id)?;
-        if !store.collections.iter().any(|c| c.id == collection_id) {
-            return Ok(());
-        }
-        store.collections.retain(|c| c.id != collection_id);
-        let mut order = read_loadorder(paths, game_id)?;
-        collapse_load_order(paths, game_id, &mut order)?;
-        drop_collection_from_mods(&mut order, collection_id);
-        for m in &mut order.mods {
-            if m.collection_ids.is_empty() {
-                m.independent = true;
+        with_game_collections(game_id, || {
+            let mut store = read_collections(paths, game_id)?;
+            if !store.collections.iter().any(|c| c.id == collection_id) {
+                return Ok(());
             }
-        }
-        write_loadorder(paths, game_id, &order)?;
-        save_collections(paths, game_id, &store)?;
-        Ok(())
+            store.collections.retain(|c| c.id != collection_id);
+            let mut order = read_loadorder(paths, game_id)?;
+            collapse_load_order(paths, game_id, &mut order)?;
+            drop_collection_from_mods(&mut order, collection_id);
+            for m in &mut order.mods {
+                if m.collection_ids.is_empty() {
+                    m.independent = true;
+                }
+            }
+            write_loadorder(paths, game_id, &order)?;
+            write_collections(paths, game_id, &store)?;
+            Ok(())
+        })
+    })
+}
+
+#[derive(Serialize)]
+struct CollectionSnapshotMember<'a> {
+    id: &'a str,
+    order: u32,
+    enabled: bool,
+    version: &'a Option<String>,
+    nexus_file_id: u64,
+    modio_file_id: Option<u64>,
+    fomod_selection: &'a Option<FomodSelection>,
+    option_selection: &'a Option<ModOptionSelection>,
+}
+
+pub fn collection_snapshot_signature(collection_id: &str, order: &LoadOrder) -> String {
+    let mut members: Vec<&StagedMod> = order
+        .mods
+        .iter()
+        .filter(|m| m.collection_ids.iter().any(|id| id == collection_id))
+        .collect();
+    members.sort_by_key(|m| m.order);
+    let payload: Vec<CollectionSnapshotMember<'_>> = members
+        .into_iter()
+        .map(|m| CollectionSnapshotMember {
+            id: m.id.as_str(),
+            order: m.order,
+            enabled: m.enabled,
+            version: &m.version,
+            nexus_file_id: m.nexus_file_id,
+            modio_file_id: m.modio_file_id,
+            fomod_selection: &m.fomod_selection,
+            option_selection: &m.option_selection,
+        })
+        .collect();
+    let json = serde_json::to_string(&payload).unwrap_or_default();
+    crate::share::share_hash(&json)
+}
+
+pub fn mutate_collections<T>(
+    paths: &Paths,
+    game_id: &str,
+    f: impl FnOnce(&mut InstalledCollections) -> Result<T>,
+) -> Result<T> {
+    with_game_collections(game_id, || {
+        let mut store = read_collections(paths, game_id)?;
+        let result = f(&mut store)?;
+        write_collections(paths, game_id, &store)?;
+        Ok(result)
     })
 }
 
@@ -1149,7 +1279,320 @@ pub fn list_installed_collections(
     paths: &Paths,
     game_id: &str,
 ) -> Result<Vec<InstalledCollection>> {
-    Ok(load_collections(paths, game_id)?.collections)
+    let order = load_loadorder(paths, game_id)?;
+    let mut ordered_mods: Vec<&StagedMod> = order.mods.iter().collect();
+    ordered_mods.sort_by_key(|m| m.order);
+
+    with_game_collections(game_id, || {
+        let mut store = read_collections(paths, game_id)?;
+        if store.collections.is_empty() {
+            return Ok(store.collections);
+        }
+        let mut dirty = false;
+        for col in &mut store.collections {
+            let mut seen = HashSet::new();
+            let before_len = col.mod_ids.len();
+            col.mod_ids.retain(|id| seen.insert(id.clone()));
+            if col.mod_ids.len() != before_len {
+                dirty = true;
+            }
+            for m in &ordered_mods {
+                if m.collection_ids.iter().any(|id| id == &col.id) && seen.insert(m.id.clone()) {
+                    col.mod_ids.push(m.id.clone());
+                    dirty = true;
+                }
+            }
+            let sig = collection_snapshot_signature(&col.id, &order);
+            if col.saved_snapshot_hash.is_none() {
+                col.saved_snapshot_hash = Some(sig.clone());
+                dirty = true;
+            }
+            col.has_unsaved_changes = col.saved_snapshot_hash.as_deref() != Some(sig.as_str());
+        }
+        if dirty {
+            write_collections(paths, game_id, &store)?;
+        }
+        Ok(store.collections)
+    })
+}
+
+pub fn set_collection_auto_save(
+    paths: &Paths,
+    game_id: &str,
+    collection_id: &str,
+    auto_save: bool,
+) -> Result<InstalledCollection> {
+    mutate_collections(paths, game_id, |store| {
+        let col = store
+            .collections
+            .iter_mut()
+            .find(|c| c.id == collection_id)
+            .ok_or_else(|| anyhow::anyhow!("Collection not found: {collection_id}"))?;
+        col.auto_save = auto_save;
+        Ok(col.clone())
+    })
+}
+
+pub struct RenamedInstalledCollection {
+    pub collection: InstalledCollection,
+    pub old_code: Option<String>,
+}
+
+pub fn rename_installed_collection(
+    paths: &Paths,
+    game_id: &str,
+    collection_id: &str,
+    name: &str,
+) -> Result<RenamedInstalledCollection> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow::anyhow!("Name cannot be empty."));
+    }
+    mutate_collections(paths, game_id, |store| {
+        let col = store
+            .collections
+            .iter_mut()
+            .find(|c| c.id == collection_id)
+            .ok_or_else(|| anyhow::anyhow!("Collection not found: {collection_id}"))?;
+        let old_code = col.profile_code.clone();
+        col.name = trimmed.to_string();
+        if let Some(code) = col.profile_code.as_deref() {
+            if let Ok(mut manifest) = crate::share::decode_share_code(code) {
+                manifest.name = Some(trimmed.to_string());
+                col.profile_code = Some(crate::share::encode_share_manifest(&manifest)?);
+            }
+        }
+        let updated = col.clone();
+        Ok(RenamedInstalledCollection {
+            collection: updated,
+            old_code,
+        })
+    })
+}
+
+pub fn sync_installed_collection_rename(
+    paths: &Paths,
+    game_id: &str,
+    share_id: &str,
+    old_code: &str,
+    name: &str,
+    new_code: &str,
+) -> Result<bool> {
+    with_game_collections(game_id, || {
+        let mut store = read_collections(paths, game_id)?;
+        let mut changed = false;
+        let trimmed_old = old_code.trim();
+        for col in &mut store.collections {
+            let matches = col.id == share_id
+                || (col.source == CollectionSource::Emperor
+                    && col.profile_code.as_deref().map(str::trim) == Some(trimmed_old));
+            if matches {
+                col.name = name.to_string();
+                if col.source == CollectionSource::Emperor {
+                    col.profile_code = Some(new_code.to_string());
+                }
+                changed = true;
+            }
+        }
+        if changed {
+            write_collections(paths, game_id, &store)?;
+        }
+        Ok(changed)
+    })
+}
+
+/// Update which installed collections a staged mod belongs to, keeping both
+/// `StagedMod.collection_ids` (plus `independent`) and `InstalledCollection.mod_ids`
+/// in sync.
+pub fn set_mod_collections(
+    paths: &Paths,
+    game_id: &str,
+    mod_uid: &str,
+    collection_ids: &[String],
+) -> Result<StagedMod> {
+    with_game_order(game_id, || {
+        let mut order = read_loadorder(paths, game_id)?;
+        collapse_load_order(paths, game_id, &mut order)?;
+        with_game_collections(game_id, || {
+            let mut store = read_collections(paths, game_id)?;
+
+            let mut target_ids: Vec<String> = Vec::new();
+            for id in collection_ids {
+                if !store.collections.iter().any(|c| &c.id == id) {
+                    bail!("collection not found: {id}");
+                }
+                push_unique(&mut target_ids, id.clone());
+            }
+
+            let Some(m) = order.mods.iter_mut().find(|m| m.id == mod_uid) else {
+                bail!("staged mod not found: {mod_uid}");
+            };
+            m.collection_ids = target_ids.clone();
+            m.independent = target_ids.is_empty();
+            let updated = m.clone();
+
+            for c in &mut store.collections {
+                if target_ids.iter().any(|id| id == &c.id) {
+                    push_unique(&mut c.mod_ids, mod_uid.to_string());
+                } else {
+                    c.mod_ids.retain(|id| id != mod_uid);
+                }
+            }
+
+            write_loadorder(paths, game_id, &order)?;
+            write_collections(paths, game_id, &store)?;
+            Ok(updated)
+        })
+    })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CollectionModIssueKind {
+    MissingFromLoadOrder,
+    MissingStagingDir,
+    CorruptedStaging {
+        actual_files: usize,
+        expected_files: Option<usize>,
+    },
+    MissingFromManifest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectionModIssue {
+    pub mod_id: String,
+    pub name: String,
+    pub source: ModSource,
+    pub issue: CollectionModIssueKind,
+    pub can_retry: bool,
+    pub domain: String,
+    pub nexus_mod_id: u64,
+    pub nexus_file_id: u64,
+    pub ts_namespace: Option<String>,
+    pub ts_name: Option<String>,
+    pub modio_game_id: Option<u32>,
+    pub modio_mod_id: Option<u64>,
+    pub modio_file_id: Option<u64>,
+    pub version: Option<String>,
+    pub file_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectionIntegrityReport {
+    pub collection_id: String,
+    pub collection_name: String,
+    pub checked_count: usize,
+    pub issues: Vec<CollectionModIssue>,
+}
+
+pub fn staged_mod_can_retry(staged: &StagedMod) -> bool {
+    match staged.source {
+        ModSource::Nexus => {
+            !staged.domain.trim().is_empty() && staged.nexus_mod_id > 0 && staged.nexus_file_id > 0
+        }
+        ModSource::Thunderstore => {
+            !staged.domain.trim().is_empty()
+                && staged.ts_namespace.as_deref().is_some_and(|s| !s.trim().is_empty())
+                && staged.ts_name.as_deref().is_some_and(|s| !s.trim().is_empty())
+        }
+        ModSource::Modio => {
+            staged.modio_game_id.is_some_and(|id| id > 0)
+                && staged.modio_mod_id.is_some_and(|id| id > 0)
+        }
+    }
+}
+
+pub fn issue_from_staged(staged: &StagedMod, issue: CollectionModIssueKind) -> CollectionModIssue {
+    CollectionModIssue {
+        mod_id: staged.id.clone(),
+        name: staged.name.clone(),
+        source: staged.source.clone(),
+        issue,
+        can_retry: staged_mod_can_retry(staged),
+        domain: staged.domain.clone(),
+        nexus_mod_id: staged.nexus_mod_id,
+        nexus_file_id: staged.nexus_file_id,
+        ts_namespace: staged.ts_namespace.clone(),
+        ts_name: staged.ts_name.clone(),
+        modio_game_id: staged.modio_game_id,
+        modio_mod_id: staged.modio_mod_id,
+        modio_file_id: staged.modio_file_id,
+        version: staged.version.clone(),
+        file_name: staged.file_name.clone(),
+    }
+}
+
+pub fn check_staged_mod_integrity(staged: &StagedMod) -> Option<CollectionModIssueKind> {
+    let staging = Path::new(&staged.staging_path);
+    if !staging.is_dir() {
+        return Some(CollectionModIssueKind::MissingStagingDir);
+    }
+    let actual_files = count_staged_files(staging);
+    if actual_files == 0 {
+        return Some(CollectionModIssueKind::CorruptedStaging {
+            actual_files,
+            expected_files: staged.staged_file_count,
+        });
+    }
+    if let Some(expected) = staged.staged_file_count {
+        if actual_files < expected {
+            return Some(CollectionModIssueKind::CorruptedStaging {
+                actual_files,
+                expected_files: Some(expected),
+            });
+        }
+    }
+    None
+}
+
+/// Checks every mod ID recorded on an `InstalledCollection` against `order`
+/// and its staging directory on disk.
+pub fn check_collection_local_integrity(
+    collection: &InstalledCollection,
+    order: &LoadOrder,
+) -> CollectionIntegrityReport {
+    let by_id: HashMap<&str, &StagedMod> = order.mods.iter().map(|m| (m.id.as_str(), m)).collect();
+    let mut issues = Vec::new();
+    let mut checked_ids = HashSet::new();
+
+    for mod_id in &collection.mod_ids {
+        if !checked_ids.insert(mod_id.clone()) {
+            continue;
+        }
+        let Some(staged) = by_id.get(mod_id.as_str()) else {
+            issues.push(CollectionModIssue {
+                mod_id: mod_id.clone(),
+                name: mod_id.clone(),
+                source: match collection.source {
+                    CollectionSource::Thunderstore => ModSource::Thunderstore,
+                    _ => ModSource::Nexus,
+                },
+                issue: CollectionModIssueKind::MissingFromLoadOrder,
+                can_retry: false,
+                domain: String::new(),
+                nexus_mod_id: 0,
+                nexus_file_id: 0,
+                ts_namespace: None,
+                ts_name: None,
+                modio_game_id: None,
+                modio_mod_id: None,
+                modio_file_id: None,
+                version: None,
+                file_name: None,
+            });
+            continue;
+        };
+        if let Some(kind) = check_staged_mod_integrity(staged) {
+            issues.push(issue_from_staged(staged, kind));
+        }
+    }
+
+    CollectionIntegrityReport {
+        collection_id: collection.id.clone(),
+        collection_name: collection.name.clone(),
+        checked_count: checked_ids.len(),
+        issues,
+    }
 }
 
 pub fn cache_supported_game_versions(
@@ -1179,13 +1622,14 @@ pub fn cache_collection_game_versions(
     if updates.is_empty() {
         return Ok(());
     }
-    let mut store = load_collections(paths, game_id)?;
-    for collection in &mut store.collections {
-        if let Some(versions) = updates.get(&collection.id) {
-            collection.game_versions = Some(versions.clone());
+    mutate_collections(paths, game_id, |store| {
+        for collection in &mut store.collections {
+            if let Some(versions) = updates.get(&collection.id) {
+                collection.game_versions = Some(versions.clone());
+            }
         }
-    }
-    save_collections(paths, game_id, &store)
+        Ok(())
+    })
 }
 
 fn copy_dir_all(src: &Path, dest: &Path) -> Result<()> {
@@ -1722,22 +2166,144 @@ fn stage_filled_mod(
     committed
 }
 
-/// Mods staged from one picked folder: each top-level archive, plus the extracted remainder.
+/// Mods staged from one or more imported files or folders.
 #[derive(Debug, Clone, Serialize)]
-pub struct ImportFolderResult {
+pub struct ImportResult {
     pub mods: Vec<StagedMod>,
     pub errors: Vec<String>,
 }
 
+/// Stage any mix of archives, mod files, and folders for `game_id`, detecting
+/// each path's type automatically.
+pub fn import_paths(
+    paths: &Paths,
+    game_id: &str,
+    targets: &[PathBuf],
+    domain: &str,
+    install_path: Option<&Path>,
+) -> Result<ImportResult> {
+    if targets.is_empty() {
+        bail!("No files or folders selected");
+    }
+
+    let mut used_file_ids = load_used_import_file_ids(paths, game_id)?;
+    let mut mods = Vec::new();
+    let mut errors = Vec::new();
+
+    for target in targets {
+        if !target.exists() {
+            errors.push(format!("Path not found: {}", target.display()));
+            continue;
+        }
+        if target.is_dir() {
+            match import_folder_into(
+                paths,
+                game_id,
+                target,
+                domain,
+                install_path,
+                &mut used_file_ids,
+            ) {
+                Ok(mut res) => {
+                    mods.append(&mut res.mods);
+                    errors.append(&mut res.errors);
+                }
+                Err(err) => {
+                    log::warn!("import folder {}: {err:#}", target.display());
+                    errors.push(format!("{}: {err}", folder_import_label(target)));
+                }
+            }
+        } else if target.is_file() {
+            stage_imported_file(
+                paths,
+                game_id,
+                target,
+                domain,
+                &mut used_file_ids,
+                &mut mods,
+                &mut errors,
+            );
+        } else {
+            errors.push(format!("Unsupported path: {}", target.display()));
+        }
+    }
+
+    Ok(ImportResult { mods, errors })
+}
+
 /// Copy an already-extracted mod folder into staging, and stage each immediate
 /// `.zip`, `.7z`, or `.rar` as its own mod. The source folder is left in place.
+#[cfg(test)]
 pub fn import_folder(
     paths: &Paths,
     game_id: &str,
     folder: &Path,
     domain: &str,
     install_path: Option<&Path>,
-) -> Result<ImportFolderResult> {
+) -> Result<ImportResult> {
+    let mut used_file_ids = load_used_import_file_ids(paths, game_id)?;
+    import_folder_into(
+        paths,
+        game_id,
+        folder,
+        domain,
+        install_path,
+        &mut used_file_ids,
+    )
+}
+
+fn load_used_import_file_ids(paths: &Paths, game_id: &str) -> Result<HashSet<u64>> {
+    let order = read_loadorder(paths, game_id)?;
+    Ok(order
+        .mods
+        .iter()
+        .filter(|staged| staged.nexus_mod_id == 0)
+        .map(|staged| staged.nexus_file_id)
+        .collect())
+}
+
+fn stage_imported_file(
+    paths: &Paths,
+    game_id: &str,
+    file: &Path,
+    domain: &str,
+    used_file_ids: &mut HashSet<u64>,
+    mods: &mut Vec<StagedMod>,
+    errors: &mut Vec<String>,
+) {
+    let file_id = allocate_import_file_id(used_file_ids);
+    let label = archive_import_label(file);
+    let imported_name = file
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned());
+    match stage_mod(
+        paths,
+        game_id,
+        &label,
+        domain,
+        0,
+        file_id,
+        None,
+        pick_staged_file_name(&label, None, imported_name.as_deref()),
+        file,
+    ) {
+        Ok(staged) => mods.push(staged),
+        Err(err) => {
+            let name = imported_name.unwrap_or_else(|| file.display().to_string());
+            log::warn!("import file {name}: {err:#}");
+            errors.push(format!("{name}: {err}"));
+        }
+    }
+}
+
+fn import_folder_into(
+    paths: &Paths,
+    game_id: &str,
+    folder: &Path,
+    domain: &str,
+    install_path: Option<&Path>,
+    used_file_ids: &mut HashSet<u64>,
+) -> Result<ImportResult> {
     if !folder.exists() {
         bail!("Folder not found: {}", folder.display());
     }
@@ -1762,44 +2328,22 @@ pub fn import_folder(
         bail!("Folder is empty");
     }
 
-    let order = read_loadorder(paths, game_id)?;
-    let mut used_file_ids: HashSet<u64> = order
-        .mods
-        .iter()
-        .filter(|staged| staged.nexus_mod_id == 0)
-        .map(|staged| staged.nexus_file_id)
-        .collect();
-
     let mut mods = Vec::new();
     let mut errors = Vec::new();
     for archive in &archives {
-        let file_id = allocate_import_file_id(&mut used_file_ids);
-        let label = archive_import_label(archive);
-        let imported_name = archive
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned());
-        match stage_mod(
+        stage_imported_file(
             paths,
             game_id,
-            &label,
-            domain,
-            0,
-            file_id,
-            None,
-            pick_staged_file_name(&label, None, imported_name.as_deref()),
             archive,
-        ) {
-            Ok(staged) => mods.push(staged),
-            Err(err) => {
-                let name = imported_name.unwrap_or_else(|| archive.display().to_string());
-                log::warn!("import folder archive {name}: {err:#}");
-                errors.push(format!("{name}: {err}"));
-            }
-        }
+            domain,
+            used_file_ids,
+            &mut mods,
+            &mut errors,
+        );
     }
 
     if !remainder.is_empty() {
-        let file_id = allocate_import_file_id(&mut used_file_ids);
+        let file_id = allocate_import_file_id(used_file_ids);
         let label = folder_import_label(folder);
         match stage_filled_mod(
             paths,
@@ -1821,7 +2365,7 @@ pub fn import_folder(
         }
     }
 
-    Ok(ImportFolderResult { mods, errors })
+    Ok(ImportResult { mods, errors })
 }
 
 fn folder_import_entries(folder: &Path) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
@@ -2265,6 +2809,7 @@ pub struct SyncedModSelection {
     pub mod_id: String,
     pub fomod_selection: Option<FomodSelection>,
     pub option_selection: Option<ModOptionSelection>,
+    pub enabled: Option<bool>,
 }
 
 /// Reorders the specified collection mods to match `selections` in relative order
@@ -2297,7 +2842,7 @@ pub fn apply_collection_order_and_selections(
                     if let Some(opts) = &sel.option_selection {
                         m.option_selection = Some(opts.clone());
                     }
-                    m.enabled = true;
+                    m.enabled = sel.enabled.unwrap_or(true);
                 }
                 by_id.insert(m.id.clone(), m);
                 slots.push(None);
@@ -2349,17 +2894,18 @@ pub fn set_friend_collection_auto_sync(
     collection_id: &str,
     auto_sync: bool,
 ) -> Result<()> {
-    let mut store = load_collections(paths, game_id)?;
-    let col = store
-        .collections
-        .iter_mut()
-        .find(|c| c.id == collection_id)
-        .ok_or_else(|| anyhow::anyhow!("Collection not found: {collection_id}"))?;
-    let Some(sync) = col.friend_sync.as_mut() else {
-        bail!("Collection is not linked to a friend");
-    };
-    sync.auto_sync = auto_sync;
-    save_collections(paths, game_id, &store)
+    mutate_collections(paths, game_id, |store| {
+        let col = store
+            .collections
+            .iter_mut()
+            .find(|c| c.id == collection_id)
+            .ok_or_else(|| anyhow::anyhow!("Collection not found: {collection_id}"))?;
+        let Some(sync) = col.friend_sync.as_mut() else {
+            bail!("Collection is not linked to a friend");
+        };
+        sync.auto_sync = auto_sync;
+        Ok(())
+    })
 }
 
 pub fn remove_mod(paths: &Paths, game_id: &str, mod_uid: &str) -> Result<()> {
@@ -2370,11 +2916,12 @@ pub fn remove_mod(paths: &Paths, game_id: &str, mod_uid: &str) -> Result<()> {
             let m = order.mods.remove(pos);
             delete_staged_row(&m)?;
             write_loadorder(paths, game_id, &order)?;
-            let mut store = load_collections(paths, game_id)?;
-            for c in &mut store.collections {
-                c.mod_ids.retain(|id| id != mod_uid);
-            }
-            save_collections(paths, game_id, &store)?;
+            mutate_collections(paths, game_id, |store| {
+                for c in &mut store.collections {
+                    c.mod_ids.retain(|id| id != mod_uid);
+                }
+                Ok(())
+            })?;
         }
         Ok(())
     })
@@ -5160,7 +5707,7 @@ mod tests {
                     mod_ids: vec!["1_10".into(), "1_20".into()],
                     installed_at: "t".into(),
                     game_versions: None,
-                    friend_sync: None,
+                    friend_sync: None, ..Default::default()
                 }],
             },
         )
@@ -5354,7 +5901,7 @@ mod tests {
                         mod_ids: vec!["A".into(), "Z".into()],
                         installed_at: "t".into(),
                         game_versions: None,
-                        friend_sync: None,
+                        friend_sync: None, ..Default::default()
                     },
                     InstalledCollection {
                         id: "col-b".into(),
@@ -5371,7 +5918,7 @@ mod tests {
                         mod_ids: vec!["B".into()],
                         installed_at: "t".into(),
                         game_versions: None,
-                        friend_sync: None,
+                        friend_sync: None, ..Default::default()
                     },
                 ],
             },
@@ -5435,7 +5982,7 @@ mod tests {
                     mod_ids: vec!["A".into(), "Z".into()],
                     installed_at: "t".into(),
                     game_versions: None,
-                    friend_sync: None,
+                    friend_sync: None, ..Default::default()
                 }],
             },
         )
@@ -5605,6 +6152,44 @@ mod tests {
         assert!(err.to_string().contains("staging"), "{err}");
     }
 
+    #[test]
+    fn import_paths_stages_mixed_files_and_folders() {
+        let (tmp, paths) = test_paths();
+        let archive = tmp.path().join("Solo.zip");
+        fs::write(&archive, zip_bytes()).unwrap();
+        let loose = tmp.path().join("Loose.package");
+        fs::write(&loose, b"pkg").unwrap();
+        let folder = tmp.path().join("ExtractedMod");
+        fs::create_dir_all(folder.join("data")).unwrap();
+        fs::write(folder.join("data").join("plugin.dll"), b"dll").unwrap();
+        let missing = tmp.path().join("does-not-exist.zip");
+
+        let result = import_paths(
+            &paths,
+            "game",
+            &[archive, loose, folder, missing],
+            "skyrim",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result.errors.len(), 1);
+        assert!(result.errors[0].contains("does-not-exist.zip"));
+        assert_eq!(result.mods.len(), 3);
+        let mut names: Vec<_> = result.mods.iter().map(|m| m.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["ExtractedMod", "Loose", "Solo"]);
+        let ids: HashSet<_> = result.mods.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids.len(), 3);
+    }
+
+    #[test]
+    fn import_paths_rejects_empty_selection() {
+        let (_tmp, paths) = test_paths();
+        let err = import_paths(&paths, "game", &[], "skyrim", None).unwrap_err();
+        assert!(err.to_string().contains("No files or folders"), "{err}");
+    }
+
     /// Live check: redeploy managed Risk of Rain 2 and ensure RoR2BepInExPack
     /// ships Newtonsoft.Json. Opt-in via `EMPEROR_VERIFY_ROR2=1`.
     #[test]
@@ -5692,11 +6277,13 @@ mod tests {
                     mod_id: "b".into(),
                     fomod_selection: Some(fomod.clone()),
                     option_selection: None,
+                    enabled: None,
                 },
                 SyncedModSelection {
                     mod_id: "a".into(),
                     fomod_selection: None,
                     option_selection: None,
+                    enabled: None,
                 },
             ],
         )
@@ -5706,5 +6293,666 @@ mod tests {
         let ids: Vec<_> = after.mods.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, ["local_top", "b", "a", "local_bottom"]);
         assert_eq!(after.mods[1].fomod_selection, Some(fomod));
+    }
+
+    #[test]
+    fn check_collection_local_integrity_reports_missing_and_corrupted_mods() {
+        let dir = tempfile::tempdir().unwrap();
+        let intact_dir = dir.path().join("intact");
+        fs::create_dir_all(&intact_dir).unwrap();
+        fs::write(intact_dir.join("a.dll"), b"ok").unwrap();
+        fs::write(intact_dir.join("b.dll"), b"ok").unwrap();
+
+        let damaged_dir = dir.path().join("damaged");
+        fs::create_dir_all(&damaged_dir).unwrap();
+        fs::write(damaged_dir.join("only_one.dll"), b"partial").unwrap();
+
+        let empty_dir = dir.path().join("empty");
+        fs::create_dir_all(&empty_dir).unwrap();
+
+        let missing_dir = dir.path().join("missing_on_disk");
+
+        let order = LoadOrder {
+            mods: vec![
+                StagedMod {
+                    id: "10_1".into(),
+                    name: "Intact Nexus Mod".into(),
+                    source: ModSource::Nexus,
+                    nexus_mod_id: 10,
+                    nexus_file_id: 1,
+                    domain: "skyrimspecialedition".into(),
+                    staging_path: intact_dir.to_string_lossy().into(),
+                    staged_file_count: Some(2),
+                    ..Default::default()
+                },
+                StagedMod {
+                    id: "ts_Owner_Damaged".into(),
+                    name: "Damaged TS Mod".into(),
+                    source: ModSource::Thunderstore,
+                    domain: "riskofrain2".into(),
+                    ts_namespace: Some("Owner".into()),
+                    ts_name: Some("Damaged".into()),
+                    staging_path: damaged_dir.to_string_lossy().into(),
+                    staged_file_count: Some(3),
+                    ..Default::default()
+                },
+                StagedMod {
+                    id: "ts_Owner_Empty".into(),
+                    name: "Empty TS Mod".into(),
+                    source: ModSource::Thunderstore,
+                    domain: "riskofrain2".into(),
+                    ts_namespace: Some("Owner".into()),
+                    ts_name: Some("Empty".into()),
+                    staging_path: empty_dir.to_string_lossy().into(),
+                    staged_file_count: None,
+                    ..Default::default()
+                },
+                StagedMod {
+                    id: "20_2".into(),
+                    name: "Missing Dir Mod".into(),
+                    source: ModSource::Nexus,
+                    nexus_mod_id: 20,
+                    nexus_file_id: 2,
+                    domain: "skyrimspecialedition".into(),
+                    staging_path: missing_dir.to_string_lossy().into(),
+                    staged_file_count: Some(1),
+                    ..Default::default()
+                },
+            ],
+        };
+
+        let collection = InstalledCollection {
+            id: "nexus:test".into(),
+            source: CollectionSource::Nexus,
+            kind: CollectionKind::Collection,
+            name: "Test Collection".into(),
+            slug: Some("test".into()),
+            namespace: None,
+            package_name: None,
+            community: None,
+            revision: Some(1),
+            version: None,
+            profile_code: None,
+            mod_ids: vec![
+                "10_1".into(),
+                "ts_Owner_Damaged".into(),
+                "ts_Owner_Empty".into(),
+                "20_2".into(),
+                "999_9".into(),
+            ],
+            installed_at: String::new(),
+            game_versions: None,
+            friend_sync: None, ..Default::default()
+        };
+
+        let report = check_collection_local_integrity(&collection, &order);
+        assert_eq!(report.checked_count, 5);
+        assert_eq!(report.issues.len(), 4);
+        assert_eq!(report.issues[0].mod_id, "ts_Owner_Damaged");
+        assert_eq!(
+            report.issues[0].issue,
+            CollectionModIssueKind::CorruptedStaging {
+                actual_files: 1,
+                expected_files: Some(3)
+            }
+        );
+        assert!(report.issues[0].can_retry);
+
+        assert_eq!(report.issues[1].mod_id, "ts_Owner_Empty");
+        assert_eq!(
+            report.issues[1].issue,
+            CollectionModIssueKind::CorruptedStaging {
+                actual_files: 0,
+                expected_files: None
+            }
+        );
+        assert!(report.issues[1].can_retry);
+
+        assert_eq!(report.issues[2].mod_id, "20_2");
+        assert_eq!(report.issues[2].issue, CollectionModIssueKind::MissingStagingDir);
+        assert!(report.issues[2].can_retry);
+
+        assert_eq!(report.issues[3].mod_id, "999_9");
+        assert_eq!(
+            report.issues[3].issue,
+            CollectionModIssueKind::MissingFromLoadOrder
+        );
+        assert!(!report.issues[3].can_retry);
+    }
+
+    #[test]
+    fn set_mod_collections_moves_and_shares_between_collections() {
+        let (_dir, paths) = test_paths();
+        let game_id = "game-move";
+        crate::config::ensure_game_dirs(&paths, game_id).unwrap();
+        let staging_root = paths.mods_dir(game_id);
+        for id in ["A", "B"] {
+            std::fs::create_dir_all(staging_root.join(id)).unwrap();
+        }
+        let staged = |id: &str, independent: bool, collection_ids: Vec<String>| StagedMod {
+            id: id.into(),
+            name: id.into(),
+            staging_path: staging_root.join(id).to_string_lossy().into(),
+            independent,
+            collection_ids,
+            ..Default::default()
+        };
+        save_loadorder(
+            &paths,
+            game_id,
+            &LoadOrder {
+                mods: vec![
+                    staged("A", false, vec!["col-a".into()]),
+                    staged("B", false, vec!["col-b".into()]),
+                ],
+            },
+        )
+        .unwrap();
+        let make_col = |id: &str, mod_ids: Vec<&str>| InstalledCollection {
+            id: id.into(),
+            source: CollectionSource::Nexus,
+            kind: CollectionKind::Collection,
+            name: id.into(),
+            slug: None,
+            namespace: None,
+            package_name: None,
+            community: None,
+            revision: None,
+            version: None,
+            profile_code: None,
+            mod_ids: mod_ids.into_iter().map(Into::into).collect(),
+            installed_at: "t".into(),
+            game_versions: None,
+            friend_sync: None, ..Default::default()
+        };
+        save_collections(
+            &paths,
+            game_id,
+            &InstalledCollections {
+                collections: vec![make_col("col-a", vec!["A"]), make_col("col-b", vec!["B"])],
+            },
+        )
+        .unwrap();
+
+        // Move A from col-a to col-b.
+        let updated = set_mod_collections(&paths, game_id, "A", &["col-b".into()]).unwrap();
+        assert_eq!(updated.collection_ids, vec!["col-b".to_string()]);
+        assert!(!updated.independent);
+
+        let cols = list_installed_collections(&paths, game_id).unwrap();
+        assert!(cols[0].mod_ids.is_empty());
+        assert_eq!(cols[1].mod_ids, vec!["B".to_string(), "A".to_string()]);
+
+        // Assign A to both col-a and col-b (deduplicating repeated ids).
+        let updated = set_mod_collections(
+            &paths,
+            game_id,
+            "A",
+            &["col-a".into(), "col-b".into(), "col-a".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            updated.collection_ids,
+            vec!["col-a".to_string(), "col-b".to_string()]
+        );
+        assert!(!updated.independent);
+        let cols = list_installed_collections(&paths, game_id).unwrap();
+        assert_eq!(cols[0].mod_ids, vec!["A".to_string()]);
+        assert_eq!(cols[1].mod_ids, vec!["B".to_string(), "A".to_string()]);
+    }
+
+    #[test]
+    fn set_mod_collections_to_empty_marks_mod_independent() {
+        let (_dir, paths) = test_paths();
+        let game_id = "game-unassign";
+        crate::config::ensure_game_dirs(&paths, game_id).unwrap();
+        let staging_root = paths.mods_dir(game_id);
+        std::fs::create_dir_all(staging_root.join("A")).unwrap();
+        save_loadorder(
+            &paths,
+            game_id,
+            &LoadOrder {
+                mods: vec![StagedMod {
+                    id: "A".into(),
+                    name: "A".into(),
+                    staging_path: staging_root.join("A").to_string_lossy().into(),
+                    independent: false,
+                    collection_ids: vec!["col-a".into()],
+                    ..Default::default()
+                }],
+            },
+        )
+        .unwrap();
+        save_collections(
+            &paths,
+            game_id,
+            &InstalledCollections {
+                collections: vec![InstalledCollection {
+                    id: "col-a".into(),
+                    source: CollectionSource::Nexus,
+                    kind: CollectionKind::Collection,
+                    name: "A".into(),
+                    slug: None,
+                    namespace: None,
+                    package_name: None,
+                    community: None,
+                    revision: None,
+                    version: None,
+                    profile_code: None,
+                    mod_ids: vec!["A".into()],
+                    installed_at: "t".into(),
+                    game_versions: None,
+                    friend_sync: None, ..Default::default()
+                }],
+            },
+        )
+        .unwrap();
+
+        let updated = set_mod_collections(&paths, game_id, "A", &[]).unwrap();
+        assert!(updated.collection_ids.is_empty());
+        assert!(updated.independent);
+        let cols = list_installed_collections(&paths, game_id).unwrap();
+        assert!(cols[0].mod_ids.is_empty());
+    }
+
+    #[test]
+    fn set_mod_collections_rejects_unknown_collection_or_mod() {
+        let (_dir, paths) = test_paths();
+        let game_id = "game-err";
+        crate::config::ensure_game_dirs(&paths, game_id).unwrap();
+        let staging_root = paths.mods_dir(game_id);
+        std::fs::create_dir_all(staging_root.join("A")).unwrap();
+        save_loadorder(
+            &paths,
+            game_id,
+            &LoadOrder {
+                mods: vec![StagedMod {
+                    id: "A".into(),
+                    name: "A".into(),
+                    staging_path: staging_root.join("A").to_string_lossy().into(),
+                    independent: false,
+                    collection_ids: vec!["col-a".into()],
+                    ..Default::default()
+                }],
+            },
+        )
+        .unwrap();
+        save_collections(
+            &paths,
+            game_id,
+            &InstalledCollections {
+                collections: vec![InstalledCollection {
+                    id: "col-a".into(),
+                    source: CollectionSource::Nexus,
+                    kind: CollectionKind::Collection,
+                    name: "A".into(),
+                    slug: None,
+                    namespace: None,
+                    package_name: None,
+                    community: None,
+                    revision: None,
+                    version: None,
+                    profile_code: None,
+                    mod_ids: vec!["A".into()],
+                    installed_at: "t".into(),
+                    game_versions: None,
+                    friend_sync: None, ..Default::default()
+                }],
+            },
+        )
+        .unwrap();
+
+        assert!(set_mod_collections(&paths, game_id, "A", &["missing-col".into()]).is_err());
+        assert!(set_mod_collections(&paths, game_id, "missing-mod", &["col-a".into()]).is_err());
+
+        let order = load_loadorder(&paths, game_id).unwrap();
+        assert_eq!(order.mods[0].collection_ids, vec!["col-a".to_string()]);
+        let cols = list_installed_collections(&paths, game_id).unwrap();
+        assert_eq!(cols[0].mod_ids, vec!["A".to_string()]);
+    }
+
+    #[test]
+    fn sync_installed_collection_replaces_members_and_disables_dropped_non_independent() {
+        let (_dir, paths) = test_paths();
+        let game_id = "skyrim";
+        crate::config::ensure_game_dirs(&paths, game_id).unwrap();
+        let staging_root = paths.mods_dir(game_id);
+        std::fs::create_dir_all(&staging_root).unwrap();
+
+        save_loadorder(
+            &paths,
+            game_id,
+            &LoadOrder {
+                mods: vec![
+                    StagedMod {
+                        id: "A".into(),
+                        name: "A".into(),
+                        enabled: true,
+                        independent: false,
+                        collection_ids: vec!["friend-col".into()],
+                        staging_path: staging_root.join("A").to_string_lossy().into(),
+                        ..Default::default()
+                    },
+                    StagedMod {
+                        id: "B".into(),
+                        name: "B".into(),
+                        enabled: true,
+                        independent: false,
+                        collection_ids: vec!["friend-col".into()],
+                        staging_path: staging_root.join("B").to_string_lossy().into(),
+                        ..Default::default()
+                    },
+                    StagedMod {
+                        id: "C".into(),
+                        name: "C".into(),
+                        enabled: true,
+                        independent: true,
+                        collection_ids: vec!["friend-col".into()],
+                        staging_path: staging_root.join("C").to_string_lossy().into(),
+                        ..Default::default()
+                    },
+                ],
+            },
+        )
+        .unwrap();
+
+        let initial = InstalledCollection {
+            id: "friend-col".into(),
+            source: CollectionSource::Emperor,
+            kind: CollectionKind::Share,
+            name: "Friend Col".into(),
+            slug: None,
+            namespace: None,
+            package_name: None,
+            community: None,
+            revision: None,
+            version: None,
+            profile_code: Some("code-1".into()),
+            mod_ids: vec!["A".into(), "B".into(), "C".into()],
+            installed_at: String::new(),
+            game_versions: None,
+            friend_sync: Some(FriendSyncMetadata {
+                friend_peer_id: "peer-1".into(),
+                friend_collection_id: "active:skyrim".into(),
+                last_synced_hash: "h1".into(),
+                last_synced_at: "t1".into(),
+                auto_sync: true,
+            }),
+            ..Default::default()
+        };
+        record_installed_collection(&paths, game_id, initial.clone(), &[]).unwrap();
+
+        // Sync with B and C dropped; only A remains.
+        let mut updated = initial;
+        updated.mod_ids = vec!["A".into()];
+        updated.profile_code = Some("code-2".into());
+        sync_installed_collection(&paths, game_id, updated, &[]).unwrap();
+
+        let cols = list_installed_collections(&paths, game_id).unwrap();
+        assert_eq!(cols[0].mod_ids, vec!["A".to_string()]);
+        assert_eq!(cols[0].friend_sync.as_ref().unwrap().auto_sync, true);
+
+        let order = load_loadorder(&paths, game_id).unwrap();
+        let mod_a = order.mods.iter().find(|m| m.id == "A").unwrap();
+        let mod_b = order.mods.iter().find(|m| m.id == "B").unwrap();
+        let mod_c = order.mods.iter().find(|m| m.id == "C").unwrap();
+        assert!(mod_a.enabled);
+        assert_eq!(mod_a.collection_ids, vec!["friend-col".to_string()]);
+        assert!(!mod_b.enabled);
+        assert!(mod_b.collection_ids.is_empty());
+        // Independent mod C stays enabled even after being detached.
+        assert!(mod_c.enabled);
+        assert!(mod_c.collection_ids.is_empty());
+    }
+
+    #[test]
+    fn list_installed_collections_reconciles_member_mods_and_tracks_unsaved_changes() {
+        let (dir, paths) = test_paths();
+        let game_id = "skyrim";
+        crate::config::ensure_game_dirs(&paths, game_id).unwrap();
+
+        let staged = |id: &str, order: u32, collection_ids: Vec<String>| StagedMod {
+            id: id.into(),
+            name: id.into(),
+            order,
+            enabled: true,
+            collection_ids,
+            independent: false,
+            staging_path: dir.path().join(id).to_string_lossy().into(),
+            ..Default::default()
+        };
+
+        let mut mods = Vec::new();
+        for i in 0..5 {
+            mods.push(staged(&format!("m{i}"), i, vec!["col-1".into()]));
+        }
+        save_loadorder(&paths, game_id, &LoadOrder { mods }).unwrap();
+
+        // Simulate collections.json only having 2 of the 5 installed mods.
+        save_collections(
+            &paths,
+            game_id,
+            &InstalledCollections {
+                collections: vec![InstalledCollection {
+                    id: "col-1".into(),
+                    source: CollectionSource::Emperor,
+                    kind: CollectionKind::Share,
+                    name: "INC".into(),
+                    mod_ids: vec!["m0".into(), "m1".into()],
+                    ..Default::default()
+                }],
+            },
+        )
+        .unwrap();
+
+        let cols = list_installed_collections(&paths, game_id).unwrap();
+        assert_eq!(cols[0].mod_ids.len(), 5);
+        assert!(!cols[0].has_unsaved_changes);
+
+        // Reordering marks the collection as having unsaved changes.
+        set_load_order(
+            &paths,
+            game_id,
+            &[
+                "m4".into(),
+                "m0".into(),
+                "m1".into(),
+                "m2".into(),
+                "m3".into(),
+            ],
+        )
+        .unwrap();
+        let cols_after_reorder = list_installed_collections(&paths, game_id).unwrap();
+        assert!(cols_after_reorder[0].has_unsaved_changes);
+
+        // Toggling auto_save persists the flag.
+        let updated = set_collection_auto_save(&paths, game_id, "col-1", true).unwrap();
+        assert!(updated.auto_save);
+    }
+
+    #[test]
+    fn rename_installed_collection_and_sync_update_name_and_profile_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_dir: dir.path().join("cfg"),
+            data_dir: dir.path().join("data"),
+            cache_dir: dir.path().join("cache"),
+        };
+        let game_id = "skyrim_1";
+        let manifest = crate::share::ShareManifest {
+            v: 1,
+            name: Some("Initial Pack".into()),
+            game: crate::share::ShareGameHint {
+                title: Some("Skyrim SE".into()),
+                nexus_domain: Some("skyrimspecialedition".into()),
+                ..Default::default()
+            },
+            game_versions: None,
+            mods: Vec::new(),
+        };
+        let initial_code = crate::share::encode_share_manifest(&manifest).unwrap();
+        let share_id = crate::share::emperor_share_id(&initial_code);
+
+        save_collections(
+            &paths,
+            game_id,
+            &InstalledCollections {
+                collections: vec![InstalledCollection {
+                    id: share_id.clone(),
+                    source: CollectionSource::Emperor,
+                    kind: CollectionKind::Share,
+                    name: "Initial Pack".into(),
+                    profile_code: Some(initial_code.clone()),
+                    ..Default::default()
+                }],
+            },
+        )
+        .unwrap();
+
+        let renamed =
+            rename_installed_collection(&paths, game_id, &share_id, "  My Co-op Pack ").unwrap();
+        assert_eq!(renamed.collection.name, "My Co-op Pack");
+        assert_eq!(renamed.old_code.as_deref(), Some(initial_code.as_str()));
+        let decoded = crate::share::decode_share_code(
+            renamed.collection.profile_code.as_deref().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(decoded.name.as_deref(), Some("My Co-op Pack"));
+
+        let mut next_manifest = manifest;
+        next_manifest.name = Some("From Collections Tab".into());
+        let next_code = crate::share::encode_share_manifest(&next_manifest).unwrap();
+        let synced = sync_installed_collection_rename(
+            &paths,
+            game_id,
+            &share_id,
+            renamed.collection.profile_code.as_deref().unwrap(),
+            "From Collections Tab",
+            &next_code,
+        )
+        .unwrap();
+        assert!(synced);
+        let cols = load_collections(&paths, game_id).unwrap().collections;
+        assert_eq!(cols[0].name, "From Collections Tab");
+        assert_eq!(cols[0].profile_code.as_deref(), Some(next_code.as_str()));
+    }
+
+    #[test]
+    fn auto_save_persists_across_relaunch_and_concurrent_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_dir: dir.path().join("cfg"),
+            data_dir: dir.path().join("data"),
+            cache_dir: dir.path().join("cache"),
+        };
+        let game_id = "skyrim_1";
+        let staged = |id: &str, ord: u32| StagedMod {
+            id: id.into(),
+            name: id.into(),
+            domain: "skyrimspecialedition".into(),
+            staging_path: paths.mods_dir(game_id).join(id).to_string_lossy().into(),
+            enabled: true,
+            order: ord,
+            collection_ids: vec!["col-1".into()],
+            ..Default::default()
+        };
+        save_loadorder(
+            &paths,
+            game_id,
+            &LoadOrder {
+                mods: vec![staged("m1", 1), staged("m2", 2)],
+            },
+        )
+        .unwrap();
+        save_collections(
+            &paths,
+            game_id,
+            &InstalledCollections {
+                collections: vec![InstalledCollection {
+                    id: "col-1".into(),
+                    source: CollectionSource::Emperor,
+                    kind: CollectionKind::Share,
+                    name: "Coop".into(),
+                    mod_ids: vec!["m1".into(), "m2".into()],
+                    ..Default::default()
+                }],
+            },
+        )
+        .unwrap();
+
+        let updated = set_collection_auto_save(&paths, game_id, "col-1", true).unwrap();
+        assert!(updated.auto_save);
+
+        // Concurrent/subsequent list_installed_collections and cache_collection_game_versions
+        // (simulating relaunch & metadata refresh) must preserve auto_save = true.
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    let _ = list_installed_collections(&paths, game_id).unwrap();
+                    let mut updates = HashMap::new();
+                    updates.insert("col-1".to_string(), vec!["1.6.1170".to_string()]);
+                    let _ = cache_collection_game_versions(&paths, game_id, &updates).unwrap();
+                });
+            }
+        });
+
+        let relaunched = list_installed_collections(&paths, game_id).unwrap();
+        assert!(relaunched[0].auto_save);
+        let raw = load_collections(&paths, game_id).unwrap();
+        assert!(raw.collections[0].auto_save);
+    }
+
+    #[test]
+    fn apply_collection_order_and_selections_respects_enabled_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_dir: dir.path().join("cfg"),
+            data_dir: dir.path().join("data"),
+            cache_dir: dir.path().join("cache"),
+        };
+        let game_id = "skyrim_1";
+        let staged = |id: &str, ord: u32, enabled: bool| StagedMod {
+            id: id.into(),
+            name: id.into(),
+            domain: "skyrimspecialedition".into(),
+            staging_path: paths.mods_dir(game_id).join(id).to_string_lossy().into(),
+            enabled,
+            order: ord,
+            ..Default::default()
+        };
+        save_loadorder(
+            &paths,
+            game_id,
+            &LoadOrder {
+                mods: vec![staged("a", 1, true), staged("b", 2, true)],
+            },
+        )
+        .unwrap();
+
+        apply_collection_order_and_selections(
+            &paths,
+            game_id,
+            &[
+                SyncedModSelection {
+                    mod_id: "b".into(),
+                    fomod_selection: None,
+                    option_selection: None,
+                    enabled: Some(false),
+                },
+                SyncedModSelection {
+                    mod_id: "a".into(),
+                    fomod_selection: None,
+                    option_selection: None,
+                    enabled: None,
+                },
+            ],
+        )
+        .unwrap();
+
+        let after = load_loadorder(&paths, game_id).unwrap();
+        assert_eq!(after.mods[0].id, "b");
+        assert!(!after.mods[0].enabled);
+        assert_eq!(after.mods[1].id, "a");
+        assert!(after.mods[1].enabled);
     }
 }

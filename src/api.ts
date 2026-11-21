@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { EmperorOpenMod } from "./modDeepLink";
 import type {
   AuthorSuggestion,
+  BannerPersistence,
   BannerTimeouts,
   BrowseMeta,
   BrowseSearchOpts,
@@ -14,6 +15,7 @@ import type {
   CollectionModFile,
   CollectionSearchPage,
   CollectionVersionAdvice,
+  CollectionVisibility,
   GameLaunchState,
   LaunchCommandSource,
   LaunchEnvVar,
@@ -26,8 +28,11 @@ import type {
   GameInfo,
   GamePluginInfo,
   GameVersionReport,
-  ImportFolderResult,
+  ImportResult,
   InstalledCollection,
+  CollectionIntegrityReport,
+  RetryCollectionModTarget,
+  RetryCollectionModsResult,
   IgnoredRequirement,
   ManagedGame,
   ModDetail,
@@ -42,6 +47,7 @@ import type {
   ModSearchPage,
   NexusUser,
   OrphanScan,
+  PersistedBanner,
   RecoveryReport,
   ClearDownloadCacheResult,
   Settings,
@@ -74,6 +80,7 @@ import type {
   AppInstallResult,
   FriendsState,
   FriendSyncResult,
+  FriendCollectionSyncStatus,
 } from "./types";
 
 export const api = {
@@ -105,6 +112,13 @@ export const api = {
     invoke<void>("set_recent_downloads_limit", { limit }),
   setBannerTimeouts: (timeouts: BannerTimeouts) =>
     invoke<void>("set_banner_timeouts", { timeouts }),
+  setBannerPersistence: (persistence: BannerPersistence) =>
+    invoke<void>("set_banner_persistence", { persistence }),
+  setDismissBannerOnRetry: (enabled: boolean) =>
+    invoke<void>("set_dismiss_banner_on_retry", { enabled }),
+  getPersistedBanners: () => invoke<PersistedBanner[]>("get_persisted_banners"),
+  savePersistedBanners: (banners: PersistedBanner[]) =>
+    invoke<void>("save_persisted_banners", { banners }),
   setBrowseGridSize: (size: number) =>
     invoke<void>("set_browse_grid_size", { size }),
   scanModOrphans: () => invoke<OrphanScan>("scan_mod_orphans"),
@@ -143,6 +157,8 @@ export const api = {
     invoke<ManagedGame>("set_game_version", { id, version }),
   setIgnoredRequirements: (id: string, ignored: IgnoredRequirement[]) =>
     invoke<ManagedGame>("set_ignored_requirements", { id, ignored }),
+  setWineOverridesDismissed: (id: string, dismissed: boolean) =>
+    invoke<ManagedGame>("set_wine_overrides_dismissed", { id, dismissed }),
   checkModGameVersions: (gameId: string) =>
     invoke<GameVersionReport>("check_mod_game_versions", { gameId }),
   adviseCollectionVersions: (
@@ -445,12 +461,63 @@ export const api = {
     invoke<SavedCollectionDetail>("get_saved_collection", { id }),
   renameSavedCollection: (id: string, name: string) =>
     invoke<SavedCollectionEntry>("rename_saved_collection", { id, name }),
+  renameInstalledCollection: (
+    gameId: string,
+    collectionId: string,
+    name: string,
+  ) =>
+    invoke<InstalledCollection>("rename_installed_collection", {
+      gameId,
+      collectionId,
+      name,
+    }),
   deleteSavedCollection: (id: string) =>
     invoke<void>("delete_saved_collection", { id }),
   listInstalledCollections: (gameId: string) =>
     invoke<InstalledCollection[]>("list_installed_collections", { gameId }),
+  saveCollectionChanges: (gameId: string, collectionId: string) =>
+    invoke<InstalledCollection>("save_collection_changes", {
+      gameId,
+      collectionId,
+    }),
+  setCollectionAutoSave: (
+    gameId: string,
+    collectionId: string,
+    autoSave: boolean,
+  ) =>
+    invoke<InstalledCollection>("set_collection_auto_save", {
+      gameId,
+      collectionId,
+      autoSave,
+    }),
   uninstallCollection: (gameId: string, collectionId: string) =>
     invoke<number>("uninstall_collection", { gameId, collectionId }),
+  checkInstalledCollectionsLocal: (gameId: string) =>
+    invoke<CollectionIntegrityReport[]>("check_installed_collections_local", {
+      gameId,
+    }),
+  checkCollectionIntegrity: (
+    gameId: string,
+    collectionId: string,
+    checkRemote = true,
+  ) =>
+    invoke<CollectionIntegrityReport>("check_collection_integrity", {
+      gameId,
+      collectionId,
+      checkRemote,
+    }),
+  retryCollectionMods: (
+    gameId: string,
+    collectionId: string,
+    targets: RetryCollectionModTarget[],
+  ) =>
+    invoke<RetryCollectionModsResult>("retry_collection_mods", {
+      gameId,
+      collectionId,
+      targets,
+    }),
+  setModCollections: (gameId: string, modId: string, collectionIds: string[]) =>
+    invoke<StagedMod>("set_mod_collections", { gameId, modId, collectionIds }),
   recordNexusCollection: (args: {
     gameId: string;
     slug: string;
@@ -470,16 +537,8 @@ export const api = {
   handleNxm: (url: string) => invoke<DownloadItem>("handle_nxm", { url }),
   takePendingEmperorModLink: () =>
     invoke<EmperorOpenMod | null>("take_pending_emperor_mod_link"),
-  importModArchive: (args: {
-    gameId: string;
-    path: string;
-    name?: string | null;
-    domain?: string | null;
-    modId?: number | null;
-    fileId?: number | null;
-  }) => invoke<StagedMod>("import_mod_archive", args),
-  importModFolder: (args: { gameId: string; path: string }) =>
-    invoke<ImportFolderResult>("import_mod_folder", args),
+  importMods: (args: { gameId: string; paths: string[] }) =>
+    invoke<ImportResult>("import_mods", args),
   importAssistDownload: (path: string) =>
     invoke<StagedMod | null>("import_assist_download", { path }),
   listMods: (gameId: string) => invoke<StagedMod[]>("list_mods", { gameId }),
@@ -582,8 +641,14 @@ export const api = {
   getFriendsState: () => invoke<FriendsState>("get_friends_state"),
   setP2pDisplayName: (name: string) =>
     invoke<FriendsState>("set_p2p_display_name", { name }),
+  setP2pProfilePicture: (dataUrl: string | null) =>
+    invoke<FriendsState>("set_p2p_profile_picture", { dataUrl }),
+  setP2pAppearOffline: (appearOffline: boolean) =>
+    invoke<FriendsState>("set_p2p_appear_offline", { appearOffline }),
   setCollectionVisibility: (collectionId: string, hidden: boolean) =>
     invoke<FriendsState>("set_collection_visibility", { collectionId, hidden }),
+  setCollectionSharing: (collectionId: string, visibility: CollectionVisibility) =>
+    invoke<FriendsState>("set_collection_sharing", { collectionId, visibility }),
   addFriendByCode: (code: string) =>
     invoke<FriendsState>("add_friend_by_code", { code }),
   respondFriendRequest: (peerId: string, accept: boolean) =>
@@ -624,5 +689,9 @@ export const api = {
       gameId,
       collectionId,
       autoSync,
+    }),
+  getFriendCollectionSyncStates: (gameId: string) =>
+    invoke<FriendCollectionSyncStatus[]>("get_friend_collection_sync_states", {
+      gameId,
     }),
 };

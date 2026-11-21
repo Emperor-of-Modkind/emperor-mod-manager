@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
-import { faCheck, faCopy } from "@fortawesome/free-solid-svg-icons";
+import { faCheck, faCopy, faXmark } from "@fortawesome/free-solid-svg-icons";
 
 import type { WineOverrideAdvice } from "./types";
 
@@ -8,10 +8,12 @@ export function WineOverrideNotice({
   advice,
   busy,
   onApply,
+  onDismiss,
 }: {
   advice: WineOverrideAdvice;
   busy: boolean;
   onApply: () => void;
+  onDismiss?: () => void;
 }) {
   const [copied, setCopied] = useState(false);
 
@@ -42,20 +44,33 @@ export function WineOverrideNotice({
         <p className="wine-override-command">{advice.launch_options}</p>
       </div>
       <div className="wine-override-actions">
-        <button
-          type="button"
-          className="icon-btn"
-          aria-label={copied ? "Copied" : "Copy"}
-          title={copied ? "Copied" : "Copy"}
-          onClick={() => {
-            void navigator.clipboard.writeText(advice.launch_options).then(
-              () => setCopied(true),
-              () => setCopied(false),
-            );
-          }}
-        >
-          <FontAwesomeIcon icon={copied ? faCheck : faCopy} />
-        </button>
+        <div className="wine-override-icon-actions">
+          <button
+            type="button"
+            className="icon-btn"
+            aria-label={copied ? "Copied" : "Copy"}
+            title={copied ? "Copied" : "Copy"}
+            onClick={() => {
+              void navigator.clipboard.writeText(advice.launch_options).then(
+                () => setCopied(true),
+                () => setCopied(false),
+              );
+            }}
+          >
+            <FontAwesomeIcon icon={copied ? faCheck : faCopy} />
+          </button>
+          {onDismiss && (
+            <button
+              type="button"
+              className="icon-btn"
+              aria-label="Dismiss"
+              title="Dismiss"
+              onClick={onDismiss}
+            >
+              <FontAwesomeIcon icon={faXmark} />
+            </button>
+          )}
+        </div>
         {advice.can_apply && (
           <button type="button" onClick={onApply} disabled={busy}>
             Set in Steam

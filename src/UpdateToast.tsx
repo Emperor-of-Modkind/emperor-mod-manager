@@ -40,6 +40,22 @@ export function CheckingUpdatesToast({ show, stagedCount }: CheckingUpdatesToast
   );
 }
 
+/** Quiet status while P2P friend update polling is running. */
+export function CheckingFriendUpdatesToast({ show }: { show: boolean }) {
+  return (
+    <Reveal show={show} className="update-toast-slot">
+      <div className="update-toast" role="status">
+        <div className="update-toast-row">
+          <Throbber />
+          <div className="update-toast-copy">
+            <p className="update-toast-title">Checking for friend updates…</p>
+          </div>
+        </div>
+      </div>
+    </Reveal>
+  );
+}
+
 /** Small offer to install a newer app release, or open the release page. */
 export function UpdateToast({
   show,

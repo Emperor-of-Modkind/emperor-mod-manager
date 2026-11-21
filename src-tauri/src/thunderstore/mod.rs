@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::StreamExt;
@@ -13,11 +13,12 @@ use reqwest::header::{
     HeaderMap, HeaderValue, IF_MODIFIED_SINCE, LAST_MODIFIED, LOCATION, USER_AGENT,
 };
 use serde::{Deserialize, Serialize};
-use tokio::fs::OpenOptions;
-use tokio::io::AsyncWriteExt;
 
 use crate::config::{APP_NAME, APP_VERSION};
-use crate::nexus::{TransferControl, CANCELLED_MSG, PAUSED_MSG};
+use crate::nexus::{
+    is_retryable_transfer_err, stream_url_to_file, TransferControl, CANCELLED_MSG, PAUSED_MSG,
+};
+use crate::rate_limit::{backoff_with_jitter, sleep_interruptible};
 use walkdir::WalkDir;
 
 const TS_BASE: &str = "https://thunderstore.io";
@@ -205,7 +206,10 @@ fn build_http(follow_redirects: bool) -> Result<reqwest::Client> {
         USER_AGENT,
         HeaderValue::from_str(&format!("{APP_NAME}/{APP_VERSION}"))?,
     );
-    let mut builder = reqwest::Client::builder().default_headers(headers);
+    let mut builder = reqwest::Client::builder()
+        .default_headers(headers)
+        .connect_timeout(Duration::from_secs(30))
+        .read_timeout(Duration::from_secs(60));
     if !follow_redirects {
         builder = builder.redirect(reqwest::redirect::Policy::none());
     }
@@ -464,66 +468,51 @@ impl ThunderstoreClient {
         control: Option<&TransferControl>,
         on_progress: Option<&Arc<dyn Fn(u64, Option<u64>, u64) + Send + Sync>>,
     ) -> Result<()> {
-        if let Some(parent) = dest.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        let resp = self
-            .http
-            .get(&version.download_url)
-            .send()
+        let cancel = control.map(|c| c.cancel.as_ref());
+        let pause = control.map(|c| c.pause.as_ref());
+        const MAX_ATTEMPTS: u32 = 3;
+
+        for attempt in 0..MAX_ATTEMPTS {
+            let offset = if attempt == 0 {
+                0
+            } else {
+                tokio::fs::metadata(dest).await.map(|m| m.len()).unwrap_or(0)
+            };
+            match stream_url_to_file(
+                &self.http,
+                &version.download_url,
+                dest,
+                offset,
+                None,
+                control,
+                on_progress,
+            )
             .await
-            .with_context(|| format!("GET {}", version.download_url))?;
-        if !resp.status().is_success() {
-            bail!("Thunderstore download failed: {}", resp.status());
-        }
-        let total = resp
-            .content_length()
-            .or_else(|| (version.file_size > 0).then_some(version.file_size));
-        let mut stream = resp.bytes_stream();
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(dest)
-            .await?;
-        let mut downloaded: u64 = 0;
-        let started = Instant::now();
-        let mut last_report = started;
-        while let Some(chunk) = stream.next().await {
-            if let Some(ctrl) = control {
-                if ctrl.cancel.load(Ordering::Relaxed) {
-                    bail!(CANCELLED_MSG);
-                }
-                if ctrl.pause.load(Ordering::Relaxed) {
-                    file.flush().await?;
-                    if let Some(cb) = on_progress {
-                        cb(downloaded, total, 0);
+            {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    let msg = e.to_string();
+                    if is_retryable_transfer_err(&msg) && attempt + 1 < MAX_ATTEMPTS {
+                        let delay = backoff_with_jitter(attempt, 1500, 20_000);
+                        log::warn!(
+                            "Thunderstore download retry {}/{} in {}ms: {msg}",
+                            attempt + 1,
+                            MAX_ATTEMPTS,
+                            delay.as_millis()
+                        );
+                        if !sleep_interruptible(delay, cancel, pause).await {
+                            if cancel.map(|c| c.load(Ordering::SeqCst)).unwrap_or(false) {
+                                bail!("{CANCELLED_MSG}");
+                            }
+                            bail!("{PAUSED_MSG}");
+                        }
+                        continue;
                     }
-                    bail!(PAUSED_MSG);
+                    return Err(e);
                 }
             }
-            let chunk = chunk?;
-            file.write_all(&chunk).await?;
-            downloaded += chunk.len() as u64;
-            let now = Instant::now();
-            if now.duration_since(last_report).as_millis() >= 150 {
-                if let Some(cb) = on_progress {
-                    let elapsed = started.elapsed().as_secs_f64().max(0.001);
-                    cb(downloaded, total, (downloaded as f64 / elapsed) as u64);
-                }
-                last_report = now;
-            }
         }
-        file.flush().await?;
-        if let Some(cb) = on_progress {
-            let elapsed = started.elapsed().as_secs_f64().max(0.001);
-            cb(
-                downloaded,
-                total.or(Some(downloaded)),
-                (downloaded as f64 / elapsed) as u64,
-            );
-        }
-        Ok(())
+        unreachable!("loop returns on final attempt")
     }
 }
 

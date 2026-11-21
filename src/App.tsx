@@ -21,13 +21,18 @@ import {
   faArrowUp,
   faBars,
   faCaretDown,
+  faCheck,
   faCopy,
+  faEye,
+  faEyeSlash,
+  faFileImport,
   faFilter,
   faGear,
   faLink,
   faMagnifyingGlass,
   faPlay,
   faPlus,
+  faRightLeft,
   faStop,
   faTrashCan,
   faXmark,
@@ -38,10 +43,24 @@ import { listen } from "@tauri-apps/api/event";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import appLogo from "./assets/app-logo.png";
 import { AccountConnections } from "./AccountConnections";
+import {
+  CollectionDetailView,
+  CollectionStats,
+  EditableCollectionTitle,
+  ShareModList,
+} from "./CollectionDetailView";
+import { CollectionsGameList } from "./CollectionsGameList";
+import {
+  CollectionSharingModal,
+  formatVisibilityLabel,
+  resolveCollectionVisibility,
+  visibilityIcon,
+} from "./CollectionSharingModal";
 import { FriendsPage } from "./FriendsPage";
 import { SettingsSection } from "./SettingsSection";
+import { SocialSettingsSection } from "./SocialSettingsSection";
 import { Throbber } from "./Throbber";
-import { CheckingUpdatesToast, UpdateToast } from "./UpdateToast";
+import { CheckingFriendUpdatesToast, CheckingUpdatesToast, UpdateToast } from "./UpdateToast";
 import { api } from "./api";
 import { setupCanFinish } from "./setupGate";
 import {
@@ -58,7 +77,7 @@ import {
   clampCatalogSourceFilter,
   type CatalogSourceFilter,
 } from "./catalogSources";
-import { SourceMark } from "./SourceMark";
+import { SourceMark, sourceMarkName } from "./SourceMark";
 import { ImageCarousel } from "./ImageCarousel";
 import {
   MotionCard,
@@ -79,7 +98,6 @@ import {
   BrowseListSkeleton,
   BrowseResultsSkeleton,
   CollectionDetailSkeleton,
-  InlineStatSkeleton,
   ModDetailSkeleton,
   StagedModsSkeleton,
 } from "./Skeleton";
@@ -135,6 +153,7 @@ import {
   type FomodPass,
 } from "./fomodQueue";
 import { ModOptionsDialog } from "./ModOptionsDialog";
+import { MoveModCollectionDialog } from "./MoveModCollectionDialog";
 import { QuickInstallDialog } from "./QuickInstallDialog";
 import {
   disabledRequirementWarnings,
@@ -148,16 +167,22 @@ import {
 } from "./RequirementsDialog";
 import {
   StatusBanner,
+  bannerPersistenceFor,
   bannerTimeoutFor,
   deployStatusNotice,
   dismissBanner,
+  dismissBannersForDownload,
+  filterPersistableBanners,
+  pruneExpiredBanners,
   pushBanner,
+  remainingBannerTimeoutSeconds,
   type BannerAction,
   type BannerKind,
   type StackedBanner,
   type StatusNotice,
 } from "./StatusBanner";
 import { WineOverrideNotice } from "./WineOverrideNotice";
+import { CollectionIntegrityDialog } from "./CollectionIntegrityDialog";
 import {
   COLLECTION_COVER_PREFIX,
   applyCatalogCovers,
@@ -173,14 +198,19 @@ import type {
   CatalogSuggestion,
   CollectionDetail,
   CollectionHit,
+  CollectionIntegrityReport,
   CollectionModFile,
+  CollectionModIssue,
+  CollectionVisibility,
   DetectedGame,
   DownloadItem,
+  FriendsState,
   GameHealth,
   GameInfo,
   GameVersionReport,
   IgnoredRequirement,
   InstalledCollection,
+  FriendCollectionSyncStatus,
   ManagedGame,
   ModDetail,
   ModFileInfo,
@@ -219,6 +249,7 @@ import type {
 import {
   formatCollectionGameVersions,
   groupSavedCollectionsByGame,
+  savedCollectionGameKey,
   savedCollectionMatchesGame,
 } from "./savedCollectionGroups";
 import "./App.css";
@@ -1545,8 +1576,17 @@ const MediaCard = memo(function MediaCard(props: {
           {showSkeleton ? (
             <div className="media-cover-skeleton skeleton" aria-hidden="true" />
           ) : null}
-          {badge ? <span className="media-badge">{badge}</span> : null}
-          {installed ? <span className="media-status">Installed</span> : null}
+          {overlay || badge ? (
+            <div className="media-cover-top-left">
+              {overlay ? <span className="media-overlay">{overlay}</span> : null}
+              {badge ? <span className="media-badge">{badge}</span> : null}
+            </div>
+          ) : null}
+          {installed ? (
+            <span className="media-status" title="Installed" aria-label="Installed">
+              <FontAwesomeIcon icon={faCheck} aria-hidden="true" />
+            </span>
+          ) : null}
           {coverSrc ? (
             activeSrc ? (
               <img
@@ -1565,7 +1605,6 @@ const MediaCard = memo(function MediaCard(props: {
           ) : (
             <PlaceholderIcon />
           )}
-          {overlay ? <span className="media-overlay">{overlay}</span> : null}
           {coverMarks && coverMarks.length > 0 ? (
             <div className="media-cover-tags">
               {coverMarks.map((mark) => (
@@ -1637,6 +1676,7 @@ const MediaCard = memo(function MediaCard(props: {
 
 const BrowseModGridCard = memo(function BrowseModGridCard({
   mod: m,
+  sort,
   installed,
   isPremium,
   onOpen,
@@ -1644,6 +1684,7 @@ const BrowseModGridCard = memo(function BrowseModGridCard({
   onUninstall,
 }: {
   mod: CatalogHit;
+  sort?: string;
   installed: boolean;
   isPremium: boolean;
   onOpen: (mod: CatalogHit, tab: "info" | "files") => void;
@@ -1651,24 +1692,23 @@ const BrowseModGridCard = memo(function BrowseModGridCard({
   onUninstall: (mod: CatalogHit) => void;
 }) {
   const handleOpenInfo = useCallback(() => onOpen(m, "info"), [m, onOpen]);
-  const meta = useMemo(
-    () => (
-      <>
-        <SourceMark source={m.source} />
-        {m.category ? ` · ${m.category}` : ""}
-      </>
-    ),
-    [m.category, m.source],
+  const coverMarks = useMemo(
+    () => [{ source: m.source, label: sourceMarkName(m.source) }],
+    [m.source],
   );
-  const overlay = useMemo(
-    () =>
-      m.source === "nexus" && m.endorsements != null
-        ? `${m.endorsements.toLocaleString()} endorsements`
-        : m.downloads != null
-          ? `${m.downloads.toLocaleString()} downloads`
-          : null,
-    [m.downloads, m.endorsements, m.source],
-  );
+  const overlay = useMemo(() => {
+    if (sort === "downloads") {
+      if (m.downloads != null) return `${m.downloads.toLocaleString()} downloads`;
+      if (m.source === "nexus" && m.endorsements != null) {
+        return `${m.endorsements.toLocaleString()} endorsements`;
+      }
+      return null;
+    }
+    if (m.source === "nexus" && m.endorsements != null) {
+      return `${m.endorsements.toLocaleString()} endorsements`;
+    }
+    return m.downloads != null ? `${m.downloads.toLocaleString()} downloads` : null;
+  }, [m.downloads, m.endorsements, m.source, sort]);
   const coverActions = useMemo(() => {
     if (m.source === "thunderstore") {
       return installed ? (
@@ -1761,9 +1801,9 @@ const BrowseModGridCard = memo(function BrowseModGridCard({
       plain
       title={m.name}
       imageSrc={mediaSrc(null, m.picture_url)}
-      badge={m.author ?? "Mod"}
+      badge={m.author ?? undefined}
       overlay={overlay}
-      meta={meta}
+      coverMarks={coverMarks}
       installed={installed}
       onClick={handleOpenInfo}
       coverActions={coverActions}
@@ -1923,135 +1963,23 @@ function sameSnapshot(a: unknown, b: unknown): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
-function shareModLabel(m: ShareModEntry): string {
-  return (
-    m.display_name ||
-    m.name ||
-    (m.s === "nexus"
-      ? `Nexus ${m.mod_id}/${m.file_id}`
-      : m.s === "thunderstore"
-        ? `${m.namespace}-${m.name}`
-        : `mod.io ${m.mod_id}`) ||
-    "Mod"
-  );
-}
 
-const ShareModList = memo(function ShareModList({
-  mods,
-  scrollRef,
-  active = true,
-}: {
-  mods: ShareModEntry[];
-  scrollRef: RefObject<HTMLElement | null>;
-  active?: boolean;
-}) {
-  const rows = useMemo(() => mods.map((mod, index) => ({ mod, index })), [mods]);
-  const getKey = useCallback(
-    (row: { mod: ShareModEntry; index: number }) => `${row.mod.s}-${row.index}`,
-    [],
-  );
-  const renderItem = useCallback((row: { mod: ShareModEntry; index: number }) => {
-    const m = row.mod;
-    return (
-      <div>
-        <strong>{shareModLabel(m)}</strong>
-        <small>
-          {m.s}
-          {m.version ? ` · v${m.version}` : ""}
-          {m.s === "nexus" && m.mod_id != null
-            ? ` · ${m.domain} ${m.mod_id}/${m.file_id}`
-            : ""}
-          {m.s === "thunderstore"
-            ? ` · ${m.community}/${m.namespace}-${m.name}`
-            : ""}
-          {m.s === "modio" ? ` · game ${m.game_id} mod ${m.mod_id}` : ""}
-        </small>
-      </div>
-    );
-  }, []);
-  if (mods.length === 0) {
-    return (
-      <ul className="list">
-        <li className="empty">No mods in this share.</li>
-      </ul>
-    );
-  }
-  return (
-    <BrowseVirtualList
-      items={rows}
-      scrollRef={scrollRef}
-      active={active}
-      staggerEnter
-      estimateSize={estimateListRowHeight(false)}
-      getKey={getKey}
-      rowClassName=""
-      renderItem={renderItem}
-    />
-  );
-});
-
-function SavedCollectionStats({
-  entry,
-}: {
-  entry: SavedCollectionEntry;
-}) {
-  const builtFor = formatCollectionGameVersions(entry.game_versions);
-  const created = formatIsoDate(entry.created_at);
-  return (
-    <div className="detail-stats">
-      <span>
-        {entry.mod_count} mod{entry.mod_count === 1 ? "" : "s"}
-      </span>
-      {entry.nexus_count ? <span>{entry.nexus_count} Nexus</span> : null}
-      {entry.thunderstore_count ? (
-        <span>{entry.thunderstore_count} Thunderstore</span>
-      ) : null}
-      {entry.modio_count ? <span>{entry.modio_count} mod.io</span> : null}
-      {builtFor ? <span>Built for {builtFor}</span> : null}
-      {created ? <span>Created {created}</span> : null}
-    </div>
-  );
-}
 
 function SavedCollectionDetailBody({
   entry,
   mods,
-  renameValue,
-  onRenameChange,
-  onRenameSubmit,
   showMods,
   scrollRef,
   active,
 }: {
   entry: SavedCollectionEntry;
   mods: ShareModEntry[];
-  renameValue: string;
-  onRenameChange: (value: string) => void;
-  onRenameSubmit: () => void;
   showMods: boolean;
   scrollRef: RefObject<HTMLElement | null>;
   active: boolean;
 }) {
   return (
     <>
-      <label className="saved-collection-rename-label">
-        Name
-        <div className="saved-collection-rename">
-          <input
-            value={renameValue}
-            onChange={(e) => onRenameChange(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") {
-                e.preventDefault();
-                onRenameSubmit();
-              }
-            }}
-          />
-          <button type="button" onClick={onRenameSubmit}>
-            Rename
-          </button>
-        </div>
-      </label>
       <h2>Contained mods</h2>
       <ResultsReveal
         show={showMods}
@@ -2088,24 +2016,51 @@ export default function App() {
   const [appUpdate, setAppUpdate] = useState<AppUpdateStatus | null>(null);
   const [checkingAppUpdate, setCheckingAppUpdate] = useState(false);
   const [checkingModUpdates, setCheckingModUpdates] = useState(false);
+  const [checkingFriendUpdates, setCheckingFriendUpdates] = useState(false);
   const [installingAppUpdate, setInstallingAppUpdate] = useState(false);
   const [appUpdateMessage, setAppUpdateMessage] = useState<string | null>(null);
   const [dismissedUpdateVersion, setDismissedUpdateVersion] = useState<string | null>(null);
   const [error, setErrorMessage] = useState<string | null>(null);
   const [banners, setBanners] = useState<StackedBanner[]>([]);
   const nextBannerIdRef = useRef(1);
+  const sessionStartMsRef = useRef(Date.now());
+  const bannersHydratedRef = useRef(false);
   const dismissBannerById = useCallback((id: number) => {
     setBanners((prev) => dismissBanner(prev, id));
   }, []);
-  const setError = useCallback((message: string | null, action?: BannerAction | null) => {
-    setErrorMessage(message);
-    if (message) {
-      const id = nextBannerIdRef.current++;
-      setBanners((prev) =>
-        pushBanner(prev, { kind: "error", message, action: action ?? null }, id),
-      );
-    }
-  }, []);
+  const dismissDownloadBanners = useCallback(
+    (downloadId: string) => {
+      if (settings?.dismiss_banner_on_retry === false) return;
+      setBanners((prev) => dismissBannersForDownload(prev, downloadId));
+    },
+    [settings?.dismiss_banner_on_retry],
+  );
+  const setError = useCallback(
+    (
+      message: string | null,
+      action?: BannerAction | null,
+      downloadId?: string | null,
+    ) => {
+      setErrorMessage(message);
+      if (message) {
+        const id = nextBannerIdRef.current++;
+        setBanners((prev) =>
+          pushBanner(
+            prev,
+            {
+              kind: "error",
+              message,
+              action: action ?? null,
+              downloadId: downloadId ?? null,
+              createdAt: Date.now(),
+            },
+            id,
+          ),
+        );
+      }
+    },
+    [],
+  );
   const setNotice = useCallback((next: StatusNotice | null) => {
     if (!next) {
       setBanners((prev) => prev.filter((b) => b.kind !== "info"));
@@ -2120,11 +2075,67 @@ export default function App() {
           message: next.message,
           details: next.details,
           action: next.action,
+          createdAt: Date.now(),
         },
         id,
       ),
     );
   }, []);
+
+  useEffect(() => {
+    if (!settings || bannersHydratedRef.current) return;
+    bannersHydratedRef.current = true;
+    const persistence = bannerPersistenceFor(settings);
+    if (persistence === "off") {
+      void api.savePersistedBanners([]).catch(() => {});
+      return;
+    }
+    let cancelled = false;
+    void api
+      .getPersistedBanners()
+      .then((saved) => {
+        if (cancelled || saved.length === 0) return;
+        const restored: StackedBanner[] = saved
+          .filter((b) =>
+            persistence === "errors_and_warnings"
+              ? b.kind === "error" || b.kind === "warn"
+              : b.kind === "error",
+          )
+          .map((b) => ({
+            id: b.id,
+            kind: b.kind,
+            message: b.message,
+            details: b.details?.length ? b.details : undefined,
+            downloadId: b.download_id ?? null,
+            createdAt: b.created_at,
+          }));
+        const active = pruneExpiredBanners(restored, settings, sessionStartMsRef.current);
+        if (active.length === 0) {
+          void api.savePersistedBanners([]).catch(() => {});
+          return;
+        }
+        const maxId = active.reduce((max, b) => Math.max(max, b.id), 0);
+        nextBannerIdRef.current = Math.max(nextBannerIdRef.current, maxId + 1);
+        setBanners((prev) => {
+          let merged = [...active];
+          for (const current of [...prev].reverse()) {
+            merged = pushBanner(merged, current, current.id);
+          }
+          return merged;
+        });
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [settings]);
+
+  useEffect(() => {
+    if (!settings || !bannersHydratedRef.current) return;
+    const persistence = bannerPersistenceFor(settings);
+    const toSave = filterPersistableBanners(banners, persistence);
+    void api.savePersistedBanners(toSave).catch(() => {});
+  }, [banners, settings]);
   const [busy, setBusy] = useState<string | null>(null);
   const [apiKeyInput, setApiKeyInput] = useState("");
   const [detected, setDetected] = useState<DetectedGame[]>([]);
@@ -2179,15 +2190,32 @@ export default function App() {
     useState<CatalogSourceFilter>("all");
   const [modsSort, setModsSort] = useState<ModsSort>("loadOrder");
   const [modsCollectionFilter, setModsCollectionFilter] = useState("");
+  const [collectionIntegrityById, setCollectionIntegrityById] = useState<
+    Record<string, CollectionIntegrityReport>
+  >({});
+  const checkingCollectionIntegrityKeysRef = useRef<Set<string>>(new Set());
+  const [integrityDialogReport, setIntegrityDialogReport] =
+    useState<CollectionIntegrityReport | null>(null);
+  const [integrityRetrying, setIntegrityRetrying] = useState(false);
   const [modsFiltersOpen, setModsFiltersOpen] = useState(false);
-  const [modsActionsMenuOpen, setModsActionsMenuOpen] = useState(false);
+  const [moveCollectionMod, setMoveCollectionMod] = useState<StagedMod | null>(null);
+  const [moveCollectionBusy, setMoveCollectionBusy] = useState(false);
   const [installedCollections, setInstalledCollections] = useState<
     InstalledCollection[]
   >([]);
+  const [friendSyncStates, setFriendSyncStates] = useState<
+    Record<string, FriendCollectionSyncStatus>
+  >({});
+  const [syncingCollectionIds, setSyncingCollectionIds] = useState<
+    Record<string, boolean>
+  >({});
+  const [savingCollectionIds, setSavingCollectionIds] = useState<
+    Record<string, boolean>
+  >({});
+  const autoSyncInFlightRef = useRef<Set<string>>(new Set());
+  const autoSyncNotifiedHashRef = useRef<Map<string, string>>(new Map());
   const [profileImportOpen, setProfileImportOpen] = useState(false);
   const [profileCode, setProfileCode] = useState("");
-  const [shareExportOpen, setShareExportOpen] = useState(false);
-  const [shareExportName, setShareExportName] = useState("");
   const [shareImportOpen, setShareImportOpen] = useState(false);
   const [shareImportCode, setShareImportCode] = useState("");
   const [collectionImportOpen, setCollectionImportOpen] = useState(false);
@@ -2195,14 +2223,24 @@ export default function App() {
   const [saveImportPrompt, setSaveImportPrompt] = useState<SaveImportPrompt | null>(
     null,
   );
-  const [lastShareCode, setLastShareCode] = useState<string | null>(null);
+  const [saveLoadoutPrompt, setSaveLoadoutPrompt] = useState<{
+    gameId: string;
+    gameTitle: string;
+    modCount: number;
+  } | null>(null);
+  const [saveLoadoutName, setSaveLoadoutName] = useState("");
   const [savedCollections, setSavedCollections] = useState<SavedCollectionEntry[]>(
     [],
   );
+  const [friendsState, setFriendsState] = useState<FriendsState | null>(null);
+  const [sharingTarget, setSharingTarget] = useState<{
+    id: string;
+    name: string;
+    visibility: CollectionVisibility;
+  } | null>(null);
   const [savedDetail, setSavedDetail] = useState<SavedCollectionDetail | null>(
     null,
   );
-  const [savedRename, setSavedRename] = useState("");
   const [savedInstallGameId, setSavedInstallGameId] = useState("");
   const [expandedCollectionGameKey, setExpandedCollectionGameKey] = useState<
     string | null
@@ -2217,7 +2255,6 @@ export default function App() {
   const [gameSavedDetail, setGameSavedDetail] = useState<SavedCollectionDetail | null>(
     null,
   );
-  const [gameSavedRename, setGameSavedRename] = useState("");
   const [orphanScan, setOrphanScan] = useState<OrphanScan | null>(null);
   const [downloads, setDownloads] = useState<DownloadItem[]>([]);
   const [downloadsReady, setDownloadsReady] = useState(false);
@@ -2275,6 +2312,8 @@ export default function App() {
     "info" | "collections" | "tools" | "launch" | null
   >(null);
   const [unmanageTarget, setUnmanageTarget] = useState<ManagedGame | null>(null);
+  const [uninstallCollectionTarget, setUninstallCollectionTarget] =
+    useState<InstalledCollection | null>(null);
   const [unmanageStatus, setUnmanageStatus] = useState<{
     has_portable_mods: boolean;
     mod_count: number;
@@ -2284,6 +2323,8 @@ export default function App() {
   } | null>(null);
   const [unmanageStatusLoading, setUnmanageStatusLoading] = useState(false);
   const [gameSettingsMenuOpen, setGameSettingsMenuOpen] = useState(false);
+  const [importModalOpen, setImportModalOpen] = useState(false);
+  const [importDropActive, setImportDropActive] = useState(false);
   const [launchMenuOpen, setLaunchMenuOpen] = useState(false);
   const [launchStates, setLaunchStates] = useState<Record<string, GameLaunchState>>({});
   const [activeDeploymentByGame, setActiveDeploymentByGame] = useState<Record<string, boolean>>({});
@@ -2293,7 +2334,6 @@ export default function App() {
   const [wrapperDraft, setWrapperDraft] = useState("");
   const [argsDraft, setArgsDraft] = useState("");
   const [gameInfo, setGameInfo] = useState<GameInfo | null>(null);
-  const [gameInfoLoading, setGameInfoLoading] = useState(false);
   const [modDetail, setModDetail] = useState<ModDetail | null>(null);
   const [modDetailLoading, setModDetailLoading] = useState(false);
   const [modFilesLoading, setModFilesLoading] = useState(false);
@@ -2420,7 +2460,6 @@ export default function App() {
   const authorSuggestRef = useRef<HTMLDivElement | null>(null);
   const authorSuggestReqRef = useRef(0);
   const tagSearchRef = useRef<HTMLInputElement | null>(null);
-  const modsActionsMenuRef = useRef<HTMLDivElement | null>(null);
   const gameSettingsMenuRef = useRef<HTMLDivElement | null>(null);
   const launchMenuRef = useRef<HTMLDivElement | null>(null);
   const mainScrollRef = useRef<HTMLElement | null>(null);
@@ -2489,6 +2528,7 @@ export default function App() {
   const lastEmperorOpenRef = useRef<{ key: string; at: number } | null>(null);
   const modUpdatesReqRef = useRef(0);
   const checkingModUpdatesTimerRef = useRef<number | null>(null);
+  const checkingFriendUpdatesTimerRef = useRef<number | null>(null);
   const modFilesReqRef = useRef(0);
   const modFilesModIdRef = useRef<number | null>(null);
   const wineAdviceReqRef = useRef(0);
@@ -2640,7 +2680,6 @@ export default function App() {
       setGameSavedDetailPending(false);
       setSavedDetail(null);
       setSavedDetailPending(false);
-      setSavedRename("");
       setBrowseReturnTab(entry.browseReturnTab);
 
       if (entry.tab !== tabRef.current) {
@@ -2753,20 +2792,12 @@ export default function App() {
       setGameSettingsMenuOpen(false);
       return true;
     }
-    if (modsActionsMenuOpen) {
-      setModsActionsMenuOpen(false);
-      return true;
-    }
     if (modsFiltersOpen) {
       setModsFiltersOpen(false);
       return true;
     }
     if (profileImportOpen) {
       setProfileImportOpen(false);
-      return true;
-    }
-    if (shareExportOpen) {
-      setShareExportOpen(false);
       return true;
     }
     if (shareImportOpen) {
@@ -2784,13 +2815,10 @@ export default function App() {
   navForwardRef.current = navForward;
 
   const resetLibraryEphemeralState = useCallback(() => {
-    setShareExportOpen(false);
-    setShareExportName("");
     setShareImportOpen(false);
     setShareImportCode("");
-    setLastShareCode(null);
     setModsFiltersOpen(false);
-    setModsActionsMenuOpen(false);
+    setGameSettingsMenuOpen(false);
   }, []);
 
   const unmanaged = useMemo(() => {
@@ -2914,6 +2942,7 @@ export default function App() {
         next.map((m) => m.id),
       );
       setMods(next);
+      void api.listInstalledCollections(activeGame.id).then(setInstalledCollections);
     },
     [activeGame, canReorderMods, mods],
   );
@@ -3037,17 +3066,14 @@ export default function App() {
     const req = ++gameInfoReqRef.current;
     if (!key) {
       setGameInfo(null);
-      setGameInfoLoading(false);
       return;
     }
     const cached = gameInfoCacheRef.current.get(key);
     if (cached) {
       setGameInfo(cached);
-      setGameInfoLoading(false);
       return;
     }
     setGameInfo(null);
-    setGameInfoLoading(true);
     try {
       const info = await api.getGame(key);
       gameInfoCacheRef.current.set(key, info);
@@ -3056,10 +3082,6 @@ export default function App() {
       }
     } catch {
       /* Nexus metadata is optional for local game info */
-    } finally {
-      if (req === gameInfoReqRef.current) {
-        setGameInfoLoading(false);
-      }
     }
   }, []);
 
@@ -3291,11 +3313,58 @@ export default function App() {
     }
   }, []);
 
+  const refreshFriendSyncStates = useCallback(async (gameId: string) => {
+    try {
+      const states = await api.getFriendCollectionSyncStates(gameId);
+      if (activeGameRef.current?.id !== gameId) return;
+      const map: Record<string, FriendCollectionSyncStatus> = {};
+      for (const s of states) {
+        map[s.collection_id] = s;
+      }
+      setFriendSyncStates(map);
+    } catch {
+      // Non-fatal: friend sync status is best-effort.
+    }
+  }, []);
+
   const refreshCollections = useCallback(async (gameId: string) => {
     const list = await api.listInstalledCollections(gameId);
     if (activeGameRef.current?.id !== gameId) return;
     setInstalledCollections(list);
-  }, []);
+    void refreshFriendSyncStates(gameId);
+    try {
+      const reports = await api.checkInstalledCollectionsLocal(gameId);
+      if (activeGameRef.current?.id !== gameId) return;
+      const map: Record<string, CollectionIntegrityReport> = {};
+      for (const r of reports) {
+        map[r.collection_id] = r;
+      }
+      setCollectionIntegrityById(map);
+    } catch {
+      // Non-fatal: local integrity badge is best-effort.
+    }
+
+    for (const c of list) {
+      const checkKey = `${gameId}:${c.id}`;
+      if (checkingCollectionIntegrityKeysRef.current.has(checkKey)) continue;
+      checkingCollectionIntegrityKeysRef.current.add(checkKey);
+      void api
+        .checkCollectionIntegrity(gameId, c.id, true)
+        .then((report) => {
+          if (activeGameRef.current?.id !== gameId) return;
+          setCollectionIntegrityById((prev) => ({
+            ...prev,
+            [c.id]: report,
+          }));
+        })
+        .catch(() => {
+          // Non-fatal: background remote integrity check is best-effort.
+        })
+        .finally(() => {
+          checkingCollectionIntegrityKeysRef.current.delete(checkKey);
+        });
+    }
+  }, [refreshFriendSyncStates]);
 
   const refreshOrphanScan = useCallback(async () => {
     const scan = await api.scanModOrphans();
@@ -3580,7 +3649,6 @@ export default function App() {
       gameSavedOpenRef.current += 1;
       setSavedDetail(null);
       setSavedDetailPending(false);
-      setSavedRename("");
       setSavedInstallGameId(nextId ?? "");
       setGameSavedDetail(null);
       setGameSavedDetailPending(false);
@@ -3855,7 +3923,7 @@ export default function App() {
     setModsSort("loadOrder");
     setModsCollectionFilter("");
     setModsFiltersOpen(false);
-    setModsActionsMenuOpen(false);
+    setGameSettingsMenuOpen(false);
   }, [libraryDetail?.game.id]);
 
   useEffect(() => {
@@ -4082,27 +4150,6 @@ export default function App() {
       document.removeEventListener("keydown", onKeyDown);
     };
   }, [gameSettingsMenuOpen]);
-
-  useEffect(() => {
-    if (!modsActionsMenuOpen) return;
-    const onPointerDown = (e: MouseEvent) => {
-      if (
-        modsActionsMenuRef.current &&
-        !modsActionsMenuRef.current.contains(e.target as Node)
-      ) {
-        setModsActionsMenuOpen(false);
-      }
-    };
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setModsActionsMenuOpen(false);
-    };
-    document.addEventListener("mousedown", onPointerDown);
-    document.addEventListener("keydown", onKeyDown);
-    return () => {
-      document.removeEventListener("mousedown", onPointerDown);
-      document.removeEventListener("keydown", onKeyDown);
-    };
-  }, [modsActionsMenuOpen]);
 
   useEffect(() => {
     navHistoryRef.current = new AppNavHistory(captureNavEntry());
@@ -4465,15 +4512,25 @@ export default function App() {
     }
     if (q.emperorShare && !q.cancelled) {
       try {
-        await api.recordEmperorShare({
-          gameId: q.entries[0]?.gameId ?? game?.id ?? "",
-          collectionId: q.emperorShare.collectionId,
-          name: q.emperorShare.name,
-          code: q.emperorShare.code,
-          files: q.emperorShare.files,
-          memberIds: q.emperorShare.memberIds,
-          existingModIds: q.emperorShare.existingModIds,
-        });
+        const targetGameId = q.entries[0]?.gameId ?? game?.id ?? "";
+        if (q.emperorShare.friendSync && q.emperorShare.code) {
+          await api.finalizeFriendCollectionSync({
+            gameId: targetGameId,
+            peerId: q.emperorShare.friendSync.peerId,
+            friendCollectionId: q.emperorShare.friendSync.friendCollectionId,
+            shareCode: q.emperorShare.code,
+          });
+        } else {
+          await api.recordEmperorShare({
+            gameId: targetGameId,
+            collectionId: q.emperorShare.collectionId,
+            name: q.emperorShare.name,
+            code: q.emperorShare.code,
+            files: q.emperorShare.files,
+            memberIds: q.emperorShare.memberIds,
+            existingModIds: q.emperorShare.existingModIds,
+          });
+        }
         if (game) await refreshCollections(game.id);
       } catch (e) {
         if (!String(e).includes("No staged mods matched")) {
@@ -4665,6 +4722,7 @@ export default function App() {
   );
 
   const restartOneDownload = useCallback(async (id: string) => {
+    dismissDownloadBanners(id);
     try {
       await api.restartDownload(id);
     } catch (e) {
@@ -4682,22 +4740,7 @@ export default function App() {
     setBusy(null);
     downloadProgressAtRef.current.set(id, { bytes: 0, at: Date.now() });
     await refreshDownloads();
-  }, [refreshDownloads]);
-
-  const forceResetOneDownload = useCallback(async (id: string) => {
-    try {
-      await api.forceResetDownload(id);
-    } catch (e) {
-      setError(String(e));
-    }
-    setBusy(null);
-    downloadProgressAtRef.current.delete(id);
-    const list = await api.listDownloads();
-    setDownloads(list);
-    if (!hasActiveDownloads(list)) {
-      setBusy(null);
-    }
-  }, []);
+  }, [dismissDownloadBanners, refreshDownloads]);
 
   const retryAssistOpening = useCallback(async () => {
     const q = assistQueueRef.current;
@@ -4731,6 +4774,7 @@ export default function App() {
 
   const removeOneDownload = useCallback(
     async (id: string) => {
+      dismissDownloadBanners(id);
       try {
         await api.removeDownload(id);
       } catch (e) {
@@ -4738,7 +4782,7 @@ export default function App() {
       }
       await refreshDownloads();
     },
-    [refreshDownloads],
+    [dismissDownloadBanners, refreshDownloads],
   );
 
   const pauseOneDownload = useCallback(
@@ -5006,16 +5050,27 @@ export default function App() {
             }
             if (batch.emperorShare) {
               try {
-                await api.recordEmperorShare({
-                  gameId:
-                    event.payload.game_id ?? activeGameRef.current?.id ?? "",
-                  collectionId: batch.emperorShare.collectionId,
-                  name: batch.emperorShare.name,
-                  code: batch.emperorShare.code,
-                  files: batch.emperorShare.files,
-                  memberIds: batch.emperorShare.memberIds,
-                  existingModIds: batch.emperorShare.existingModIds,
-                });
+                const targetGameId =
+                  event.payload.game_id ?? activeGameRef.current?.id ?? "";
+                if (batch.emperorShare.friendSync && batch.emperorShare.code) {
+                  await api.finalizeFriendCollectionSync({
+                    gameId: targetGameId,
+                    peerId: batch.emperorShare.friendSync.peerId,
+                    friendCollectionId:
+                      batch.emperorShare.friendSync.friendCollectionId,
+                    shareCode: batch.emperorShare.code,
+                  });
+                } else {
+                  await api.recordEmperorShare({
+                    gameId: targetGameId,
+                    collectionId: batch.emperorShare.collectionId,
+                    name: batch.emperorShare.name,
+                    code: batch.emperorShare.code,
+                    files: batch.emperorShare.files,
+                    memberIds: batch.emperorShare.memberIds,
+                    existingModIds: batch.emperorShare.existingModIds,
+                  });
+                }
               } catch {
                 /* ignore incomplete match */
               }
@@ -5065,7 +5120,7 @@ export default function App() {
         }
       },
     );
-    const unlistenDlFailed = listen<{ label?: string; error?: string }>(
+    const unlistenDlFailed = listen<{ id?: string; label?: string; error?: string }>(
       "download-failed",
       async (event) => {
         const list = await api.listDownloads();
@@ -5084,7 +5139,22 @@ export default function App() {
         const label = event.payload.label ?? "Download";
         const err = event.payload.error ?? "unknown error";
         if (err !== "Reset by user") {
-          setError(`${label}: ${err}`);
+          const failedItem = event.payload.id
+            ? list.find((d) => d.id === event.payload.id)
+            : undefined;
+          setError(
+            `${label}: ${err}`,
+            failedItem?.can_restart
+              ? {
+                  label: "Retry",
+                  dismiss: true,
+                  run: () => {
+                    void restartOneDownload(failedItem.id);
+                  },
+                }
+              : undefined,
+            event.payload.id ?? null,
+          );
         }
         if (!hasActiveDownloads(list)) {
           setBusy(null);
@@ -5205,7 +5275,7 @@ export default function App() {
       unlistenProgress.then((f) => f());
       unlistenStarted.then((f) => f());
     };
-  }, [advanceAssistAfterFailure, advanceAssistAfterStart, refreshDownloads, refreshMods, refreshCollections, refreshModUpdates, refreshMissingRequirements, syncAssistHost]);
+  }, [advanceAssistAfterFailure, advanceAssistAfterStart, refreshDownloads, refreshMods, refreshCollections, refreshModUpdates, refreshMissingRequirements, restartOneDownload, syncAssistHost]);
 
   async function withBusy<T>(label: string, fn: () => Promise<T>): Promise<T | undefined> {
     setBusy(label);
@@ -5532,6 +5602,7 @@ export default function App() {
         if (closedDetail || wasActive) {
           setMods([]);
           setInstalledCollections([]);
+          setFriendSyncStates({});
         }
         await scan();
       },
@@ -6875,6 +6946,7 @@ export default function App() {
     gameId: string,
     code: string,
     result: ShareImportResult,
+    friendSync?: { peerId: string; friendCollectionId: string } | null,
   ) {
     if (result.needs_assist.length > 0) {
       const existingModIds = mods.map((m) => m.id);
@@ -6899,6 +6971,7 @@ export default function App() {
           modId: f.mod_id,
           fileId: f.file_id,
         })),
+        friendSync: friendSync ?? null,
       });
       if (result.warnings.length > 0) {
         setNotice({
@@ -6917,10 +6990,270 @@ export default function App() {
     await refreshDownloads();
     setNotice({
       kind: result.warnings.length > 0 ? "warn" : "ok",
-      message: `Installed ${result.name} (${result.member_ids.length} mods).`,
+      message: `${friendSync ? "Synced" : "Installed"} ${result.name} (${result.member_ids.length} mods).`,
       details: result.warnings.length > 0 ? result.warnings : undefined,
     });
   }
+
+  async function syncInstalledCollection(c: InstalledCollection) {
+    if (!activeGame) return;
+    const gameId = activeGame.id;
+    setError(null);
+    setSyncingCollectionIds((prev) => ({ ...prev, [c.id]: true }));
+    try {
+      if (c.friend_sync) {
+        const res = await api.joinOrSyncFriendCollection({
+          gameId,
+          peerId: c.friend_sync.friend_peer_id,
+          friendCollectionId: c.friend_sync.friend_collection_id,
+        });
+        await handleShareImportResult(
+          gameId,
+          res.share_code,
+          {
+            collection_id: res.collection_id,
+            name: res.name,
+            member_ids: res.member_ids,
+            needs_assist: res.needs_assist,
+            warnings: res.warnings,
+            collection: res.collection ?? null,
+          },
+          {
+            peerId: c.friend_sync.friend_peer_id,
+            friendCollectionId: c.friend_sync.friend_collection_id,
+          },
+        );
+        return;
+      }
+      if (c.source === "nexus" && c.slug) {
+        const detail = await api.getCollection({ slug: c.slug });
+        await installCollection({
+          source: "nexus",
+          id: detail.slug,
+          slug: detail.slug,
+          name: detail.name || c.name,
+          summary: detail.summary,
+          author: null,
+          category: null,
+          endorsements: detail.endorsements,
+          total_downloads: detail.total_downloads,
+          overall_rating: null,
+          overall_rating_count: null,
+          tile_image_url: detail.tile_image_url ?? null,
+          revision_number: detail.revision_number ?? c.revision ?? null,
+          latest_version: null,
+          domain_name: detail.domain_name,
+          created_at: null,
+          updated_at: null,
+          mod_count: null,
+          file_size: null,
+        });
+        return;
+      }
+      if (
+        c.source === "thunderstore" &&
+        c.kind === "modpack" &&
+        c.community &&
+        c.namespace &&
+        c.package_name
+      ) {
+        await withBusy(`Updating modpack ${c.name}…`, async () => {
+          await api.downloadThunderstoreMod({
+            gameId,
+            community: c.community!,
+            namespace: c.namespace!,
+            name: c.package_name!,
+            version: null,
+            recordAsModpack: true,
+          });
+          await refreshMods(gameId);
+          await refreshCollections(gameId);
+          await refreshDownloads();
+          setNotice({ kind: "ok", message: `Updated ${c.name}.` });
+        });
+      }
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSyncingCollectionIds((prev) => {
+        const next = { ...prev };
+        delete next[c.id];
+        return next;
+      });
+    }
+  }
+
+  const runAutoSyncPass = useCallback(async () => {
+    const currentActive = activeGameRef.current;
+    if (currentActive) {
+      await refreshFriendSyncStates(currentActive.id);
+    }
+    for (const game of managedRef.current) {
+      let states: FriendCollectionSyncStatus[] = [];
+      try {
+        states = await api.getFriendCollectionSyncStates(game.id);
+      } catch {
+        continue;
+      }
+      for (const st of states) {
+        if (!st.auto_sync || !st.has_update) continue;
+        const key = `${game.id}:${st.collection_id}`;
+        if (autoSyncInFlightRef.current.has(key)) continue;
+        autoSyncInFlightRef.current.add(key);
+        try {
+          const res = await api.joinOrSyncFriendCollection({
+            gameId: game.id,
+            peerId: st.peer_id,
+            friendCollectionId: st.friend_collection_id,
+          });
+          if (res.needs_assist.length === 0) {
+            if (activeGameRef.current?.id === game.id) {
+              await refreshMods(game.id);
+              await refreshCollections(game.id);
+              await refreshFriendSyncStates(game.id);
+              await refreshDownloads();
+            }
+            setNotice({
+              kind: "ok",
+              message: `Auto-synced ${res.name} to latest settings.`,
+            });
+          } else if (
+            autoSyncNotifiedHashRef.current.get(key) !== st.latest_hash
+          ) {
+            autoSyncNotifiedHashRef.current.set(key, st.latest_hash);
+            setNotice({
+              kind: "warn",
+              message: `${res.name} has an update that requires manual Nexus download assist. Click Sync on the game page to download.`,
+            });
+          }
+        } catch (e) {
+          if (autoSyncNotifiedHashRef.current.get(key) !== st.latest_hash) {
+            autoSyncNotifiedHashRef.current.set(key, st.latest_hash);
+            setNotice({
+              kind: "warn",
+              message: `Auto-sync failed for collection: ${String(e)}`,
+            });
+          }
+        } finally {
+          autoSyncInFlightRef.current.delete(key);
+        }
+      }
+    }
+  }, [
+    refreshCollections,
+    refreshDownloads,
+    refreshFriendSyncStates,
+    refreshMods,
+  ]);
+
+  async function toggleInstalledCollectionAutoSync(
+    c: InstalledCollection,
+    autoSync: boolean,
+  ) {
+    if (!activeGame || !c.friend_sync) return;
+    setError(null);
+    try {
+      await api.setFriendCollectionAutoSync(activeGame.id, c.id, autoSync);
+      await refreshCollections(activeGame.id);
+      if (autoSync) {
+        void runAutoSyncPass();
+      }
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function saveCollectionChanges(c: InstalledCollection) {
+    if (!activeGame) return;
+    setSavingCollectionIds((prev) => ({ ...prev, [c.id]: true }));
+    setError(null);
+    try {
+      const updated = await api.saveCollectionChanges(activeGame.id, c.id);
+      setInstalledCollections((prev) =>
+        prev.map((item) => (item.id === updated.id ? updated : item)),
+      );
+      await refreshCollections(activeGame.id);
+      await refreshSavedCollections(true);
+      setNotice({ kind: "ok", message: `Saved changes to ${c.name}.` });
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSavingCollectionIds((prev) => {
+        const next = { ...prev };
+        delete next[c.id];
+        return next;
+      });
+    }
+  }
+
+  async function toggleInstalledCollectionAutoSave(
+    c: InstalledCollection,
+    autoSave: boolean,
+  ) {
+    if (!activeGame || savingCollectionIds[c.id]) return;
+    setSavingCollectionIds((prev) => ({ ...prev, [c.id]: true }));
+    setError(null);
+    try {
+      const updated = await api.setCollectionAutoSave(
+        activeGame.id,
+        c.id,
+        autoSave,
+      );
+      setInstalledCollections((prev) =>
+        prev.map((item) => (item.id === updated.id ? updated : item)),
+      );
+      await refreshCollections(activeGame.id);
+      await refreshSavedCollections(true);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSavingCollectionIds((prev) => {
+        const next = { ...prev };
+        delete next[c.id];
+        return next;
+      });
+    }
+  }
+
+  useEffect(() => {
+    const unlisten = listen("friends-changed", () => {
+      void runAutoSyncPass();
+    });
+    return () => {
+      void unlisten.then((f) => f());
+    };
+  }, [runAutoSyncPass]);
+
+  useEffect(() => {
+    const unlisten = listen<boolean>("friends-checking", (event) => {
+      const checking = Boolean(event.payload);
+      if (checkingFriendUpdatesTimerRef.current != null) {
+        window.clearTimeout(checkingFriendUpdatesTimerRef.current);
+        checkingFriendUpdatesTimerRef.current = null;
+      }
+      if (checking) {
+        checkingFriendUpdatesTimerRef.current = window.setTimeout(() => {
+          checkingFriendUpdatesTimerRef.current = null;
+          setCheckingFriendUpdates(true);
+        }, MOD_UPDATE_CHECK_TOAST_DELAY_MS);
+      } else {
+        setCheckingFriendUpdates(false);
+      }
+    });
+    return () => {
+      if (checkingFriendUpdatesTimerRef.current != null) {
+        window.clearTimeout(checkingFriendUpdatesTimerRef.current);
+        checkingFriendUpdatesTimerRef.current = null;
+      }
+      void unlisten.then((f) => f());
+    };
+  }, []);
+
+  useEffect(() => {
+    if (managed.length > 0) {
+      void runAutoSyncPass();
+    }
+  }, [managed.length, runAutoSyncPass]);
 
   async function runUnifiedImport(
     gameId: string,
@@ -7023,20 +7356,6 @@ export default function App() {
     await runUnifiedImport(prompt.gameId, prompt.code, prompt.name);
   }
 
-  async function saveShareCodeToFile(code: string, suggestedName?: string) {
-    const { save } = await import("@tauri-apps/plugin-dialog");
-    const path = await save({
-      defaultPath: `${(suggestedName || "loadout").replace(/[^\w.-]+/g, "_") || "loadout"}.emperor-share`,
-      filters: [
-        { name: "Emperor share", extensions: ["emperor-share"] },
-        { name: "Text", extensions: ["txt"] },
-      ],
-    });
-    if (!path) return false;
-    await api.writeShareFile(path, code);
-    return true;
-  }
-
   async function openShareCodeFile() {
     if (!activeGame) return;
     const { open } = await import("@tauri-apps/plugin-dialog");
@@ -7065,36 +7384,101 @@ export default function App() {
     }
   }
 
-  async function exportShareLoadout() {
+  function openSaveLoadoutPrompt() {
     if (!activeGame) return;
-    setBusy("Creating share code…");
+    setError(null);
+    setSaveLoadoutName("");
+    setSaveLoadoutPrompt({
+      gameId: activeGame.id,
+      gameTitle: activeGame.title,
+      modCount: enabledModCount,
+    });
+  }
+
+  async function saveLoadout(name?: string | null) {
+    if (!activeGame) return;
+    const trimmed = name?.trim() || null;
+    setSaveLoadoutPrompt(null);
+    setBusy("Saving loadout…");
     setError(null);
     try {
-      const result = await api.exportShareCode(
-        activeGame.id,
-        shareExportName.trim() || null,
-      );
-      setLastShareCode(result.code);
-      let message = `Copied share code for ${result.mod_count} mod(s). Saved to Collections. Prefer Save as file for Discord.`;
-      try {
-        await navigator.clipboard.writeText(result.code);
-      } catch {
-        message = `Share code ready for ${result.mod_count} mod(s). Saved to Collections (copy from the box below, or Save as file for Discord).`;
-      }
+      const result = await api.exportShareCode(activeGame.id, trimmed);
       setNotice({
-        kind: "warn",
-        message,
+        kind: result.warnings.length > 0 ? "warn" : "ok",
+        message: `Saved loadout "${result.saved.name}" (${result.mod_count} mod(s)) to Collections.`,
         details: result.warnings.length > 0 ? result.warnings : undefined,
       });
-      setShareExportOpen(false);
-      setShareExportName("");
       await refreshSavedCollections();
       await refreshCollections(activeGame.id);
       await refreshMods(activeGame.id);
+      setGameModal("collections");
     } catch (e) {
       setError(String(e));
     } finally {
       setBusy(null);
+    }
+  }
+
+  async function renameSavedCollectionById(id: string, nextName: string) {
+    try {
+      const updated = await api.renameSavedCollection(id, nextName);
+      setSavedDetail((prev) =>
+        prev && prev.entry.id === updated.id ? { ...prev, entry: updated } : prev,
+      );
+      setGameSavedDetail((prev) =>
+        prev && prev.entry.id === updated.id ? { ...prev, entry: updated } : prev,
+      );
+      await refreshSavedCollections();
+      if (activeGame) {
+        await refreshCollections(activeGame.id);
+      }
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function renameInstalledCollectionItem(
+    col: InstalledCollection,
+    nextName: string,
+  ) {
+    if (!activeGame) return;
+    try {
+      const updated = await api.renameInstalledCollection(
+        activeGame.id,
+        col.id,
+        nextName,
+      );
+      setInstalledCollections((prev) =>
+        prev.map((item) => (item.id === updated.id ? updated : item)),
+      );
+      setSavedDetail((prev) =>
+        prev && prev.entry.share_id === updated.id
+          ? {
+              ...prev,
+              entry: {
+                ...prev.entry,
+                name: updated.name,
+                code: updated.profile_code ?? prev.entry.code,
+              },
+            }
+          : prev,
+      );
+      setGameSavedDetail((prev) =>
+        prev && prev.entry.share_id === updated.id
+          ? {
+              ...prev,
+              entry: {
+                ...prev.entry,
+                name: updated.name,
+                code: updated.profile_code ?? prev.entry.code,
+              },
+            }
+          : prev,
+      );
+      await refreshSavedCollections();
+      await refreshCollections(activeGame.id);
+    } catch (e) {
+      setError(String(e));
     }
   }
 
@@ -7185,17 +7569,12 @@ export default function App() {
     const known = savedCollections.find((entry) => entry.id === id);
     const installId = (entry: SavedCollectionEntry) => {
       const matches = managed.filter((game) => savedCollectionMatchesGame(entry, game));
-      return (
-        matches[0]?.id ??
-        entry.source_game_id ??
-        activeGame?.id ??
-        managed[0]?.id ??
-        ""
-      );
+      if (matches.length > 0) return matches[0].id;
+      if (savedCollectionGameKey(entry) !== "unknown") return "";
+      return entry.source_game_id ?? activeGame?.id ?? managed[0]?.id ?? "";
     };
     if (known) {
       setSavedDetail({ entry: known, mods: [] });
-      setSavedRename(known.name);
       setSavedInstallGameId(installId(known));
       setSavedDetailPending(true);
     }
@@ -7205,7 +7584,6 @@ export default function App() {
       startTransition(() => {
         if (request !== savedOpenRef.current) return;
         setSavedDetail(detail);
-        setSavedRename(detail.entry.name);
         setSavedInstallGameId(installId(detail.entry));
         setSavedDetailPending(false);
       });
@@ -7231,7 +7609,6 @@ export default function App() {
     const known = savedCollections.find((entry) => entry.id === id);
     if (known) {
       setGameSavedDetail({ entry: known, mods: [] });
-      setGameSavedRename(known.name);
       setGameSavedDetailPending(true);
     }
     try {
@@ -7240,7 +7617,6 @@ export default function App() {
       startTransition(() => {
         if (request !== gameSavedOpenRef.current) return;
         setGameSavedDetail(detail);
-        setGameSavedRename(detail.entry.name);
         setGameSavedDetailPending(false);
       });
     } catch (e) {
@@ -7426,13 +7802,78 @@ export default function App() {
     [gamePlugins.length, managed, savedCollections],
   );
 
+  const refreshFriendsSharingState = useCallback(async () => {
+    try {
+      const next = await api.getFriendsState();
+      setFriendsState(next);
+    } catch {
+      /* ignore if p2p state unavailable */
+    }
+  }, []);
+
+  function getSavedCollectionVisibility(entryId: string): CollectionVisibility {
+    const colId = `saved:${entryId}`;
+    const localCol = friendsState?.local_collections.find((c) => c.id === colId);
+    return resolveCollectionVisibility(localCol, colId);
+  }
+
+  function openSavedCollectionSharing(entry: SavedCollectionEntry) {
+    const colId = `saved:${entry.id}`;
+    setSharingTarget({
+      id: colId,
+      name: entry.name,
+      visibility: getSavedCollectionVisibility(entry.id),
+    });
+    if (!friendsState) {
+      void refreshFriendsSharingState();
+    }
+  }
+
+  const [togglingAppearOffline, setTogglingAppearOffline] = useState(false);
+
+  const handleToggleAppearOffline = useCallback(async () => {
+    const nextOffline = !(friendsState?.appear_offline ?? false);
+    setTogglingAppearOffline(true);
+    try {
+      const updated = await api.setP2pAppearOffline(nextOffline);
+      setFriendsState(updated);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setTogglingAppearOffline(false);
+    }
+  }, [friendsState?.appear_offline]);
+
+  useEffect(() => {
+    void refreshFriendsSharingState();
+  }, [refreshFriendsSharingState]);
+
+  useEffect(() => {
+    const unlisten = listen("friends-changed", () => {
+      void refreshFriendsSharingState();
+    });
+    return () => {
+      void unlisten.then((fn) => fn());
+    };
+  }, [refreshFriendsSharingState]);
+
+  useNavSettledEffect(
+    tab === "settings",
+    0,
+    () => {
+      void refreshFriendsSharingState();
+    },
+    [refreshFriendsSharingState],
+  );
+
   useNavSettledEffect(
     tab === "collections",
     savedCollectionsReady ? 150 : 0,
     () => {
       void refreshSavedCollections(false);
+      void refreshFriendsSharingState();
     },
-    [refreshSavedCollections, savedCollectionsReady],
+    [refreshSavedCollections, refreshFriendsSharingState, savedCollectionsReady],
   );
 
   useNavSettledEffect(
@@ -7470,15 +7911,124 @@ export default function App() {
     if (tab === "collections") void refreshCollectionsPageMeta();
   }
 
+  async function retryCollectionIssues(
+    report: CollectionIntegrityReport,
+    selected: CollectionModIssue[],
+  ) {
+    if (!activeGame || selected.length === 0) return;
+    const col = installedCollections.find((c) => c.id === report.collection_id);
+    const assistNexus = !isPremium
+      ? selected.filter((i) => i.source === "nexus")
+      : [];
+    const directTargets = isPremium
+      ? selected
+      : selected.filter((i) => i.source !== "nexus");
+
+    setIntegrityRetrying(true);
+    setError(null);
+    try {
+      let retriedCount = 0;
+      const failures: string[] = [];
+
+      if (directTargets.length > 0) {
+        const res = await api.retryCollectionMods(
+          activeGame.id,
+          report.collection_id,
+          directTargets.map((i) => ({
+            mod_id: i.mod_id,
+            name: i.name,
+            source: i.source,
+            domain: i.domain,
+            nexus_mod_id: i.nexus_mod_id,
+            nexus_file_id: i.nexus_file_id,
+            ts_namespace: i.ts_namespace ?? null,
+            ts_name: i.ts_name ?? null,
+            modio_game_id: i.modio_game_id ?? null,
+            modio_mod_id: i.modio_mod_id ?? null,
+            modio_file_id: i.modio_file_id ?? null,
+            version: i.version ?? null,
+            file_name: i.file_name ?? null,
+          })),
+        );
+        retriedCount += res.retried;
+        for (const f of res.failed) {
+          failures.push(`${f.name}: ${f.error}`);
+        }
+      }
+
+      if (assistNexus.length > 0) {
+        const entries = assistNexus.map((i) =>
+          createQueueEntry(
+            activeGame.id,
+            i.domain,
+            i.nexus_mod_id,
+            i.nexus_file_id,
+            i.name,
+            i.version ?? null,
+            null,
+            chosenFileLabel(i.name, { name: i.file_name ?? null }),
+          ),
+        );
+        const nexusCol =
+          col?.source === "nexus" && col.slug
+            ? {
+                slug: col.slug,
+                name: col.name,
+                revision: col.revision ?? null,
+                existingModIds: mods.map((m) => m.id),
+                files: assistNexus.map((i) => ({
+                  modId: i.nexus_mod_id,
+                  fileId: i.nexus_file_id,
+                })),
+              }
+            : null;
+        const emperorShare =
+          col?.source === "emperor"
+            ? {
+                collectionId: col.id,
+                name: col.name,
+                code: col.profile_code ?? null,
+                existingModIds: mods.map((m) => m.id),
+                memberIds: col.mod_ids,
+                files: assistNexus.map((i) => ({
+                  domain: i.domain,
+                  modId: i.nexus_mod_id,
+                  fileId: i.nexus_file_id,
+                })),
+              }
+            : null;
+        await enqueueAssistEntries(
+          entries,
+          `${report.collection_name} (retry)`,
+          nexusCol,
+          emperorShare,
+        );
+      }
+
+      await refreshMods(activeGame.id);
+      await refreshCollections(activeGame.id);
+      await refreshDownloads();
+      setIntegrityDialogReport(null);
+
+      if (failures.length > 0) {
+        setError(
+          `Retried ${retriedCount} mod(s), ${failures.length} failed: ${failures.join("; ")}`,
+        );
+      } else if (retriedCount > 0 && assistNexus.length === 0) {
+        setNotice({
+          kind: "ok",
+          message: `Retried ${retriedCount} mod${retriedCount === 1 ? "" : "s"} in ${report.collection_name}.`,
+        });
+      }
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setIntegrityRetrying(false);
+    }
+  }
+
   async function uninstallInstalledCollection(c: InstalledCollection) {
     if (!activeGame) return;
-    if (
-      !window.confirm(
-        `Uninstall ${c.name}? Mods only used by this collection will be removed. Shared requirements stay.`,
-      )
-    ) {
-      return;
-    }
     await withBusy(`Uninstalling ${c.name}…`, async () => {
       await api.uninstallCollection(activeGame.id, c.id);
       await refreshMods(activeGame.id);
@@ -7652,40 +8202,14 @@ export default function App() {
     }
   }
 
-  async function importArchive() {
-    if (!activeGame) return;
-    const { open } = await import("@tauri-apps/plugin-dialog");
-    const selected = await open({
-      multiple: false,
-      filters: [
-        {
-          name: "Mods",
-          extensions: ["zip", "7z", "rar", "package", "ts4script", "dbc", "sims3pack"],
-        },
-        { name: "Archives", extensions: ["zip", "7z", "rar"] },
-      ],
-    });
-    if (!selected || Array.isArray(selected)) return;
-    await withBusy("Importing archive…", async () => {
-      await api.importModArchive({ gameId: activeGame.id, path: selected });
-      await refreshMods(activeGame.id);
-      await refreshCollections(activeGame.id);
-    });
-  }
-
-  async function importFolder() {
-    if (!activeGame) return;
-    const { open } = await import("@tauri-apps/plugin-dialog");
-    const selected = await open({
-      directory: true,
-      multiple: false,
-      title: "Import mods from folder",
-    });
-    if (!selected || Array.isArray(selected)) return;
-    await withBusy("Importing folder…", async () => {
-      const result = await api.importModFolder({
+  async function importPaths(paths: string[]) {
+    if (!activeGame || paths.length === 0) return;
+    setImportModalOpen(false);
+    setImportDropActive(false);
+    await withBusy("Importing mods…", async () => {
+      const result = await api.importMods({
         gameId: activeGame.id,
-        path: selected,
+        paths,
       });
       await refreshMods(activeGame.id);
       await refreshCollections(activeGame.id);
@@ -7706,6 +8230,72 @@ export default function App() {
       }
     });
   }
+
+  async function pickAndImportFiles() {
+    if (!activeGame) return;
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const selected = await open({
+      multiple: true,
+      title: "Import mod files or archives",
+      filters: [
+        {
+          name: "Mods",
+          extensions: ["zip", "7z", "rar", "package", "ts4script", "dbc", "sims3pack"],
+        },
+        { name: "Archives", extensions: ["zip", "7z", "rar"] },
+      ],
+    });
+    if (!selected) return;
+    const paths = Array.isArray(selected) ? selected : [selected];
+    await importPaths(paths);
+  }
+
+  async function pickAndImportFolder() {
+    if (!activeGame) return;
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const selected = await open({
+      directory: true,
+      multiple: false,
+      title: "Import mods from folder",
+    });
+    if (!selected || Array.isArray(selected)) return;
+    await importPaths([selected]);
+  }
+
+  useEffect(() => {
+    if (!importModalOpen) {
+      setImportDropActive(false);
+      return;
+    }
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    void import("@tauri-apps/api/window")
+      .then(({ getCurrentWindow }) =>
+        getCurrentWindow().onDragDropEvent((event) => {
+          if (cancelled) return;
+          if (event.payload.type === "enter" || event.payload.type === "over") {
+            setImportDropActive(true);
+          } else if (event.payload.type === "leave") {
+            setImportDropActive(false);
+          } else if (event.payload.type === "drop") {
+            setImportDropActive(false);
+            void importPaths(event.payload.paths);
+          }
+        }),
+      )
+      .then((fn) => {
+        if (cancelled) {
+          fn();
+        } else {
+          unlisten = fn;
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [importModalOpen, activeGame?.id]);
 
   async function toggleMod(m: StagedMod) {
     if (!activeGame) return;
@@ -7882,11 +8472,22 @@ export default function App() {
     }
   }
 
-  function ignoreRequirement(row: IgnoredRequirement) {
-    if (!activeGame) return;
+  function ignoreRequirements(rows: IgnoredRequirement[]) {
+    if (!activeGame || rows.length === 0) return;
     const current = activeGame.ignored_requirements ?? [];
-    if (current.some((item) => item.key === row.key)) return;
-    void saveIgnoredRequirements([...current, row]);
+    const existingKeys = new Set(current.map((item) => item.key));
+    const additions: IgnoredRequirement[] = [];
+    for (const row of rows) {
+      if (existingKeys.has(row.key)) continue;
+      existingKeys.add(row.key);
+      additions.push(row);
+    }
+    if (additions.length === 0) return;
+    void saveIgnoredRequirements([...current, ...additions]);
+  }
+
+  function ignoreRequirement(row: IgnoredRequirement) {
+    ignoreRequirements([row]);
   }
 
   function unignoreRequirement(key: string) {
@@ -8083,6 +8684,35 @@ export default function App() {
       setError(String(e));
     } finally {
       setWineApplyBusy(false);
+    }
+  }
+
+  async function dismissWineOverrides() {
+    if (!activeGame) return;
+    const gameId = activeGame.id;
+    setError(null);
+    try {
+      const updated = await api.setWineOverridesDismissed(gameId, true);
+      setManaged((prev) =>
+        prev.map((game) => (game.id === updated.id ? updated : game)),
+      );
+      setLibraryDetail((detail) =>
+        detail && detail.game.id === updated.id
+          ? { ...detail, game: updated }
+          : detail,
+      );
+      setNotice({
+        kind: "warn",
+        message:
+          "Proton launch options dismissed. They are still available in Info from the menu (☰).",
+        action: {
+          label: "Open Info",
+          run: () => setGameModal("info"),
+          dismiss: true,
+        },
+      });
+    } catch (e) {
+      setError(String(e));
     }
   }
 
@@ -8330,6 +8960,7 @@ export default function App() {
     (m: CatalogHit) => (
       <BrowseModGridCard
         mod={m}
+        sort={browseSort}
         installed={installedIds.has(m.id)}
         isPremium={isPremium}
         onOpen={handleBrowseOpenMod}
@@ -8338,6 +8969,7 @@ export default function App() {
       />
     ),
     [
+      browseSort,
       handleBrowseOpenMod,
       handleBrowseQuickInstall,
       handleBrowseUninstall,
@@ -8450,6 +9082,7 @@ export default function App() {
         <div className="app-game-backdrop" aria-hidden="true" />
       ) : null}
       <aside className="sidebar">
+        <div className="sidebar-scroll">
         <div className="sidebar-top">
           <div
             className="brand"
@@ -8488,16 +9121,46 @@ export default function App() {
             </NavTab>
           ))}
         </NavGroup>
-        {activeGame ? (
-          <div className="active-game">
-            <span>Active</span>
-            <strong>{activeGame.title}</strong>
-            {(downloadStatus || showSidebarAssist) && (
-              <div className="sidebar-status-block in-active-game">
+        <div className="sidebar-bottom">
+          {activeGame ? (
+            <div className="active-game">
+              <span>Active</span>
+              <strong>{activeGame.title}</strong>
+              {(downloadStatus || showSidebarAssist) && (
+                <div className="sidebar-status-block in-active-game">
+                  {downloadStatus ? (
+                    <button
+                      type="button"
+                      className="active-game-status"
+                      onClick={openDownloadsTab}
+                      title="Open Downloads"
+                    >
+                      <Throbber />
+                      <span className="status-copy">
+                        <span className="status-primary">{downloadStatus.primary}</span>
+                        {downloadStatus.secondary ? (
+                          <span className="status-secondary">{downloadStatus.secondary}</span>
+                        ) : null}
+                      </span>
+                    </button>
+                  ) : null}
+                  {showSidebarAssist ? (
+                    <div
+                      ref={handleSidebarAssistHost}
+                      className="sidebar-assist-host active"
+                      aria-hidden
+                    />
+                  ) : null}
+                </div>
+              )}
+            </div>
+          ) : (
+            (downloadStatus || showSidebarAssist) && (
+              <div className="sidebar-status-block standalone">
                 {downloadStatus ? (
                   <button
                     type="button"
-                    className="active-game-status"
+                    className="sidebar-status"
                     onClick={openDownloadsTab}
                     title="Open Downloads"
                   >
@@ -8518,37 +9181,52 @@ export default function App() {
                   />
                 ) : null}
               </div>
-            )}
-          </div>
-        ) : (
-          (downloadStatus || showSidebarAssist) && (
-            <div className="sidebar-status-block standalone">
-              {downloadStatus ? (
-                <button
-                  type="button"
-                  className="sidebar-status"
-                  onClick={openDownloadsTab}
-                  title="Open Downloads"
-                >
-                  <Throbber />
-                  <span className="status-copy">
-                    <span className="status-primary">{downloadStatus.primary}</span>
-                    {downloadStatus.secondary ? (
-                      <span className="status-secondary">{downloadStatus.secondary}</span>
-                    ) : null}
-                  </span>
-                </button>
-              ) : null}
-              {showSidebarAssist ? (
-                <div
-                  ref={handleSidebarAssistHost}
-                  className="sidebar-assist-host active"
-                  aria-hidden
-                />
-              ) : null}
+            )
+          )}
+          <div
+            className="sidebar-p2p-status"
+            title="Serverless iroh P2P endpoint status"
+          >
+            <div className="sidebar-p2p-info">
+              <span
+                className={`sidebar-p2p-dot ${
+                  friendsState?.appear_offline
+                    ? "offline"
+                    : friendsState?.endpoint_ready
+                      ? "ok"
+                      : "warn"
+                }`}
+                aria-hidden="true"
+              />
+              <span className="sidebar-p2p-label">
+                {friendsState?.appear_offline
+                  ? "Appear Offline"
+                  : friendsState?.endpoint_ready
+                    ? "P2P Ready"
+                    : "Connecting..."}
+              </span>
             </div>
-          )
-        )}
+            <button
+              type="button"
+              className="sidebar-p2p-toggle"
+              title={
+                friendsState?.appear_offline
+                  ? "Go online on P2P"
+                  : "Appear offline to friends"
+              }
+              aria-label="Appear offline"
+              aria-pressed={Boolean(friendsState?.appear_offline)}
+              disabled={togglingAppearOffline}
+              onClick={() => void handleToggleAppearOffline()}
+            >
+              <FontAwesomeIcon
+                icon={friendsState?.appear_offline ? faEyeSlash : faEye}
+                aria-hidden="true"
+              />
+            </button>
+          </div>
+        </div>
+        </div>
       </aside>
 
       <main
@@ -8573,7 +9251,11 @@ export default function App() {
                 message={b.message}
                 details={b.details}
                 action={b.action}
-                timeoutSeconds={bannerTimeoutFor(b.kind, settings)}
+                timeoutSeconds={remainingBannerTimeoutSeconds(
+                  b,
+                  settings,
+                  sessionStartMsRef.current,
+                )}
                 onDismiss={() => dismissBannerById(b.id)}
               />
             ))}
@@ -8601,8 +9283,21 @@ export default function App() {
                       Home
                     </button>
                     <h1>{libraryDetail.game.title}</h1>
+                    <div className="detail-head-stats">
+                      <span>
+                        {mods.length} mod{mods.length === 1 ? "" : "s"}
+                      </span>
+                      <span>{enabledModCount} enabled</span>
+                    </div>
                   </div>
                   <div className="panel-head-actions">
+                    <button
+                      type="button"
+                      disabled={enabledModCount === 0}
+                      onClick={() => openSaveLoadoutPrompt()}
+                    >
+                      Save loadout
+                    </button>
                     {(() => {
                       const launchState = launchStates[libraryDetail.game.id];
                       const phase = launchState?.phase ?? "idle";
@@ -8708,7 +9403,7 @@ export default function App() {
                           setGameSettingsMenuOpen((open) => !open)
                         }
                       >
-                        <FontAwesomeIcon icon={faGear} />
+                        <FontAwesomeIcon icon={faBars} />
                       </button>
                       <PopIn
                         show={gameSettingsMenuOpen}
@@ -8751,6 +9446,28 @@ export default function App() {
                         <button
                           type="button"
                           role="menuitem"
+                          onClick={() => {
+                            setGameSettingsMenuOpen(false);
+                            void checkLoadLogs();
+                          }}
+                        >
+                          Check logs
+                        </button>
+                        <button
+                          type="button"
+                          role="menuitem"
+                          className="danger"
+                          disabled={mods.length === 0}
+                          onClick={() => {
+                            setGameSettingsMenuOpen(false);
+                            void removeAllMods();
+                          }}
+                        >
+                          Remove all mods
+                        </button>
+                        <button
+                          type="button"
+                          role="menuitem"
                           className="danger"
                           onClick={() => {
                             setGameSettingsMenuOpen(false);
@@ -8764,13 +9481,7 @@ export default function App() {
                   </div>
                 </div>
 
-                <div
-                  className={
-                    installedCollections.length > 0
-                      ? "detail-hero has-installed-collections"
-                      : "detail-hero"
-                  }
-                >
+                <div className="detail-hero">
                   <div className="detail-cover">
                     {gameCoverSrc(libraryDetail.game) ? (
                       <img src={gameCoverSrc(libraryDetail.game)!} alt="" />
@@ -8779,27 +9490,6 @@ export default function App() {
                     )}
                   </div>
                   <div className="detail-meta">
-                    <p className="detail-author">
-                      {shortLauncher(libraryDetail.game.launcher)}
-                      {gameInfo?.genre ? ` · ${gameInfo.genre}` : ""}
-                    </p>
-                    <div className="detail-stats">
-                      <span>
-                        {mods.length} mod{mods.length === 1 ? "" : "s"}
-                      </span>
-                      <span>
-                        {enabledModCount} enabled
-                      </span>
-                      {gameInfo?.mods != null ? (
-                        <span>{gameInfo.mods.toLocaleString()} on Nexus</span>
-                      ) : gameInfoLoading && libraryDetail.game.nexus_domain ? (
-                        <InlineStatSkeleton />
-                      ) : null}
-                      {gameInfo?.downloads != null && (
-                        <span>{gameInfo.downloads.toLocaleString()} downloads</span>
-                      )}
-                      <span>{libraryDetail.game.nexus_domain}</span>
-                    </div>
                     <div className="detail-external-links">
                       <button
                         type="button"
@@ -8821,29 +9511,46 @@ export default function App() {
                         </button>
                       )}
                     </div>
-                  </div>
-                  {installedCollections.length > 0 && (
-                    <section
-                      className="hero-installed-collections"
-                      aria-label="Installed collections"
-                    >
-                      <div className="hero-installed-collections-head">
-                        <h2>Installed collections</h2>
-                        <span className="hero-installed-collections-count">
-                          {installedCollections.length}
-                        </span>
-                      </div>
-                      <div className="hero-installed-collections-track">
+                    {installedCollections.length > 0 && (
+                      <div
+                        className="detail-installed-collections"
+                        aria-label="Installed collections"
+                      >
                         {installedCollections.map((c) => {
                           const installedLabel = formatInstalledAt(
                             c.installed_at,
                           );
                           const sourceLabel = installedCollectionSourceLabel(c);
                           const isFiltering = modsCollectionFilter === c.id;
+                          const syncState = friendSyncStates[c.id];
+                          const hasUpdate = Boolean(syncState?.has_update);
+                          const isSyncing = Boolean(syncingCollectionIds[c.id]);
+                          const autoSyncOn = Boolean(c.friend_sync?.auto_sync);
+                          const canUpdateSource = Boolean(
+                            c.friend_sync ||
+                              (c.source === "nexus" && c.slug) ||
+                              (c.source === "thunderstore" &&
+                                c.kind === "modpack" &&
+                                c.community &&
+                                c.namespace &&
+                                c.package_name),
+                          );
+                          const installedMemberCount = mods.filter((m) =>
+                            (m.collection_ids ?? []).includes(c.id),
+                          ).length;
+                          const modCount =
+                            installedMemberCount > 0
+                              ? installedMemberCount
+                              : c.mod_ids.length;
                           const tooltip = [
                             c.name,
                             sourceLabel,
-                            `${c.mod_ids.length} mods`,
+                            `${modCount} mods`,
+                            c.friend_sync
+                              ? hasUpdate
+                                ? "Update available"
+                                : "Synced"
+                              : null,
                             installedLabel,
                           ]
                             .filter(Boolean)
@@ -8851,232 +9558,196 @@ export default function App() {
                           return (
                             <article
                               key={c.id}
+                              role="button"
+                              tabIndex={0}
                               className={
                                 isFiltering
                                   ? "installed-collection-card is-active"
                                   : "installed-collection-card"
                               }
                               title={tooltip}
+                              onClick={(e) => {
+                                if (
+                                  (e.target as HTMLElement).closest("button")
+                                ) {
+                                  return;
+                                }
+                                void refreshSavedCollections();
+                                setGameModal("collections");
+                              }}
+                              onKeyDown={(e) => {
+                                if (
+                                  e.target === e.currentTarget &&
+                                  (e.key === "Enter" || e.key === " ")
+                                ) {
+                                  e.preventDefault();
+                                  void refreshSavedCollections();
+                                  setGameModal("collections");
+                                }
+                              }}
                             >
-                              {(c.source === "nexus" ||
-                                c.source === "thunderstore") && (
-                                <div className="installed-collection-card-top">
-                                  <SourceMark
-                                    source={c.source}
-                                    label={sourceLabel}
-                                  />
+                              <div className="installed-collection-card-header">
+                                <div className="installed-collection-card-title">
+                                  {(c.source === "nexus" ||
+                                    c.source === "thunderstore") && (
+                                    <SourceMark
+                                      source={c.source}
+                                      label={sourceLabel}
+                                    />
+                                  )}
+                                  <strong className="installed-collection-card-name">
+                                    {c.name}
+                                  </strong>
                                 </div>
-                              )}
-                              <div className="installed-collection-card-body">
-                                <strong className="installed-collection-card-name">
-                                  {c.name}
-                                </strong>
-                                <span className="installed-collection-card-meta">
-                                  {c.mod_ids.length} mod
-                                  {c.mod_ids.length === 1 ? "" : "s"}
-                                </span>
+                                <div className="installed-collection-card-actions">
+                                  {canUpdateSource && (
+                                    <button
+                                      type="button"
+                                      className={hasUpdate ? "accent" : ""}
+                                      disabled={isSyncing}
+                                      title={
+                                        c.friend_sync
+                                          ? hasUpdate
+                                            ? `Sync ${c.name} to friend's latest settings`
+                                            : `Re-sync ${c.name} to latest settings`
+                                          : `Update ${c.name} to latest version`
+                                      }
+                                      onClick={() =>
+                                        void syncInstalledCollection(c)
+                                      }
+                                    >
+                                      {isSyncing
+                                        ? "Syncing…"
+                                        : c.friend_sync
+                                          ? hasUpdate
+                                            ? "Sync Update"
+                                            : "Sync"
+                                          : "Update"}
+                                    </button>
+                                  )}
+                                  {c.friend_sync && (
+                                    <button
+                                      type="button"
+                                      className={autoSyncOn ? "active" : ""}
+                                      aria-pressed={autoSyncOn}
+                                      title={
+                                        autoSyncOn
+                                          ? "Auto-sync enabled (click to disable)"
+                                          : "Enable auto-sync when friend updates this collection"
+                                      }
+                                      onClick={() =>
+                                        void toggleInstalledCollectionAutoSync(
+                                          c,
+                                          !autoSyncOn,
+                                        )
+                                      }
+                                    >
+                                      Auto
+                                    </button>
+                                  )}
+                                  <button
+                                    type="button"
+                                    className="danger icon-btn"
+                                    aria-label={`Uninstall ${c.name}`}
+                                    title={`Uninstall ${c.name}`}
+                                    onClick={() =>
+                                      setUninstallCollectionTarget(c)
+                                    }
+                                  >
+                                    <FontAwesomeIcon icon={faTrashCan} />
+                                  </button>
+                                </div>
                               </div>
-                              <div className="installed-collection-card-actions">
-                                <button
-                                  type="button"
-                                  className={isFiltering ? "active" : ""}
-                                  onClick={() =>
-                                    setModsCollectionFilter((prev) =>
-                                      prev === c.id ? "" : c.id,
-                                    )
-                                  }
-                                >
-                                  {isFiltering ? "Showing" : "Filter"}
-                                </button>
-                                <button
-                                  type="button"
-                                  className="danger icon-btn"
-                                  aria-label={`Uninstall ${c.name}`}
-                                  title={`Uninstall ${c.name}`}
-                                  onClick={() =>
-                                    void uninstallInstalledCollection(c)
-                                  }
-                                >
-                                  <FontAwesomeIcon icon={faTrashCan} />
-                                </button>
+                              <div className="installed-collection-card-meta">
+                                <span>
+                                  {modCount} mod{modCount === 1 ? "" : "s"}
+                                </span>
+                                {c.friend_sync ? (
+                                  <>
+                                    {" · "}
+                                    <span
+                                      className={
+                                        hasUpdate
+                                          ? "installed-collection-sync-pill is-update"
+                                          : "installed-collection-sync-pill"
+                                      }
+                                    >
+                                      {hasUpdate ? "Update" : "Synced"}
+                                    </span>
+                                  </>
+                                ) : null}
+                                {collectionIntegrityById[c.id]?.issues
+                                  .length ? (
+                                  <>
+                                    {" · "}
+                                    <button
+                                      type="button"
+                                      className="installed-collection-issue-pill"
+                                      onClick={() =>
+                                        setIntegrityDialogReport(
+                                          collectionIntegrityById[c.id],
+                                        )
+                                      }
+                                    >
+                                      {
+                                        collectionIntegrityById[c.id].issues
+                                          .length
+                                      }{" "}
+                                      issue
+                                      {collectionIntegrityById[c.id].issues
+                                        .length === 1
+                                        ? ""
+                                        : "s"}
+                                    </button>
+                                  </>
+                                ) : null}
                               </div>
                             </article>
                           );
                         })}
                       </div>
-                    </section>
-                  )}
+                    )}
+                  </div>
                 </div>
 
                 <div className="detail-body">
                     <Reveal
-                      show={Boolean(shareExportOpen || shareImportOpen || lastShareCode)}
-                      className="profile-import share-panel"
+                      show={Boolean(
+                        settings?.platform_linux &&
+                          wineAdvice &&
+                          !libraryDetail.game.wine_overrides_dismissed,
+                      )}
                     >
-                        {shareExportOpen && (
-                          <>
-                            <h2>Share loadout</h2>
-                            <p className="note">
-                              Encodes enabled portable mods (Nexus, Thunderstore, mod.io) into a
-                              pasteable code. Saved under Collections. For Discord, use Save as
-                              file — chat paste often breaks the code.
-                            </p>
-                            <label>
-                              Name (optional)
-                              <input
-                                value={shareExportName}
-                                onChange={(e) => setShareExportName(e.target.value)}
-                                placeholder="My loadout"
-                              />
-                            </label>
-                            <div className="actions">
-                              <button
-                                type="button"
-                                onClick={() => void exportShareLoadout()}
-                              >
-                                Create &amp; copy code
-                              </button>
-                              <button
-                                type="button"
-                                className="linkish"
-                                onClick={() => setShareExportOpen(false)}
-                              >
-                                Cancel
-                              </button>
-                            </div>
-                          </>
-                        )}
-                        {shareImportOpen && (
-                          <>
-                            <h2>Import code</h2>
-                            <label>
-                              Code
-                              <textarea
-                                rows={4}
-                                value={shareImportCode}
-                                onChange={(e) => setShareImportCode(e.target.value)}
-                                placeholder="Paste Emperor share code or r2modman / Gale profile code"
-                              />
-                            </label>
-                            <div className="actions">
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  const code = shareImportCode.trim();
-                                  if (!code || !activeGame) return;
-                                  void beginCodeImport(activeGame.id, code);
-                                }}
-                              >
-                                Import
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => void openShareCodeFile()}
-                              >
-                                Open file
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  const code = shareImportCode.trim();
-                                  if (!code) return;
-                                  void (async () => {
-                                    try {
-                                      await api.saveCollectionCode({
-                                        code,
-                                        sourceGameId: activeGame?.id,
-                                      });
-                                      setNotice({
-                                        kind: "ok",
-                                        message: "Saved to Collections.",
-                                      });
-                                      await refreshSavedCollections();
-                                    } catch (e) {
-                                      setError(String(e));
-                                    }
-                                  })();
-                                }}
-                              >
-                                Save only
-                              </button>
-                              <button
-                                type="button"
-                                className="linkish"
-                                onClick={() => setShareImportOpen(false)}
-                              >
-                                Cancel
-                              </button>
-                            </div>
-                          </>
-                        )}
-                        {lastShareCode && !shareExportOpen && (
-                          <>
-                            <h2>Last share code</h2>
-                            <textarea
-                              rows={3}
-                              readOnly
-                              value={lastShareCode}
-                              onFocus={(e) => e.target.select()}
-                            />
-                            <div className="actions">
-                              <button
-                                type="button"
-                                className="icon-btn"
-                                aria-label="Copy again"
-                                title="Copy again"
-                                onClick={() =>
-                                  void navigator.clipboard.writeText(lastShareCode)
-                                }
-                              >
-                                <FontAwesomeIcon icon={faCopy} />
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  void (async () => {
-                                    try {
-                                      const saved = await saveShareCodeToFile(
-                                        lastShareCode,
-                                        shareExportName.trim() || "loadout",
-                                      );
-                                      if (saved) {
-                                        setNotice({
-                                          kind: "ok",
-                                          message:
-                                            "Saved .emperor-share file. Send that instead of pasting into Discord.",
-                                        });
-                                      }
-                                    } catch (e) {
-                                      setError(String(e));
-                                    }
-                                  })()
-                                }
-                              >
-                                Save as file
-                              </button>
-                              <button
-                                type="button"
-                                className="linkish"
-                                onClick={() => setLastShareCode(null)}
-                              >
-                                Dismiss
-                              </button>
-                            </div>
-                          </>
-                        )}
-                    </Reveal>
-                    <Reveal show={Boolean(settings?.platform_linux && wineAdvice)}>
-                      {settings?.platform_linux && wineAdvice ? (
+                      {settings?.platform_linux &&
+                      wineAdvice &&
+                      !libraryDetail.game.wine_overrides_dismissed ? (
                         <WineOverrideNotice
                           advice={wineAdvice}
                           busy={wineApplyBusy}
                           onApply={() => void applyWineOverrides()}
+                          onDismiss={() => void dismissWineOverrides()}
                         />
                       ) : null}
                     </Reveal>
                     <div className="mods-toolbar">
                       <div className="mods-toolbar-actions">
                         <div className="mods-toolbar-actions-left">
+                          <button
+                            type="button"
+                            className="mods-toolbar-icon-btn"
+                            aria-label="Import mod"
+                            title="Import mod"
+                            onClick={() => setImportModalOpen(true)}
+                          >
+                            <FontAwesomeIcon icon={faFileImport} />
+                          </button>
+                          <button
+                            type="button"
+                            disabled={checkingModUpdates}
+                            onClick={() => void checkStagedModUpdatesNow()}
+                          >
+                            Check for updates
+                          </button>
                           {stagedUpdateCount > 0 && (
                             <button
                               type="button"
@@ -9102,100 +9773,6 @@ export default function App() {
                           >
                             <FontAwesomeIcon icon={faFilter} />
                           </button>
-                          <div className="mods-actions-menu" ref={modsActionsMenuRef}>
-                            <button
-                              type="button"
-                              className="mods-toolbar-icon-btn"
-                              aria-label="More"
-                              aria-haspopup="menu"
-                              aria-expanded={modsActionsMenuOpen}
-                              onClick={() =>
-                                setModsActionsMenuOpen((open) => !open)
-                              }
-                            >
-                              <FontAwesomeIcon icon={faBars} />
-                            </button>
-                            <PopIn
-                              show={modsActionsMenuOpen}
-                              className="mods-actions-menu-popup"
-                              role="menu"
-                            >
-                              <button
-                                type="button"
-                                role="menuitem"
-                                onClick={() => {
-                                  setModsActionsMenuOpen(false);
-                                  setShareExportOpen((v) => !v);
-                                  setShareImportOpen(false);
-                                }}
-                              >
-                                Share loadout
-                              </button>
-                              <button
-                                type="button"
-                                role="menuitem"
-                                onClick={() => {
-                                  setModsActionsMenuOpen(false);
-                                  setShareImportOpen((v) => !v);
-                                  setShareExportOpen(false);
-                                }}
-                              >
-                                Import code
-                              </button>
-                              <button
-                                type="button"
-                                role="menuitem"
-                                onClick={() => {
-                                  setModsActionsMenuOpen(false);
-                                  void importArchive();
-                                }}
-                              >
-                                Import archive
-                              </button>
-                              <button
-                                type="button"
-                                role="menuitem"
-                                onClick={() => {
-                                  setModsActionsMenuOpen(false);
-                                  void importFolder();
-                                }}
-                              >
-                                Import folder
-                              </button>
-                              <button
-                                type="button"
-                                role="menuitem"
-                                onClick={() => {
-                                  setModsActionsMenuOpen(false);
-                                  void checkLoadLogs();
-                                }}
-                              >
-                                Check logs
-                              </button>
-                              <button
-                                type="button"
-                                role="menuitem"
-                                onClick={() => {
-                                  setModsActionsMenuOpen(false);
-                                  void checkStagedModUpdatesNow();
-                                }}
-                              >
-                                Check for updates
-                              </button>
-                              <button
-                                type="button"
-                                role="menuitem"
-                                className="danger"
-                                disabled={mods.length === 0}
-                                onClick={() => {
-                                  setModsActionsMenuOpen(false);
-                                  void removeAllMods();
-                                }}
-                              >
-                                Remove all mods
-                              </button>
-                            </PopIn>
-                          </div>
                         </div>
                       </div>
                       <Collapse show={modsFiltersOpen}>
@@ -9546,6 +10123,17 @@ export default function App() {
                                   <FontAwesomeIcon icon={faGear} />
                                 </button>
                               )}
+                              {installedCollections.length > 1 && (
+                                <button
+                                  type="button"
+                                  className="icon-btn"
+                                  onClick={() => setMoveCollectionMod(m)}
+                                  aria-label={`Move ${m.name} between collections`}
+                                  title="Move between collections"
+                                >
+                                  <FontAwesomeIcon icon={faRightLeft} />
+                                </button>
+                              )}
                               <button
                                 type="button"
                                 className="icon-btn"
@@ -9872,23 +10460,18 @@ export default function App() {
                 savedDetail.entry.game.title ??
                 "Saved collection";
               return (
-              <div>
-                <div className="panel-head">
-                  <div className="detail-head-title">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        savedOpenRef.current += 1;
-                        setSavedDetail(null);
-                        setSavedDetailPending(false);
-                        setSavedRename("");
-                      }}
-                    >
-                      Home
-                    </button>
-                    <h1>{savedDetail.entry.name}</h1>
-                  </div>
-                  <div className="panel-head-actions">
+                <CollectionDetailView
+                  title={savedDetail.entry.name}
+                  onRename={(nextName) =>
+                    renameSavedCollectionById(savedDetail.entry.id, nextName)
+                  }
+                  backLabel="Home"
+                  onBack={() => {
+                    savedOpenRef.current += 1;
+                    setSavedDetail(null);
+                    setSavedDetailPending(false);
+                  }}
+                  headerActions={
                     <button
                       type="button"
                       className="danger"
@@ -9911,94 +10494,68 @@ export default function App() {
                     >
                       Delete
                     </button>
-                  </div>
-                </div>
-                <div className="detail-hero">
-                  <div className="detail-cover">
-                    {coverSrc ? (
-                      <img src={coverSrc} alt="" />
-                    ) : (
-                      <PlaceholderIcon />
-                    )}
-                  </div>
-                  <div className="detail-meta">
-                    <p className="detail-author">
-                      {gameTitle}
-                      {isSavedCollectionInstalled(savedDetail.entry) ? (
-                        <>
-                          {" "}
-                          <span className="pill ok">Installed</span>
-                        </>
-                      ) : null}
-                    </p>
-                    <SavedCollectionStats entry={savedDetail.entry} />
-                    {showGameVersionWarnings &&
-                      savedCollectionAdvice[savedDetail.entry.id]?.status ===
-                        "mismatch" && (
-                        <p className="mod-version-warn">
-                          {savedCollectionAdvice[savedDetail.entry.id]?.message}
-                        </p>
-                      )}
-                    <div className="saved-collection-actions">
-                      <select
-                        className="saved-collection-game-select"
-                        aria-label="Install into"
-                        value={savedInstallGameId}
-                        onChange={(e) => setSavedInstallGameId(e.target.value)}
-                      >
-                        <option value="">Select managed game…</option>
-                        {managed.map((g) => (
-                          <option key={g.id} value={g.id}>
-                            {g.title}
-                            {savedCollectionMatchesGame(savedDetail.entry, g)
-                              ? " (match)"
-                              : ""}
-                          </option>
-                        ))}
-                      </select>
-                      <button type="button" onClick={() => void installSavedCollection()}>
-                        Install
-                      </button>
+                  }
+                  coverSrc={coverSrc}
+                  gameTitle={gameTitle}
+                  metaPills={
+                    isSavedCollectionInstalled(savedDetail.entry) ? (
+                      <>
+                        {" "}
+                        <span className="pill ok">Installed</span>
+                      </>
+                    ) : null
+                  }
+                  stats={savedDetail.entry}
+                  versionWarning={
+                    showGameVersionWarnings &&
+                    savedCollectionAdvice[savedDetail.entry.id]?.status === "mismatch"
+                      ? savedCollectionAdvice[savedDetail.entry.id]?.message
+                      : null
+                  }
+                  managed={managed}
+                  selectedGameId={savedInstallGameId}
+                  onSelectGameId={setSavedInstallGameId}
+                  gameMatches={(g) =>
+                    savedCollectionMatchesGame(savedDetail.entry, g)
+                  }
+                  gameKnown={savedCollectionGameKey(savedDetail.entry) !== "unknown"}
+                  actions={
+                    <>
                       <button
                         type="button"
-                        className="icon-btn"
-                        aria-label="Copy code"
-                        title="Copy code"
-                        onClick={() =>
-                          void navigator.clipboard.writeText(savedDetail.entry.code)
-                        }
+                        onClick={() => void installSavedCollection()}
                       >
-                        <FontAwesomeIcon icon={faCopy} />
+                        Install
                       </button>
-                    </div>
-                  </div>
-                </div>
-                <div className="detail-body">
-                  <SavedCollectionDetailBody
-                    entry={savedDetail.entry}
-                    mods={savedDetail.mods}
-                    renameValue={savedRename}
-                    onRenameChange={setSavedRename}
-                    onRenameSubmit={() =>
-                      void (async () => {
-                        try {
-                          const updated = await api.renameSavedCollection(
-                            savedDetail.entry.id,
-                            savedRename,
-                          );
-                          setSavedDetail({ ...savedDetail, entry: updated });
-                          await refreshSavedCollections();
-                        } catch (e) {
-                          setError(String(e));
-                        }
-                      })()
-                    }
-                    showMods={showSavedMods}
-                    scrollRef={mainScrollRef}
-                    active={tab === "collections"}
-                  />
-                </div>
-              </div>
+                      {(() => {
+                        const vis = getSavedCollectionVisibility(
+                          savedDetail.entry.id,
+                        );
+                        const label = formatVisibilityLabel(vis);
+                        return (
+                          <button
+                            type="button"
+                            className="collection-sharing-btn"
+                            aria-label={`Sharing: ${label}`}
+                            title={`Sharing: ${label}`}
+                            onClick={() =>
+                              openSavedCollectionSharing(savedDetail.entry)
+                            }
+                          >
+                            <FontAwesomeIcon icon={visibilityIcon(vis)} />{" "}
+                            {label}
+                          </button>
+                        );
+                      })()}
+                    </>
+                  }
+                  code={savedDetail.entry.code}
+                  mods={savedDetail.mods}
+                  showMods={showSavedMods}
+                  skeletonCount={savedDetail.entry.mod_count}
+                  scrollRef={mainScrollRef}
+                  active={tab === "collections"}
+                />
               );
             })() : (
               <div>
@@ -10021,179 +10578,138 @@ export default function App() {
                 </div>
                 <p className="note">
                   Local Emperor share codes grouped by game. Create one from Library →
-                  game → Mods → Share loadout, or import a code or file here.
+                  game → Save loadout, or import a code or file here.
                 </p>
                 {showCollectionsList ? (
-                <div className="results-fill">
-                <ul className="list collections-by-game">
-                  {savedCollectionGameGroups.slice(0, visibleCollectionGroupCount).map((group, idx) => {
-                    const expanded = expandedCollectionGameKey === group.key;
-                    const childLimit = expandedGroupLimits[group.key] ?? 25;
-                    const visibleChildren = expanded
-                      ? group.collections.slice(0, childLimit)
-                      : [];
-                    return (
-                      <li
-                        key={group.key}
-                        className="collections-game-row list-row-poster stagger-item"
-                        style={staggerStyle(idx)}
-                      >
-                        <div
-                          className="collections-game-header list-row-clickable"
-                          aria-expanded={expanded}
-                          onClick={() =>
-                            setExpandedCollectionGameKey(
-                              expanded ? null : group.key,
-                            )
-                          }
-                          onKeyDown={(e: ReactKeyboardEvent<HTMLDivElement>) => {
-                            if (e.key === "Enter" || e.key === " ") {
-                              e.preventDefault();
-                              setExpandedCollectionGameKey(
-                                expanded ? null : group.key,
-                              );
-                            }
-                          }}
-                          role="button"
-                          tabIndex={0}
+                  <CollectionsGameList
+                    groups={savedCollectionGameGroups}
+                    expandedGameKey={expandedCollectionGameKey}
+                    onToggleGameKey={(key) =>
+                      setExpandedCollectionGameKey(
+                        expandedCollectionGameKey === key ? null : key,
+                      )
+                    }
+                    groupLimit={visibleCollectionGroupCount}
+                    expandedGroupLimits={expandedGroupLimits}
+                    onShowMoreChildren={(groupKey) =>
+                      setExpandedGroupLimits((prev) => ({
+                        ...prev,
+                        [groupKey]: (prev[groupKey] ?? 25) + 25,
+                      }))
+                    }
+                    renderPoster={(coverPath) => (
+                      <ListPoster src={posterSrc(coverPath)} />
+                    )}
+                    emptyMessage="No saved share codes yet. Share a loadout from a managed game."
+                    renderChild={(group, c, childIdx) => {
+                      const builtFor = formatCollectionGameVersions(
+                        c.game_versions,
+                      );
+                      const advice = savedCollectionAdvice[c.id];
+                      const installed = isSavedCollectionInstalled(c);
+                      return (
+                        <li
+                          key={c.id}
+                          className="list-row-clickable stagger-item"
+                          style={staggerStyle(childIdx)}
+                          onClick={() => void openSavedCollection(c.id)}
                         >
-                          <ListPoster src={posterSrc(group.coverPath)} />
                           <div className="list-row-main">
-                            <strong>{group.title}</strong>
+                            <strong>
+                              {c.name}
+                              {installed ? (
+                                <span className="pill ok">Installed</span>
+                              ) : null}
+                            </strong>
                             <small>
-                              {group.collections.length} collection
-                              {group.collections.length === 1 ? "" : "s"}
-                              {group.managed ? " · managed" : " · not managed"}
+                              {c.mod_count} mods
+                              {builtFor ? ` · Built for ${builtFor}` : ""}
+                              {formatIsoDate(c.created_at)
+                                ? ` · ${formatIsoDate(c.created_at)}`
+                                : ""}
                             </small>
+                            {showGameVersionWarnings &&
+                              advice?.status === "mismatch" && (
+                                <small className="mod-version-warn">
+                                  {advice.message}
+                                </small>
+                              )}
                           </div>
-                        </div>
-                        <Collapse
-                          show={expanded}
-                          className="collections-game-expand"
-                        >
-                          <ul className="list collections-game-children">
-                            {visibleChildren.map((c, childIdx) => {
-                              const builtFor = formatCollectionGameVersions(
-                                c.game_versions,
-                              );
-                              const advice = savedCollectionAdvice[c.id];
-                              const installed = isSavedCollectionInstalled(c);
+                          <div
+                            className="actions"
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            <button
+                              type="button"
+                              onClick={() =>
+                                void (async () => {
+                                  if (group.managed) {
+                                    await runUnifiedImport(
+                                      group.managed.id,
+                                      c.code,
+                                      c.name,
+                                    );
+                                    await refreshCollectionsPageMeta();
+                                    return;
+                                  }
+                                  await openSavedCollection(c.id);
+                                })()
+                              }
+                            >
+                              Install
+                            </button>
+                            <button
+                              type="button"
+                              className="icon-btn"
+                              aria-label={`Copy ${c.name}`}
+                              title="Copy"
+                              onClick={() =>
+                                void navigator.clipboard.writeText(c.code)
+                              }
+                            >
+                              <FontAwesomeIcon icon={faCopy} />
+                            </button>
+                            {(() => {
+                              const vis = getSavedCollectionVisibility(c.id);
+                              const label = formatVisibilityLabel(vis);
                               return (
-                                <li
-                                  key={c.id}
-                                  className="list-row-clickable stagger-item"
-                                  style={staggerStyle(childIdx)}
-                                  onClick={() => void openSavedCollection(c.id)}
+                                <button
+                                  type="button"
+                                  className="collection-sharing-btn"
+                                  aria-label={`Sharing for ${c.name}: ${label}`}
+                                  title={`Sharing: ${label}`}
+                                  onClick={() => openSavedCollectionSharing(c)}
                                 >
-                                  <div className="list-row-main">
-                                    <strong>
-                                      {c.name}
-                                      {installed ? (
-                                        <span className="pill ok">Installed</span>
-                                      ) : null}
-                                    </strong>
-                                    <small>
-                                      {c.mod_count} mods
-                                      {builtFor ? ` · Built for ${builtFor}` : ""}
-                                      {formatIsoDate(c.created_at)
-                                    ? ` · ${formatIsoDate(c.created_at)}`
-                                    : ""}
-                                    </small>
-                                    {showGameVersionWarnings &&
-                                      advice?.status === "mismatch" && (
-                                        <small className="mod-version-warn">
-                                          {advice.message}
-                                        </small>
-                                      )}
-                                  </div>
-                                  <div
-                                    className="actions"
-                                    onClick={(e) => e.stopPropagation()}
-                                  >
-                                    <button
-                                      type="button"
-                                      onClick={() =>
-                                        void (async () => {
-                                          if (group.managed) {
-                                            await runUnifiedImport(
-                                              group.managed.id,
-                                              c.code,
-                                              c.name,
-                                            );
-                                            await refreshCollectionsPageMeta();
-                                            return;
-                                          }
-                                          await openSavedCollection(c.id);
-                                        })()
-                                      }
-                                    >
-                                      Install
-                                    </button>
-                                    <button
-                                      type="button"
-                                      className="icon-btn"
-                                      aria-label={`Copy ${c.name}`}
-                                      title="Copy"
-                                      onClick={() =>
-                                        void navigator.clipboard.writeText(c.code)
-                                      }
-                                    >
-                                      <FontAwesomeIcon icon={faCopy} />
-                                    </button>
-                                    <button
-                                      type="button"
-                                      className="danger icon-btn"
-                                      aria-label={`Delete ${c.name}`}
-                                      title="Delete"
-                                      onClick={() =>
-                                        void (async () => {
-                                          if (
-                                            !window.confirm(`Delete ${c.name}?`)
-                                          ) {
-                                            return;
-                                          }
-                                          try {
-                                            await deleteSavedCollectionEntry(c);
-                                          } catch (err) {
-                                            setError(String(err));
-                                          }
-                                        })()
-                                      }
-                                    >
-                                      <FontAwesomeIcon icon={faTrashCan} />
-                                    </button>
-                                  </div>
-                                </li>
+                                  <FontAwesomeIcon icon={visibilityIcon(vis)} />{" "}
+                                  {label}
+                                </button>
                               );
-                            })}
-                          </ul>
-                          {expanded && group.collections.length > visibleChildren.length && (
-                            <div className="list-load-more">
-                              <button
-                                type="button"
-                                className="linkish"
-                                onClick={() =>
-                                  setExpandedGroupLimits((prev) => ({
-                                    ...prev,
-                                    [group.key]: (prev[group.key] ?? 25) + 25,
-                                  }))
-                                }
-                              >
-                                Show more ({group.collections.length - visibleChildren.length} remaining)
-                              </button>
-                            </div>
-                          )}
-                        </Collapse>
-                      </li>
-                    );
-                  })}
-                  {savedCollectionGameGroups.length === 0 && (
-                    <li className="empty">
-                      No saved share codes yet. Share a loadout from a managed game.
-                    </li>
-                  )}
-                </ul>
-                </div>
+                            })()}
+                            <button
+                              type="button"
+                              className="danger icon-btn"
+                              aria-label={`Delete ${c.name}`}
+                              title="Delete"
+                              onClick={() =>
+                                void (async () => {
+                                  if (!window.confirm(`Delete ${c.name}?`)) {
+                                    return;
+                                  }
+                                  try {
+                                    await deleteSavedCollectionEntry(c);
+                                  } catch (err) {
+                                    setError(String(err));
+                                  }
+                                })()
+                              }
+                            >
+                              <FontAwesomeIcon icon={faTrashCan} />
+                            </button>
+                          </div>
+                        </li>
+                      );
+                    }}
+                  />
                 ) : (
                   <BrowseListSkeleton count={6} posters />
                 )}
@@ -10258,20 +10774,45 @@ export default function App() {
             <FriendsPage
               active={tab === "friends"}
               managed={managed}
+              detected={detected}
+              plugins={gamePlugins}
+              catalogCovers={collectionCatalogCovers}
               activeGameId={activeGame?.id ?? null}
+              scrollRef={mainScrollRef}
+              installedShareIds={installedEmperorShareIds}
+              resolveGameCover={(game) => gameCoverSrc(game)}
+              renderPoster={(coverPath) => (
+                <ListPoster src={posterSrc(coverPath)} />
+              )}
               onError={setError}
               onNotice={(msg) =>
                 setNotice(msg ? { kind: "ok", message: msg } : null)
               }
-              onCollectionSynced={async (gameId, res) => {
-                await handleShareImportResult(gameId, res.share_code, {
-                  collection_id: res.collection_id,
-                  name: res.name,
-                  member_ids: res.member_ids,
-                  needs_assist: res.needs_assist,
-                  warnings: res.warnings,
-                  collection: res.collection ?? null,
+              onInstallCollection={async (gameId, code, name) => {
+                await runUnifiedImport(gameId, code, name);
+              }}
+              onSaveCollection={async (code, name, sourceGameId) => {
+                await api.saveCollectionCode({ code, name, sourceGameId });
+                await refreshSavedCollections();
+                setNotice({
+                  kind: "ok",
+                  message: `Saved ${name} to Collections.`,
                 });
+              }}
+              onCollectionSynced={async (gameId, res, friendSync) => {
+                await handleShareImportResult(
+                  gameId,
+                  res.share_code,
+                  {
+                    collection_id: res.collection_id,
+                    name: res.name,
+                    member_ids: res.member_ids,
+                    needs_assist: res.needs_assist,
+                    warnings: res.warnings,
+                    collection: res.collection ?? null,
+                  },
+                  friendSync ?? null,
+                );
               }}
             />
           </ParkedTabGate>
@@ -11500,8 +12041,8 @@ export default function App() {
                             : "Showing NSFW content (click to hide)"
                         }
                       >
-                        <span className="browse-nsfw-track" aria-hidden="true">
-                          <span className="browse-nsfw-thumb" />
+                        <span className="switch-track" aria-hidden="true">
+                          <span className="switch-thumb" />
                         </span>
                         <span>Hide NSFW</span>
                       </button>
@@ -11868,7 +12409,6 @@ export default function App() {
             onCancelRemaining={() => cancelRemainingBatch()}
             onCancelDownload={(id) => cancelOneDownload(id)}
             onRestartDownload={(id) => restartOneDownload(id)}
-            onForceResetDownload={(id) => forceResetOneDownload(id)}
             onRetryAssistOpening={() => retryAssistOpening()}
             isDownloadStuck={isDownloadStuck}
             onClearRecent={(ids) => clearRecentDownloads(ids)}
@@ -12068,9 +12608,49 @@ export default function App() {
               )}
             </SettingsSection>
             <SettingsSection title="Banners">
+              <div className="setting-block">
+                <span>Remember across restarts</span>
+                <Segment>
+                  {(
+                    [
+                      ["off", "Off"],
+                      ["errors", "Errors only"],
+                      ["errors_and_warnings", "Errors & warnings"],
+                    ] as const
+                  ).map(([val, optLabel]) => (
+                    <SegmentTab
+                      key={val}
+                      layoutId="settings-banner-persistence"
+                      active={bannerPersistenceFor(settings) === val}
+                      onClick={() => {
+                        if (bannerPersistenceFor(settings) === val) return;
+                        void withBusy("Saving…", async () => {
+                          await api.setBannerPersistence(val);
+                          await refreshSettings();
+                        });
+                      }}
+                    >
+                      {optLabel}
+                    </SegmentTab>
+                  ))}
+                </Segment>
+              </div>
+              <label className="inline">
+                <input
+                  type="checkbox"
+                  checked={settings?.dismiss_banner_on_retry !== false}
+                  onChange={(e) =>
+                    withBusy("Saving…", async () => {
+                      await api.setDismissBannerOnRetry(e.target.checked);
+                      await refreshSettings();
+                    })
+                  }
+                />
+                Dismiss download error banners when retrying or removing the download
+              </label>
               <p className="note">
                 Choose how long status banners stay visible before automatically
-                dismissing.
+                dismissing. Saved banners remain until dismissed, retried, or timed out.
               </p>
               {(
                 [
@@ -12354,6 +12934,14 @@ export default function App() {
                 </div>
               </div>
             </SettingsSection>
+            <SettingsSection title="Social">
+              <SocialSettingsSection
+                friendsState={friendsState}
+                onFriendsStateChange={setFriendsState}
+                onNotice={(msg) => setNotice({ kind: "ok", message: msg })}
+                onError={(msg) => setError(msg)}
+              />
+            </SettingsSection>
             <SettingsSection title="Accounts">
               {accountConnections}
             </SettingsSection>
@@ -12368,6 +12956,95 @@ export default function App() {
           gameTitle={activeGame?.title}
           onClose={() => setLoadDiagnosis(null)}
         />
+      )}
+      {importModalOpen && activeGame && (
+        <Modal
+          title="Import mod"
+          subtitle={`Stage archives, mod files, or folders for ${activeGame.title}.`}
+          onClose={() => setImportModalOpen(false)}
+          footer={
+            <div className="modal-foot-actions">
+              <button
+                type="button"
+                className="linkish"
+                onClick={() => setImportModalOpen(false)}
+              >
+                Cancel
+              </button>
+            </div>
+          }
+        >
+          <div
+            className={
+              importDropActive
+                ? "import-dropzone import-dropzone-active"
+                : "import-dropzone"
+            }
+          >
+            <p className="import-dropzone-title">
+              Drop archives, mod files, or folders here
+            </p>
+            <p className="note">
+              Archives (.zip, .7z, .rar), loose mod files, and extracted folders
+              are detected automatically.
+            </p>
+            <div className="import-dropzone-actions">
+              <button type="button" onClick={() => void pickAndImportFiles()}>
+                Choose file(s)…
+              </button>
+              <button type="button" onClick={() => void pickAndImportFolder()}>
+                Choose folder…
+              </button>
+            </div>
+          </div>
+        </Modal>
+      )}
+      {saveLoadoutPrompt && (
+        <Modal
+          title="Save loadout"
+          onClose={() => setSaveLoadoutPrompt(null)}
+          footer={
+            <div className="modal-foot-actions">
+              <button
+                type="button"
+                className="linkish"
+                onClick={() => setSaveLoadoutPrompt(null)}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="accent"
+                onClick={() => void saveLoadout(saveLoadoutName)}
+              >
+                Save loadout
+              </button>
+            </div>
+          }
+        >
+          <p className="note">
+            Save {saveLoadoutPrompt.modCount} enabled mod
+            {saveLoadoutPrompt.modCount === 1 ? "" : "s"} for{" "}
+            {saveLoadoutPrompt.gameTitle} as a shareable collection.
+          </p>
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              void saveLoadout(saveLoadoutName);
+            }}
+          >
+            <label>
+              Collection name
+              <input
+                type="text"
+                autoFocus
+                value={saveLoadoutName}
+                onChange={(e) => setSaveLoadoutName(e.target.value)}
+                placeholder="Shared loadout"
+              />
+            </label>
+          </form>
+        </Modal>
       )}
       {saveImportPrompt && (
         <Modal
@@ -12438,6 +13115,26 @@ export default function App() {
           {error ? <p className="error-banner">{error}</p> : null}
         </Modal>
       )}
+      {sharingTarget && (
+        <CollectionSharingModal
+          collectionId={sharingTarget.id}
+          collectionName={sharingTarget.name}
+          initialVisibility={sharingTarget.visibility}
+          friends={friendsState?.friends ?? []}
+          onSave={async (visibility) => {
+            try {
+              const next = await api.setCollectionSharing(
+                sharingTarget.id,
+                visibility,
+              );
+              setFriendsState(next);
+            } catch (e) {
+              setError(String(e));
+            }
+          }}
+          onClose={() => setSharingTarget(null)}
+        />
+      )}
       {nexusLoginOpen && (
         <Modal
           className="modal-nexus-login"
@@ -12505,6 +13202,7 @@ export default function App() {
           onEnable={(ids) => void enableStagedMods(ids)}
           onDisable={(ids) => void disableStagedMods(ids)}
           onIgnore={ignoreRequirement}
+          onIgnoreMany={ignoreRequirements}
         />
       )}
       {ignoredRequirementsOpen && ignoredRequirements.length > 0 && (
@@ -12586,6 +13284,15 @@ export default function App() {
               </>
             )}
           </dl>
+          {settings?.platform_linux && wineAdvice && (
+            <div style={{ marginTop: "1rem" }}>
+              <WineOverrideNotice
+                advice={wineAdvice}
+                busy={wineApplyBusy}
+                onApply={() => void applyWineOverrides()}
+              />
+            </div>
+          )}
           <div className="panel" style={{ marginTop: "1rem" }}>
             <h3>Catalog & deploy settings</h3>
             <p className="note">
@@ -12646,7 +13353,7 @@ export default function App() {
             gameSavedOpenRef.current += 1;
             setGameSavedDetail(null);
             setGameSavedDetailPending(false);
-            setGameSavedRename("");
+            setShareImportOpen(false);
             setGameModal(null);
           }}
         >
@@ -12661,11 +13368,19 @@ export default function App() {
                         gameSavedOpenRef.current += 1;
                         setGameSavedDetail(null);
                         setGameSavedDetailPending(false);
-                        setGameSavedRename("");
                       }}
                     >
                       Back
                     </button>
+                    <EditableCollectionTitle
+                      title={gameSavedDetail.entry.name}
+                      onRename={(nextName) =>
+                        renameSavedCollectionById(
+                          gameSavedDetail.entry.id,
+                          nextName,
+                        )
+                      }
+                    />
                     {isSavedCollectionInstalled(gameSavedDetail.entry) ? (
                       <span className="pill ok">Installed</span>
                     ) : null}
@@ -12701,7 +13416,7 @@ export default function App() {
                     </button>
                   </div>
                 </div>
-                <SavedCollectionStats entry={gameSavedDetail.entry} />
+                <CollectionStats entry={gameSavedDetail.entry} />
                 {showGameVersionWarnings &&
                   savedCollectionAdvice[gameSavedDetail.entry.id]?.status ===
                     "mismatch" && (
@@ -12733,25 +13448,6 @@ export default function App() {
                 <SavedCollectionDetailBody
                   entry={gameSavedDetail.entry}
                   mods={gameSavedDetail.mods}
-                  renameValue={gameSavedRename}
-                  onRenameChange={setGameSavedRename}
-                  onRenameSubmit={() =>
-                    void (async () => {
-                      try {
-                        const updated = await api.renameSavedCollection(
-                          gameSavedDetail.entry.id,
-                          gameSavedRename,
-                        );
-                        setGameSavedDetail({
-                          ...gameSavedDetail,
-                          entry: updated,
-                        });
-                        await refreshSavedCollections();
-                      } catch (e) {
-                        setError(String(e));
-                      }
-                    })()
-                  }
                   showMods={showGameSavedMods}
                   scrollRef={mainScrollRef}
                   active={tab === "library"}
@@ -12767,6 +13463,29 @@ export default function App() {
                         const installedLabel = formatInstalledAt(
                           c.installed_at,
                         );
+                        const syncState = friendSyncStates[c.id];
+                        const hasUpdate = Boolean(syncState?.has_update);
+                        const isSyncing = Boolean(syncingCollectionIds[c.id]);
+                        const isSaving = Boolean(savingCollectionIds[c.id]);
+                        const autoSyncOn = Boolean(c.friend_sync?.auto_sync);
+                        const autoSaveOn = Boolean(c.auto_save);
+                        const hasUnsaved = Boolean(c.has_unsaved_changes);
+                        const installedMemberCount = mods.filter((m) =>
+                          (m.collection_ids ?? []).includes(c.id),
+                        ).length;
+                        const modCount =
+                          installedMemberCount > 0
+                            ? installedMemberCount
+                            : c.mod_ids.length;
+                        const canUpdateSource = Boolean(
+                          c.friend_sync ||
+                            (c.source === "nexus" && c.slug) ||
+                            (c.source === "thunderstore" &&
+                              c.kind === "modpack" &&
+                              c.community &&
+                              c.namespace &&
+                              c.package_name),
+                        );
                         return (
                           <li
                             key={c.id}
@@ -12774,37 +13493,144 @@ export default function App() {
                             style={staggerStyle(idx)}
                           >
                             <div>
-                              <strong>{c.name}</strong>
+                              <EditableCollectionTitle
+                                as="strong"
+                                title={c.name}
+                                onRename={(nextName) =>
+                                  renameInstalledCollectionItem(c, nextName)
+                                }
+                              />
                               <small>
                                 {installedCollectionSourceLabel(c)}
-                                {` · ${c.mod_ids.length} mods`}
+                                {` · ${modCount} mod${modCount === 1 ? "" : "s"}`}
                                 {installedLabel
                                   ? ` · ${installedLabel}`
                                   : ""}
+                                {hasUnsaved && !autoSaveOn ? (
+                                  <>
+                                    {" · "}
+                                    <span className="installed-collection-sync-pill is-update">
+                                      Unsaved changes
+                                    </span>
+                                  </>
+                                ) : null}
+                                {c.friend_sync ? (
+                                  <>
+                                    {" · "}
+                                    <span
+                                      className={
+                                        hasUpdate
+                                          ? "installed-collection-sync-pill is-update"
+                                          : "installed-collection-sync-pill"
+                                      }
+                                    >
+                                      {hasUpdate ? "Update available" : "Synced"}
+                                    </span>
+                                  </>
+                                ) : null}
+                                {collectionIntegrityById[c.id]?.issues.length ? (
+                                  <>
+                                    {" · "}
+                                    <button
+                                      type="button"
+                                      className="installed-collection-issue-pill"
+                                      onClick={() =>
+                                        setIntegrityDialogReport(
+                                          collectionIntegrityById[c.id],
+                                        )
+                                      }
+                                    >
+                                      {collectionIntegrityById[c.id].issues.length}{" "}
+                                      issue
+                                      {collectionIntegrityById[c.id].issues.length === 1
+                                        ? ""
+                                        : "s"}
+                                    </button>
+                                  </>
+                                ) : null}
                               </small>
                             </div>
                             <div className="actions">
+                              {!autoSaveOn && (
+                                <button
+                                  type="button"
+                                  className={hasUnsaved ? "accent" : ""}
+                                  disabled={isSaving}
+                                  title={
+                                    hasUnsaved
+                                      ? `Save load order, member mods, and FOMOD options for ${c.name}`
+                                      : `Save current snapshot of ${c.name}`
+                                  }
+                                  onClick={() => void saveCollectionChanges(c)}
+                                >
+                                  {isSaving ? "Saving…" : "Save"}
+                                </button>
+                              )}
                               <button
                                 type="button"
-                                className={
-                                  modsCollectionFilter === c.id
-                                    ? "active"
-                                    : ""
+                                role="switch"
+                                aria-checked={autoSaveOn}
+                                disabled={isSaving}
+                                className="collection-autosave-toggle"
+                                title="Automatically save changes to load order, member mods, and FOMOD options"
+                                onClick={() =>
+                                  void toggleInstalledCollectionAutoSave(
+                                    c,
+                                    !autoSaveOn,
+                                  )
                                 }
-                                onClick={() => {
-                                  setModsCollectionFilter(c.id);
-                                  setGameModal(null);
-                                }}
                               >
-                                {modsCollectionFilter === c.id
-                                  ? "Showing"
-                                  : "Filter"}
+                                <span
+                                  className="switch-track"
+                                  aria-hidden="true"
+                                >
+                                  <span className="switch-thumb" />
+                                </span>
+                                <span>Auto-save</span>
                               </button>
+                              {canUpdateSource && (
+                                <button
+                                  type="button"
+                                  className={hasUpdate ? "accent" : ""}
+                                  disabled={isSyncing}
+                                  onClick={() =>
+                                    void syncInstalledCollection(c)
+                                  }
+                                >
+                                  {isSyncing
+                                    ? "Syncing…"
+                                    : c.friend_sync
+                                      ? hasUpdate
+                                        ? "Sync Update"
+                                        : "Sync"
+                                      : "Update"}
+                                </button>
+                              )}
+                              {c.friend_sync && (
+                                <button
+                                  type="button"
+                                  className={autoSyncOn ? "active" : ""}
+                                  aria-pressed={autoSyncOn}
+                                  title={
+                                    autoSyncOn
+                                      ? "Auto-sync enabled (click to disable)"
+                                      : "Enable auto-sync when friend updates this collection"
+                                  }
+                                  onClick={() =>
+                                    void toggleInstalledCollectionAutoSync(
+                                      c,
+                                      !autoSyncOn,
+                                    )
+                                  }
+                                >
+                                  Auto
+                                </button>
+                              )}
                               <button
                                 type="button"
                                 className="danger"
                                 onClick={() =>
-                                  void uninstallInstalledCollection(c)
+                                  setUninstallCollectionTarget(c)
                                 }
                               >
                                 Uninstall
@@ -12816,12 +13642,87 @@ export default function App() {
                     </ul>
                   </div>
                 )}
-                <h2>Saved share codes</h2>
+                <div className="panel-head-inline">
+                  <h2>Saved share codes</h2>
+                  <button
+                    type="button"
+                    className={shareImportOpen ? "active" : ""}
+                    onClick={() => setShareImportOpen((v) => !v)}
+                  >
+                    Import code
+                  </button>
+                </div>
+                <Reveal
+                  show={shareImportOpen}
+                  className="profile-import share-panel"
+                >
+                  <h2>Import code</h2>
+                  <label>
+                    Code
+                    <textarea
+                      rows={4}
+                      value={shareImportCode}
+                      onChange={(e) => setShareImportCode(e.target.value)}
+                      placeholder="Paste Emperor share code or r2modman / Gale profile code"
+                    />
+                  </label>
+                  <div className="actions">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const code = shareImportCode.trim();
+                        if (!code || !activeGame) return;
+                        void beginCodeImport(activeGame.id, code);
+                      }}
+                    >
+                      Import
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void openShareCodeFile()}
+                    >
+                      Open file
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const code = shareImportCode.trim();
+                        if (!code) return;
+                        void (async () => {
+                          try {
+                            await api.saveCollectionCode({
+                              code,
+                              sourceGameId: activeGame?.id,
+                            });
+                            setNotice({
+                              kind: "ok",
+                              message: "Saved to Collections.",
+                            });
+                            setShareImportCode("");
+                            setShareImportOpen(false);
+                            await refreshSavedCollections();
+                          } catch (e) {
+                            setError(String(e));
+                          }
+                        })();
+                      }}
+                    >
+                      Save only
+                    </button>
+                    <button
+                      type="button"
+                      className="linkish"
+                      onClick={() => setShareImportOpen(false)}
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </Reveal>
                 <p className="note">
                   Emperor share codes that match this game (Nexus domain,
                   Thunderstore community, mod.io ID, or source game). Create
-                  one from Mods → Share loadout, or paste a code under Mods →
-                  Import code → Save only.
+                  one using Save loadout, or paste a code using Import
+                  code → Save only.
                 </p>
                 <ul className="list">
                   {gameSavedCollections.map((c, idx) => (
@@ -12832,7 +13733,14 @@ export default function App() {
                       onClick={() => void openGameSavedCollection(c.id)}
                     >
                       <div className="list-row-main">
-                        <strong>{c.name}</strong>
+                        <EditableCollectionTitle
+                          as="strong"
+                          stopRowClick
+                          title={c.name}
+                          onRename={(nextName) =>
+                            renameSavedCollectionById(c.id, nextName)
+                          }
+                        />
                         <small>
                           {c.mod_count} mods
                           {c.game.nexus_domain
@@ -12890,7 +13798,7 @@ export default function App() {
                   {gameSavedCollections.length === 0 && (
                     <li className="empty">
                       No saved share codes for this game yet. Share a loadout
-                      from Mods or save a code from Import code.
+                      from Mods or save a code with Import code.
                     </li>
                   )}
                 </ul>
@@ -13162,6 +14070,39 @@ export default function App() {
           )}
         </Modal>
       )}
+      {uninstallCollectionTarget && (
+        <Modal
+          title={`Uninstall ${uninstallCollectionTarget.name}?`}
+          onClose={() => setUninstallCollectionTarget(null)}
+          footer={
+            <div className="modal-foot-actions">
+              <button
+                type="button"
+                onClick={() => setUninstallCollectionTarget(null)}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="danger"
+                onClick={() => {
+                  const target = uninstallCollectionTarget;
+                  setUninstallCollectionTarget(null);
+                  void uninstallInstalledCollection(target);
+                }}
+              >
+                Uninstall
+              </button>
+            </div>
+          }
+        >
+          <p className="note">
+            Are you sure you want to uninstall {uninstallCollectionTarget.name}?
+            Mods only used by this collection will be removed. Shared
+            requirements stay.
+          </p>
+        </Modal>
+      )}
       <div className="toast-stack">
         <UpdateToast
           show={
@@ -13188,6 +14129,7 @@ export default function App() {
           show={checkingModUpdates}
           stagedCount={checkingModUpdates && mods.length > 0 ? mods.length : null}
         />
+        <CheckingFriendUpdatesToast show={checkingFriendUpdates} />
       </div>
       {openFomod && activeGame && (
         <FomodDialog
@@ -13205,6 +14147,7 @@ export default function App() {
               ),
             );
             setFomodNeedingIds((ids) => ids.filter((id) => id !== savedId));
+            void refreshCollections(activeGame.id);
           }}
         />
       )}
@@ -13223,6 +14166,46 @@ export default function App() {
               kind: "ok",
               message: `Saved options for ${modOptionsFor.name}. Launch modded to apply them.`,
             });
+            void refreshCollections(activeGame.id);
+          }}
+        />
+      )}
+      {moveCollectionMod && activeGame && installedCollections.length > 1 && (
+        <MoveModCollectionDialog
+          mod={moveCollectionMod}
+          collections={installedCollections}
+          busy={moveCollectionBusy}
+          onClose={() => {
+            if (!moveCollectionBusy) setMoveCollectionMod(null);
+          }}
+          onSave={async (collectionIds) => {
+            setMoveCollectionBusy(true);
+            try {
+              await api.setModCollections(
+                activeGame.id,
+                moveCollectionMod.id,
+                collectionIds,
+              );
+              await refreshMods(activeGame.id);
+              await refreshCollections(activeGame.id);
+              setMoveCollectionMod(null);
+            } catch (e) {
+              setError(String(e));
+            } finally {
+              setMoveCollectionBusy(false);
+            }
+          }}
+        />
+      )}
+      {integrityDialogReport && activeGame && (
+        <CollectionIntegrityDialog
+          report={integrityDialogReport}
+          retrying={integrityRetrying}
+          onRetry={(selected) =>
+            void retryCollectionIssues(integrityDialogReport, selected)
+          }
+          onClose={() => {
+            if (!integrityRetrying) setIntegrityDialogReport(null);
           }}
         />
       )}

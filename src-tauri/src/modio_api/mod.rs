@@ -14,6 +14,7 @@ use serde::Serialize;
 use tokio::io::{AsyncWriteExt, BufWriter};
 
 use crate::config::KEYRING_SERVICE;
+use crate::rate_limit::backoff_with_jitter;
 
 pub const KEYRING_USER: &str = "modio-api-key";
 
@@ -274,6 +275,37 @@ impl ModioClient {
     }
 
     pub async fn download_file(
+        &self,
+        game_id: u32,
+        mod_id: u64,
+        file_id: Option<u64>,
+        dest: &Path,
+        on_progress: Option<&Arc<dyn Fn(u64, Option<u64>, u64) + Send + Sync>>,
+    ) -> Result<()> {
+        const MAX_ATTEMPTS: u32 = 3;
+        for attempt in 0..MAX_ATTEMPTS {
+            match self
+                .download_file_once(game_id, mod_id, file_id, dest, on_progress)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(e) if attempt + 1 < MAX_ATTEMPTS => {
+                    let delay = backoff_with_jitter(attempt, 1500, 20_000);
+                    log::warn!(
+                        "mod.io download retry {}/{} in {}ms: {e}",
+                        attempt + 1,
+                        MAX_ATTEMPTS,
+                        delay.as_millis()
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        unreachable!("loop returns on final attempt")
+    }
+
+    async fn download_file_once(
         &self,
         game_id: u32,
         mod_id: u64,

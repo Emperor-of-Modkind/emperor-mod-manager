@@ -1,11 +1,12 @@
 //! Nexus Mods REST v1 + GraphQL v2 client.
 
+use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::StreamExt;
@@ -17,6 +18,9 @@ use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 
 use crate::config::{APP_NAME, APP_VERSION};
+use crate::rate_limit::{
+    backoff_with_jitter, is_retryable_status, parse_retry_after, sleep_interruptible, RateLimitGate,
+};
 
 pub mod requirements;
 pub use requirements::{collect_missing, MissingRequirements, RequirementRoot, StagedNexusMod};
@@ -29,6 +33,19 @@ pub const PAUSED_MSG: &str = "PAUSED";
 /// A transfer that ended before `Content-Length` bytes arrived. Callers must
 /// treat the partial file as garbage rather than resume from it.
 pub const INCOMPLETE_MSG: &str = "INCOMPLETE";
+/// A transfer that was deliberately aborted because sustained throughput fell
+/// below the minimum speed floor (e.g. 1 KB/s CDN throttling). Partial bytes
+/// on disk are flushed and valid for `Range` resume on another mirror.
+pub const THROTTLED_STALL_MSG: &str = "THROTTLED_STALL";
+
+/// Initial grace period before enforcing the low-speed stall detector.
+const STALL_GRACE_SECS: u64 = 15;
+/// Rolling evaluation window for sustained low-speed detection.
+const STALL_WINDOW_SECS: u64 = 20;
+/// Minimum sustained throughput (16 KB/s) before aborting to switch mirrors.
+const MIN_TRANSFER_SPEED_BPS: u64 = 16 * 1024;
+/// Sliding window for live UI speed reporting.
+const SPEED_REPORT_WINDOW_SECS: u64 = 3;
 
 /// Cooperative cancel / pause flags for an in-flight HTTP transfer.
 pub struct TransferControl {
@@ -43,6 +60,7 @@ pub struct NexusClient {
     /// client's rustls fingerprint. This client impersonates Chrome and does
     /// not carry the API key.
     page_http: wreq::Client,
+    rate_limit: Arc<RateLimitGate>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -282,6 +300,13 @@ const DEFAULT_COLLECTIONS_PAGE_SIZE: u32 = 25;
 
 impl NexusClient {
     pub fn new(api_key: impl Into<String>) -> Result<Self> {
+        Self::new_with_gate(api_key, Arc::new(RateLimitGate::new()))
+    }
+
+    pub fn new_with_gate(
+        api_key: impl Into<String>,
+        rate_limit: Arc<RateLimitGate>,
+    ) -> Result<Self> {
         let api_key = api_key.into();
         if api_key.trim().is_empty() {
             bail!("API key is empty");
@@ -316,13 +341,18 @@ impl NexusClient {
             .read_timeout(Duration::from_secs(60))
             .build()
             .context("chrome page client")?;
-        Ok(Self { http, page_http })
+        Ok(Self {
+            http,
+            page_http,
+            rate_limit,
+        })
     }
 
     pub async fn validate(&self) -> Result<NexusUser> {
         let url = format!("{REST_BASE}/users/validate.json");
-        let resp = self.http.get(&url).send().await?;
-        self.check_rate_limit(&resp);
+        let resp = self
+            .send_with_retry(None, || self.http.get(&url))
+            .await?;
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
@@ -333,15 +363,74 @@ impl NexusClient {
     }
 
     fn check_rate_limit(&self, resp: &reqwest::Response) {
-        if let Some(remaining) = resp.headers().get("x-rl-hourly-remaining") {
-            if let Ok(s) = remaining.to_str() {
-                if let Ok(n) = s.parse::<i64>() {
-                    if n < 10 {
-                        log::warn!("Nexus hourly rate limit low: {n} remaining");
+        self.rate_limit.observe_nexus_headers(resp.headers());
+    }
+
+    async fn send_with_retry<F>(
+        &self,
+        control: Option<&TransferControl>,
+        build_req: F,
+    ) -> Result<reqwest::Response>
+    where
+        F: Fn() -> reqwest::RequestBuilder,
+    {
+        const MAX_ATTEMPTS: u32 = 4;
+        let cancel = control.map(|c| c.cancel.as_ref());
+        let pause = control.map(|c| c.pause.as_ref());
+        let mut last_err: Option<anyhow::Error> = None;
+
+        for attempt in 0..MAX_ATTEMPTS {
+            if !self.rate_limit.wait_if_cooled_down(cancel, pause).await {
+                if cancel.map(|c| c.load(Ordering::SeqCst)).unwrap_or(false) {
+                    bail!("{CANCELLED_MSG}");
+                }
+                bail!("{PAUSED_MSG}");
+            }
+
+            match build_req().send().await {
+                Ok(resp) => {
+                    self.check_rate_limit(&resp);
+                    let status = resp.status();
+                    if is_retryable_status(status) && attempt + 1 < MAX_ATTEMPTS {
+                        let delay = parse_retry_after(resp.headers())
+                            .unwrap_or_else(|| backoff_with_jitter(attempt, 1500, 30_000));
+                        self.rate_limit
+                            .record_throttle(delay, &format!("Nexus API HTTP {status}"));
+                        if !sleep_interruptible(delay, cancel, pause).await {
+                            if cancel.map(|c| c.load(Ordering::SeqCst)).unwrap_or(false) {
+                                bail!("{CANCELLED_MSG}");
+                            }
+                            bail!("{PAUSED_MSG}");
+                        }
+                        continue;
                     }
+                    return Ok(resp);
+                }
+                Err(e) => {
+                    let is_transient = e.is_timeout() || e.is_connect() || e.is_request();
+                    if is_transient && attempt + 1 < MAX_ATTEMPTS {
+                        let delay = backoff_with_jitter(attempt, 1000, 15_000);
+                        log::warn!(
+                            "Nexus API request error (attempt {}/{}), retrying in {}ms: {e}",
+                            attempt + 1,
+                            MAX_ATTEMPTS,
+                            delay.as_millis()
+                        );
+                        if !sleep_interruptible(delay, cancel, pause).await {
+                            if cancel.map(|c| c.load(Ordering::SeqCst)).unwrap_or(false) {
+                                bail!("{CANCELLED_MSG}");
+                            }
+                            bail!("{PAUSED_MSG}");
+                        }
+                        last_err = Some(e.into());
+                        continue;
+                    }
+                    return Err(e.into());
                 }
             }
         }
+
+        Err(last_err.unwrap_or_else(|| anyhow!("Nexus API request failed after retries")))
     }
 
     pub async fn search_mods(
@@ -455,12 +544,10 @@ impl NexusClient {
     async fn search_mods_rest(&self, domain: &str, query: &str) -> Result<Vec<ModSearchHit>> {
         let url = format!("{REST_BASE}/games/{domain}/mods/search.json");
         let resp = self
-            .http
-            .get(&url)
-            .query(&[("search", query), ("page", "1")])
-            .send()
+            .send_with_retry(None, || {
+                self.http.get(&url).query(&[("search", query), ("page", "1")])
+            })
             .await?;
-        self.check_rate_limit(&resp);
         if !resp.status().is_success() {
             let trending = self.trending_mods(domain).await?;
             let q = query.to_lowercase();
@@ -502,8 +589,7 @@ impl NexusClient {
 
     pub async fn trending_mods(&self, domain: &str) -> Result<Vec<ModSearchHit>> {
         let url = format!("{REST_BASE}/games/{domain}/mods/trending.json");
-        let resp = self.http.get(&url).send().await?;
-        self.check_rate_limit(&resp);
+        let resp = self.send_with_retry(None, || self.http.get(&url)).await?;
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
@@ -537,8 +623,7 @@ impl NexusClient {
 
     pub async fn list_games(&self) -> Result<Vec<NexusGameEntry>> {
         let url = format!("{REST_BASE}/games.json");
-        let resp = self.http.get(&url).send().await?;
-        self.check_rate_limit(&resp);
+        let resp = self.send_with_retry(None, || self.http.get(&url)).await?;
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
@@ -569,8 +654,7 @@ impl NexusClient {
 
     pub async fn get_game(&self, domain: &str) -> Result<GameInfo> {
         let url = format!("{REST_BASE}/games/{domain}.json");
-        let resp = self.http.get(&url).send().await?;
-        self.check_rate_limit(&resp);
+        let resp = self.send_with_retry(None, || self.http.get(&url)).await?;
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
@@ -622,8 +706,7 @@ impl NexusClient {
 
     pub async fn get_mod(&self, domain: &str, mod_id: u64) -> Result<ModDetail> {
         let url = format!("{REST_BASE}/games/{domain}/mods/{mod_id}.json");
-        let resp = self.http.get(&url).send().await?;
-        self.check_rate_limit(&resp);
+        let resp = self.send_with_retry(None, || self.http.get(&url)).await?;
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         detail_from_mod_response(status, &body, domain, mod_id)
@@ -647,8 +730,7 @@ impl NexusClient {
 
     pub async fn list_mod_files(&self, domain: &str, mod_id: u64) -> Result<Vec<ModFileInfo>> {
         let url = format!("{REST_BASE}/games/{domain}/mods/{mod_id}/files.json");
-        let resp = self.http.get(&url).send().await?;
-        self.check_rate_limit(&resp);
+        let resp = self.send_with_retry(None, || self.http.get(&url)).await?;
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
@@ -699,6 +781,47 @@ impl NexusClient {
         Ok(out)
     }
 
+    async fn fetch_download_mirrors(
+        &self,
+        domain: &str,
+        mod_id: u64,
+        file_id: u64,
+        nxm_key: Option<&str>,
+        nxm_expires: Option<u64>,
+        control: Option<&TransferControl>,
+    ) -> Result<Vec<String>> {
+        let url =
+            format!("{REST_BASE}/games/{domain}/mods/{mod_id}/files/{file_id}/download_link.json");
+        let expires_str = nxm_expires.map(|e| e.to_string());
+        let resp = self
+            .send_with_retry(control, || {
+                let mut req = self.http.get(&url);
+                if let (Some(key), Some(exp)) = (nxm_key, expires_str.as_deref()) {
+                    req = req.query(&[("key", key), ("expires", exp)]);
+                }
+                req
+            })
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("download_link failed ({status}): {body}");
+        }
+        let links: Value = resp.json().await?;
+        let urls: Vec<String> = links
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.get("URI").and_then(|u| u.as_str()))
+            .filter(|u| !u.trim().is_empty())
+            .map(str::to_string)
+            .collect();
+        if urls.is_empty() {
+            bail!("no download URI in response");
+        }
+        Ok(urls)
+    }
+
     pub async fn download_file(
         &self,
         domain: &str,
@@ -720,39 +843,86 @@ impl NexusClient {
                  Premium unlocks one-click API downloads."
             );
         }
-        let url =
-            format!("{REST_BASE}/games/{domain}/mods/{mod_id}/files/{file_id}/download_link.json");
-        let mut req = self.http.get(&url);
-        if let (Some(key), Some(expires)) = (nxm_key, nxm_expires) {
-            req = req.query(&[("key", key), ("expires", &expires.to_string())]);
-        }
-        let resp = req.send().await?;
-        self.check_rate_limit(&resp);
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("download_link failed ({status}): {body}");
-        }
-        let links: Value = resp.json().await?;
-        let download_url = links
-            .as_array()
-            .and_then(|a| a.first())
-            .and_then(|v| v.get("URI"))
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("no download URI in response"))?
-            .to_string();
 
-        stream_url_to_file(
-            &self.http,
-            &download_url,
-            dest,
-            start_offset,
-            None,
-            control,
-            on_progress,
-        )
-        .await?;
-        Ok(filename_from_url(&download_url))
+        let cancel = control.map(|c| c.cancel.as_ref());
+        let pause = control.map(|c| c.pause.as_ref());
+        const MAX_ROUNDS: u32 = 2;
+        let mut last_err: Option<anyhow::Error> = None;
+
+        for round in 0..MAX_ROUNDS {
+            let mirrors = self
+                .fetch_download_mirrors(domain, mod_id, file_id, nxm_key, nxm_expires, control)
+                .await?;
+            let total_mirrors = mirrors.len();
+
+            for (idx, download_url) in mirrors.into_iter().enumerate() {
+                if !self.rate_limit.wait_if_cooled_down(cancel, pause).await {
+                    if cancel.map(|c| c.load(Ordering::SeqCst)).unwrap_or(false) {
+                        bail!("{CANCELLED_MSG}");
+                    }
+                    bail!("{PAUSED_MSG}");
+                }
+
+                let offset = if round == 0 && idx == 0 {
+                    start_offset
+                } else {
+                    tokio::fs::metadata(dest).await.map(|m| m.len()).unwrap_or(0)
+                };
+
+                match stream_url_to_file(
+                    &self.http,
+                    &download_url,
+                    dest,
+                    offset,
+                    None,
+                    control,
+                    on_progress,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        self.rate_limit.record_healthy();
+                        return Ok(filename_from_url(&download_url));
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if msg.contains(CANCELLED_MSG) || msg.contains(PAUSED_MSG) {
+                            return Err(e);
+                        }
+                        if is_retryable_transfer_err(&msg) {
+                            let delay = backoff_with_jitter(idx as u32 + round, 1500, 20_000);
+                            self.rate_limit.record_throttle(
+                                delay,
+                                &format!("CDN mirror {}/{total_mirrors} failed: {msg}", idx + 1),
+                            );
+                            last_err = Some(e);
+                            if !sleep_interruptible(delay, cancel, pause).await {
+                                if cancel.map(|c| c.load(Ordering::SeqCst)).unwrap_or(false) {
+                                    bail!("{CANCELLED_MSG}");
+                                }
+                                bail!("{PAUSED_MSG}");
+                            }
+                            continue;
+                        }
+                        // Non-retryable (e.g. 404/403 expired); re-fetch mirrors once on round 0.
+                        last_err = Some(e);
+                        break;
+                    }
+                }
+            }
+
+            if round + 1 < MAX_ROUNDS {
+                let delay = backoff_with_jitter(round + 1, 3000, 30_000);
+                if !sleep_interruptible(delay, cancel, pause).await {
+                    if cancel.map(|c| c.load(Ordering::SeqCst)).unwrap_or(false) {
+                        bail!("{CANCELLED_MSG}");
+                    }
+                    bail!("{PAUSED_MSG}");
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| anyhow!("all CDN mirrors failed")))
     }
 }
 
@@ -787,6 +957,43 @@ fn percent_decode(raw: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Rolling-window low-speed stall policy for [`stream_url_to_file_with_policy`].
+#[derive(Debug, Clone, Copy)]
+pub struct StallPolicy {
+    pub grace: Duration,
+    pub window: Duration,
+    pub min_bps: u64,
+}
+
+impl Default for StallPolicy {
+    fn default() -> Self {
+        Self {
+            grace: Duration::from_secs(STALL_GRACE_SECS),
+            window: Duration::from_secs(STALL_WINDOW_SECS),
+            min_bps: MIN_TRANSFER_SPEED_BPS,
+        }
+    }
+}
+
+/// Returns `true` when a transfer error is transient/throttled and worth
+/// retrying or switching CDN mirrors (keeping partial bytes on disk).
+pub fn is_retryable_transfer_err(msg: &str) -> bool {
+    if msg.contains(CANCELLED_MSG) || msg.contains(PAUSED_MSG) {
+        return false;
+    }
+    msg.contains(THROTTLED_STALL_MSG)
+        || msg.contains(INCOMPLETE_MSG)
+        || msg.contains("(429")
+        || msg.contains("(408")
+        || msg.contains("(502")
+        || msg.contains("(503")
+        || msg.contains("(504")
+        || msg.contains("timed out")
+        || msg.contains("connection reset")
+        || msg.contains("error decoding response body")
+        || msg.contains("error reading a body from connection")
+}
+
 /// Stream an HTTP URL to `dest`, optionally resuming with a Range request.
 pub async fn stream_url_to_file(
     http: &reqwest::Client,
@@ -797,39 +1004,84 @@ pub async fn stream_url_to_file(
     control: Option<&TransferControl>,
     on_progress: Option<&Arc<dyn Fn(u64, Option<u64>, u64) + Send + Sync>>,
 ) -> Result<()> {
+    stream_url_to_file_with_policy(
+        http,
+        download_url,
+        dest,
+        start_offset,
+        extra_headers,
+        control,
+        on_progress,
+        StallPolicy::default(),
+    )
+    .await
+}
+
+/// Stream an HTTP URL to `dest` with a configurable low-speed [`StallPolicy`].
+#[allow(clippy::too_many_arguments)]
+pub async fn stream_url_to_file_with_policy(
+    http: &reqwest::Client,
+    download_url: &str,
+    dest: &Path,
+    start_offset: u64,
+    extra_headers: Option<&HeaderMap>,
+    control: Option<&TransferControl>,
+    on_progress: Option<&Arc<dyn Fn(u64, Option<u64>, u64) + Send + Sync>>,
+    stall_policy: StallPolicy,
+) -> Result<()> {
     if let Some(parent) = dest.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
 
     let mut offset = start_offset;
-    let mut req = http.get(download_url);
-    if let Some(headers) = extra_headers {
-        req = req.headers(headers.clone());
-    }
-    if offset > 0 {
-        req = req.header(RANGE, format!("bytes={offset}-"));
-    }
+    let resp = loop {
+        let mut req = http.get(download_url);
+        if let Some(headers) = extra_headers {
+            req = req.headers(headers.clone());
+        }
+        if offset > 0 {
+            req = req.header(RANGE, format!("bytes={offset}-"));
+        }
 
-    let resp = req.send().await?;
+        let resp = req.send().await?;
+        let status = resp.status();
+
+        if offset > 0 && status == StatusCode::OK {
+            // Server ignored Range — restart from scratch.
+            offset = 0;
+            break resp;
+        } else if offset > 0 && status == StatusCode::PARTIAL_CONTENT {
+            // Resume from offset.
+            break resp;
+        } else if offset > 0 && status == StatusCode::RANGE_NOT_SATISFIABLE {
+            if let Some(total) = parse_content_range_total(resp.headers().get(CONTENT_RANGE)) {
+                if total > 0 && offset == total {
+                    if let Some(cb) = on_progress {
+                        cb(offset, Some(total), 0);
+                    }
+                    return Ok(());
+                }
+            }
+            // Partial file is oversized/stale or server rejected the range;
+            // restart from scratch without a Range header.
+            offset = 0;
+            continue;
+        } else if offset > 0
+            && (status == StatusCode::FORBIDDEN
+                || status == StatusCode::UNAUTHORIZED
+                || status == StatusCode::GONE
+                || status == StatusCode::NOT_FOUND)
+        {
+            let body = resp.text().await.unwrap_or_default();
+            bail!("resume failed ({status}): link expired or unavailable. {body}");
+        } else if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            bail!("download failed ({status}): {body}");
+        } else {
+            break resp;
+        }
+    };
     let status = resp.status();
-
-    if offset > 0 && status == StatusCode::OK {
-        // Server ignored Range — restart from scratch.
-        offset = 0;
-    } else if offset > 0 && status == StatusCode::PARTIAL_CONTENT {
-        // Resume from offset.
-    } else if offset > 0
-        && (status == StatusCode::FORBIDDEN
-            || status == StatusCode::UNAUTHORIZED
-            || status == StatusCode::GONE
-            || status == StatusCode::NOT_FOUND)
-    {
-        let body = resp.text().await.unwrap_or_default();
-        bail!("resume failed ({status}): link expired or unavailable. {body}");
-    } else if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        bail!("download failed ({status}): {body}");
-    }
 
     let content_len = resp.content_length();
     let total = if status == StatusCode::PARTIAL_CONTENT {
@@ -851,10 +1103,13 @@ pub async fn stream_url_to_file(
 
     let mut stream = resp.bytes_stream();
     let mut downloaded: u64 = offset;
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     let mut last_report = started;
-    // Bytes transferred this session (for speed).
     let session_start = offset;
+    let mut speed_samples: VecDeque<(Instant, u64)> = VecDeque::new();
+    let mut stall_samples: VecDeque<(Instant, u64)> = VecDeque::new();
+    speed_samples.push_back((started, downloaded));
+    stall_samples.push_back((started, downloaded));
 
     while let Some(chunk) = stream.next().await {
         if control
@@ -876,15 +1131,66 @@ pub async fn stream_url_to_file(
             }
             bail!("{PAUSED_MSG}");
         }
-        let chunk = chunk?;
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = file.flush().await;
+                return Err(e.into());
+            }
+        };
         file.write_all(&chunk).await?;
         downloaded += chunk.len() as u64;
-        let now = std::time::Instant::now();
+        let now = Instant::now();
+
+        speed_samples.push_back((now, downloaded));
+        let speed_cutoff = now.checked_sub(Duration::from_secs(SPEED_REPORT_WINDOW_SECS));
+        while speed_samples.len() > 2 {
+            let Some((front_t, _)) = speed_samples.get(1).copied() else {
+                break;
+            };
+            if speed_cutoff.map(|c| front_t <= c).unwrap_or(false) {
+                speed_samples.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        stall_samples.push_back((now, downloaded));
+        let stall_cutoff = now.checked_sub(stall_policy.window);
+        while stall_samples.len() > 2 {
+            let Some((front_t, _)) = stall_samples.get(1).copied() else {
+                break;
+            };
+            if stall_cutoff.map(|c| front_t <= c).unwrap_or(false) {
+                stall_samples.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        if stall_policy.min_bps > 0 && now.duration_since(started) >= stall_policy.grace {
+            if let Some((oldest_t, oldest_bytes)) = stall_samples.front().copied() {
+                let window_elapsed = now.duration_since(oldest_t);
+                if window_elapsed >= stall_policy.window {
+                    let window_bytes = downloaded.saturating_sub(oldest_bytes);
+                    let window_bps =
+                        (window_bytes as f64 / window_elapsed.as_secs_f64().max(0.001)) as u64;
+                    if window_bps < stall_policy.min_bps {
+                        file.flush().await?;
+                        drop(file);
+                        bail!(
+                            "{THROTTLED_STALL_MSG}: sustained {window_bps} B/s (< {} B/s)",
+                            stall_policy.min_bps
+                        );
+                    }
+                }
+            }
+        }
+
         if now.duration_since(last_report).as_millis() >= 150
             || downloaded == total.unwrap_or(u64::MAX)
         {
-            let elapsed = started.elapsed().as_secs_f64().max(0.001);
-            let speed = ((downloaded - session_start) as f64 / elapsed) as u64;
+            let speed = window_speed(&speed_samples, now, downloaded, session_start, started);
             if let Some(cb) = on_progress {
                 cb(downloaded, total, speed);
             }
@@ -898,11 +1204,28 @@ pub async fn stream_url_to_file(
     // there, where the cause is no longer visible.
     verify_complete(downloaded, total)?;
     if let Some(cb) = on_progress {
-        let elapsed = started.elapsed().as_secs_f64().max(0.001);
-        let speed = ((downloaded - session_start) as f64 / elapsed) as u64;
+        let now = Instant::now();
+        let speed = window_speed(&speed_samples, now, downloaded, session_start, started);
         cb(downloaded, total.or(Some(downloaded)), speed);
     }
     Ok(())
+}
+
+fn window_speed(
+    samples: &VecDeque<(Instant, u64)>,
+    now: Instant,
+    downloaded: u64,
+    session_start: u64,
+    started: Instant,
+) -> u64 {
+    if let Some((oldest_t, oldest_bytes)) = samples.front().copied() {
+        let dt = now.duration_since(oldest_t).as_secs_f64();
+        if dt >= 0.25 {
+            return (downloaded.saturating_sub(oldest_bytes) as f64 / dt) as u64;
+        }
+    }
+    let elapsed = started.elapsed().as_secs_f64().max(0.001);
+    ((downloaded - session_start) as f64 / elapsed) as u64
 }
 
 /// `total` is `None` when the server sent no length, which leaves nothing to
@@ -1619,13 +1942,10 @@ impl NexusClient {
     }
 
     pub(super) async fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        let payload = json!({ "query": query, "variables": variables });
         let resp = self
-            .http
-            .post(GQL_URL)
-            .json(&json!({ "query": query, "variables": variables }))
-            .send()
+            .send_with_retry(None, || self.http.post(GQL_URL).json(&payload))
             .await?;
-        self.check_rate_limit(&resp);
         let status = resp.status();
         let body: Value = resp.json().await?;
         if !status.is_success() {
@@ -2960,5 +3280,229 @@ mod tests {
     fn page_size_defaults() {
         assert_eq!(DEFAULT_MODS_PAGE_SIZE, 30);
         assert_eq!(DEFAULT_COLLECTIONS_PAGE_SIZE, 25);
+    }
+
+    #[test]
+    fn retryable_transfer_err_classification() {
+        assert!(is_retryable_transfer_err("THROTTLED_STALL: too slow"));
+        assert!(is_retryable_transfer_err("download failed (429 Too Many Requests): slow"));
+        assert!(is_retryable_transfer_err("download failed (503 Service Unavailable): "));
+        assert!(!is_retryable_transfer_err("CANCELLED"));
+        assert!(!is_retryable_transfer_err("PAUSED"));
+        assert!(!is_retryable_transfer_err("download failed (404 Not Found): "));
+    }
+
+    #[tokio::test]
+    async fn slow_drip_aborts_and_resumes_from_partial_offset() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let payload: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_payload = payload.clone();
+
+        let server = tokio::spawn(async move {
+            // Connection 1: send headers + 512 bytes, then drip 16 bytes every 60ms.
+            let (mut sock1, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = sock1.read(&mut buf).await;
+            let hdr1 = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                server_payload.len()
+            );
+            let _ = sock1.write_all(hdr1.as_bytes()).await;
+            let _ = sock1.write_all(&server_payload[..512]).await;
+            let _ = sock1.flush().await;
+            for chunk in server_payload[512..1024].chunks(16) {
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                if sock1.write_all(chunk).await.is_err() {
+                    break;
+                }
+            }
+            drop(sock1);
+
+            // Connection 2: expect Range header and serve remaining bytes with 206.
+            let (mut sock2, _) = listener.accept().await.unwrap();
+            let n = sock2.read(&mut buf).await.unwrap_or(0);
+            let req_text = String::from_utf8_lossy(&buf[..n]);
+            let range_start = req_text
+                .lines()
+                .find_map(|l| {
+                    let lower = l.to_ascii_lowercase();
+                    lower
+                        .strip_prefix("range: bytes=")
+                        .and_then(|rest| rest.trim().strip_suffix('-'))
+                        .and_then(|num| num.parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            let remaining = &server_payload[range_start..];
+            let hdr2 = format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\nConnection: close\r\n\r\n",
+                remaining.len(),
+                range_start,
+                server_payload.len() - 1,
+                server_payload.len()
+            );
+            let _ = sock2.write_all(hdr2.as_bytes()).await;
+            let _ = sock2.write_all(remaining).await;
+            let _ = sock2.flush().await;
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("mod.zip");
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/mod.zip");
+
+        let policy = StallPolicy {
+            grace: Duration::from_millis(80),
+            window: Duration::from_millis(180),
+            min_bps: 4096,
+        };
+        let err = stream_url_to_file_with_policy(&client, &url, &dest, 0, None, None, None, policy)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains(THROTTLED_STALL_MSG),
+            "unexpected error: {err}"
+        );
+
+        let partial_len = std::fs::metadata(&dest).unwrap().len();
+        assert!(partial_len >= 512 && partial_len < payload.len() as u64);
+
+        // Resume from partial_len and verify full payload.
+        stream_url_to_file_with_policy(
+            &client,
+            &url,
+            &dest,
+            partial_len,
+            None,
+            None,
+            None,
+            StallPolicy::default(),
+        )
+        .await
+        .unwrap();
+
+        let got = std::fs::read(&dest).unwrap();
+        assert_eq!(got, payload);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stream_416_at_exact_total_treats_transfer_as_complete() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let payload = b"complete-mod-archive-bytes".to_vec();
+        let total = payload.len();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = sock.read(&mut buf).await;
+            let resp = format!(
+                "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{total}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.flush().await;
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("mod.zip");
+        std::fs::write(&dest, &payload).unwrap();
+
+        let progress_seen = Arc::new(std::sync::Mutex::new(None));
+        let progress_seen_cb = Arc::clone(&progress_seen);
+        let on_progress: Arc<dyn Fn(u64, Option<u64>, u64) + Send + Sync> =
+            Arc::new(move |dl, tot, spd| {
+                *progress_seen_cb.lock().unwrap() = Some((dl, tot, spd));
+            });
+
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/mod.zip");
+        stream_url_to_file(
+            &client,
+            &url,
+            &dest,
+            total as u64,
+            None,
+            None,
+            Some(&on_progress),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(std::fs::read(&dest).unwrap(), payload);
+        assert_eq!(
+            *progress_seen.lock().unwrap(),
+            Some((total as u64, Some(total as u64), 0))
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stream_416_oversized_or_without_content_range_restarts_from_zero() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let payload = b"fresh-mod-archive-bytes".to_vec();
+        let server_payload = payload.clone();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            // Connection 1: receives Range, returns 416 HTML without Content-Range.
+            let (mut sock1, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let n = sock1.read(&mut buf).await.unwrap_or(0);
+            let req1 = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+            assert!(req1.contains("range: bytes="), "expected Range on first request: {req1}");
+            let html = "<html><head><title>416 Requested Range Not Satisfiable</title></head></html>";
+            let resp1 = format!(
+                "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                html.len(),
+                html
+            );
+            let _ = sock1.write_all(resp1.as_bytes()).await;
+            let _ = sock1.flush().await;
+            drop(sock1);
+
+            // Connection 2: expects no Range header, serves full 200 OK.
+            let (mut sock2, _) = listener.accept().await.unwrap();
+            let n = sock2.read(&mut buf).await.unwrap_or(0);
+            let req2 = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+            assert!(!req2.contains("range:"), "unexpected Range on restart request: {req2}");
+            let resp2 = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                server_payload.len()
+            );
+            let _ = sock2.write_all(resp2.as_bytes()).await;
+            let _ = sock2.write_all(&server_payload).await;
+            let _ = sock2.flush().await;
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("mod.zip");
+        std::fs::write(&dest, vec![b'x'; payload.len() + 100]).unwrap();
+
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/mod.zip");
+        stream_url_to_file(
+            &client,
+            &url,
+            &dest,
+            (payload.len() + 100) as u64,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(std::fs::read(&dest).unwrap(), payload);
+        server.await.unwrap();
     }
 }

@@ -5,11 +5,16 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_BANNER_TIMEOUTS,
   StatusBanner,
+  bannerPersistenceFor,
   bannerTimeoutFor,
   deployStatusNotice,
   dismissBanner,
+  dismissBannersForDownload,
+  filterPersistableBanners,
   hiddenBannerDetails,
+  pruneExpiredBanners,
   pushBanner,
+  remainingBannerTimeoutSeconds,
   type StackedBanner,
 } from "./StatusBanner";
 import type { DeployResult, MissingRequirements, Settings } from "./types";
@@ -193,6 +198,54 @@ describe("StatusBanner", () => {
     expect(view.host.querySelector('button[aria-label="Dismiss"]')).not.toBeNull();
     await view.unmount();
   });
+
+  it("dismisses the banner after running an action with dismiss: true", async () => {
+    const onDismiss = vi.fn();
+    const run = vi.fn();
+    const view = await render(
+      <StatusBanner
+        kind="error"
+        message="Download failed"
+        action={{ label: "Retry", dismiss: true, run }}
+        onDismiss={onDismiss}
+      />,
+    );
+
+    const button = Array.from(view.host.querySelectorAll("button")).find(
+      (b) => b.textContent === "Retry",
+    );
+    expect(button).toBeDefined();
+    await act(async () => {
+      button!.click();
+    });
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(onDismiss).toHaveBeenCalledTimes(1);
+    await view.unmount();
+  });
+
+  it("keeps the banner open when dismiss is not set on the action", async () => {
+    const onDismiss = vi.fn();
+    const run = vi.fn();
+    const view = await render(
+      <StatusBanner
+        kind="warn"
+        message="Launched with warnings"
+        action={{ label: "Review requirements", run }}
+        onDismiss={onDismiss}
+      />,
+    );
+
+    const button = Array.from(view.host.querySelectorAll("button")).find(
+      (b) => b.textContent === "Review requirements",
+    );
+    expect(button).toBeDefined();
+    await act(async () => {
+      button!.click();
+    });
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(onDismiss).not.toHaveBeenCalled();
+    await view.unmount();
+  });
 });
 
 describe("banner timeouts", () => {
@@ -357,5 +410,67 @@ describe("banner stack", () => {
 
     stack = dismissBanner(stack, 4);
     expect(stack.map((b) => b.id)).toEqual([3]);
+  });
+
+  it("filters persistable banners by persistence mode and dismisses by downloadId", () => {
+    const stack: StackedBanner[] = [
+      { id: 1, kind: "info", message: "Done", createdAt: 1000 },
+      { id: 2, kind: "warn", message: "Warn", createdAt: 2000 },
+      {
+        id: 3,
+        kind: "error",
+        message: "Download failed",
+        downloadId: "dl-1",
+        createdAt: 3000,
+      },
+    ];
+
+    expect(bannerPersistenceFor(undefined)).toBe("errors");
+    expect(filterPersistableBanners(stack, "off")).toEqual([]);
+    expect(filterPersistableBanners(stack, "errors")).toEqual([
+      {
+        id: 3,
+        kind: "error",
+        message: "Download failed",
+        details: undefined,
+        download_id: "dl-1",
+        created_at: 3000,
+      },
+    ]);
+    expect(filterPersistableBanners(stack, "errors_and_warnings").map((b) => b.id)).toEqual([
+      2, 3,
+    ]);
+
+    expect(dismissBannersForDownload(stack, "dl-1").map((b) => b.id)).toEqual([1, 2]);
+  });
+
+  it("computes remaining timeout across restarts and prunes expired banners", () => {
+    const settings = {
+      banner_timeouts: { info: 10, warn: 60, error: null },
+    } as Settings;
+
+    const warnBanner: StackedBanner = {
+      id: 1,
+      kind: "warn",
+      message: "Warning",
+      createdAt: 10_000,
+    };
+    const errorBanner: StackedBanner = {
+      id: 2,
+      kind: "error",
+      message: "Error",
+      createdAt: 10_000,
+    };
+
+    expect(remainingBannerTimeoutSeconds(warnBanner, settings, 25_000)).toBe(45);
+    expect(remainingBannerTimeoutSeconds(errorBanner, settings, 999_000)).toBeNull();
+    expect(remainingBannerTimeoutSeconds(warnBanner, settings, 5_000)).toBe(60);
+
+    expect(
+      pruneExpiredBanners([warnBanner, errorBanner], settings, 70_000).map((b) => b.id),
+    ).toEqual([2]);
+    expect(
+      pruneExpiredBanners([warnBanner, errorBanner], settings, 69_000).map((b) => b.id),
+    ).toEqual([1, 2]);
   });
 });

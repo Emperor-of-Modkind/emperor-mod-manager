@@ -43,6 +43,10 @@ export type AssistQueueState = {
     existingModIds: string[];
     memberIds: string[];
     files: { domain: string; modId: number; fileId: number }[];
+    friendSync?: {
+      peerId: string;
+      friendCollectionId: string;
+    } | null;
   } | null;
 };
 
@@ -162,7 +166,6 @@ type DownloadsWorkspaceProps = {
   onCancelRemaining: () => void;
   onCancelDownload: (id: string) => void;
   onRestartDownload: (id: string) => void;
-  onForceResetDownload: (id: string) => void;
   onRetryAssistOpening: () => void;
   isDownloadStuck: (id: string, status: string) => boolean;
   onClearRecent: (ids: string[]) => void;
@@ -190,7 +193,6 @@ export const DownloadsWorkspace = memo(function DownloadsWorkspace(
     onCancelRemaining,
     onCancelDownload,
     onRestartDownload,
-    onForceResetDownload,
     onRetryAssistOpening,
     isDownloadStuck,
     onClearRecent,
@@ -322,7 +324,14 @@ export const DownloadsWorkspace = memo(function DownloadsWorkspace(
                   <div className="downloads-active-row">
                     <div className="downloads-active-meta">
                       <strong>{d.label}</strong>
-                      {d.file_name ? <small>{d.file_name}</small> : null}
+                      {d.file_name ? (
+                        <small
+                          className="downloads-active-filename"
+                          title={d.file_name}
+                        >
+                          {d.file_name}
+                        </small>
+                      ) : null}
                       <small>
                         {statusLabel(d.status)}
                         {pct != null ? ` · ${pct}%` : ""}
@@ -333,26 +342,6 @@ export const DownloadsWorkspace = memo(function DownloadsWorkspace(
                           No progress — try Restart
                         </small>
                       ) : null}
-                      <div
-                        className={
-                          pct != null
-                            ? "downloads-progress"
-                            : "downloads-progress downloads-progress-indeterminate"
-                        }
-                        role="progressbar"
-                        aria-valuemin={0}
-                        aria-valuemax={100}
-                        aria-valuenow={pct ?? undefined}
-                      >
-                        <div
-                          className="downloads-progress-bar"
-                          style={
-                            pct != null
-                              ? { transform: `scaleX(${Math.min(100, Math.max(0, pct)) / 100})` }
-                              : undefined
-                          }
-                        />
-                      </div>
                     </div>
                     <div className="downloads-active-actions">
                       <button
@@ -389,6 +378,26 @@ export const DownloadsWorkspace = memo(function DownloadsWorkspace(
                       </button>
                     </div>
                   </div>
+                  <div
+                    className={
+                      pct != null
+                        ? "downloads-progress"
+                        : "downloads-progress downloads-progress-indeterminate"
+                    }
+                    role="progressbar"
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-valuenow={pct ?? undefined}
+                  >
+                    <div
+                      className="downloads-progress-bar"
+                      style={
+                        pct != null
+                          ? { transform: `scaleX(${Math.min(100, Math.max(0, pct)) / 100})` }
+                          : undefined
+                      }
+                    />
+                  </div>
                 </li>
               );
             })}
@@ -411,11 +420,14 @@ export const DownloadsWorkspace = memo(function DownloadsWorkspace(
               <ul className="list downloads-recent">
                 {visibleRecent.map((d) => {
                   const openable = d.page != null;
+                  const recoverable = d.status === "failed" || d.status === "cancelled";
+                  const canRetry = recoverable && Boolean(d.can_restart);
+                  const canOpenMod = recoverable && !d.can_restart && openable;
                   const identity = (
                     <>
                       <strong>{d.label}</strong>
                       {d.file_name ? <small>{d.file_name}</small> : null}
-                      <small>
+                      <small className={d.status === "failed" ? "downloads-recent-error" : undefined}>
                         {statusLabel(d.status)}
                         {d.error ? ` · ${d.error}` : ""}
                       </small>
@@ -442,7 +454,7 @@ export const DownloadsWorkspace = memo(function DownloadsWorkspace(
                         <div>{identity}</div>
                       )}
                       <div className="downloads-recent-actions">
-                        {d.status === "failed" && d.can_restart ? (
+                        {canRetry ? (
                           <button
                             type="button"
                             className="downloads-control-one"
@@ -450,14 +462,13 @@ export const DownloadsWorkspace = memo(function DownloadsWorkspace(
                           >
                             Retry
                           </button>
-                        ) : null}
-                        {d.status === "failed" && !d.can_restart ? (
+                        ) : canOpenMod ? (
                           <button
                             type="button"
                             className="downloads-control-one"
-                            onClick={() => onForceResetDownload(d.id)}
+                            onClick={() => onOpenRecent(d)}
                           >
-                            Dismiss
+                            Open mod
                           </button>
                         ) : null}
                         <button

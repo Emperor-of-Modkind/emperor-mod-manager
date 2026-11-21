@@ -83,6 +83,7 @@ export type ManagedGame = {
   custom_env_vars?: LaunchEnvVar[];
   custom_wrapper?: string | null;
   custom_launch_args?: string | null;
+  wine_overrides_dismissed?: boolean;
 };
 
 export type IgnoredRequirement = {
@@ -503,6 +504,70 @@ export type InstalledCollection = {
   /** Game versions this collection revision was built for. */
   game_versions?: string[] | null;
   friend_sync?: FriendSyncMetadata | null;
+  auto_save?: boolean;
+  has_unsaved_changes?: boolean;
+};
+
+export type CollectionModIssueKind =
+  | { kind: "missing_from_load_order" }
+  | { kind: "missing_staging_dir" }
+  | {
+      kind: "corrupted_staging";
+      actual_files: number;
+      expected_files?: number | null;
+    }
+  | { kind: "missing_from_manifest" };
+
+export type CollectionModIssue = {
+  mod_id: string;
+  name: string;
+  source: "nexus" | "thunderstore" | "modio";
+  issue: CollectionModIssueKind;
+  can_retry: boolean;
+  domain: string;
+  nexus_mod_id: number;
+  nexus_file_id: number;
+  ts_namespace?: string | null;
+  ts_name?: string | null;
+  modio_game_id?: number | null;
+  modio_mod_id?: number | null;
+  modio_file_id?: number | null;
+  version?: string | null;
+  file_name?: string | null;
+};
+
+export type CollectionIntegrityReport = {
+  collection_id: string;
+  collection_name: string;
+  checked_count: number;
+  issues: CollectionModIssue[];
+};
+
+export type RetryCollectionModTarget = {
+  mod_id: string;
+  name: string;
+  source: "nexus" | "thunderstore" | "modio";
+  domain: string;
+  nexus_mod_id: number;
+  nexus_file_id: number;
+  ts_namespace?: string | null;
+  ts_name?: string | null;
+  modio_game_id?: number | null;
+  modio_mod_id?: number | null;
+  modio_file_id?: number | null;
+  version?: string | null;
+  file_name?: string | null;
+};
+
+export type RetryCollectionModFailure = {
+  mod_id: string;
+  name: string;
+  error: string;
+};
+
+export type RetryCollectionModsResult = {
+  retried: number;
+  failed: RetryCollectionModFailure[];
 };
 
 export type ShareGameHint = {
@@ -685,7 +750,7 @@ export type StagedMod = {
   version_support_generation?: number;
 };
 
-export type ImportFolderResult = {
+export type ImportResult = {
   mods: StagedMod[];
   errors: string[];
 };
@@ -796,6 +861,7 @@ export type FriendShareRef = {
 export type PeerProfileSummary = {
   peer_id: string;
   display_name: string;
+  profile_picture?: string | null;
   updated_at: string;
   collections: FriendShareRef[];
 };
@@ -805,6 +871,7 @@ export type FriendStatus = "connected" | "pending_outgoing";
 export type FriendRecord = {
   peer_id: string;
   display_name: string;
+  profile_picture?: string | null;
   status: FriendStatus;
   online: boolean;
   last_seen_at?: string | null;
@@ -814,8 +881,14 @@ export type FriendRecord = {
 export type PendingFriendRequest = {
   peer_id: string;
   display_name: string;
+  profile_picture?: string | null;
   received_at: string;
 };
+
+export type CollectionVisibility =
+  | { mode: "all_friends" }
+  | { mode: "specific_friends"; peer_ids: string[] }
+  | { mode: "private" };
 
 export type LocalShareableCollection = {
   id: string;
@@ -824,13 +897,17 @@ export type LocalShareableCollection = {
   game_title: string;
   mod_count: number;
   hidden: boolean;
+  visibility?: CollectionVisibility;
 };
 
 export type FriendsState = {
   endpoint_ready: boolean;
+  appear_offline?: boolean;
   peer_id?: string | null;
   join_code?: string | null;
   display_name: string;
+  display_name_set: boolean;
+  profile_picture?: string | null;
   friends: FriendRecord[];
   pending_requests: PendingFriendRequest[];
   local_collections: LocalShareableCollection[];
@@ -845,6 +922,16 @@ export type FriendSyncResult = {
   needs_assist: ShareAssistFile[];
   warnings: string[];
   collection?: InstalledCollection | null;
+};
+
+export type FriendCollectionSyncStatus = {
+  collection_id: string;
+  peer_id: string;
+  friend_collection_id: string;
+  latest_hash: string;
+  has_update: boolean;
+  auto_sync: boolean;
+  friend_online: boolean;
 };
 
 export type ModioModDetail = {
@@ -1047,6 +1134,17 @@ export type BannerTimeouts = {
   error: number | null;
 };
 
+export type BannerPersistence = "off" | "errors" | "errors_and_warnings";
+
+export type PersistedBanner = {
+  id: number;
+  kind: "error" | "warn";
+  message: string;
+  details?: string[];
+  download_id?: string | null;
+  created_at: number;
+};
+
 export type Settings = {
   adult_content: boolean;
   game_version_warnings: boolean;
@@ -1060,6 +1158,8 @@ export type Settings = {
   recent_downloads_limit?: number;
   browse_grid_size?: number;
   banner_timeouts?: BannerTimeouts;
+  banner_persistence?: BannerPersistence;
+  dismiss_banner_on_retry?: boolean;
   has_api_key: boolean;
   has_modio_api_key?: boolean;
   initial_setup_complete: boolean;

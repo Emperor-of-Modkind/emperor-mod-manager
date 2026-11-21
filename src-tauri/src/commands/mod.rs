@@ -29,10 +29,11 @@ use crate::{
         StagedModUpdate,
     },
     nexus::{
-        self, stream_url_to_file, CollectionDetail, CollectionModFile, GameInfo, ModDetail,
-        ModFileInfo, ModGalleryImage, NexusClient, NexusUser, TransferControl, CANCELLED_MSG,
-        PAUSED_MSG,
+        self, is_retryable_transfer_err, stream_url_to_file, CollectionDetail, CollectionModFile,
+        GameInfo, ModDetail, ModFileInfo, ModGalleryImage, NexusClient, NexusUser, TransferControl,
+        CANCELLED_MSG, PAUSED_MSG,
     },
+    rate_limit::{backoff_with_jitter, sleep_interruptible, RateLimitGate},
     share::{
         self, DetectImportResult, ExportShareResult, ImportCodeKind, SavedCollectionDetail,
         SavedCollectionEntry, ShareAssistFile, ShareDecodePreview, ShareImportResult,
@@ -41,7 +42,7 @@ use crate::{
     thunderstore::{self, ThunderstoreClient, TsDependency, TsPackageDetail},
 };
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum DownloadResumeSource {
     Api {
         game_id: String,
@@ -168,6 +169,10 @@ pub struct AppState {
     /// downloads at once, and saturating the connection is what makes CDN
     /// streams stall and end short in the first place.
     pub download_slots: tokio::sync::Semaphore,
+    /// Shared rate-limit, cooldown, and adaptive pacing coordinator.
+    pub rate_limit: Arc<RateLimitGate>,
+    /// Shared HTTP client for CDN archive transfers (connect + read timeouts).
+    pub cdn_http: reqwest::Client,
     /// Per-game launch & process-monitoring state.
     pub launch_states: Arc<Mutex<HashMap<String, crate::launch::GameLaunchState>>>,
     /// Per-game close signal flags for active launch watchers.
@@ -306,8 +311,10 @@ impl AppState {
             config::clamp_recent_downloads_limit(config.recent_downloads_limit) as usize;
         let recent_before = recent.len();
         trim_finished_downloads(&mut recent, recent_limit);
+        let restart_meta = load_recent_restart_meta(&paths, &mut recent, now_unix_secs());
         if recent.len() != recent_before {
             save_recent_downloads(&paths, &recent);
+            save_recent_restart_meta(&paths, &recent, &restart_meta, now_unix_secs());
         }
         let p2p = crate::p2p::P2pService::new(paths.clone());
         Ok(Self {
@@ -318,7 +325,7 @@ impl AppState {
             user: Mutex::new(None),
             downloads: Mutex::new(recent),
             download_jobs: Mutex::new(HashMap::new()),
-            download_restart_meta: Mutex::new(HashMap::new()),
+            download_restart_meta: Mutex::new(restart_meta),
             assist: Mutex::new(None),
             assist_window_gen: AtomicU64::new(0),
             assist_closed_gen: AtomicU64::new(0),
@@ -342,6 +349,13 @@ impl AppState {
             detected_games: Mutex::new(None),
             ts_communities_cache: Mutex::new(None),
             download_slots: tokio::sync::Semaphore::new(MAX_CONCURRENT_DOWNLOADS),
+            rate_limit: Arc::new(RateLimitGate::new()),
+            cdn_http: reqwest::Client::builder()
+                .user_agent(format!("{APP_NAME}/{APP_VERSION}"))
+                .connect_timeout(Duration::from_secs(30))
+                .read_timeout(Duration::from_secs(60))
+                .build()
+                .expect("cdn_http client"),
             launch_states: Arc::new(Mutex::new(HashMap::new())),
             close_flags: Arc::new(Mutex::new(HashMap::new())),
             p2p,
@@ -392,7 +406,27 @@ impl AppState {
             .map_err(|e| e.to_string())?
             .clone()
             .ok_or_else(|| "No API key set. Add one in Setup.".to_string())?;
-        NexusClient::new(key).map_err(|e| e.to_string())
+        NexusClient::new_with_gate(key, self.rate_limit.clone()).map_err(|e| e.to_string())
+    }
+
+    /// Acquires download semaphore permits respecting adaptive concurrency
+    /// (1 permit normally, or all `MAX_CONCURRENT_DOWNLOADS` permits when
+    /// throttled so only a single transfer runs at a time).
+    pub async fn acquire_download_permits(
+        &self,
+    ) -> Result<tokio::sync::SemaphorePermit<'_>, String> {
+        let eff = self
+            .rate_limit
+            .effective_concurrency(MAX_CONCURRENT_DOWNLOADS);
+        let permits = if eff <= 1 {
+            MAX_CONCURRENT_DOWNLOADS as u32
+        } else {
+            1
+        };
+        self.download_slots
+            .acquire_many(permits)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     pub fn is_premium(&self) -> bool {
@@ -506,6 +540,24 @@ fn trim_finished_downloads(downloads: &mut Vec<DownloadItem>, limit: usize) {
     });
 }
 
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn is_restart_source_still_valid(source: &DownloadResumeSource, now_unix: u64) -> bool {
+    match source {
+        DownloadResumeSource::Thunderstore { .. } | DownloadResumeSource::Modio { .. } => true,
+        DownloadResumeSource::Api { nxm_expires, .. } => {
+            nxm_expires.map_or(true, |exp| exp > now_unix)
+        }
+        // Free-user CDN URLs and assist cookies are short-lived and tied to a session.
+        DownloadResumeSource::Cdn { .. } => false,
+    }
+}
+
 fn load_recent_downloads(paths: &Paths) -> Vec<DownloadItem> {
     let path = paths.recent_downloads_file();
     let Ok(raw) = std::fs::read_to_string(&path) else {
@@ -524,6 +576,39 @@ fn load_recent_downloads(paths: &Paths) -> Vec<DownloadItem> {
         item.speed_bps = 0;
     }
     items
+}
+
+fn load_recent_restart_meta(
+    paths: &Paths,
+    items: &mut [DownloadItem],
+    now_unix: u64,
+) -> HashMap<String, DownloadResumeSource> {
+    let path = paths.recent_download_restart_meta_file();
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return HashMap::new();
+    };
+    let Ok(stored) = serde_json::from_str::<HashMap<String, DownloadResumeSource>>(&raw) else {
+        log::warn!(
+            "ignoring unreadable recent download restart metadata file {}",
+            path.display()
+        );
+        return HashMap::new();
+    };
+    let mut restored = HashMap::new();
+    for item in items.iter_mut() {
+        let retryable_status = item.status == "failed" || item.status == "cancelled";
+        if retryable_status {
+            if let Some(src) = stored.get(&item.id) {
+                if is_restart_source_still_valid(src, now_unix) {
+                    item.can_restart = true;
+                    restored.insert(item.id.clone(), src.clone());
+                    continue;
+                }
+            }
+        }
+        item.can_restart = false;
+    }
+    restored
 }
 
 fn save_recent_downloads(paths: &Paths, downloads: &[DownloadItem]) {
@@ -548,6 +633,33 @@ fn save_recent_downloads(paths: &Paths, downloads: &[DownloadItem]) {
     }
 }
 
+fn save_recent_restart_meta(
+    paths: &Paths,
+    downloads: &[DownloadItem],
+    meta: &HashMap<String, DownloadResumeSource>,
+    now_unix: u64,
+) {
+    let mut filtered = HashMap::new();
+    for d in downloads {
+        if (d.status == "failed" || d.status == "cancelled") && d.can_restart {
+            if let Some(src) = meta.get(&d.id) {
+                if is_restart_source_still_valid(src, now_unix) {
+                    filtered.insert(d.id.clone(), src.clone());
+                }
+            }
+        }
+    }
+    let path = paths.recent_download_restart_meta_file();
+    match serde_json::to_string_pretty(&filtered) {
+        Ok(raw) => {
+            if let Err(e) = std::fs::write(&path, raw) {
+                log::warn!("failed to save recent download restart metadata: {e}");
+            }
+        }
+        Err(e) => log::warn!("failed to serialize recent download restart metadata: {e}"),
+    }
+}
+
 fn recent_downloads_limit(state: &AppState) -> usize {
     state
         .config
@@ -566,7 +678,14 @@ fn commit_recent_downloads(state: &AppState) {
         trim_finished_downloads(&mut q, limit);
         q.clone()
     };
+    let meta_snapshot = state
+        .download_restart_meta
+        .lock()
+        .map(|m| m.clone())
+        .unwrap_or_default();
+    let now = now_unix_secs();
     save_recent_downloads(&state.paths, &snapshot);
+    save_recent_restart_meta(&state.paths, &snapshot, &meta_snapshot, now);
 }
 
 fn push_download(state: &AppState, item: DownloadItem) {
@@ -1337,6 +1456,7 @@ pub fn manage_game(
         custom_env_vars: Vec::new(),
         custom_wrapper: None,
         custom_launch_args: None,
+        wine_overrides_dismissed: false,
     };
     let install_exists = Path::new(&install_path).is_dir();
     let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
@@ -1450,6 +1570,24 @@ pub fn set_ignored_requirements(
             }
         })
         .collect();
+    let managed = game.clone();
+    config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())?;
+    Ok(managed)
+}
+
+#[tauri::command]
+pub fn set_wine_overrides_dismissed(
+    state: State<'_, AppState>,
+    id: String,
+    dismissed: bool,
+) -> Result<ManagedGame, String> {
+    let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
+    let game = cfg
+        .managed_games
+        .iter_mut()
+        .find(|g| g.id == id)
+        .ok_or_else(|| "Managed game not found".to_string())?;
+    game.wine_overrides_dismissed = dismissed;
     let managed = game.clone();
     config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())?;
     Ok(managed)
@@ -2070,6 +2208,8 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<serde_json::Value, Str
             "warn": (banner_timeouts.warn > 0).then_some(banner_timeouts.warn),
             "error": (banner_timeouts.error > 0).then_some(banner_timeouts.error),
         },
+        "banner_persistence": cfg.banner_persistence,
+        "dismiss_banner_on_retry": cfg.dismiss_banner_on_retry,
         "has_api_key": has_key,
         "has_modio_api_key": has_modio_api_key,
         "initial_setup_complete": initial_setup_complete,
@@ -2248,6 +2388,67 @@ pub fn set_banner_timeouts(
     let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
     cfg.banner_timeouts = next;
     config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersistedBanner {
+    pub id: u64,
+    pub kind: String,
+    pub message: String,
+    #[serde(default)]
+    pub details: Vec<String>,
+    #[serde(default)]
+    pub download_id: Option<String>,
+    pub created_at: u64,
+}
+
+#[tauri::command]
+pub fn set_banner_persistence(
+    state: State<'_, AppState>,
+    persistence: config::BannerPersistence,
+) -> Result<(), String> {
+    let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
+    cfg.banner_persistence = persistence;
+    config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn set_dismiss_banner_on_retry(
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
+    cfg.dismiss_banner_on_retry = enabled;
+    config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn get_persisted_banners(state: State<'_, AppState>) -> Result<Vec<PersistedBanner>, String> {
+    let path = state.paths.persisted_banners_file();
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Ok(Vec::new());
+    };
+    let Ok(items) = serde_json::from_str::<Vec<PersistedBanner>>(&raw) else {
+        log::warn!("ignoring unreadable persisted banners file {}", path.display());
+        return Ok(Vec::new());
+    };
+    Ok(items)
+}
+
+#[tauri::command]
+pub fn save_persisted_banners(
+    state: State<'_, AppState>,
+    banners: Vec<PersistedBanner>,
+) -> Result<(), String> {
+    let path = state.paths.persisted_banners_file();
+    if banners.is_empty() {
+        if path.exists() {
+            std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+        }
+        return Ok(());
+    }
+    let raw = serde_json::to_string_pretty(&banners).map_err(|e| e.to_string())?;
+    std::fs::write(&path, raw).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -3692,7 +3893,7 @@ pub async fn download_thunderstore_mod(
             mod_ids: member_ids,
             installed_at: String::new(),
             game_versions: None,
-            friend_sync: None,
+            friend_sync: None, ..Default::default()
         };
         mods::record_installed_collection(&state.paths, &game_id, collection, &new_ids)
             .map_err(|e| e.to_string())?;
@@ -3852,7 +4053,7 @@ pub async fn import_thunderstore_profile(
         mod_ids: member_ids,
         installed_at: String::new(),
         game_versions: None,
-        friend_sync: None,
+        friend_sync: None, ..Default::default()
     };
     let collection =
         mods::record_installed_collection(&state.paths, &game_id, collection, &new_ids)
@@ -4971,11 +5172,7 @@ async fn download_and_stage_inner(
 
     // Held for the transfer only; extraction is disk-bound and should not
     // occupy a network slot.
-    let _slot = state
-        .download_slots
-        .acquire()
-        .await
-        .map_err(|e| e.to_string())?;
+    let _slot = state.acquire_download_permits().await?;
 
     let download_result = client
         .download_file(
@@ -5109,6 +5306,11 @@ async fn download_and_stage_inner(
             }
             update_download(state, &dl_id, "staged", None);
             let _ = std::fs::remove_file(&dest);
+            if replace_staged_id.is_some() {
+                if let Ok(game) = managed_game(state, game_id) {
+                    let _ = maybe_auto_save_collections(&state.paths, &game);
+                }
+            }
             finish_download_success(state, &dl_id);
             Ok(staged)
         }
@@ -5214,11 +5416,7 @@ async fn download_and_install_loader_inner(
     };
     let on_progress = progress_callback(app, dl_id.clone());
 
-    let _slot = state
-        .download_slots
-        .acquire()
-        .await
-        .map_err(|e| e.to_string())?;
+    let _slot = state.acquire_download_permits().await?;
 
     let download_result = client
         .download_file(
@@ -5403,6 +5601,8 @@ pub async fn install_collection(
     let before = snapshot_mod_ids(&state.paths, &game_id)?;
     let mut installed = 0usize;
     let mut member_ids = Vec::new();
+    let mut failed_mods: Vec<String> = Vec::new();
+    let mut download_index = 0usize;
     for file in files {
         if file.optional && !include_optional {
             continue;
@@ -5422,6 +5622,15 @@ pub async fn install_collection(
         if batch_cancelled {
             break;
         }
+        if !state
+            .rate_limit
+            .pace_batch_item(download_index, None, None)
+            .await
+        {
+            break;
+        }
+        download_index += 1;
+        let mod_label = file.mod_name.clone();
         match download_and_stage_inner(
             Some(&app),
             &*state,
@@ -5445,7 +5654,10 @@ pub async fn install_collection(
                 installed += 1;
             }
             Err(e) if is_cancel_err(&e) || is_pause_err(&e) => break,
-            Err(e) => return Err(e),
+            Err(e) => {
+                log::warn!("Collection mod '{mod_label}' failed: {e}");
+                failed_mods.push(format!("{mod_label}: {e}"));
+            }
         }
     }
     if !member_ids.is_empty() {
@@ -5471,10 +5683,17 @@ pub async fn install_collection(
             mod_ids: member_ids,
             installed_at: String::new(),
             game_versions: None,
-            friend_sync: None,
+            friend_sync: None, ..Default::default()
         };
         mods::record_installed_collection(&state.paths, &game_id, collection, &new_ids)
             .map_err(|e| e.to_string())?;
+    }
+    if !failed_mods.is_empty() {
+        return Err(format!(
+            "Installed {installed} mod(s), but {} failed: {}",
+            failed_mods.len(),
+            failed_mods.join("; ")
+        ));
     }
     Ok(installed)
 }
@@ -5736,69 +5955,12 @@ pub async fn handle_nxm(
 }
 
 #[tauri::command]
-pub fn import_mod_archive(
+pub fn import_mods(
     state: State<'_, AppState>,
     game_id: String,
-    path: String,
-    name: Option<String>,
-    domain: Option<String>,
-    mod_id: Option<u64>,
-    file_id: Option<u64>,
-) -> Result<StagedMod, String> {
-    let archive = PathBuf::from(&path);
-    if !archive.is_file() {
-        return Err(format!("Archive not found: {path}"));
-    }
-    let label = name.unwrap_or_else(|| {
-        archive
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "Imported mod".into())
-    });
-    let domain = domain.unwrap_or_else(|| {
-        state
-            .config
-            .lock()
-            .ok()
-            .and_then(|c| {
-                c.managed_games
-                    .iter()
-                    .find(|g| g.id == game_id)
-                    .map(|g| g.nexus_domain.clone())
-            })
-            .unwrap_or_else(|| "unknown".into())
-    });
-    let mod_id = mod_id.unwrap_or(0);
-    let file_id = file_id.unwrap_or_else(|| {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(1)
-    });
-
-    let imported_name = archive.file_name().map(|s| s.to_string_lossy().to_string());
-    mods::stage_mod(
-        &state.paths,
-        &game_id,
-        &label,
-        &domain,
-        mod_id,
-        file_id,
-        None,
-        mods::pick_staged_file_name(&label, None, imported_name.as_deref()),
-        &archive,
-    )
-    .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub fn import_mod_folder(
-    state: State<'_, AppState>,
-    game_id: String,
-    path: String,
-) -> Result<mods::ImportFolderResult, String> {
-    let folder = PathBuf::from(&path);
+    paths: Vec<String>,
+) -> Result<mods::ImportResult, String> {
+    let targets: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
     let (domain, install_path) = {
         let cfg = state.config.lock().map_err(|e| e.to_string())?;
         match cfg.managed_games.iter().find(|game| game.id == game_id) {
@@ -5813,10 +5975,10 @@ pub fn import_mod_folder(
             None => ("unknown".to_string(), None),
         }
     };
-    mods::import_folder(
+    mods::import_paths(
         &state.paths,
         &game_id,
-        &folder,
+        &targets,
         &domain,
         install_path.as_deref(),
     )
@@ -6136,11 +6298,6 @@ async fn download_cdn_archive(
         }
     }
 
-    let client = reqwest::Client::builder()
-        .user_agent(format!("{APP_NAME}/{APP_VERSION}"))
-        .build()
-        .map_err(|e| e.to_string())?;
-
     let mut headers = reqwest::header::HeaderMap::new();
     if !cookie_header.is_empty() {
         headers.insert(
@@ -6149,7 +6306,6 @@ async fn download_cdn_archive(
         );
     }
 
-    let start_offset = file_offset(&dest);
     let control = TransferControl {
         cancel: cancel.clone(),
         pause: pause.clone(),
@@ -6157,32 +6313,73 @@ async fn download_cdn_archive(
     let on_progress = progress_callback(Some(app), dl_id.to_string());
 
     log::info!(
-        "cdn download start offset={start_offset} for {cdn_url} -> {}",
+        "cdn download start offset={} for {cdn_url} -> {}",
+        file_offset(&dest),
         dest.display()
     );
 
     // Held for the transfer only; extraction is disk-bound and should not
     // occupy a network slot.
-    let slot = state
-        .download_slots
-        .acquire()
-        .await
-        .map_err(|e| e.to_string())?;
+    let slot = state.acquire_download_permits().await?;
 
-    let download_result = stream_url_to_file(
-        &client,
-        cdn_url,
-        &dest,
-        start_offset,
-        if headers.is_empty() {
-            None
-        } else {
-            Some(&headers)
-        },
-        Some(&control),
-        on_progress.as_ref(),
-    )
-    .await;
+    const MAX_CDN_ATTEMPTS: u32 = 3;
+    let mut download_result = Ok(());
+    for attempt in 0..MAX_CDN_ATTEMPTS {
+        if !state
+            .rate_limit
+            .wait_if_cooled_down(Some(&cancel), Some(&pause))
+            .await
+        {
+            if cancel.load(Ordering::SeqCst) {
+                download_result = Err(anyhow::anyhow!("{CANCELLED_MSG}"));
+            } else {
+                download_result = Err(anyhow::anyhow!("{PAUSED_MSG}"));
+            }
+            break;
+        }
+        let offset = file_offset(&dest);
+        match stream_url_to_file(
+            &state.cdn_http,
+            cdn_url,
+            &dest,
+            offset,
+            if headers.is_empty() {
+                None
+            } else {
+                Some(&headers)
+            },
+            Some(&control),
+            on_progress.as_ref(),
+        )
+        .await
+        {
+            Ok(()) => {
+                state.rate_limit.record_healthy();
+                download_result = Ok(());
+                break;
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if is_retryable_transfer_err(&msg) && attempt + 1 < MAX_CDN_ATTEMPTS {
+                    let delay = backoff_with_jitter(attempt, 1500, 20_000);
+                    state
+                        .rate_limit
+                        .record_throttle(delay, &format!("CDN archive retry: {msg}"));
+                    if !sleep_interruptible(delay, Some(&cancel), Some(&pause)).await {
+                        if cancel.load(Ordering::SeqCst) {
+                            download_result = Err(anyhow::anyhow!("{CANCELLED_MSG}"));
+                        } else {
+                            download_result = Err(anyhow::anyhow!("{PAUSED_MSG}"));
+                        }
+                        break;
+                    }
+                    continue;
+                }
+                download_result = Err(e);
+                break;
+            }
+        }
+    }
 
     match download_result {
         Ok(()) => {}
@@ -6199,7 +6396,8 @@ async fn download_cdn_archive(
                 return Err("Cancelled".into());
             }
             let fail_msg = if msg.contains("link expired") {
-                format!("{msg} Cancel and re-queue via Download Assist to get a fresh link.")
+                clear_restart_meta(state, dl_id);
+                format!("{msg} Open the mod page to re-queue via Download Assist.")
             } else {
                 msg.clone()
             };
@@ -6337,6 +6535,11 @@ async fn fetch_and_stage_cdn(
             }
             update_download(state, dl_id, "staged", None);
             let _ = std::fs::remove_file(&dest);
+            if replace_staged_id.is_some() {
+                if let Ok(game) = managed_game(state, game_id) {
+                    let _ = maybe_auto_save_collections(&state.paths, &game);
+                }
+            }
             finish_download_success(state, dl_id);
             Ok(staged)
         }
@@ -6478,6 +6681,11 @@ pub fn import_assist_download(
                 }
                 update_download(&state, &dl_id, "staged", None);
                 clear_download_job(&state, &dl_id);
+                if ctx.replace_staged_id.is_some() {
+                    if let Ok(game) = managed_game(&state, &ctx.game_id) {
+                        let _ = maybe_auto_save_collections(&state.paths, &game);
+                    }
+                }
                 let _ = crate::assist::close_assist_intentionally(&app, &state);
                 let _ = app.emit(
                     "fromsoft-loader-installed",
@@ -6567,6 +6775,11 @@ pub fn import_assist_download(
                 }
                 update_download(&state, &dl_id, "staged", None);
                 clear_download_job(&state, &dl_id);
+                if ctx.replace_staged_id.is_some() {
+                    if let Ok(game) = managed_game(&state, &ctx.game_id) {
+                        let _ = maybe_auto_save_collections(&state.paths, &game);
+                    }
+                }
                 let _ = crate::assist::close_assist_intentionally(&app, &state);
                 let _ = app.emit(
                     "download-finished",
@@ -7226,6 +7439,720 @@ pub fn uninstall_collection(
 }
 
 #[tauri::command]
+pub async fn set_mod_collections(
+    state: State<'_, AppState>,
+    game_id: String,
+    mod_id: String,
+    collection_ids: Vec<String>,
+) -> Result<StagedMod, String> {
+    let paths = state.paths.clone();
+    let game = managed_game(&state, &game_id)?;
+    blocking(move || {
+        let updated = mods::set_mod_collections(&paths, &game_id, &mod_id, &collection_ids)
+            .map_err(|e| e.to_string())?;
+        let _ = maybe_auto_save_collections(&paths, &game);
+        Ok(updated)
+    })
+    .await
+}
+
+fn save_collection_snapshot_inner(
+    paths: &Paths,
+    game: &ManagedGame,
+    collection_id: &str,
+) -> Result<InstalledCollection, String> {
+    let order = mods::load_loadorder(paths, &game.id).map_err(|e| e.to_string())?;
+    mods::mutate_collections(paths, &game.id, |store| {
+        let col = store
+            .collections
+            .iter_mut()
+            .find(|c| c.id == collection_id)
+            .ok_or_else(|| anyhow::anyhow!("Installed collection not found: {collection_id}"))?;
+
+        let mut members: Vec<&mods::StagedMod> = order
+            .mods
+            .iter()
+            .filter(|m| m.collection_ids.iter().any(|id| id == collection_id))
+            .collect();
+        members.sort_by_key(|m| m.order);
+        let ordered_ids: Vec<String> = members.iter().map(|m| m.id.clone()).collect();
+
+        let (mut manifest, _, _) =
+            share::build_manifest_for_collection(&order, game, collection_id, Some(col.name.clone()));
+        let game_versions = col.game_versions.clone().or_else(|| {
+            game.game_version
+                .as_ref()
+                .filter(|v| !v.trim().is_empty())
+                .map(|v| vec![v.clone()])
+        });
+        manifest.game_versions = game_versions.clone();
+
+        let old_code = col.profile_code.clone();
+        let new_code = share::encode_share_manifest(&manifest)?;
+        col.profile_code = Some(new_code.clone());
+        let _ = share::update_saved_collection_snapshot(
+            paths,
+            &col.id,
+            old_code.as_deref(),
+            &new_code,
+            game_versions,
+        );
+
+        col.mod_ids = ordered_ids;
+        col.saved_snapshot_hash = Some(mods::collection_snapshot_signature(&col.id, &order));
+        col.has_unsaved_changes = false;
+        Ok(col.clone())
+    })
+    .map_err(|e| e.to_string())
+}
+
+fn maybe_auto_save_collections(paths: &Paths, game: &ManagedGame) -> Result<(), String> {
+    let store = mods::load_collections(paths, &game.id).map_err(|e| e.to_string())?;
+    let auto_ids: Vec<String> = store
+        .collections
+        .iter()
+        .filter(|c| c.auto_save)
+        .map(|c| c.id.clone())
+        .collect();
+    if auto_ids.is_empty() {
+        return Ok(());
+    }
+    let order = mods::load_loadorder(paths, &game.id).map_err(|e| e.to_string())?;
+    for col in &store.collections {
+        if !col.auto_save {
+            continue;
+        }
+        let sig = mods::collection_snapshot_signature(&col.id, &order);
+        if col.saved_snapshot_hash.as_deref() != Some(sig.as_str()) {
+            let _ = save_collection_snapshot_inner(paths, game, &col.id);
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn save_collection_changes(
+    state: State<'_, AppState>,
+    game_id: String,
+    collection_id: String,
+) -> Result<InstalledCollection, String> {
+    let paths = state.paths.clone();
+    let game = managed_game(&state, &game_id)?;
+    blocking(move || save_collection_snapshot_inner(&paths, &game, &collection_id)).await
+}
+
+#[tauri::command]
+pub async fn set_collection_auto_save(
+    state: State<'_, AppState>,
+    game_id: String,
+    collection_id: String,
+    auto_save: bool,
+) -> Result<InstalledCollection, String> {
+    let paths = state.paths.clone();
+    let game = managed_game(&state, &game_id)?;
+    blocking(move || {
+        let updated = mods::set_collection_auto_save(&paths, &game_id, &collection_id, auto_save)
+            .map_err(|e| e.to_string())?;
+        if auto_save {
+            return save_collection_snapshot_inner(&paths, &game, &collection_id);
+        }
+        Ok(updated)
+    })
+    .await
+}
+
+fn enrich_report_with_share_manifest(
+    report: &mut mods::CollectionIntegrityReport,
+    collection: &InstalledCollection,
+    order: &mods::LoadOrder,
+) {
+    let Some(code) = collection.profile_code.as_deref() else {
+        return;
+    };
+    let Ok(manifest) = share::decode_share_code(code) else {
+        return;
+    };
+    let mut existing_issue_ids: HashSet<String> =
+        report.issues.iter().map(|i| i.mod_id.clone()).collect();
+
+    for entry in &manifest.mods {
+        match entry.s {
+            share::ShareModSource::Nexus => {
+                let (Some(domain), Some(mod_id), Some(file_id)) =
+                    (entry.domain.as_ref(), entry.mod_id, entry.file_id)
+                else {
+                    continue;
+                };
+                if mods::find_nexus_file(order, mod_id, file_id).is_some() {
+                    continue;
+                }
+                let synthetic_id = format!("{mod_id}_{file_id}");
+                let label = entry
+                    .display_name
+                    .clone()
+                    .unwrap_or_else(|| format!("Nexus mod {mod_id}"));
+                if let Some(issue) = report
+                    .issues
+                    .iter_mut()
+                    .find(|i| i.mod_id == synthetic_id && i.issue == mods::CollectionModIssueKind::MissingFromLoadOrder)
+                {
+                    issue.name = label;
+                    issue.source = ModSource::Nexus;
+                    issue.can_retry = true;
+                    issue.domain = domain.clone();
+                    issue.nexus_mod_id = mod_id;
+                    issue.nexus_file_id = file_id;
+                    issue.version = entry.version.clone();
+                } else if existing_issue_ids.insert(synthetic_id.clone()) {
+                    report.checked_count += 1;
+                    report.issues.push(mods::CollectionModIssue {
+                        mod_id: synthetic_id,
+                        name: label,
+                        source: ModSource::Nexus,
+                        issue: mods::CollectionModIssueKind::MissingFromManifest,
+                        can_retry: true,
+                        domain: domain.clone(),
+                        nexus_mod_id: mod_id,
+                        nexus_file_id: file_id,
+                        ts_namespace: None,
+                        ts_name: None,
+                        modio_game_id: None,
+                        modio_mod_id: None,
+                        modio_file_id: None,
+                        version: entry.version.clone(),
+                        file_name: None,
+                    });
+                }
+            }
+            share::ShareModSource::Thunderstore => {
+                let (Some(community), Some(ns), Some(name)) = (
+                    entry.community.as_ref(),
+                    entry.namespace.as_ref(),
+                    entry.name.as_ref(),
+                ) else {
+                    continue;
+                };
+                if mods::find_thunderstore_package(order, ns, name).is_some() {
+                    continue;
+                }
+                let mod_id = mods::thunderstore_mod_id(ns, name);
+                let label = entry
+                    .display_name
+                    .clone()
+                    .unwrap_or_else(|| format!("{ns}-{name}"));
+                if let Some(issue) = report
+                    .issues
+                    .iter_mut()
+                    .find(|i| i.mod_id == mod_id && i.issue == mods::CollectionModIssueKind::MissingFromLoadOrder)
+                {
+                    issue.name = label;
+                    issue.source = ModSource::Thunderstore;
+                    issue.can_retry = true;
+                    issue.domain = community.clone();
+                    issue.ts_namespace = Some(ns.clone());
+                    issue.ts_name = Some(name.clone());
+                    issue.version = entry.version.clone();
+                } else if existing_issue_ids.insert(mod_id.clone()) {
+                    report.checked_count += 1;
+                    report.issues.push(mods::CollectionModIssue {
+                        mod_id,
+                        name: label,
+                        source: ModSource::Thunderstore,
+                        issue: mods::CollectionModIssueKind::MissingFromManifest,
+                        can_retry: true,
+                        domain: community.clone(),
+                        nexus_mod_id: 0,
+                        nexus_file_id: 0,
+                        ts_namespace: Some(ns.clone()),
+                        ts_name: Some(name.clone()),
+                        modio_game_id: None,
+                        modio_mod_id: None,
+                        modio_file_id: None,
+                        version: entry.version.clone(),
+                        file_name: None,
+                    });
+                }
+            }
+            share::ShareModSource::Modio => {
+                let (Some(game_id), Some(mod_id)) = (entry.game_id, entry.mod_id) else {
+                    continue;
+                };
+                if mods::find_modio_mod(order, game_id, mod_id).is_some() {
+                    continue;
+                }
+                let id = mods::modio_identity_id(game_id, mod_id);
+                let label = entry
+                    .display_name
+                    .clone()
+                    .unwrap_or_else(|| format!("mod.io mod {mod_id}"));
+                if let Some(issue) = report
+                    .issues
+                    .iter_mut()
+                    .find(|i| i.mod_id == id && i.issue == mods::CollectionModIssueKind::MissingFromLoadOrder)
+                {
+                    issue.name = label;
+                    issue.source = ModSource::Modio;
+                    issue.can_retry = true;
+                    issue.modio_game_id = Some(game_id);
+                    issue.modio_mod_id = Some(mod_id);
+                    issue.modio_file_id = entry.file_id;
+                    issue.version = entry.version.clone();
+                } else if existing_issue_ids.insert(id.clone()) {
+                    report.checked_count += 1;
+                    report.issues.push(mods::CollectionModIssue {
+                        mod_id: id,
+                        name: label,
+                        source: ModSource::Modio,
+                        issue: mods::CollectionModIssueKind::MissingFromManifest,
+                        can_retry: true,
+                        domain: String::new(),
+                        nexus_mod_id: 0,
+                        nexus_file_id: 0,
+                        ts_namespace: None,
+                        ts_name: None,
+                        modio_game_id: Some(game_id),
+                        modio_mod_id: Some(mod_id),
+                        modio_file_id: entry.file_id,
+                        version: entry.version.clone(),
+                        file_name: None,
+                    });
+                }
+            }
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn check_installed_collections_local(
+    state: State<'_, AppState>,
+    game_id: String,
+) -> Result<Vec<mods::CollectionIntegrityReport>, String> {
+    let paths = state.paths.clone();
+    blocking(move || {
+        let collections =
+            mods::list_installed_collections(&paths, &game_id).map_err(|e| e.to_string())?;
+        if collections.is_empty() {
+            return Ok(Vec::new());
+        }
+        let order = mods::load_loadorder(&paths, &game_id).map_err(|e| e.to_string())?;
+        let reports = collections
+            .iter()
+            .map(|c| {
+                let mut report = mods::check_collection_local_integrity(c, &order);
+                if c.source == CollectionSource::Emperor {
+                    enrich_report_with_share_manifest(&mut report, c, &order);
+                }
+                report
+            })
+            .collect();
+        Ok(reports)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn check_collection_integrity(
+    state: State<'_, AppState>,
+    game_id: String,
+    collection_id: String,
+    check_remote: Option<bool>,
+) -> Result<mods::CollectionIntegrityReport, String> {
+    let collections = mods::list_installed_collections(&state.paths, &game_id)
+        .map_err(|e| e.to_string())?;
+    let collection = collections
+        .into_iter()
+        .find(|c| c.id == collection_id)
+        .ok_or_else(|| format!("Installed collection not found: {collection_id}"))?;
+    let order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
+    let mut report = mods::check_collection_local_integrity(&collection, &order);
+
+    if collection.source == CollectionSource::Emperor {
+        enrich_report_with_share_manifest(&mut report, &collection, &order);
+    }
+
+    if check_remote.unwrap_or(true) {
+        match collection.source {
+            CollectionSource::Nexus => {
+                if let (Some(slug), Ok(client)) = (collection.slug.as_deref(), state.client()) {
+                    let adult = state
+                        .config
+                        .lock()
+                        .map(|c| c.adult_content)
+                        .unwrap_or(false);
+                    if let Ok(files) = client
+                        .collection_mod_files(slug, collection.revision, adult)
+                        .await
+                    {
+                        let mut existing_ids: HashSet<String> =
+                            report.issues.iter().map(|i| i.mod_id.clone()).collect();
+                        for file in files {
+                            if file.optional {
+                                continue;
+                            }
+                            if mods::find_nexus_file(&order, file.mod_id, file.file_id).is_some() {
+                                continue;
+                            }
+                            let synthetic_id = format!("{}_{}", file.mod_id, file.file_id);
+                            if existing_ids.insert(synthetic_id.clone()) {
+                                report.checked_count += 1;
+                                report.issues.push(mods::CollectionModIssue {
+                                    mod_id: synthetic_id,
+                                    name: file.mod_name,
+                                    source: ModSource::Nexus,
+                                    issue: mods::CollectionModIssueKind::MissingFromManifest,
+                                    can_retry: true,
+                                    domain: file.domain_name,
+                                    nexus_mod_id: file.mod_id,
+                                    nexus_file_id: file.file_id,
+                                    ts_namespace: None,
+                                    ts_name: None,
+                                    modio_game_id: None,
+                                    modio_mod_id: None,
+                                    modio_file_id: None,
+                                    version: file.version,
+                                    file_name: Some(file.file_name),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            CollectionSource::Thunderstore => {
+                if let (Some(community), Some(ns), Some(pkg_name)) = (
+                    collection.community.as_deref(),
+                    collection.namespace.as_deref(),
+                    collection.package_name.as_deref(),
+                ) {
+                    if let Ok(client) = ThunderstoreClient::new() {
+                        if let Ok(resolved) = client
+                            .resolve_install_order(
+                                community,
+                                ns,
+                                pkg_name,
+                                collection.version.as_deref(),
+                            )
+                            .await
+                        {
+                            let mut existing_ids: HashSet<String> =
+                                report.issues.iter().map(|i| i.mod_id.clone()).collect();
+                            for dep in resolved {
+                                if mods::find_thunderstore_package(&order, &dep.namespace, &dep.name)
+                                    .is_some()
+                                {
+                                    continue;
+                                }
+                                let mod_id = mods::thunderstore_mod_id(&dep.namespace, &dep.name);
+                                if existing_ids.insert(mod_id.clone()) {
+                                    report.checked_count += 1;
+                                    report.issues.push(mods::CollectionModIssue {
+                                        mod_id,
+                                        name: dep.name.clone(),
+                                        source: ModSource::Thunderstore,
+                                        issue: mods::CollectionModIssueKind::MissingFromManifest,
+                                        can_retry: true,
+                                        domain: community.to_string(),
+                                        nexus_mod_id: 0,
+                                        nexus_file_id: 0,
+                                        ts_namespace: Some(dep.namespace),
+                                        ts_name: Some(dep.name),
+                                        modio_game_id: None,
+                                        modio_mod_id: None,
+                                        modio_file_id: None,
+                                        version: dep
+                                            .versions
+                                            .first()
+                                            .map(|v| v.version_number.clone()),
+                                        file_name: None,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            CollectionSource::Emperor => {}
+        }
+    }
+
+    Ok(report)
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RetryCollectionModTarget {
+    pub mod_id: String,
+    pub name: String,
+    pub source: ModSource,
+    pub domain: String,
+    pub nexus_mod_id: u64,
+    pub nexus_file_id: u64,
+    pub ts_namespace: Option<String>,
+    pub ts_name: Option<String>,
+    pub modio_game_id: Option<u32>,
+    pub modio_mod_id: Option<u64>,
+    pub modio_file_id: Option<u64>,
+    pub version: Option<String>,
+    pub file_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RetryCollectionModFailure {
+    pub mod_id: String,
+    pub name: String,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RetryCollectionModsResult {
+    pub retried: usize,
+    pub failed: Vec<RetryCollectionModFailure>,
+}
+
+#[tauri::command]
+pub async fn retry_collection_mods(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    game_id: String,
+    collection_id: String,
+    targets: Vec<RetryCollectionModTarget>,
+) -> Result<RetryCollectionModsResult, String> {
+    let collections = mods::list_installed_collections(&state.paths, &game_id)
+        .map_err(|e| e.to_string())?;
+    let collection = collections
+        .into_iter()
+        .find(|c| c.id == collection_id)
+        .ok_or_else(|| format!("Installed collection not found: {collection_id}"))?;
+
+    let order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
+    let batch_id = uuid::Uuid::new_v4().to_string();
+    let mut retried = 0usize;
+    let mut failed = Vec::new();
+    let mut recovered_ids = Vec::new();
+
+    for target in targets {
+        let existing = order.mods.iter().find(|m| m.id == target.mod_id);
+        match target.source {
+            ModSource::Thunderstore => {
+                let (Some(ns), Some(pkg_name)) =
+                    (target.ts_namespace.as_deref(), target.ts_name.as_deref())
+                else {
+                    failed.push(RetryCollectionModFailure {
+                        mod_id: target.mod_id,
+                        name: target.name,
+                        error: "Missing Thunderstore package metadata.".into(),
+                    });
+                    continue;
+                };
+                let mut pkg = match load_ts_package_detail(&state, &target.domain, ns, pkg_name).await
+                {
+                    Ok(p) => p,
+                    Err(e) => {
+                        failed.push(RetryCollectionModFailure {
+                            mod_id: target.mod_id,
+                            name: target.name,
+                            error: e,
+                        });
+                        continue;
+                    }
+                };
+                if let Some(want) = target.version.as_deref() {
+                    if let Some(pos) = pkg.versions.iter().position(|v| v.version_number == want) {
+                        let wanted = pkg.versions.remove(pos);
+                        pkg.versions.insert(0, wanted);
+                    }
+                }
+                let client = match ThunderstoreClient::new() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        failed.push(RetryCollectionModFailure {
+                            mod_id: target.mod_id,
+                            name: target.name,
+                            error: e.to_string(),
+                        });
+                        continue;
+                    }
+                };
+                match stage_thunderstore_package(
+                    &app,
+                    &*state,
+                    &client,
+                    &game_id,
+                    &target.domain,
+                    &pkg,
+                    &target.name,
+                    existing.map(|m| m.enabled),
+                    None,
+                    StagePolicy::Force,
+                )
+                .await
+                {
+                    Ok(staged) => {
+                        recovered_ids.push(staged.id);
+                        retried += 1;
+                    }
+                    Err(e) => failed.push(RetryCollectionModFailure {
+                        mod_id: target.mod_id,
+                        name: target.name,
+                        error: e,
+                    }),
+                }
+            }
+            ModSource::Nexus => {
+                if !state.ensure_premium_status().await {
+                    failed.push(RetryCollectionModFailure {
+                        mod_id: target.mod_id,
+                        name: target.name,
+                        error: "Nexus Premium required for direct retry; use Download Assist.".into(),
+                    });
+                    continue;
+                }
+                match download_and_stage_inner(
+                    Some(&app),
+                    &*state,
+                    &game_id,
+                    &target.domain,
+                    target.nexus_mod_id,
+                    target.nexus_file_id,
+                    &target.name,
+                    target.version.clone(),
+                    None,
+                    None,
+                    None,
+                    Some(batch_id.clone()),
+                    existing.map(|m| m.id.clone()),
+                    target.file_name.clone(),
+                )
+                .await
+                {
+                    Ok(staged) => {
+                        recovered_ids.push(staged.id);
+                        retried += 1;
+                    }
+                    Err(e) => failed.push(RetryCollectionModFailure {
+                        mod_id: target.mod_id,
+                        name: target.name,
+                        error: e,
+                    }),
+                }
+            }
+            ModSource::Modio => {
+                let (Some(modio_game_id), Some(modio_mod_id)) =
+                    (target.modio_game_id, target.modio_mod_id)
+                else {
+                    failed.push(RetryCollectionModFailure {
+                        mod_id: target.mod_id,
+                        name: target.name,
+                        error: "Missing mod.io metadata.".into(),
+                    });
+                    continue;
+                };
+                match retry_single_modio_mod(
+                    &app,
+                    &*state,
+                    &game_id,
+                    modio_game_id,
+                    modio_mod_id,
+                    target.modio_file_id,
+                    &target.name,
+                    target.version.clone(),
+                )
+                .await
+                {
+                    Ok(staged) => {
+                        recovered_ids.push(staged.id);
+                        retried += 1;
+                    }
+                    Err(e) => failed.push(RetryCollectionModFailure {
+                        mod_id: target.mod_id,
+                        name: target.name,
+                        error: e,
+                    }),
+                }
+            }
+        }
+    }
+
+    if !recovered_ids.is_empty() {
+        let mut updated = collection;
+        for id in &recovered_ids {
+            if !updated.mod_ids.iter().any(|m| m == id) {
+                updated.mod_ids.push(id.clone());
+            }
+        }
+        let _ = mods::record_installed_collection(&state.paths, &game_id, updated, &recovered_ids);
+    }
+
+    Ok(RetryCollectionModsResult { retried, failed })
+}
+
+async fn retry_single_modio_mod(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    game_id: &str,
+    modio_game_id: u32,
+    mod_id: u64,
+    file_id: Option<u64>,
+    _label: &str,
+    version: Option<String>,
+) -> Result<StagedMod, String> {
+    let key = state
+        .modio_api_key
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clone()
+        .ok_or_else(|| "mod.io API key required".to_string())?;
+    let client = ModioClient::new(&key).map_err(|e| e.to_string())?;
+    let detail = client
+        .get_mod(modio_game_id, mod_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let resolved_file = file_id
+        .or(detail.primary_file_id)
+        .ok_or_else(|| format!("No downloadable file for mod.io mod {mod_id}"))?;
+    let dl_id = uuid::Uuid::new_v4().to_string();
+    let dest = state.paths.downloads_dir().join(format!(
+        "modio_{}_{}_{}.zip",
+        dl_id,
+        sanitize_filename::sanitize(&detail.name_id),
+        resolved_file
+    ));
+    let on_progress = progress_callback(Some(app), dl_id);
+    client
+        .download_file(
+            modio_game_id,
+            mod_id,
+            Some(resolved_file),
+            &dest,
+            on_progress.as_ref(),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    let file_label = modio_file_label(
+        &client,
+        modio_game_id,
+        mod_id,
+        resolved_file,
+        detail.primary_file_id,
+        &detail.name,
+    )
+    .await;
+    let staged = mods::stage_modio_mod(
+        &state.paths,
+        game_id,
+        modio_game_id,
+        mod_id,
+        resolved_file,
+        &detail.name,
+        version,
+        file_label,
+        detail.picture_url,
+        &dest,
+    )
+    .map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(&dest);
+    Ok(staged)
+}
+
+#[tauri::command]
 pub fn record_nexus_collection(
     state: State<'_, AppState>,
     game_id: String,
@@ -7266,7 +8193,7 @@ pub fn record_nexus_collection(
         mod_ids: member_ids,
         installed_at: String::new(),
         game_versions: None,
-        friend_sync: None,
+        friend_sync: None, ..Default::default()
     };
     mods::record_installed_collection(&state.paths, &game_id, collection, &new_ids)
         .map_err(|e| e.to_string())
@@ -7346,7 +8273,7 @@ pub fn export_share_code(
         mod_ids: member_ids,
         installed_at: String::new(),
         game_versions,
-        friend_sync: None,
+        friend_sync: None, ..Default::default()
     };
     // Empty new_mod_ids: mods were already staged; keep independent so uninstall
     // of this share collection does not delete the user's loadout.
@@ -7488,6 +8415,8 @@ pub async fn import_share_code(
     let mut needs_assist = Vec::new();
     let mut modio_failures = 0usize;
     let ts_client = ThunderstoreClient::new().map_err(|e| e.to_string())?;
+    let order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
+    let mut download_index = 0usize;
 
     for entry in &manifest.mods {
         match entry.s {
@@ -7506,14 +8435,17 @@ pub async fn import_share_code(
                     ));
                     continue;
                 }
-                let order =
-                    mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
                 if let Some(existing) = mods::find_nexus_file(&order, mod_id, file_id) {
                     member_ids.push(existing.id.clone());
                     continue;
                 }
                 let label = share::mod_label(entry);
                 if is_premium {
+                    let _ = state
+                        .rate_limit
+                        .pace_batch_item(download_index, None, None)
+                        .await;
+                    download_index += 1;
                     match download_and_stage_inner(
                         Some(&app),
                         &*state,
@@ -7567,6 +8499,11 @@ pub async fn import_share_code(
                     .ok_or_else(|| "Thunderstore entry missing package name".to_string())?;
                 let label = share::mod_label(entry);
                 let version = entry.version.as_deref().filter(|s| !s.is_empty());
+                let _ = state
+                    .rate_limit
+                    .pace_batch_item(download_index, None, None)
+                    .await;
+                download_index += 1;
                 match stage_thunderstore_with_deps(
                     &app,
                     &state,
@@ -7609,12 +8546,15 @@ pub async fn import_share_code(
                     ));
                     continue;
                 }
-                let order =
-                    mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
                 if let Some(existing) = mods::find_modio_mod(&order, gid, mid) {
                     member_ids.push(existing.id.clone());
                     continue;
                 }
+                let _ = state
+                    .rate_limit
+                    .pace_batch_item(download_index, None, None)
+                    .await;
+                download_index += 1;
                 let client = ModioClient::new(key).map_err(|e| e.to_string())?;
                 let detail = client.get_mod(gid, mid).await.map_err(|e| e.to_string())?;
                 let resolved_file = entry
@@ -7641,6 +8581,19 @@ pub async fn import_share_code(
                         ),
                     );
                 }
+                store_restart_meta(
+                    &state,
+                    &dl_id,
+                    DownloadResumeSource::Modio {
+                        game_id: game_id.clone(),
+                        modio_game_id: gid,
+                        mod_id: mid,
+                        file_id: resolved_file,
+                        name: detail.name.clone(),
+                        version: entry.version.clone(),
+                        name_id: detail.name_id.clone(),
+                    },
+                );
                 let _ = app.emit("downloads-changed", ());
                 let on_progress = progress_callback(Some(&app), dl_id.clone());
                 match client
@@ -7727,6 +8680,14 @@ pub async fn import_share_code(
             .filter(|id| !before.contains(*id))
             .cloned()
             .collect();
+        let mut final_member_ids =
+            apply_share_manifest_order_and_selections(&state.paths, &game_id, &manifest)?;
+        for id in &member_ids {
+            if !final_member_ids.contains(id) {
+                final_member_ids.push(id.clone());
+            }
+        }
+        member_ids = final_member_ids.clone();
         let col = InstalledCollection {
             id: collection_id.clone(),
             source: CollectionSource::Emperor,
@@ -7739,10 +8700,10 @@ pub async fn import_share_code(
             revision: None,
             version: None,
             profile_code: Some(code),
-            mod_ids: member_ids.clone(),
+            mod_ids: final_member_ids,
             installed_at: String::new(),
             game_versions: manifest.game_versions.clone(),
-            friend_sync: None,
+            friend_sync: None, ..Default::default()
         };
         Some(
             mods::record_installed_collection(&state.paths, &game_id, col, &new_ids)
@@ -7801,15 +8762,25 @@ pub fn record_emperor_share(
         return Err("No staged mods matched this share yet.".into());
     }
     let preexisting: HashSet<String> = existing_mod_ids.unwrap_or_default().into_iter().collect();
+    let decoded_manifest = code
+        .as_deref()
+        .and_then(|raw| share::decode_share_code(raw).ok());
+    if let Some(manifest) = decoded_manifest.as_ref() {
+        let mut final_ids =
+            apply_share_manifest_order_and_selections(&state.paths, &game_id, manifest)?;
+        for id in ids {
+            if !final_ids.contains(&id) {
+                final_ids.push(id);
+            }
+        }
+        ids = final_ids;
+    }
     let new_ids: Vec<String> = ids
         .iter()
         .filter(|id| !preexisting.contains(*id))
         .cloned()
         .collect();
-    let game_versions = code
-        .as_deref()
-        .and_then(|raw| share::decode_share_code(raw).ok())
-        .and_then(|manifest| manifest.game_versions);
+    let game_versions = decoded_manifest.and_then(|manifest| manifest.game_versions);
     let collection = InstalledCollection {
         id: collection_id.clone(),
         source: CollectionSource::Emperor,
@@ -7825,7 +8796,7 @@ pub fn record_emperor_share(
         mod_ids: ids,
         installed_at: String::new(),
         game_versions,
-        friend_sync: None,
+        friend_sync: None, ..Default::default()
     };
     mods::record_installed_collection(&state.paths, &game_id, collection, &new_ids)
         .map_err(|e| e.to_string())
@@ -7899,7 +8870,52 @@ pub fn rename_saved_collection(
     if name.trim().is_empty() {
         return Err("Name cannot be empty.".into());
     }
-    share::rename_saved_collection(&state.paths, &id, &name).map_err(|e| e.to_string())
+    let renamed =
+        share::rename_saved_collection(&state.paths, &id, &name).map_err(|e| e.to_string())?;
+    let share_id = renamed
+        .entry
+        .share_id
+        .clone()
+        .unwrap_or_else(|| share::emperor_share_id(renamed.old_code.trim()));
+    let game_ids: Vec<String> = {
+        let cfg = state.config.lock().map_err(|e| e.to_string())?;
+        cfg.managed_games.iter().map(|g| g.id.clone()).collect()
+    };
+    for game_id in game_ids {
+        let _ = mods::sync_installed_collection_rename(
+            &state.paths,
+            &game_id,
+            &share_id,
+            &renamed.old_code,
+            &renamed.entry.name,
+            &renamed.entry.code,
+        );
+    }
+    Ok(renamed.entry)
+}
+
+#[tauri::command]
+pub fn rename_installed_collection(
+    state: State<'_, AppState>,
+    game_id: String,
+    collection_id: String,
+    name: String,
+) -> Result<InstalledCollection, String> {
+    if name.trim().is_empty() {
+        return Err("Name cannot be empty.".into());
+    }
+    let renamed = mods::rename_installed_collection(&state.paths, &game_id, &collection_id, &name)
+        .map_err(|e| e.to_string())?;
+    if renamed.collection.source == CollectionSource::Emperor {
+        let _ = share::rename_saved_collection_by_share(
+            &state.paths,
+            &renamed.collection.id,
+            renamed.old_code.as_deref(),
+            &renamed.collection.name,
+            renamed.collection.profile_code.as_deref(),
+        );
+    }
+    Ok(renamed.collection)
 }
 
 #[tauri::command]
@@ -7949,7 +8965,11 @@ pub fn set_mod_enabled(
     mod_id: String,
     enabled: bool,
 ) -> Result<(), String> {
-    mods::set_enabled(&state.paths, &game_id, &mod_id, enabled).map_err(|e| e.to_string())
+    mods::set_enabled(&state.paths, &game_id, &mod_id, enabled).map_err(|e| e.to_string())?;
+    if let Ok(game) = managed_game(&state, &game_id) {
+        let _ = maybe_auto_save_collections(&state.paths, &game);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -7958,7 +8978,11 @@ pub fn set_load_order(
     game_id: String,
     ordered_ids: Vec<String>,
 ) -> Result<(), String> {
-    mods::set_load_order(&state.paths, &game_id, &ordered_ids).map_err(|e| e.to_string())
+    mods::set_load_order(&state.paths, &game_id, &ordered_ids).map_err(|e| e.to_string())?;
+    if let Ok(game) = managed_game(&state, &game_id) {
+        let _ = maybe_auto_save_collections(&state.paths, &game);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -8119,6 +9143,9 @@ pub fn set_mod_options(
     let normalized = options::normalize_selection(&set, &selection);
     mods::set_mod_options(&state.paths, &game_id, &mod_id, normalized.clone())
         .map_err(|e| e.to_string())?;
+    if let Ok(game) = managed_game(&state, &game_id) {
+        let _ = maybe_auto_save_collections(&state.paths, &game);
+    }
     Ok(normalized)
 }
 
@@ -8201,6 +9228,9 @@ pub fn set_fomod_selection(
     fomod::selection_is_valid(&module, &normalized).map_err(|e| e.to_string())?;
     mods::set_fomod_selection(&state.paths, &game_id, &mod_id, normalized.clone())
         .map_err(|e| e.to_string())?;
+    if let Ok(game) = managed_game(&state, &game_id) {
+        let _ = maybe_auto_save_collections(&state.paths, &game);
+    }
     Ok(normalized)
 }
 
@@ -8243,7 +9273,11 @@ pub fn remove_mod(
     game_id: String,
     mod_id: String,
 ) -> Result<(), String> {
-    mods::remove_mod(&state.paths, &game_id, &mod_id).map_err(|e| e.to_string())
+    mods::remove_mod(&state.paths, &game_id, &mod_id).map_err(|e| e.to_string())?;
+    if let Ok(game) = managed_game(&state, &game_id) {
+        let _ = maybe_auto_save_collections(&state.paths, &game);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -9573,6 +10607,20 @@ pub fn restart_download(
     let source = take_restart_source(&state, &id)
         .ok_or_else(|| "No restart metadata for this download".to_string())?;
 
+    if let DownloadResumeSource::Api {
+        nxm_expires: Some(exp),
+        ..
+    } = &source
+    {
+        if *exp <= now_unix_secs() {
+            let msg = "Download link expired. Open the mod page to re-download.".to_string();
+            clear_restart_meta(&state, &id);
+            update_download(&state, &id, "failed", Some(msg.clone()));
+            let _ = app.emit("downloads-changed", ());
+            return Err(msg);
+        }
+    }
+
     if let Ok(mut jobs) = state.download_jobs.lock() {
         if let Some(job) = jobs.get_mut(&id) {
             job.cancel.store(true, Ordering::SeqCst);
@@ -10125,7 +11173,7 @@ fn match_manifest_entry_to_staged<'a>(
     }
 }
 
-fn apply_friend_manifest_order_and_selections(
+fn apply_share_manifest_order_and_selections(
     paths: &Paths,
     game_id: &str,
     manifest: &share::ShareManifest,
@@ -10142,6 +11190,7 @@ fn apply_friend_manifest_order_and_selections(
                     mod_id: staged.id.clone(),
                     fomod_selection: entry.fomod.clone(),
                     option_selection: entry.options.clone(),
+                    enabled: entry.enabled,
                 });
             }
         }
@@ -10167,6 +11216,28 @@ pub fn set_p2p_display_name(
 }
 
 #[tauri::command]
+pub fn set_p2p_profile_picture(
+    state: State<'_, AppState>,
+    data_url: Option<String>,
+) -> Result<crate::p2p::FriendsState, String> {
+    state
+        .p2p
+        .set_profile_picture(data_url)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn set_p2p_appear_offline(
+    state: State<'_, AppState>,
+    appear_offline: bool,
+) -> Result<crate::p2p::FriendsState, String> {
+    state
+        .p2p
+        .set_appear_offline(appear_offline)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub fn set_collection_visibility(
     state: State<'_, AppState>,
     collection_id: String,
@@ -10175,6 +11246,18 @@ pub fn set_collection_visibility(
     state
         .p2p
         .set_collection_visibility(collection_id, hidden)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn set_collection_sharing(
+    state: State<'_, AppState>,
+    collection_id: String,
+    visibility: crate::p2p::CollectionVisibility,
+) -> Result<crate::p2p::FriendsState, String> {
+    state
+        .p2p
+        .set_collection_sharing(collection_id, visibility)
         .map_err(|e| e.to_string())
 }
 
@@ -10266,35 +11349,19 @@ pub async fn join_or_sync_friend_collection(
 
     let local_col_id = friend_collection_local_id(&peer_id, &friend_collection_id);
     if result.needs_assist.is_empty() {
-        let ordered_ids =
-            apply_friend_manifest_order_and_selections(&state.paths, &game_id, &manifest)?;
-        let col = InstalledCollection {
-            id: local_col_id.clone(),
-            source: CollectionSource::Emperor,
-            kind: CollectionKind::Share,
-            name: result.name.clone(),
-            slug: Some(friend_collection_id.clone()),
-            namespace: None,
-            package_name: None,
-            community: None,
-            revision: None,
-            version: None,
-            profile_code: Some(share_code.clone()),
-            mod_ids: ordered_ids.clone(),
-            installed_at: String::new(),
-            game_versions: manifest.game_versions.clone(),
-            friend_sync: Some(mods::FriendSyncMetadata {
-                friend_peer_id: peer_id,
-                friend_collection_id,
-                last_synced_hash: share_hash.clone(),
-                last_synced_at: chrono::Utc::now().to_rfc3339(),
-                auto_sync: false,
-            }),
-        };
-        let recorded = mods::record_installed_collection(&state.paths, &game_id, col, &[])
-            .map_err(|e| e.to_string())?;
+        let recorded = record_synced_friend_collection(
+            &state.paths,
+            &game_id,
+            &local_col_id,
+            &peer_id,
+            &friend_collection_id,
+            result.name.clone(),
+            share_code.clone(),
+            share_hash.clone(),
+            &manifest,
+        )?;
+        result.member_ids = recorded.mod_ids.clone();
         result.collection = Some(recorded);
-        result.member_ids = ordered_ids;
     }
 
     Ok(FriendSyncResult {
@@ -10309,6 +11376,54 @@ pub async fn join_or_sync_friend_collection(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn record_synced_friend_collection(
+    paths: &Paths,
+    game_id: &str,
+    local_col_id: &str,
+    peer_id: &str,
+    friend_collection_id: &str,
+    name: String,
+    share_code: String,
+    share_hash: String,
+    manifest: &share::ShareManifest,
+) -> Result<InstalledCollection, String> {
+    let ordered_ids = apply_share_manifest_order_and_selections(paths, game_id, manifest)?;
+    let existing_auto_sync = mods::list_installed_collections(paths, game_id)
+        .ok()
+        .and_then(|cols| {
+            cols.into_iter()
+                .find(|c| c.id == local_col_id)
+                .and_then(|c| c.friend_sync.map(|s| s.auto_sync))
+        })
+        .unwrap_or(true);
+    let col = InstalledCollection {
+        id: local_col_id.to_string(),
+        source: CollectionSource::Emperor,
+        kind: CollectionKind::Share,
+        name,
+        slug: Some(friend_collection_id.to_string()),
+        namespace: None,
+        package_name: None,
+        community: None,
+        revision: None,
+        version: None,
+        profile_code: Some(share_code),
+        mod_ids: ordered_ids,
+        installed_at: String::new(),
+        game_versions: manifest.game_versions.clone(),
+        friend_sync: Some(mods::FriendSyncMetadata {
+            friend_peer_id: peer_id.to_string(),
+            friend_collection_id: friend_collection_id.to_string(),
+            last_synced_hash: share_hash,
+            last_synced_at: chrono::Utc::now().to_rfc3339(),
+            auto_sync: existing_auto_sync,
+        }),
+        ..Default::default()
+    };
+    mods::sync_installed_collection(paths, game_id, col, &[]).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub fn finalize_friend_collection_sync(
     state: State<'_, AppState>,
@@ -10319,37 +11434,76 @@ pub fn finalize_friend_collection_sync(
 ) -> Result<InstalledCollection, String> {
     let manifest = share::decode_share_code(&share_code).map_err(|e| e.to_string())?;
     let share_hash = share::share_hash(&share_code);
-    let ordered_ids =
-        apply_friend_manifest_order_and_selections(&state.paths, &game_id, &manifest)?;
     let local_col_id = friend_collection_local_id(&peer_id, &friend_collection_id);
-    let col = InstalledCollection {
-        id: local_col_id,
-        source: CollectionSource::Emperor,
-        kind: CollectionKind::Share,
-        name: manifest
-            .name
-            .clone()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| "Friend Collection".into()),
-        slug: Some(friend_collection_id.clone()),
-        namespace: None,
-        package_name: None,
-        community: None,
-        revision: None,
-        version: None,
-        profile_code: Some(share_code),
-        mod_ids: ordered_ids,
-        installed_at: String::new(),
-        game_versions: manifest.game_versions,
-        friend_sync: Some(mods::FriendSyncMetadata {
-            friend_peer_id: peer_id,
-            friend_collection_id,
-            last_synced_hash: share_hash,
-            last_synced_at: chrono::Utc::now().to_rfc3339(),
-            auto_sync: false,
-        }),
-    };
-    mods::record_installed_collection(&state.paths, &game_id, col, &[]).map_err(|e| e.to_string())
+    let name = manifest
+        .name
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "Friend Collection".into());
+    record_synced_friend_collection(
+        &state.paths,
+        &game_id,
+        &local_col_id,
+        &peer_id,
+        &friend_collection_id,
+        name,
+        share_code,
+        share_hash,
+        &manifest,
+    )
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FriendCollectionSyncStatus {
+    pub collection_id: String,
+    pub peer_id: String,
+    pub friend_collection_id: String,
+    pub latest_hash: String,
+    pub has_update: bool,
+    pub auto_sync: bool,
+    pub friend_online: bool,
+}
+
+#[tauri::command]
+pub fn get_friend_collection_sync_states(
+    state: State<'_, AppState>,
+    game_id: String,
+) -> Result<Vec<FriendCollectionSyncStatus>, String> {
+    let installed = mods::list_installed_collections(&state.paths, &game_id)
+        .map_err(|e| e.to_string())?;
+    let friends_state = state.p2p.get_state().map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for col in installed {
+        let Some(sync) = col.friend_sync else {
+            continue;
+        };
+        let friend = friends_state
+            .friends
+            .iter()
+            .find(|f| f.peer_id == sync.friend_peer_id);
+        let remote_col = friend
+            .and_then(|f| f.cached_profile.as_ref())
+            .and_then(|p| {
+                p.collections
+                    .iter()
+                    .find(|c| c.id == sync.friend_collection_id)
+            });
+        let latest_hash = remote_col
+            .map(|c| c.share_hash.clone())
+            .unwrap_or_else(|| sync.last_synced_hash.clone());
+        let has_update = remote_col
+            .is_some_and(|c| c.share_hash != sync.last_synced_hash && !c.share_code.is_empty());
+        out.push(FriendCollectionSyncStatus {
+            collection_id: col.id,
+            peer_id: sync.friend_peer_id,
+            friend_collection_id: sync.friend_collection_id,
+            latest_hash,
+            has_update,
+            auto_sync: sync.auto_sync,
+            friend_online: friend.is_some_and(|f| f.online),
+        });
+    }
+    Ok(out)
 }
 
 #[tauri::command]
@@ -10392,5 +11546,241 @@ mod recent_download_limit_tests {
         assert_eq!(q.len(), 2);
         assert_eq!(q[0].id, "a");
         assert_eq!(q[1].status, "downloading");
+    }
+}
+
+#[cfg(test)]
+mod recent_download_restart_meta_tests {
+    use super::{
+        load_recent_downloads, load_recent_restart_meta, save_recent_downloads,
+        save_recent_restart_meta, DownloadItem, DownloadResumeSource,
+    };
+    use crate::config::Paths;
+    use std::collections::HashMap;
+
+    fn temp_paths(tag: &str) -> Paths {
+        let root = std::env::temp_dir().join(format!(
+            "emperor_restart_meta_test_{tag}_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        Paths {
+            config_dir: root.clone(),
+            data_dir: root.clone(),
+            cache_dir: root,
+        }
+    }
+
+    #[test]
+    fn persists_valid_restart_meta_and_skips_expired_or_cdn() {
+        let paths = temp_paths("persist");
+        let mut ts_row = DownloadItem::new("ts-1".into(), "TS".into(), "failed", None, None);
+        ts_row.can_restart = true;
+        let mut modio_row =
+            DownloadItem::new("modio-1".into(), "Modio".into(), "cancelled", None, None);
+        modio_row.can_restart = true;
+        let mut api_valid =
+            DownloadItem::new("api-ok".into(), "API OK".into(), "failed", None, None);
+        api_valid.can_restart = true;
+        let mut api_expired =
+            DownloadItem::new("api-exp".into(), "API Exp".into(), "failed", None, None);
+        api_expired.can_restart = true;
+        let mut cdn_row = DownloadItem::new("cdn-1".into(), "CDN".into(), "failed", None, None);
+        cdn_row.can_restart = true;
+        let mut done_row = DownloadItem::new("done-1".into(), "Done".into(), "done", None, None);
+        done_row.can_restart = true;
+
+        let items = vec![
+            ts_row,
+            modio_row,
+            api_valid,
+            api_expired,
+            cdn_row,
+            done_row,
+        ];
+        let mut meta = HashMap::new();
+        meta.insert(
+            "ts-1".into(),
+            DownloadResumeSource::Thunderstore {
+                game_id: "g".into(),
+                community: "c".into(),
+                namespace: "ns".into(),
+                name: "pkg".into(),
+                display_name: "TS".into(),
+                enabled: None,
+            },
+        );
+        meta.insert(
+            "modio-1".into(),
+            DownloadResumeSource::Modio {
+                game_id: "g".into(),
+                modio_game_id: 1,
+                mod_id: 2,
+                file_id: 3,
+                name: "Modio".into(),
+                version: None,
+                name_id: "modio".into(),
+            },
+        );
+        meta.insert(
+            "api-ok".into(),
+            DownloadResumeSource::Api {
+                game_id: "g".into(),
+                domain: "skyrim".into(),
+                mod_id: 10,
+                file_id: 20,
+                label: "API OK".into(),
+                version: None,
+                nxm_key: Some("k".into()),
+                nxm_expires: Some(2000),
+                replace_staged_id: None,
+                file_name: None,
+            },
+        );
+        meta.insert(
+            "api-exp".into(),
+            DownloadResumeSource::Api {
+                game_id: "g".into(),
+                domain: "skyrim".into(),
+                mod_id: 11,
+                file_id: 21,
+                label: "API Exp".into(),
+                version: None,
+                nxm_key: Some("k".into()),
+                nxm_expires: Some(500),
+                replace_staged_id: None,
+                file_name: None,
+            },
+        );
+        meta.insert(
+            "cdn-1".into(),
+            DownloadResumeSource::Cdn {
+                url: "https://example.com/a.zip".into(),
+                cookie_header: "c=1".into(),
+                game_id: "g".into(),
+                domain: "skyrim".into(),
+                mod_id: 12,
+                file_id: 22,
+                label: "CDN".into(),
+                version: None,
+                replace_staged_id: None,
+                file_name: None,
+            },
+        );
+
+        save_recent_downloads(&paths, &items);
+        save_recent_restart_meta(&paths, &items, &meta, 1000);
+
+        let mut loaded = load_recent_downloads(&paths);
+        let restored = load_recent_restart_meta(&paths, &mut loaded, 1000);
+
+        let by_id: HashMap<_, _> = loaded
+            .iter()
+            .map(|d| (d.id.as_str(), d.can_restart))
+            .collect();
+        assert_eq!(by_id.get("ts-1"), Some(&true));
+        assert_eq!(by_id.get("modio-1"), Some(&true));
+        assert_eq!(by_id.get("api-ok"), Some(&true));
+        assert_eq!(by_id.get("api-exp"), Some(&false));
+        assert_eq!(by_id.get("cdn-1"), Some(&false));
+        assert_eq!(by_id.get("done-1"), Some(&false));
+        assert_eq!(restored.len(), 3);
+
+        let _ = std::fs::remove_dir_all(&paths.data_dir);
+    }
+
+    #[test]
+    fn save_collection_snapshot_updates_saved_collection_including_empty() {
+        use super::{maybe_auto_save_collections, CollectionKind, CollectionSource, InstalledCollection};
+        use crate::config::ManagedGame;
+        use crate::mods::{self, ModSource, StagedMod};
+        use crate::share;
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_dir: dir.path().join("cfg"),
+            data_dir: dir.path().join("data"),
+            cache_dir: dir.path().join("cache"),
+        };
+        let game = ManagedGame {
+            id: "skyrim_1".into(),
+            plugin_id: "skyrimse".into(),
+            title: "Skyrim SE".into(),
+            nexus_domain: "skyrimspecialedition".into(),
+            install_path: String::new(),
+            launcher: "steam".into(),
+            cover_path: None,
+            cover_url: None,
+            project_name: None,
+            thunderstore_community: None,
+            modio_game_id: None,
+            tool_overrides: None,
+            game_version: Some("1.6.1170".into()),
+            ignored_requirements: Vec::new(),
+            launch_executable: None,
+            launch_command_source: Default::default(),
+            custom_env_vars: Vec::new(),
+            custom_wrapper: None,
+            custom_launch_args: None,
+            wine_overrides_dismissed: false,
+        };
+        let initial_order = mods::LoadOrder {
+            mods: vec![StagedMod {
+                id: "m1".into(),
+                name: "SkyUI".into(),
+                source: ModSource::Nexus,
+                domain: "skyrimspecialedition".into(),
+                nexus_mod_id: 10,
+                nexus_file_id: 20,
+                enabled: true,
+                order: 1,
+                collection_ids: vec!["col-1".into()],
+                ..Default::default()
+            }],
+        };
+        mods::save_loadorder(&paths, &game.id, &initial_order).unwrap();
+        let (manifest, _, _) =
+            share::build_manifest_for_collection(&initial_order, &game, "col-1", Some("Coop".into()));
+        let initial_code = share::encode_share_manifest(&manifest).unwrap();
+        let mut saved_entry =
+            share::entry_from_code(&initial_code, Some("Coop".into()), Some(game.id.clone()))
+                .unwrap();
+        saved_entry.share_id = Some("col-1".into());
+        let saved = share::add_saved_collection(&paths, saved_entry).unwrap();
+
+        mods::save_collections(
+            &paths,
+            &game.id,
+            &mods::InstalledCollections {
+                collections: vec![InstalledCollection {
+                    id: "col-1".into(),
+                    source: CollectionSource::Emperor,
+                    kind: CollectionKind::Share,
+                    name: "Coop".into(),
+                    profile_code: Some(initial_code.clone()),
+                    mod_ids: vec!["m1".into()],
+                    auto_save: true,
+                    ..Default::default()
+                }],
+            },
+        )
+        .unwrap();
+
+        // Disable m1 -> maybe_auto_save_collections updates both collections.json and saved_collections.json.
+        mods::set_enabled(&paths, &game.id, "m1", false).unwrap();
+        maybe_auto_save_collections(&paths, &game).unwrap();
+        let updated_saved = share::get_saved_collection(&paths, &saved.id).unwrap();
+        assert_ne!(updated_saved.entry.code, initial_code);
+        let decoded_updated = share::decode_share_code(&updated_saved.entry.code).unwrap();
+        assert_eq!(decoded_updated.mods.len(), 1);
+        assert_eq!(decoded_updated.mods[0].enabled, Some(false));
+
+        // Remove m1 -> empty manifest still updates saved_collections.json to 0 mods.
+        mods::remove_mod(&paths, &game.id, "m1").unwrap();
+        maybe_auto_save_collections(&paths, &game).unwrap();
+        let empty_saved = share::get_saved_collection(&paths, &saved.id).unwrap();
+        assert_eq!(empty_saved.entry.mod_count, 0);
+        let decoded_empty = share::decode_share_code(&empty_saved.entry.code).unwrap();
+        assert!(decoded_empty.mods.is_empty());
     }
 }

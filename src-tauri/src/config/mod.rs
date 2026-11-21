@@ -128,6 +128,12 @@ pub struct AppConfig {
     /// Auto-dismiss timeouts (seconds) for status banners; `0` means never.
     #[serde(default)]
     pub banner_timeouts: BannerTimeouts,
+    /// Which banner kinds are persisted across app restarts.
+    #[serde(default)]
+    pub banner_persistence: BannerPersistence,
+    /// When true, retrying, resetting, or removing a failed download dismisses its error banner.
+    #[serde(default = "default_true")]
+    pub dismiss_banner_on_retry: bool,
     /// Last used minimum card width (px) for the Browse grid.
     #[serde(default = "default_browse_grid_size")]
     pub browse_grid_size: u32,
@@ -219,6 +225,16 @@ pub fn clamp_browse_grid_size(size: u32) -> u32 {
 
 pub const MAX_BANNER_TIMEOUT_SECONDS: u32 = 86_400;
 
+/// Which status banner kinds are persisted across app restarts.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BannerPersistence {
+    Off,
+    #[default]
+    Errors,
+    ErrorsAndWarnings,
+}
+
 /// Per-color auto-dismiss timeouts in seconds (`0` means never auto-dismiss).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -279,6 +295,8 @@ impl Default for AppConfig {
             install_click_behavior: InstallClickBehavior::Downloads,
             recent_downloads_limit: default_recent_downloads_limit(),
             banner_timeouts: BannerTimeouts::default(),
+            banner_persistence: BannerPersistence::default(),
+            dismiss_banner_on_retry: true,
             browse_grid_size: default_browse_grid_size(),
             legacy_games_merged: false,
             tools: ToolsConfig::default(),
@@ -350,6 +368,9 @@ pub struct ManagedGame {
     /// Optional extra launch arguments (e.g. "--launcher-skip").
     #[serde(default)]
     pub custom_launch_args: Option<String>,
+    /// Whether the user dismissed the inline Proton launch options notice for this game.
+    #[serde(default)]
+    pub wine_overrides_dismissed: bool,
 }
 
 /// A requirement the user chose to hide for one managed game.
@@ -394,6 +415,16 @@ impl Paths {
     /// Finished downloads shown in the Recent list.
     pub fn recent_downloads_file(&self) -> PathBuf {
         self.data_dir.join("recent_downloads.json")
+    }
+
+    /// Persisted restart metadata for failed/cancelled recent downloads.
+    pub fn recent_download_restart_meta_file(&self) -> PathBuf {
+        self.data_dir.join("recent_download_restart_meta.json")
+    }
+
+    /// Status banners persisted across app restarts.
+    pub fn persisted_banners_file(&self) -> PathBuf {
+        self.data_dir.join("persisted_banners.json")
     }
 
     /// Persistent WebKit profile for Download Assist (Nexus website cookies).
@@ -617,5 +648,44 @@ mod tests {
         let raw = toml::to_string_pretty(&custom).unwrap();
         let reloaded: AppConfig = toml::from_str(&raw).unwrap();
         assert_eq!(reloaded.browse_grid_size, 240);
+    }
+
+    #[test]
+    fn banner_persistence_defaults_and_roundtrip() {
+        let cfg: AppConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.banner_persistence, BannerPersistence::Errors);
+        assert!(cfg.dismiss_banner_on_retry);
+
+        let mut custom = cfg;
+        custom.banner_persistence = BannerPersistence::ErrorsAndWarnings;
+        custom.dismiss_banner_on_retry = false;
+        let raw = toml::to_string_pretty(&custom).unwrap();
+        let reloaded: AppConfig = toml::from_str(&raw).unwrap();
+        assert_eq!(
+            reloaded.banner_persistence,
+            BannerPersistence::ErrorsAndWarnings
+        );
+        assert!(!reloaded.dismiss_banner_on_retry);
+    }
+
+    #[test]
+    fn wine_overrides_dismissed_defaults_false_and_roundtrips() {
+        let raw = r#"
+[[managed_games]]
+id = "g1"
+title = "Game"
+nexus_domain = "game"
+install_path = "/games/game"
+launcher = "Steam"
+plugin_id = "ue"
+"#;
+        let mut cfg: AppConfig = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.managed_games.len(), 1);
+        assert!(!cfg.managed_games[0].wine_overrides_dismissed);
+
+        cfg.managed_games[0].wine_overrides_dismissed = true;
+        let serialized = toml::to_string_pretty(&cfg).unwrap();
+        let reloaded: AppConfig = toml::from_str(&serialized).unwrap();
+        assert!(reloaded.managed_games[0].wine_overrides_dismissed);
     }
 }

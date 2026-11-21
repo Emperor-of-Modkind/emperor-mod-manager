@@ -74,7 +74,7 @@ The key is stored in your OS keyring when available, otherwise in the app config
 1. Open a mod file and choose **Download Assist**
 2. Sign in to Nexus in the assist window the first time (enable **Stay signed in**). Later assists reuse that session.
 3. With **autoclick** on (Settings, default on), the assist waits for the free download button, then clicks **Mod Manager Download** or **Slow Download**
-4. Or use **Import archive** on the Mods tab for a zip/7z/rar you already have
+4. Or use **Import mod…** on the Mods tab for a zip/7z/rar, mod file, or extracted folder you already have
 5. **Collections** queue each required mod through Download Assist one-by-one; use **Cancel** on the status banner to stop
 
 **Settings → Clear Nexus website session** resets the assist login if you need to sign in again.
