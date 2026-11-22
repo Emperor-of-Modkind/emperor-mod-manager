@@ -1,5 +1,7 @@
 //! Path helpers and persistent app configuration.
 
+pub mod secret_store;
+
 use std::{fs, path::PathBuf};
 
 use anyhow::{Context, Result};

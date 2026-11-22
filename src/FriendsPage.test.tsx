@@ -955,4 +955,178 @@ describe("FriendsPage", () => {
     });
     host.remove();
   });
+
+  it("shows which of your collections a friend is syncing on their card and detail view", async () => {
+    vi.mocked(api.getFriendsState).mockResolvedValue({
+      ...sampleState,
+      local_collections: [
+        {
+          id: "saved:pack1",
+          kind: "saved_collection",
+          name: "Co-op Essentials",
+          game_title: "Skyrim",
+          mod_count: 12,
+          hidden: false,
+        },
+      ],
+      friends: [
+        {
+          peer_id: "alice-peer",
+          display_name: "Alice",
+          status: "connected",
+          online: true,
+          syncing_my_collections: ["saved:pack1"],
+        },
+      ],
+    });
+
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const root: Root = createRoot(host);
+
+    await act(async () => {
+      root.render(
+        <FriendsPage
+          active={true}
+          managed={[]}
+          activeGameId={null}
+          onError={() => {}}
+          onNotice={() => {}}
+          onCollectionSynced={() => {}}
+        />,
+      );
+    });
+    await flush();
+
+    await clickFriendsTab(host, "Friends");
+    expect(host.textContent).toContain("Syncing your: Co-op Essentials");
+
+    const aliceCard = host.querySelector<HTMLButtonElement>(
+      ".friends-friend-card-main",
+    );
+    await act(async () => {
+      aliceCard!.click();
+    });
+    await flush();
+
+    expect(host.textContent).toContain(
+      "Syncing your collection: Co-op Essentials",
+    );
+
+    await act(async () => {
+      root.unmount();
+    });
+    host.remove();
+  });
+
+  it("shows when a friend's active loadout matches or is synced to your collection across feed, card, and collections", async () => {
+    const activeMatchState: FriendsState = {
+      ...sampleState,
+      feed_last_read_at: "2026-11-21T02:00:00Z",
+      local_collections: [
+        {
+          id: "saved:pack1",
+          kind: "saved_collection",
+          name: "Co-op Essentials",
+          game_title: "Skyrim",
+          mod_count: 1,
+          hidden: false,
+        },
+      ],
+      feed_events: [
+        {
+          id: "ev1",
+          peer_id: "alice-peer",
+          friend_display_name: "Alice",
+          kind: "collection_updated",
+          collection_id: "active:skyrim",
+          collection_kind: "active_loadout",
+          collection_name: "Skyrim Loadout",
+          game_title: "Skyrim",
+          mod_count: 1,
+          share_hash: "hash-active",
+          occurred_at: "2026-11-21T01:00:00Z",
+        },
+      ],
+      friends: [
+        {
+          peer_id: "alice-peer",
+          display_name: "Alice",
+          status: "connected",
+          online: true,
+          syncing_my_collections: ["saved:pack1"],
+          cached_profile: {
+            peer_id: "alice-peer",
+            display_name: "Alice",
+            updated_at: "2026-11-21T01:00:00Z",
+            collections: [
+              {
+                id: "active:skyrim",
+                kind: "active_loadout",
+                name: "Skyrim Loadout",
+                share_code: "#emperor1test",
+                share_hash: "hash-active",
+                updated_at: "2026-11-21T01:00:00Z",
+                matched_local_collection: {
+                  id: "saved:pack1",
+                  name: "Co-op Essentials",
+                  kind: "synced_to_yours",
+                  game_id: "skyrim",
+                  has_local_changes: false,
+                },
+              },
+            ],
+          },
+        },
+      ],
+    };
+    vi.mocked(api.getFriendsState).mockResolvedValue(activeMatchState);
+    vi.mocked(api.markFriendFeedRead).mockResolvedValue(activeMatchState);
+
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const root: Root = createRoot(host);
+
+    await act(async () => {
+      root.render(
+        <FriendsPage
+          active={true}
+          managed={[]}
+          activeGameId={null}
+          onError={() => {}}
+          onNotice={() => {}}
+          onCollectionSynced={() => {}}
+        />,
+      );
+    });
+    await flush();
+
+    // Feed tab shows the active loadout match pill.
+    expect(host.textContent).toContain('Synced to your "Co-op Essentials"');
+
+    // Friends tab card shows Active loadout: Co-op Essentials.
+    await clickFriendsTab(host, "Friends");
+    expect(host.textContent).toContain("Active loadout: Co-op Essentials");
+
+    // Friend detail banner shows the active loadout match.
+    const aliceCard = host.querySelector<HTMLButtonElement>(
+      ".friends-friend-card-main",
+    );
+    await act(async () => {
+      aliceCard!.click();
+    });
+    await flush();
+    expect(host.textContent).toContain(
+      'Active loadout: Synced to your "Co-op Essentials"',
+    );
+
+    // Collections tab shows the match pill on the Active Loadout row.
+    await clickFriendsTab(host, "Collections");
+    expect(host.textContent).toContain('Synced to your "Co-op Essentials"');
+
+    await act(async () => {
+      root.unmount();
+    });
+    host.remove();
+  });
 });

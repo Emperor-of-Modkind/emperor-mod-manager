@@ -516,6 +516,7 @@ export type InstalledCollection = {
   friend_sync?: FriendSyncMetadata | null;
   auto_save?: boolean;
   has_unsaved_changes?: boolean;
+  disabled?: boolean;
 };
 
 export type CollectionModIssueKind =
@@ -939,6 +940,20 @@ export type StagedModUpdate = {
 
 export type FriendCollectionKind = "active_loadout" | "saved_collection";
 
+export type FriendCollectionMatchKind =
+  | "synced_to_yours"
+  | "matches_saved"
+  | "matches_installed"
+  | "matches_active_loadout";
+
+export type FriendMatchedLocalCollection = {
+  id: string;
+  name: string;
+  kind: FriendCollectionMatchKind;
+  game_id?: string | null;
+  has_local_changes?: boolean;
+};
+
 export type FriendShareRef = {
   id: string;
   kind: FriendCollectionKind;
@@ -946,11 +961,14 @@ export type FriendShareRef = {
   share_code: string;
   share_hash: string;
   updated_at: string;
+  synced_source_collection_id?: string | null;
+  matched_local_collection?: FriendMatchedLocalCollection | null;
 };
 
 export type SharedFriendRef = {
   peer_id: string;
   display_name: string;
+  profile_updated_at?: string | null;
 };
 
 export type PeerProfileSummary = {
@@ -973,6 +991,8 @@ export type FriendRecord = {
   online: boolean;
   last_seen_at?: string | null;
   cached_profile?: PeerProfileSummary | null;
+  syncing_my_collections?: string[];
+  cached_via_peer_name?: string | null;
 };
 
 export type PendingFriendRequest = {
@@ -1037,6 +1057,7 @@ export type FriendsState = {
   profile_picture?: string | null;
   friends_list_visibility?: CollectionVisibility;
   allow_mutual_connections?: boolean;
+  allow_cache_relay?: boolean;
   friends: FriendRecord[];
   pending_requests: PendingFriendRequest[];
   local_collections: LocalShareableCollection[];

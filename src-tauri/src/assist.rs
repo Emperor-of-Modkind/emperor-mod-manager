@@ -46,7 +46,7 @@ const NXM_SENTINEL_PATH: &str = "/capture-nxm";
 const CDN_SENTINEL_PATH: &str = "/capture-download";
 const API_KEY_SENTINEL_PATH: &str = "/capture-api-key";
 const MODIO_KEY_SENTINEL_PATH: &str = "/capture-modio-key";
-const NEXUS_API_KEY_PAGE_URL: &str = "https://www.nexusmods.com/users/myaccount?tab=api";
+const NEXUS_API_KEY_PAGE_URL: &str = "https://next.nexusmods.com/settings/api-keys";
 const MODIO_ACCESS_PAGE_URL: &str = "https://mod.io/me/access";
 
 #[cfg(any(
@@ -86,12 +86,6 @@ const COOKIE_DISMISS_JS: &str = r#"
       for (var i = 0; i < all.length; i++) {
         if (all[i].shadowRoot) collectRoots(all[i].shadowRoot, out);
       }
-      var frames = root.querySelectorAll('iframe');
-      for (var f = 0; f < frames.length; f++) {
-        try {
-          if (frames[f].contentDocument) collectRoots(frames[f].contentDocument, out);
-        } catch (e) {}
-      }
     } catch (e) {}
   }
 
@@ -110,7 +104,7 @@ const COOKIE_DISMISS_JS: &str = r#"
           if (!isVisible(btns[b])) continue;
           var lbl = ((btns[b].innerText || btns[b].textContent || btns[b].value || '') + '').toLowerCase().replace(/\s+/g, ' ').trim();
           if (/(reject|decline|manage|settings|preferences|customize|necessary)/.test(lbl)) continue;
-          if (/^(accept( all)?( cookies)?|accept & continue|allow all( cookies)?|allow cookies|agree|i agree|i accept|got it|ok)$/.test(lbl)) {
+          if (/^(accept( all)?( cookies)?|accept (&|and) continue|accept all (&|and) continue|allow all( cookies)?|allow cookies|consent|agree|i agree|i accept|got it|ok)$/.test(lbl)) {
             btns[b].click();
             return true;
           }
@@ -144,7 +138,6 @@ const API_KEY_CAPTURE_JS: &str = r#"
   if (window.__emmApiKeyCaptureHref === hrefKey && window.__emmApiKeyCaptureTimer) return;
   window.__emmApiKeyCaptureHref = hrefKey;
   if (window.__emmApiKeyCaptureTimer) clearInterval(window.__emmApiKeyCaptureTimer);
-  try { window.confirm = function () { return true; }; } catch (e) {}
   var deadline = Date.now() + 60000;
   var lastActionAt = 0;
   var sent = false;
@@ -184,12 +177,6 @@ const API_KEY_CAPTURE_JS: &str = r#"
       for (var i = 0; i < all.length; i++) {
         if (all[i].shadowRoot) collectRoots(all[i].shadowRoot, out);
       }
-      var frames = root.querySelectorAll('iframe');
-      for (var f = 0; f < frames.length; f++) {
-        try {
-          if (frames[f].contentDocument) collectRoots(frames[f].contentDocument, out);
-        } catch (e) {}
-      }
     } catch (e) {}
   }
 
@@ -214,7 +201,7 @@ const API_KEY_CAPTURE_JS: &str = r#"
           if (!isVisible(btns[b])) continue;
           var lbl = ((btns[b].innerText || btns[b].textContent || btns[b].value || '') + '').toLowerCase().replace(/\s+/g, ' ').trim();
           if (/(reject|decline|manage|settings|preferences|customize|necessary)/.test(lbl)) continue;
-          if (/^(accept( all)?( cookies)?|accept & continue|allow all( cookies)?|allow cookies|agree|i agree|i accept|got it|ok)$/.test(lbl)) {
+          if (/^(accept( all)?( cookies)?|accept (&|and) continue|accept all (&|and) continue|allow all( cookies)?|allow cookies|consent|agree|i agree|i accept|got it|ok)$/.test(lbl)) {
             btns[b].click();
             return true;
           }
@@ -227,11 +214,11 @@ const API_KEY_CAPTURE_JS: &str = r#"
   function findPersonalKey(roots) {
     var ordered = [];
     for (var r = 0; r < roots.length; r++) {
-      var headings = roots[r].querySelectorAll('h1, h2, h3, h4, strong, label, p');
+      var headings = roots[r].querySelectorAll('h1, h2, h3, h4, strong, label, p, th, td, span');
       for (var h = 0; h < headings.length; h++) {
         var ht = (headings[h].textContent || '').toLowerCase();
         if (ht.indexOf('personal api key') !== -1) {
-          var sec = headings[h].closest('section, article, form, div');
+          var sec = headings[h].closest('section, article, form, tr, div');
           if (sec) ordered.push(sec);
         }
       }
@@ -244,7 +231,7 @@ const API_KEY_CAPTURE_JS: &str = r#"
         var cv = (clipEls[c].getAttribute('data-clipboard-text') || clipEls[c].getAttribute('data-value') || '').trim();
         if (looksLikeApiKey(cv) && !rejected[cv]) return cv;
       }
-      var inputs = scope.querySelectorAll('input[readonly], input[type="text"], input[type="password"], textarea, code, pre');
+      var inputs = scope.querySelectorAll('input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="submit"]):not([type="button"]), textarea, code, pre');
       for (var j = 0; j < inputs.length; j++) {
         var el = inputs[j];
         var val = (el.value !== undefined ? el.value : el.textContent || '').trim();
@@ -328,7 +315,6 @@ const MODIO_API_KEY_CAPTURE_JS: &str = r#"
   if (window.__emmModioKeyCaptureHref === hrefKey && window.__emmModioKeyCaptureTimer) return;
   window.__emmModioKeyCaptureHref = hrefKey;
   if (window.__emmModioKeyCaptureTimer) clearInterval(window.__emmModioKeyCaptureTimer);
-  try { window.confirm = function () { return true; }; } catch (e) {}
   var deadline = Date.now() + 60000;
   var lastActionAt = 0;
   var sent = false;
@@ -366,12 +352,6 @@ const MODIO_API_KEY_CAPTURE_JS: &str = r#"
       for (var i = 0; i < all.length; i++) {
         if (all[i].shadowRoot) collectRoots(all[i].shadowRoot, out);
       }
-      var frames = root.querySelectorAll('iframe');
-      for (var f = 0; f < frames.length; f++) {
-        try {
-          if (frames[f].contentDocument) collectRoots(frames[f].contentDocument, out);
-        } catch (e) {}
-      }
     } catch (e) {}
   }
 
@@ -396,7 +376,7 @@ const MODIO_API_KEY_CAPTURE_JS: &str = r#"
           if (!isVisible(btns[b])) continue;
           var lbl = ((btns[b].innerText || btns[b].textContent || btns[b].value || '') + '').toLowerCase().replace(/\s+/g, ' ').trim();
           if (/(reject|decline|manage|settings|preferences|customize|necessary)/.test(lbl)) continue;
-          if (/^(accept( all)?( cookies)?|accept & continue|allow all( cookies)?|allow cookies|agree|i agree|i accept|got it|ok)$/.test(lbl)) {
+          if (/^(accept( all)?( cookies)?|accept (&|and) continue|accept all (&|and) continue|allow all( cookies)?|allow cookies|consent|agree|i agree|i accept|got it|ok)$/.test(lbl)) {
             btns[b].click();
             return true;
           }
@@ -423,17 +403,6 @@ const MODIO_API_KEY_CAPTURE_JS: &str = r#"
             }
           }
         }
-      }
-      var clipEls = roots[r].querySelectorAll('[data-clipboard-text], [data-value]');
-      for (var c = 0; c < clipEls.length; c++) {
-        var cv = (clipEls[c].getAttribute('data-clipboard-text') || clipEls[c].getAttribute('data-value') || '').trim();
-        if (looksLikeModioKey(cv) && !rejected[cv]) return cv;
-      }
-      var inputs = roots[r].querySelectorAll('input[readonly], input[type="text"], input[type="password"], textarea[readonly], code, pre');
-      for (var i = 0; i < inputs.length; i++) {
-        var el = inputs[i];
-        var val = (el.value !== undefined ? el.value : el.textContent || '').trim();
-        if (looksLikeModioKey(val) && !rejected[val]) return val;
       }
     }
     return null;
@@ -1576,12 +1545,54 @@ fn assist_files_url(domain: &str, mod_id: u64, file_id: u64) -> Result<url::Url,
     url.parse().map_err(|e: url::ParseError| e.to_string())
 }
 
-fn is_nexus_login_url(url: &str) -> bool {
-    let u = url.to_ascii_lowercase();
-    if !u.contains("nexusmods.com") {
+fn is_https_nexus_host(raw: &str) -> bool {
+    let Ok(url) = url::Url::parse(raw) else {
+        return false;
+    };
+    if url.scheme() != "https" {
         return false;
     }
-    u.contains("/auth/") || u.contains("sign-in") || u.contains("signin") || u.contains("/login")
+    let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+    host == "nexusmods.com" || host.ends_with(".nexusmods.com")
+}
+
+fn is_nexus_api_key_page_url(raw: &str) -> bool {
+    let Ok(url) = url::Url::parse(raw) else {
+        return false;
+    };
+    if url.scheme() != "https" {
+        return false;
+    }
+    let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+    let path = url.path().trim_end_matches('/');
+    ((host == "nexusmods.com" || host == "www.nexusmods.com")
+        && path.eq_ignore_ascii_case("/users/myaccount"))
+        || ((host == "next.nexusmods.com"
+            || host == "www.nexusmods.com"
+            || host == "nexusmods.com")
+            && path.eq_ignore_ascii_case("/settings/api-keys"))
+}
+
+fn is_https_modio_host(raw: &str) -> bool {
+    let Ok(url) = url::Url::parse(raw) else {
+        return false;
+    };
+    if url.scheme() != "https" {
+        return false;
+    }
+    let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+    host == "mod.io" || host == "www.mod.io"
+}
+
+fn is_nexus_login_url(url: &str) -> bool {
+    if !is_https_nexus_host(url) {
+        return false;
+    }
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    let path = parsed.path().to_ascii_lowercase();
+    path.contains("/auth/") || path.contains("sign-in") || path.contains("signin") || path.contains("/login")
 }
 
 fn has_nexus_session_cookie(cookie_names: &[String]) -> bool {
@@ -1592,7 +1603,7 @@ fn has_nexus_session_cookie(cookie_names: &[String]) -> bool {
 
 /// Logged-in Nexus page with the website session cookie Download Assist reuses.
 fn nexus_website_login_succeeded(url: &str, cookie_names: &[String]) -> bool {
-    url.to_ascii_lowercase().contains("nexusmods.com")
+    is_https_nexus_host(url)
         && !is_nexus_login_url(url)
         && has_nexus_session_cookie(cookie_names)
 }
@@ -1668,7 +1679,10 @@ fn download_assist_in_use(state: &AppState) -> bool {
 }
 
 fn parse_sentinel_key(nav_url: &url::Url, expected_path: &str) -> Option<String> {
-    if nav_url.host_str() != Some(NXM_SENTINEL_HOST) || nav_url.path() != expected_path {
+    if nav_url.scheme() != "https"
+        || nav_url.host_str() != Some(NXM_SENTINEL_HOST)
+        || nav_url.path() != expected_path
+    {
         return None;
     }
     nav_url
@@ -1690,8 +1704,8 @@ fn is_modio_access_url(raw: &str) -> bool {
     let Ok(url) = url::Url::parse(raw) else {
         return false;
     };
-    let host = url.host_str().unwrap_or("").to_ascii_lowercase();
-    (host == "mod.io" || host == "www.mod.io")
+    url.scheme() == "https"
+        && is_https_modio_host(raw)
         && url.path().trim_end_matches('/').eq_ignore_ascii_case("/me/access")
 }
 
@@ -1699,8 +1713,7 @@ fn is_modio_login_url(raw: &str) -> bool {
     let Ok(url) = url::Url::parse(raw) else {
         return false;
     };
-    let host = url.host_str().unwrap_or("").to_ascii_lowercase();
-    if host != "mod.io" && host != "www.mod.io" {
+    if !is_https_modio_host(raw) {
         return false;
     }
     let path = url.path().to_ascii_lowercase();
@@ -1713,13 +1726,45 @@ fn is_modio_login_url(raw: &str) -> bool {
 }
 
 fn should_redirect_modio_to_access(raw: &str) -> bool {
+    is_https_modio_host(raw) && !is_modio_access_url(raw) && !is_modio_login_url(raw)
+}
+
+fn is_https_cloudflare_challenge_host(raw: &str) -> bool {
     let Ok(url) = url::Url::parse(raw) else {
         return false;
     };
-    let host = url.host_str().unwrap_or("").to_ascii_lowercase();
-    (host == "mod.io" || host == "www.mod.io")
-        && !is_modio_access_url(raw)
-        && !is_modio_login_url(raw)
+    url.scheme() == "https"
+        && url
+            .host_str()
+            .is_some_and(|h| h.eq_ignore_ascii_case("challenges.cloudflare.com"))
+}
+
+fn is_allowed_login_scheme(nav_url: &url::Url) -> bool {
+    match nav_url.scheme() {
+        "https" => true,
+        "about" => matches!(nav_url.path(), "blank" | "srcdoc"),
+        "blob" => nav_url.as_str().starts_with("blob:https://"),
+        "data" => true,
+        _ => false,
+    }
+}
+
+fn is_allowed_login_navigation(nav_url: &url::Url, api_key_capture: bool) -> bool {
+    if !is_allowed_login_scheme(nav_url) {
+        log::warn!(
+            "assist login blocked non-HTTPS navigation scheme: {}",
+            nav_url.scheme()
+        );
+        return false;
+    }
+    if api_key_capture && nav_url.scheme() == "https" {
+        let s = nav_url.as_str();
+        if !is_https_nexus_host(s) && !is_https_cloudflare_challenge_host(s) {
+            log::warn!("assist api key capture blocked off-domain navigation");
+            return false;
+        }
+    }
+    true
 }
 
 fn intercept_login_navigation(app: &tauri::AppHandle, nav_url: &url::Url) -> bool {
@@ -1741,7 +1786,14 @@ fn intercept_login_navigation(app: &tauri::AppHandle, nav_url: &url::Url) -> boo
     if s.starts_with("nxm://") || is_nexus_cdn_download(nav_url) {
         return false;
     }
-    nav_url.host_str() != Some(NXM_SENTINEL_HOST)
+    if nav_url.host_str() == Some(NXM_SENTINEL_HOST) {
+        return false;
+    }
+    let api_key_capture = app
+        .try_state::<AppState>()
+        .and_then(|state| peek_assist_context(&state))
+        .is_some_and(|c| matches!(c.purpose, AssistPurpose::ApiKeyCapture));
+    is_allowed_login_navigation(nav_url, api_key_capture)
 }
 
 async fn complete_modio_key_capture(app: tauri::AppHandle, key: String) {
@@ -1751,6 +1803,14 @@ async fn complete_modio_key_capture(app: tauri::AppHandle, key: String) {
     let in_modio = peek_assist_context(&state)
         .is_some_and(|c| matches!(c.purpose, AssistPurpose::ModioLogin));
     if !in_modio {
+        return;
+    }
+    let current_ok = app
+        .get_webview(ASSIST_LABEL)
+        .and_then(|w| w.url().ok())
+        .is_some_and(|u| is_modio_access_url(u.as_str()));
+    if !current_ok {
+        log::warn!("rejected mod.io key capture outside mod.io/me/access");
         return;
     }
     match crate::commands::save_and_validate_modio_key(&state, key).await {
@@ -1781,6 +1841,14 @@ async fn complete_api_key_capture(app: tauri::AppHandle, key: String) {
     if !in_capture {
         return;
     }
+    let current_ok = app
+        .get_webview(ASSIST_LABEL)
+        .and_then(|w| w.url().ok())
+        .is_some_and(|u| is_nexus_api_key_page_url(u.as_str()));
+    if !current_ok {
+        log::warn!("rejected nexus api key capture outside nexusmods.com/users/myaccount");
+        return;
+    }
     match crate::commands::save_and_validate_nexus_key(&state, key).await {
         Ok(user) => {
             log::info!("nexus api key captured silently for {}", user.name);
@@ -1795,79 +1863,83 @@ async fn complete_api_key_capture(app: tauri::AppHandle, key: String) {
     }
 }
 
+fn begin_nexus_api_key_capture(app: &tauri::AppHandle, state: &AppState, generation: u64) {
+    let still = peek_assist_context(state).is_some_and(|c| {
+        c.generation == generation && matches!(c.purpose, AssistPurpose::WebsiteLogin)
+    });
+    if !still {
+        return;
+    }
+    if let Err(e) = set_nexus_website_signed_in(state, true) {
+        log::warn!("nexus website sign-in flag: {e}");
+    }
+    let _ = app.emit("nexus-login-complete", ());
+
+    let has_key = state
+        .api_key
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .is_some_and(|k| !k.trim().is_empty());
+    if has_key {
+        let _ = close_assist_intentionally(app, state);
+        return;
+    }
+
+    // Hide the WebView immediately so the user sees login finish, then reuse
+    // the authenticated session in the background to grab the API key.
+    state.assist_desired_visible.store(false, Ordering::SeqCst);
+    let _ = apply_assist_desired_visible(app, state);
+    if let Ok(mut lock) = state.assist.lock() {
+        if let Some(ctx) = lock.as_mut() {
+            if ctx.generation == generation {
+                ctx.purpose = AssistPurpose::ApiKeyCapture;
+                ctx.label = "Nexus API key".into();
+            }
+        }
+    }
+    if let (Some(webview), Ok(url)) = (
+        app.get_webview(ASSIST_LABEL),
+        NEXUS_API_KEY_PAGE_URL.parse::<url::Url>(),
+    ) {
+        if let Err(e) = webview.navigate(url) {
+            log::warn!("nexus api key capture navigate failed: {e}");
+            let _ = close_assist_intentionally(app, state);
+            return;
+        }
+    } else {
+        let _ = close_assist_intentionally(app, state);
+        return;
+    }
+
+    // If silent background capture hasn't completed after 6s (e.g., an extra
+    // confirmation modal, cookie prompt, or challenge), reveal the WebView
+    // so the user can finish it while auto-capture keeps listening.
+    let reveal_app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        let Some(state) = reveal_app.try_state::<AppState>() else {
+            return;
+        };
+        let still_capturing = peek_assist_context(&state).is_some_and(|c| {
+            c.generation == generation && matches!(c.purpose, AssistPurpose::ApiKeyCapture)
+        });
+        if still_capturing {
+            log::info!("nexus api key capture needs user interaction; revealing webview");
+            state.assist_desired_visible.store(true, Ordering::SeqCst);
+            let _ = apply_assist_desired_visible(&reveal_app, &state);
+            let _ = reveal_app.emit("nexus-api-key-prompt", ());
+        }
+    });
+}
+
 fn schedule_nexus_login_close(app: tauri::AppHandle, generation: u64) {
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(Duration::from_millis(400)).await;
         let Some(state) = app.try_state::<AppState>() else {
             return;
         };
-        let still = peek_assist_context(&state).is_some_and(|c| {
-            c.generation == generation && matches!(c.purpose, AssistPurpose::WebsiteLogin)
-        });
-        if !still {
-            return;
-        }
-        if let Err(e) = set_nexus_website_signed_in(&state, true) {
-            log::warn!("nexus website sign-in flag: {e}");
-        }
-        let _ = app.emit("nexus-login-complete", ());
-
-        let has_key = state
-            .api_key
-            .lock()
-            .ok()
-            .and_then(|g| g.clone())
-            .is_some_and(|k| !k.trim().is_empty());
-        if has_key {
-            let _ = close_assist_intentionally(&app, &state);
-            return;
-        }
-
-        // Hide the WebView immediately so the user sees login finish, then reuse
-        // the authenticated session in the background to grab the API key.
-        state.assist_desired_visible.store(false, Ordering::SeqCst);
-        let _ = apply_assist_desired_visible(&app, &state);
-        if let Ok(mut lock) = state.assist.lock() {
-            if let Some(ctx) = lock.as_mut() {
-                if ctx.generation == generation {
-                    ctx.purpose = AssistPurpose::ApiKeyCapture;
-                    ctx.label = "Nexus API key".into();
-                }
-            }
-        }
-        if let (Some(webview), Ok(url)) = (
-            app.get_webview(ASSIST_LABEL),
-            NEXUS_API_KEY_PAGE_URL.parse::<url::Url>(),
-        ) {
-            if let Err(e) = webview.navigate(url) {
-                log::warn!("nexus api key capture navigate failed: {e}");
-                let _ = close_assist_intentionally(&app, &state);
-                return;
-            }
-        } else {
-            let _ = close_assist_intentionally(&app, &state);
-            return;
-        }
-
-        // If silent background capture hasn't completed after 6s (e.g., an extra
-        // confirmation modal, cookie prompt, or challenge), reveal the WebView
-        // so the user can finish it while auto-capture keeps listening.
-        let reveal_app = app.clone();
-        tauri::async_runtime::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(6)).await;
-            let Some(state) = reveal_app.try_state::<AppState>() else {
-                return;
-            };
-            let still_capturing = peek_assist_context(&state).is_some_and(|c| {
-                c.generation == generation && matches!(c.purpose, AssistPurpose::ApiKeyCapture)
-            });
-            if still_capturing {
-                log::info!("nexus api key capture needs user interaction; revealing webview");
-                state.assist_desired_visible.store(true, Ordering::SeqCst);
-                let _ = apply_assist_desired_visible(&reveal_app, &state);
-                let _ = reveal_app.emit("nexus-api-key-prompt", ());
-            }
-        });
+        begin_nexus_api_key_capture(&app, &state, generation);
     });
 }
 
@@ -1908,7 +1980,7 @@ fn watch_nexus_login_cookie(app: tauri::AppHandle, generation: u64, done: Arc<At
                 return;
             }
             // Rate-limit noisy warns: once every ~15s while stuck on a post-login page.
-            if href.to_ascii_lowercase().contains("nexusmods.com")
+            if is_https_nexus_host(&href)
                 && !is_nexus_login_url(&href)
                 && !has_nexus_session_cookie(&names)
             {
@@ -2057,7 +2129,10 @@ fn intercept_assist_navigation(app: &tauri::AppHandle, nav_url: &url::Url) -> bo
             spawn_cdn_download(app, cdn);
             return false;
         }
-        log::warn!("assist sentinel rejected payload: {s}");
+        log::warn!(
+            "assist sentinel rejected payload on path {}",
+            nav_url.path()
+        );
         return false;
     }
     maybe_emit_login_needed(app, s);
@@ -2608,8 +2683,20 @@ async fn open_login_webview(
 
     let handle_new = app.clone();
     builder = builder.on_new_window(move |url, _features| {
-        if let Some(webview) = handle_new.get_webview(ASSIST_LABEL) {
-            let _ = webview.navigate(url);
+        if url.scheme() == "https" {
+            let allow = handle_new
+                .try_state::<AppState>()
+                .and_then(|state| peek_assist_context(&state))
+                .map(|c| {
+                    !matches!(c.purpose, AssistPurpose::ApiKeyCapture)
+                        || is_https_nexus_host(url.as_str())
+                })
+                .unwrap_or(true);
+            if allow {
+                if let Some(webview) = handle_new.get_webview(ASSIST_LABEL) {
+                    let _ = webview.navigate(url);
+                }
+            }
         }
         NewWindowResponse::Deny
     });
@@ -2634,16 +2721,17 @@ async fn open_login_webview(
                 .map(|c| c.purpose);
             match current_purpose {
                 Some(AssistPurpose::ApiKeyCapture) => {
-                    if href.to_ascii_lowercase().contains("nexusmods.com")
-                        && !is_nexus_login_url(&href)
-                    {
+                    if is_https_nexus_host(&href) {
+                        let _ = webview.eval(COOKIE_DISMISS_JS);
+                    }
+                    if is_nexus_api_key_page_url(&href) && !is_nexus_login_url(&href) {
                         let _ = webview.eval(API_KEY_CAPTURE_JS);
                     }
                     return;
                 }
                 Some(AssistPurpose::ModioLogin) => {
                     note_assist_document_ready(&handle_load, &href);
-                    if href.to_ascii_lowercase().contains("mod.io") {
+                    if is_https_modio_host(&href) {
                         let _ = webview.eval(COOKIE_DISMISS_JS);
                     }
                     if is_modio_access_url(&href) {
@@ -2664,7 +2752,7 @@ async fn open_login_webview(
             }
         }
         note_assist_document_ready(&handle_load, &href);
-        if is_nexus_login_url(&href) || !href.to_ascii_lowercase().contains("nexusmods.com") {
+        if is_nexus_login_url(&href) || !is_https_nexus_host(&href) {
             return;
         }
         let _ = try_complete_nexus_website_login(&handle_load, &webview, generation, &done);
@@ -2815,12 +2903,8 @@ pub fn confirm_nexus_website_login(
         }
         return Err("Nexus login is not complete yet. Finish signing in, then try again.".into());
     }
-    if let Err(e) = set_nexus_website_signed_in(&state, true) {
-        log::warn!("nexus website sign-in flag: {e}");
-        return Err(e);
-    }
-    let _ = app.emit("nexus-login-complete", ());
-    close_assist_intentionally(&app, &state)
+    begin_nexus_api_key_capture(&app, &state, ctx.generation);
+    Ok(())
 }
 
 fn set_nexus_website_signed_in(state: &AppState, signed_in: bool) -> Result<(), String> {
@@ -3094,10 +3178,29 @@ mod tests {
 
         assert!(API_KEY_CAPTURE_JS.contains("dismissCookieBanners"));
         assert!(API_KEY_CAPTURE_JS.contains("clickConfirmDialogIfPresent"));
+        assert!(API_KEY_CAPTURE_JS.contains("ordered.push(roots[i])"));
+        assert!(!API_KEY_CAPTURE_JS.contains("contentDocument"));
+        assert!(!API_KEY_CAPTURE_JS.contains("window.confirm"));
         assert!(MODIO_API_KEY_CAPTURE_JS.contains("dismissCookieBanners"));
         assert!(MODIO_API_KEY_CAPTURE_JS.contains("clickConfirmDialogIfPresent"));
+        assert!(!MODIO_API_KEY_CAPTURE_JS.contains("contentDocument"));
+        assert!(!MODIO_API_KEY_CAPTURE_JS.contains("window.confirm"));
         assert!(COOKIE_DISMISS_JS.contains("CybotCookiebotDialogBodyButtonAccept"));
-        assert!(COOKIE_DISMISS_JS.contains("contentDocument"));
+
+        assert!(is_https_nexus_host("https://www.nexusmods.com/users/myaccount"));
+        assert!(!is_https_nexus_host("http://www.nexusmods.com/users/myaccount"));
+        assert!(!is_https_nexus_host("https://evil-nexusmods.com/"));
+        assert!(!is_https_nexus_host("https://evil.com/?q=nexusmods.com"));
+        assert!(is_nexus_api_key_page_url("https://www.nexusmods.com/users/myaccount?tab=api"));
+        assert!(is_nexus_api_key_page_url("https://next.nexusmods.com/settings/api-keys"));
+        assert!(is_nexus_api_key_page_url("https://next.nexusmods.com/settings/api-keys/"));
+        assert!(!is_nexus_api_key_page_url("https://next.nexusmods.com/settings/profile"));
+        assert!(!is_nexus_api_key_page_url("https://www.nexusmods.com/skyrimspecialedition"));
+        let insecure_sentinel: url::Url =
+            "http://emperor-mod-manager.invalid/capture-api-key?key=abc123XYZ=="
+                .parse()
+                .unwrap();
+        assert_eq!(parse_captured_api_key(&insecure_sentinel), None);
         #[cfg(any(
             target_os = "linux",
             target_os = "dragonfly",
@@ -3106,5 +3209,47 @@ mod tests {
             target_os = "openbsd"
         ))]
         assert!(LINUX_WEBKIT_USER_AGENT.contains("Safari/605.1.15"));
+    }
+
+    #[test]
+    fn login_navigation_allows_turnstile_frames_and_blocks_insecure_schemes() {
+        let allowed = [
+            "https://users.nexusmods.com/auth/sign_in",
+            "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/b/turnstile/if/ov2/av0/rcv/abc/0x4AAAAAA/light/normal",
+            "about:blank",
+            "about:srcdoc",
+            "blob:https://challenges.cloudflare.com/12345678-1234-1234-1234-1234567890ab",
+            "data:text/html;charset=utf-8,%3Chtml%3E%3C/html%3E",
+        ];
+        for raw in allowed {
+            let url: url::Url = raw.parse().unwrap();
+            assert!(is_allowed_login_navigation(&url, false), "expected allow for {raw}");
+        }
+
+        let blocked = [
+            "http://www.nexusmods.com/",
+            "file:///etc/passwd",
+            "ftp://example.com/file",
+            "blob:http://example.com/1234",
+            "about:config",
+        ];
+        for raw in blocked {
+            let url: url::Url = raw.parse().unwrap();
+            assert!(!is_allowed_login_navigation(&url, false), "expected block for {raw}");
+        }
+
+        assert!(is_allowed_login_navigation(
+            &"https://www.nexusmods.com/users/myaccount?tab=api".parse().unwrap(),
+            true
+        ));
+        assert!(is_allowed_login_navigation(
+            &"https://challenges.cloudflare.com/turnstile".parse().unwrap(),
+            true
+        ));
+        assert!(is_allowed_login_navigation(&"about:srcdoc".parse().unwrap(), true));
+        assert!(!is_allowed_login_navigation(
+            &"https://evil.com/phish".parse().unwrap(),
+            true
+        ));
     }
 }

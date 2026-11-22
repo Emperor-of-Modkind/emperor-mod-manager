@@ -1,8 +1,8 @@
 import { createRoot, type Root } from "react-dom/client";
 import { act, type ReactElement } from "react";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
-import { SettingsSection } from "./SettingsSection";
+import { SettingsSection, SettingsToggle } from "./SettingsSection";
 
 function sections(host: HTMLElement): HTMLDetailsElement[] {
   return [
@@ -103,5 +103,52 @@ describe("SettingsSection", () => {
     expect(updates.open).toBe(false);
     expect(appearance.open).toBe(false);
     await view.unmount();
+  });
+});
+
+describe("SettingsToggle", () => {
+  it("renders a switch button with aria-checked and toggles on click", async () => {
+    const onChange = vi.fn();
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const root: Root = createRoot(host);
+
+    await act(async () => {
+      root.render(
+        <SettingsToggle checked={false} onChange={onChange}>
+          Show adult content
+        </SettingsToggle>,
+      );
+    });
+
+    const toggle = host.querySelector<HTMLButtonElement>(
+      'button[role="switch"]',
+    );
+    expect(toggle).toBeTruthy();
+    expect(toggle?.getAttribute("aria-checked")).toBe("false");
+    expect(toggle?.textContent).toContain("Show adult content");
+
+    await act(async () => {
+      toggle!.click();
+    });
+    expect(onChange).toHaveBeenCalledWith(true);
+
+    await act(async () => {
+      root.render(
+        <SettingsToggle checked={true} disabled onChange={onChange}>
+          Show adult content
+        </SettingsToggle>,
+      );
+    });
+    expect(toggle?.getAttribute("aria-checked")).toBe("true");
+    expect(toggle?.disabled).toBe(true);
+
+    await act(async () => {
+      toggle!.click();
+    });
+    expect(onChange).toHaveBeenCalledTimes(1);
+
+    await act(async () => root.unmount());
+    host.remove();
   });
 });

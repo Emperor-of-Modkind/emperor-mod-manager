@@ -684,6 +684,8 @@ export const api = {
     invoke<FriendsState>("set_friends_list_visibility", { visibility }),
   setAllowMutualConnections: (allow: boolean) =>
     invoke<FriendsState>("set_allow_mutual_connections", { allow }),
+  setAllowCacheRelay: (allow: boolean) =>
+    invoke<FriendsState>("set_allow_cache_relay", { allow }),
   addFriendByCode: (code: string) =>
     invoke<FriendsState>("add_friend_by_code", { code }),
   addFriendByPeer: (peerId: string, displayName?: string | null) =>

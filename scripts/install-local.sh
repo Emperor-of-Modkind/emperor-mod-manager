@@ -6,7 +6,7 @@
 #   - Icons:   ~/.local/share/icons/hicolor/*/apps/emperor-mod-manager.png
 #   - Schemes: x-scheme-handler/nxm, x-scheme-handler/emperor
 #
-# Usage: ./scripts/install-local.sh [--skip-build] [--debug] [--uninstall]
+# Usage: ./scripts/install-local.sh [--skip-build] [--debug] [--clean] [--uninstall]
 set -euo pipefail
 
 APP_ID="emperor-mod-manager"
@@ -22,6 +22,7 @@ ICONS_DIR="$DATA_HOME/icons/hicolor"
 
 SKIP_BUILD=0
 BUILD_PROFILE="release"
+CLEAN=0
 UNINSTALL=0
 
 die() {
@@ -48,6 +49,7 @@ emperor:// URL handlers.
 Options:
   --skip-build   Install using the already-built binary without recompiling
   --debug        Build/install the debug binary instead of release
+  --clean        Remove build and temp artifacts after installing (alias: --cleanup)
   --uninstall    Remove the installed binary, .desktop entry, and icons
   -h, --help     Show this help message
 
@@ -64,6 +66,9 @@ while [ $# -gt 0 ]; do
       ;;
     --debug)
       BUILD_PROFILE="debug"
+      ;;
+    --clean|--cleanup)
+      CLEAN=1
       ;;
     --uninstall)
       UNINSTALL=1
@@ -220,6 +225,15 @@ esac
 resolved_bin="$(command -v "$APP_ID" 2>/dev/null || true)"
 if [ -n "$resolved_bin" ] && [ "$resolved_bin" != "$BIN_DIR/$APP_ID" ]; then
   warn "'$APP_ID' in PATH currently resolves to $resolved_bin instead of $BIN_DIR/$APP_ID"
+fi
+
+if [ "$CLEAN" -eq 1 ]; then
+  info "Cleaning up build and temp artifacts"
+  if command -v node >/dev/null 2>&1 && [ -f "$REPO_ROOT/scripts/clean.mjs" ]; then
+    (cd "$REPO_ROOT" && node "$REPO_ROOT/scripts/clean.mjs")
+  else
+    warn "node or scripts/clean.mjs not found; skipping artifact cleanup"
+  fi
 fi
 
 info "Done. Launch with: $BIN_DIR/$APP_ID"

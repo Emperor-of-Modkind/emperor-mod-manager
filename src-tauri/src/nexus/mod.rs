@@ -56,6 +56,9 @@ pub struct TransferControl {
 #[derive(Clone)]
 pub struct NexusClient {
     http: reqwest::Client,
+    /// Separate client without the `apikey` header for CDN mirror downloads
+    /// so personal API keys are never sent to third-party CDN hosts or redirects.
+    cdn_http: reqwest::Client,
     /// Public mod pages sit behind a Cloudflare check that rejects the API
     /// client's rustls fingerprint. This client impersonates Chrome and does
     /// not carry the API key.
@@ -328,29 +331,37 @@ impl NexusClient {
     }
 
     fn build_client(api_key: Option<&str>, rate_limit: Arc<RateLimitGate>) -> Result<Self> {
-        let mut headers = HeaderMap::new();
-        if let Some(key) = api_key {
-            headers.insert(
-                "apikey",
-                HeaderValue::from_str(key).context("invalid API key header")?,
-            );
-        }
-        headers.insert("Application-Name", HeaderValue::from_static(APP_NAME));
-        headers.insert(
+        let mut base_headers = HeaderMap::new();
+        base_headers.insert("Application-Name", HeaderValue::from_static(APP_NAME));
+        base_headers.insert(
             "Application-Version",
             HeaderValue::from_str(APP_VERSION).unwrap_or(HeaderValue::from_static("0.1.0")),
         );
-        headers.insert(
+        base_headers.insert(
             USER_AGENT,
             HeaderValue::from_str(&format!("{APP_NAME}/{APP_VERSION}"))
                 .unwrap_or(HeaderValue::from_static("emperor-mod-manager/0.1.0")),
         );
+
+        let mut api_headers = base_headers.clone();
+        if let Some(key) = api_key {
+            api_headers.insert(
+                "apikey",
+                HeaderValue::from_str(key).context("invalid API key header")?,
+            );
+        }
+
         let http = reqwest::Client::builder()
-            .default_headers(headers)
+            .default_headers(api_headers)
             // A read timeout is per-chunk, so a stalled CDN connection surfaces
             // as an error rather than a silent short read. Deliberately not
             // `.timeout()`, which is a whole-request deadline and would abort
             // legitimate multi-hundred-megabyte downloads.
+            .connect_timeout(Duration::from_secs(30))
+            .read_timeout(Duration::from_secs(60))
+            .build()?;
+        let cdn_http = reqwest::Client::builder()
+            .default_headers(base_headers)
             .connect_timeout(Duration::from_secs(30))
             .read_timeout(Duration::from_secs(60))
             .build()?;
@@ -362,6 +373,7 @@ impl NexusClient {
             .context("chrome page client")?;
         Ok(Self {
             http,
+            cdn_http,
             page_http,
             rate_limit,
             is_anonymous: api_key.is_none(),
@@ -1122,7 +1134,7 @@ impl NexusClient {
                 };
 
                 match stream_url_to_file(
-                    &self.http,
+                    &self.cdn_http,
                     &download_url,
                     dest,
                     offset,
@@ -3112,33 +3124,13 @@ pub fn clear_api_key() -> Result<()> {
     }
 }
 
-/// File-based API key fallback when keyring is unavailable.
+/// Encrypted file-based API key fallback when keyring is unavailable.
 pub fn store_api_key_file(path: &Path, key: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, key.trim())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(path)?.permissions();
-        perms.set_mode(0o600);
-        std::fs::set_permissions(path, perms)?;
-    }
-    Ok(())
+    crate::config::secret_store::store_encrypted_secret(path, key)
 }
 
 pub fn load_api_key_file(path: &Path) -> Result<Option<String>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let s = std::fs::read_to_string(path)?;
-    let s = s.trim().to_string();
-    if s.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(s))
-    }
+    crate::config::secret_store::load_encrypted_secret(path)
 }
 
 #[cfg(test)]

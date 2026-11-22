@@ -240,6 +240,9 @@ pub struct InstalledCollection {
     /// Computed on load: whether the collection has unsaved changes since last save.
     #[serde(default)]
     pub has_unsaved_changes: bool,
+    /// Whether the user has disabled this collection's mods.
+    #[serde(default)]
+    pub disabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -3025,14 +3028,22 @@ pub fn set_collection_enabled(
     enabled: bool,
     protect_mod_ids: &[String],
 ) -> Result<usize> {
-    let collections = load_collections(paths, game_id)?;
-    let Some(target) = collections.collections.iter().find(|c| c.id == collection_id) else {
+    let mut collections = load_collections(paths, game_id)?;
+    let Some(target_idx) = collections
+        .collections
+        .iter()
+        .position(|c| c.id == collection_id)
+    else {
         bail!("collection not found: {collection_id}");
     };
-    let target_member_ids: HashSet<String> = target.mod_ids.iter().cloned().collect();
+    let target_member_ids: HashSet<String> = collections.collections[target_idx]
+        .mod_ids
+        .iter()
+        .cloned()
+        .collect();
     let protected: HashSet<&str> = protect_mod_ids.iter().map(|s| s.as_str()).collect();
 
-    mutate_load_order(paths, game_id, |order| {
+    let changed = mutate_load_order(paths, game_id, |order| {
         let mut active_other_mod_ids: HashSet<String> = HashSet::new();
         if !enabled {
             let enabled_ids: HashSet<&str> = order
@@ -3042,17 +3053,21 @@ pub fn set_collection_enabled(
                 .map(|m| m.id.as_str())
                 .collect();
             for other in &collections.collections {
-                if other.id == collection_id {
+                if other.id == collection_id || other.disabled {
                     continue;
                 }
-                let other_has_enabled = other
-                    .mod_ids
+                let mut other_member_ids: HashSet<String> =
+                    other.mod_ids.iter().cloned().collect();
+                for m in &order.mods {
+                    if m.collection_ids.iter().any(|cid| cid == &other.id) {
+                        other_member_ids.insert(m.id.clone());
+                    }
+                }
+                let other_has_enabled = other_member_ids
                     .iter()
                     .any(|id| enabled_ids.contains(id.as_str()));
                 if other_has_enabled {
-                    for id in &other.mod_ids {
-                        active_other_mod_ids.insert(id.clone());
-                    }
+                    active_other_mod_ids.extend(other_member_ids);
                 }
             }
         }
@@ -3080,7 +3095,11 @@ pub fn set_collection_enabled(
             }
         }
         Ok(changed)
-    })
+    })?;
+
+    collections.collections[target_idx].disabled = !enabled;
+    save_collections(paths, game_id, &collections)?;
+    Ok(changed)
 }
 
 pub fn set_mod_options(
@@ -7356,12 +7375,86 @@ mod tests {
         assert!(!after.mods.iter().find(|m| m.id == "exclusive").unwrap().enabled);
         assert!(after.mods.iter().find(|m| m.id == "shared_active").unwrap().enabled);
         assert!(after.mods.iter().find(|m| m.id == "protected_incoming").unwrap().enabled);
+        let cols_after = load_collections(&paths, game_id).unwrap();
+        assert!(cols_after.collections.iter().find(|c| c.id == "col_a").unwrap().disabled);
+        assert!(!cols_after.collections.iter().find(|c| c.id == "col_b").unwrap().disabled);
 
-        // Re-enabling turns exclusive back on.
+        // Re-enabling turns exclusive back on and clears disabled.
         let reenabled = set_collection_enabled(&paths, game_id, "col_a", true, &[]).unwrap();
         assert_eq!(reenabled, 1);
         let after_re = load_loadorder(&paths, game_id).unwrap();
         assert!(after_re.mods.iter().find(|m| m.id == "exclusive").unwrap().enabled);
+        let cols_after_re = load_collections(&paths, game_id).unwrap();
+        assert!(!cols_after_re.collections.iter().find(|c| c.id == "col_a").unwrap().disabled);
+    }
+
+    #[test]
+    fn set_collection_enabled_ignores_disabled_other_collections_when_resolving_shared() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_dir: dir.path().join("cfg"),
+            data_dir: dir.path().join("data"),
+            cache_dir: dir.path().join("cache"),
+        };
+        let game_id = "skyrim_1";
+        let mk = |id: &str, cols: Vec<&str>, enabled: bool| StagedMod {
+            id: id.into(),
+            name: id.into(),
+            domain: "skyrimspecialedition".into(),
+            staging_path: paths.mods_dir(game_id).join(id).to_string_lossy().into(),
+            enabled,
+            order: 1,
+            collection_ids: cols.into_iter().map(String::from).collect(),
+            independent: false,
+            ..Default::default()
+        };
+        save_loadorder(
+            &paths,
+            game_id,
+            &LoadOrder {
+                mods: vec![
+                    mk("shared_with_disabled", vec!["col_a", "col_b"], true),
+                    mk("col_b_only", vec!["col_b"], false),
+                ],
+            },
+        )
+        .unwrap();
+        save_collections(
+            &paths,
+            game_id,
+            &InstalledCollections {
+                collections: vec![
+                    InstalledCollection {
+                        id: "col_a".into(),
+                        name: "Collection A".into(),
+                        mod_ids: vec!["shared_with_disabled".into()],
+                        disabled: false,
+                        ..Default::default()
+                    },
+                    InstalledCollection {
+                        id: "col_b".into(),
+                        name: "Collection B".into(),
+                        mod_ids: vec!["shared_with_disabled".into(), "col_b_only".into()],
+                        disabled: true,
+                        ..Default::default()
+                    },
+                ],
+            },
+        )
+        .unwrap();
+
+        let changed = set_collection_enabled(&paths, game_id, "col_a", false, &[]).unwrap();
+        assert_eq!(changed, 1);
+
+        let after = load_loadorder(&paths, game_id).unwrap();
+        assert!(
+            !after
+                .mods
+                .iter()
+                .find(|m| m.id == "shared_with_disabled")
+                .unwrap()
+                .enabled
+        );
     }
 
     #[test]

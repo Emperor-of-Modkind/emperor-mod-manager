@@ -1,6 +1,6 @@
 [package]
 name = "emperor-mod-manager"
-version = "0.9.0"
+version = "0.9.1"
 description = "Mod manager for Linux and Windows"
 authors = ["emperor-mod-manager contributors"]
 edition = "2021"
@@ -42,6 +42,9 @@ futures-util = "0.3"
 url = "2"
 sha2 = "0.10"
 hex = "0.4"
+aes-gcm = "0.10"
+rand = "0.10"
+zeroize = "1.9"
 regex = "1"
 log = "0.4"
 env_logger = "0.11"

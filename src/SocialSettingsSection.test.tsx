@@ -11,6 +11,7 @@ vi.mock("./api", () => ({
     setP2pProfilePicture: vi.fn(),
     setFriendsListVisibility: vi.fn(),
     setAllowMutualConnections: vi.fn(),
+    setAllowCacheRelay: vi.fn(),
   },
 }));
 
@@ -217,14 +218,14 @@ describe("SocialSettingsSection", () => {
       );
     });
 
-    const checkbox = host.querySelector<HTMLInputElement>(
-      'input[type="checkbox"]',
+    const toggle = host.querySelector<HTMLButtonElement>(
+      'button[role="switch"]',
     );
-    expect(checkbox).toBeTruthy();
-    expect(checkbox?.checked).toBe(true);
+    expect(toggle).toBeTruthy();
+    expect(toggle?.getAttribute("aria-checked")).toBe("true");
 
     await act(async () => {
-      checkbox!.click();
+      toggle!.click();
     });
     await flush();
 
@@ -234,6 +235,57 @@ describe("SocialSettingsSection", () => {
       allow_mutual_connections: false,
     });
     expect(onNotice).toHaveBeenCalledWith("Mutual connections disabled.");
+
+    await act(async () => {
+      root.unmount();
+    });
+    host.remove();
+  });
+
+  it("toggles share cached friend profiles setting", async () => {
+    const onFriendsStateChange = vi.fn();
+    const onNotice = vi.fn();
+    const onError = vi.fn();
+    vi.mocked(api.setAllowCacheRelay).mockResolvedValue({
+      ...baseState,
+      allow_cache_relay: false,
+    });
+
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const root: Root = createRoot(host);
+
+    await act(async () => {
+      root.render(
+        <SocialSettingsSection
+          friendsState={baseState}
+          onFriendsStateChange={onFriendsStateChange}
+          onNotice={onNotice}
+          onError={onError}
+        />,
+      );
+    });
+
+    const toggles = host.querySelectorAll<HTMLButtonElement>(
+      'button[role="switch"]',
+    );
+    expect(toggles.length).toBe(2);
+    const relayToggle = toggles[1];
+    expect(relayToggle.getAttribute("aria-checked")).toBe("true");
+
+    await act(async () => {
+      relayToggle.click();
+    });
+    await flush();
+
+    expect(api.setAllowCacheRelay).toHaveBeenCalledWith(false);
+    expect(onFriendsStateChange).toHaveBeenCalledWith({
+      ...baseState,
+      allow_cache_relay: false,
+    });
+    expect(onNotice).toHaveBeenCalledWith(
+      "Offline friend cache sharing disabled.",
+    );
 
     await act(async () => {
       root.unmount();

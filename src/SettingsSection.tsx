@@ -95,3 +95,34 @@ export function SettingsSection({
     </details>
   );
 }
+
+export interface SettingsToggleProps {
+  checked: boolean;
+  disabled?: boolean;
+  onChange: (checked: boolean) => void;
+  children: ReactNode;
+}
+
+/** Accessible switch toggle styled to match inline settings rows. */
+export function SettingsToggle({
+  checked,
+  disabled = false,
+  onChange,
+  children,
+}: SettingsToggleProps) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      disabled={disabled}
+      className="setting-toggle"
+      onClick={() => onChange(!checked)}
+    >
+      <span className="switch-track" aria-hidden="true">
+        <span className="switch-thumb" />
+      </span>
+      <span className="setting-toggle-label">{children}</span>
+    </button>
+  );
+}

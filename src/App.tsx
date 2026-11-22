@@ -54,8 +54,15 @@ import {
   resolveCollectionVisibility,
   visibilityIcon,
 } from "./CollectionSharingModal";
+import { CollectionSyncersBadge } from "./CollectionSyncersBadge";
+import {
+  findMatchingSavedCollectionId,
+  formatSyncersSummary,
+  getFriendsSyncingCollection,
+  getFriendsWithActiveLoadoutMatching,
+} from "./collectionSyncers";
 import { FriendsPage } from "./FriendsPage";
-import { SettingsSection } from "./SettingsSection";
+import { SettingsSection, SettingsToggle } from "./SettingsSection";
 import { SocialSettingsSection } from "./SocialSettingsSection";
 import { Throbber } from "./Throbber";
 import { CheckingFriendUpdatesToast, CheckingUpdatesToast, UpdateToast } from "./UpdateToast";
@@ -4103,6 +4110,7 @@ export default function App() {
     // Invalidate any in-flight open before tearing down the native webview.
     nexusLoginGenRef.current += 1;
     nexusLoginOpenRef.current = false;
+    nexusLoginAlreadyOpenRef.current = false;
     setNexusLoginConfirming(false);
     setNexusLoginOpen(false);
     api.closeDownloadAssist().catch(() => {});
@@ -4142,7 +4150,7 @@ export default function App() {
       if (!stillOpen()) return;
       await syncNexusLoginHost();
       if (!stillOpen()) return;
-      if (nexusLoginAlreadyOpenRef.current) {
+      if (webLoginProvider === "nexus-key" || nexusLoginAlreadyOpenRef.current) {
         nexusLoginAlreadyOpenRef.current = false;
         return;
       }
@@ -9731,6 +9739,37 @@ export default function App() {
                             · {installedCollections.length}
                           </span>
                         )}
+                        {(() => {
+                          const activeId = `active:${activeGame.id}`;
+                          const activeLoadoutSyncers = getFriendsSyncingCollection(
+                            friendsState?.friends,
+                            activeId,
+                          );
+                          const syncerIds = new Set(
+                            activeLoadoutSyncers.map((f) => f.peer_id),
+                          );
+                          const activeLoadoutMatchers =
+                            getFriendsWithActiveLoadoutMatching(
+                              friendsState?.friends,
+                              activeId,
+                            ).filter((f) => !syncerIds.has(f.peer_id));
+                          return (
+                            <>
+                              {activeLoadoutSyncers.length > 0 ? (
+                                <CollectionSyncersBadge
+                                  syncers={activeLoadoutSyncers}
+                                  labelPrefix="Loadout synced by"
+                                />
+                              ) : null}
+                              {activeLoadoutMatchers.length > 0 ? (
+                                <CollectionSyncersBadge
+                                  syncers={activeLoadoutMatchers}
+                                  labelPrefix="Active for"
+                                />
+                              ) : null}
+                            </>
+                          );
+                        })()}
                       </div>
                       {installedCollections.length > 0 ? (
                         <div
@@ -9767,21 +9806,58 @@ export default function App() {
                                 c.namespace &&
                                 c.package_name),
                           );
-                          const installedMemberCount = mods.filter((m) =>
-                            (m.collection_ids ?? []).includes(c.id),
+                          const installedMembers = mods.filter(
+                            (m) =>
+                              (m.collection_ids ?? []).includes(c.id) ||
+                              c.mod_ids.includes(m.id),
+                          );
+                          const installedMemberCount = installedMembers.length;
+                          const enabledMemberCount = installedMembers.filter(
+                            (m) => m.enabled,
                           ).length;
+                          const isToggling = Boolean(
+                            togglingCollectionIds[c.id],
+                          );
+                          const isCollectionDisabled =
+                            Boolean(c.disabled) ||
+                            (installedMemberCount > 0 &&
+                              enabledMemberCount === 0);
+                          const isCollectionEnabled = !isCollectionDisabled;
                           const modCount =
                             installedMemberCount > 0
                               ? installedMemberCount
                               : c.mod_ids.length;
+                          const matchingSavedId = findMatchingSavedCollectionId(
+                            c,
+                            savedCollections,
+                          );
+                          const cardSyncers = matchingSavedId
+                            ? getFriendsSyncingCollection(
+                                friendsState?.friends,
+                                matchingSavedId,
+                              )
+                            : [];
+                          const cardActiveUsers = matchingSavedId
+                            ? getFriendsWithActiveLoadoutMatching(
+                                friendsState?.friends,
+                                matchingSavedId,
+                              )
+                            : [];
                           const tooltip = [
                             c.name,
                             sourceLabel,
                             `${modCount} mods`,
+                            isCollectionDisabled ? "Disabled" : null,
                             c.friend_sync
                               ? hasUpdate
                                 ? "Update available"
                                 : "Synced"
+                              : null,
+                            cardSyncers.length > 0
+                              ? formatSyncersSummary(cardSyncers)
+                              : null,
+                            cardActiveUsers.length > 0
+                              ? formatSyncersSummary(cardActiveUsers, "Active for")
                               : null,
                             savedStatusLabel,
                             installedLabel,
@@ -9793,11 +9869,13 @@ export default function App() {
                               key={c.id}
                               role="button"
                               tabIndex={0}
-                              className={
-                                isFiltering
-                                  ? "installed-collection-card is-active"
-                                  : "installed-collection-card"
-                              }
+                              className={[
+                                "installed-collection-card",
+                                isFiltering ? "is-active" : "",
+                                isCollectionDisabled ? "is-disabled" : "",
+                              ]
+                                .filter(Boolean)
+                                .join(" ")}
                               title={tooltip}
                               onClick={(e) => {
                                 if (
@@ -9894,23 +9972,52 @@ export default function App() {
                                       Auto
                                     </button>
                                   )}
-                                  <button
-                                    type="button"
-                                    className="danger icon-btn"
-                                    aria-label={`Uninstall ${c.name}`}
-                                    title={`Uninstall ${c.name}`}
-                                    onClick={() =>
-                                      setUninstallCollectionTarget(c)
-                                    }
-                                  >
-                                    <FontAwesomeIcon icon={faTrashCan} />
-                                  </button>
+                                  {installedMemberCount > 0 && (
+                                    <button
+                                      type="button"
+                                      role="switch"
+                                      aria-checked={isCollectionEnabled}
+                                      aria-label={
+                                        isCollectionEnabled
+                                          ? `Disable mods in ${c.name}`
+                                          : `Enable mods in ${c.name}`
+                                      }
+                                      title={
+                                        isCollectionEnabled
+                                          ? `Disable mods in ${c.name} without uninstalling`
+                                          : `Enable all mods in ${c.name}`
+                                      }
+                                      disabled={isToggling}
+                                      className="installed-collection-toggle"
+                                      onClick={() =>
+                                        void toggleInstalledCollectionEnabled(
+                                          c,
+                                          isCollectionDisabled,
+                                        )
+                                      }
+                                    >
+                                      <span
+                                        className="switch-track"
+                                        aria-hidden="true"
+                                      >
+                                        <span className="switch-thumb" />
+                                      </span>
+                                    </button>
+                                  )}
                                 </div>
                               </div>
                               <div className="installed-collection-card-meta">
                                 <span>
                                   {modCount} mod{modCount === 1 ? "" : "s"}
                                 </span>
+                                {isCollectionDisabled ? (
+                                  <>
+                                    {" · "}
+                                    <span className="installed-collection-disabled-pill">
+                                      Disabled
+                                    </span>
+                                  </>
+                                ) : null}
                                 {c.friend_sync ? (
                                   <>
                                     {" · "}
@@ -9923,6 +10030,25 @@ export default function App() {
                                     >
                                       {hasUpdate ? "Update" : "Synced"}
                                     </span>
+                                  </>
+                                ) : null}
+                                {cardSyncers.length > 0 ? (
+                                  <>
+                                    {" · "}
+                                    <CollectionSyncersBadge
+                                      syncers={cardSyncers}
+                                      compact
+                                    />
+                                  </>
+                                ) : null}
+                                {cardActiveUsers.length > 0 ? (
+                                  <>
+                                    {" · "}
+                                    <CollectionSyncersBadge
+                                      syncers={cardActiveUsers}
+                                      labelPrefix="Active for"
+                                      compact
+                                    />
                                   </>
                                 ) : null}
                                 {collectionIntegrityById[c.id]?.issues
@@ -10651,14 +10777,51 @@ export default function App() {
                   }
                   coverSrc={coverSrc}
                   gameTitle={gameTitle}
-                  metaPills={
-                    isSavedCollectionInstalled(savedDetail.entry) ? (
+                  metaPills={(() => {
+                    const installedPill = isSavedCollectionInstalled(
+                      savedDetail.entry,
+                    ) ? (
                       <>
                         {" "}
                         <span className="pill ok">Installed</span>
                       </>
-                    ) : null
-                  }
+                    ) : null;
+                    const syncers = getFriendsSyncingCollection(
+                      friendsState?.friends,
+                      `saved:${savedDetail.entry.id}`,
+                    );
+                    const activeUsers = getFriendsWithActiveLoadoutMatching(
+                      friendsState?.friends,
+                      `saved:${savedDetail.entry.id}`,
+                    );
+                    if (
+                      !installedPill &&
+                      syncers.length === 0 &&
+                      activeUsers.length === 0
+                    ) {
+                      return null;
+                    }
+                    return (
+                      <>
+                        {installedPill}
+                        {syncers.length > 0 ? (
+                          <>
+                            {" "}
+                            <CollectionSyncersBadge syncers={syncers} />
+                          </>
+                        ) : null}
+                        {activeUsers.length > 0 ? (
+                          <>
+                            {" "}
+                            <CollectionSyncersBadge
+                              syncers={activeUsers}
+                              labelPrefix="Active for"
+                            />
+                          </>
+                        ) : null}
+                      </>
+                    );
+                  })()}
                   stats={savedDetail.entry}
                   versionWarning={
                     showGameVersionWarnings &&
@@ -10775,6 +10938,14 @@ export default function App() {
                       );
                       const advice = savedCollectionAdvice[c.id];
                       const installed = isSavedCollectionInstalled(c);
+                      const rowSyncers = getFriendsSyncingCollection(
+                        friendsState?.friends,
+                        `saved:${c.id}`,
+                      );
+                      const rowActiveUsers = getFriendsWithActiveLoadoutMatching(
+                        friendsState?.friends,
+                        `saved:${c.id}`,
+                      );
                       return (
                         <li
                           key={c.id}
@@ -10795,6 +10966,21 @@ export default function App() {
                               {formatIsoDate(c.created_at)
                                 ? ` · ${formatIsoDate(c.created_at)}`
                                 : ""}
+                              {rowSyncers.length > 0 ? (
+                                <>
+                                  {" · "}
+                                  <CollectionSyncersBadge syncers={rowSyncers} />
+                                </>
+                              ) : null}
+                              {rowActiveUsers.length > 0 ? (
+                                <>
+                                  {" · "}
+                                  <CollectionSyncersBadge
+                                    syncers={rowActiveUsers}
+                                    labelPrefix="Active for"
+                                  />
+                                </>
+                              ) : null}
                             </small>
                             {showGameVersionWarnings &&
                               advice?.status === "mismatch" && (
@@ -12834,19 +13020,17 @@ export default function App() {
                   ))}
                 </Segment>
               </div>
-              <label className="inline">
-                <input
-                  type="checkbox"
-                  checked={settings?.dismiss_banner_on_retry !== false}
-                  onChange={(e) =>
-                    withBusy("Saving…", async () => {
-                      await api.setDismissBannerOnRetry(e.target.checked);
-                      await refreshSettings();
-                    })
-                  }
-                />
+              <SettingsToggle
+                checked={settings?.dismiss_banner_on_retry !== false}
+                onChange={(checked) =>
+                  void withBusy("Saving…", async () => {
+                    await api.setDismissBannerOnRetry(checked);
+                    await refreshSettings();
+                  })
+                }
+              >
                 Dismiss download error banners when retrying or removing the download
-              </label>
+              </SettingsToggle>
               <p className="note">
                 Choose how long status banners stay visible before automatically
                 dismissing. Saved banners remain until dismissed, retried, or timed out.
@@ -13004,20 +13188,18 @@ export default function App() {
                   />
                 </label>
               </div>
-              <label className="inline">
-                <input
-                  type="checkbox"
-                  checked={settings?.autoclick_free_download ?? true}
-                  onChange={(e) =>
-                    withBusy("Saving…", async () => {
-                      await api.setAutoclickFreeDownload(e.target.checked);
-                      await refreshSettings();
-                    })
-                  }
-                />
+              <SettingsToggle
+                checked={settings?.autoclick_free_download ?? true}
+                onChange={(checked) =>
+                  void withBusy("Saving…", async () => {
+                    await api.setAutoclickFreeDownload(checked);
+                    await refreshSettings();
+                  })
+                }
+              >
                 Autoclick free download button in Download Assist (Nexus Fast
                 Download–style; waits for countdown)
-              </label>
+              </SettingsToggle>
               <p className="note">
                 Free accounts: Install opens the Downloads workspace with an embedded
                 Nexus Assist panel. Sign in once with Stay signed in, using Log in to
@@ -13029,32 +13211,28 @@ export default function App() {
               </p>
             </SettingsSection>
             <SettingsSection title="Content">
-              <label className="inline">
-                <input
-                  type="checkbox"
-                  checked={settings?.adult_content ?? true}
-                  onChange={(e) =>
-                    withBusy("Saving…", async () => {
-                      await api.setAdultContent(e.target.checked);
-                      await refreshSettings();
-                    })
-                  }
-                />
+              <SettingsToggle
+                checked={settings?.adult_content ?? true}
+                onChange={(checked) =>
+                  void withBusy("Saving…", async () => {
+                    await api.setAdultContent(checked);
+                    await refreshSettings();
+                  })
+                }
+              >
                 Show adult content in search
-              </label>
-              <label className="inline">
-                <input
-                  type="checkbox"
-                  checked={settings?.game_version_warnings !== false}
-                  onChange={(e) =>
-                    withBusy("Saving…", async () => {
-                      await api.setGameVersionWarnings(e.target.checked);
-                      await refreshSettings();
-                    })
-                  }
-                />
+              </SettingsToggle>
+              <SettingsToggle
+                checked={settings?.game_version_warnings !== false}
+                onChange={(checked) =>
+                  void withBusy("Saving…", async () => {
+                    await api.setGameVersionWarnings(checked);
+                    await refreshSettings();
+                  })
+                }
+              >
                 Warn when a mod does not match the game version
-              </label>
+              </SettingsToggle>
             </SettingsSection>
             <SettingsSection title="Data & maintenance">
               {settings && (
@@ -13708,7 +13886,9 @@ export default function App() {
                           (m) => m.enabled,
                         ).length;
                         const isCollectionDisabled =
-                          installedMemberCount > 0 && enabledMemberCount === 0;
+                          Boolean(c.disabled) ||
+                          (installedMemberCount > 0 &&
+                            enabledMemberCount === 0);
                         const modCount =
                           installedMemberCount > 0
                             ? installedMemberCount
@@ -13722,6 +13902,22 @@ export default function App() {
                               c.namespace &&
                               c.package_name),
                         );
+                        const matchingSavedId = findMatchingSavedCollectionId(
+                          c,
+                          savedCollections,
+                        );
+                        const cardSyncers = matchingSavedId
+                          ? getFriendsSyncingCollection(
+                              friendsState?.friends,
+                              matchingSavedId,
+                            )
+                          : [];
+                        const cardActiveUsers = matchingSavedId
+                          ? getFriendsWithActiveLoadoutMatching(
+                              friendsState?.friends,
+                              matchingSavedId,
+                            )
+                          : [];
                         return (
                           <li
                             key={c.id}
@@ -13770,6 +13966,21 @@ export default function App() {
                                     >
                                       {hasUpdate ? "Update available" : "Synced"}
                                     </span>
+                                  </>
+                                ) : null}
+                                {cardSyncers.length > 0 ? (
+                                  <>
+                                    {" · "}
+                                    <CollectionSyncersBadge syncers={cardSyncers} />
+                                  </>
+                                ) : null}
+                                {cardActiveUsers.length > 0 ? (
+                                  <>
+                                    {" · "}
+                                    <CollectionSyncersBadge
+                                      syncers={cardActiveUsers}
+                                      labelPrefix="Active for"
+                                    />
                                   </>
                                 ) : null}
                                 {collectionIntegrityById[c.id]?.issues.length ? (
@@ -13992,7 +14203,16 @@ export default function App() {
                   code → Save only.
                 </p>
                 <ul className="list">
-                  {gameSavedCollections.map((c, idx) => (
+                  {gameSavedCollections.map((c, idx) => {
+                    const rowSyncers = getFriendsSyncingCollection(
+                      friendsState?.friends,
+                      `saved:${c.id}`,
+                    );
+                    const rowActiveUsers = getFriendsWithActiveLoadoutMatching(
+                      friendsState?.friends,
+                      `saved:${c.id}`,
+                    );
+                    return (
                     <li
                       key={c.id}
                       className="list-row-clickable stagger-item"
@@ -14022,6 +14242,21 @@ export default function App() {
                           {formatIsoDate(c.created_at)
                             ? ` · ${formatIsoDate(c.created_at)}`
                             : ""}
+                          {rowSyncers.length > 0 ? (
+                            <>
+                              {" · "}
+                              <CollectionSyncersBadge syncers={rowSyncers} />
+                            </>
+                          ) : null}
+                          {rowActiveUsers.length > 0 ? (
+                            <>
+                              {" · "}
+                              <CollectionSyncersBadge
+                                syncers={rowActiveUsers}
+                                labelPrefix="Active for"
+                              />
+                            </>
+                          ) : null}
                         </small>
                       </div>
                       <div
@@ -14061,7 +14296,8 @@ export default function App() {
                         </button>
                       </div>
                     </li>
-                  ))}
+                    );
+                  })}
                   {gameSavedCollections.length === 0 && (
                     <li className="empty">
                       No saved share codes for this game yet. Share a loadout

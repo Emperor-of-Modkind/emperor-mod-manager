@@ -37,6 +37,7 @@ const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 const STREAM_IO_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CONCURRENT_INCOMING: usize = 32;
+const MAX_CONCURRENT_PER_PEER: usize = 3;
 const MAX_STREAMS_PER_CONN: usize = 8;
 const MAX_PENDING_REQUESTS: usize = 50;
 const MAX_JOIN_CODE_LEN: usize = 16 * 1024;
@@ -44,6 +45,7 @@ const MAX_JOIN_TICKET_BYTES: usize = 64 * 1024;
 const MAX_DISPLAY_NAME_CHARS: usize = 64;
 const MAX_REMOTE_COLLECTIONS: usize = 128;
 const MAX_REMOTE_FRIENDS: usize = 256;
+const MAX_FRIEND_CACHED_SHARE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_COLLECTION_ID_CHARS: usize = 128;
 const MAX_COLLECTION_NAME_CHARS: usize = 128;
 const MAX_SHARE_HASH_CHARS: usize = 128;
@@ -54,15 +56,47 @@ const MAX_FEED_DIFF_NAMES: usize = 5;
 const HELLO_PER_PEER_COOLDOWN: Duration = Duration::from_secs(5);
 const HELLO_GLOBAL_WINDOW: Duration = Duration::from_secs(60);
 const HELLO_GLOBAL_MAX_PER_WINDOW: usize = 20;
+const PROFILE_RATE_BURST: f64 = 8.0;
+const PROFILE_RATE_REFILL_PER_SEC: f64 = 0.5;
+const RELAY_PROFILE_DOMAIN_PREFIX: &[u8] = b"emperor-relay-profile-v1\0";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum FriendCollectionKind {
+    #[default]
     ActiveLoadout,
     SavedCollection,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FriendCollectionMatchKind {
+    /// Friend is syncing one of your collections and their active loadout uses it.
+    SyncedToYours,
+    /// Friend's active loadout matches the mod set of one of your saved collections.
+    MatchesSaved,
+    /// Friend's active loadout matches the mod set of one of your installed collections.
+    MatchesInstalled,
+    /// Friend's active loadout matches the mod set of your own active loadout.
+    MatchesActiveLoadout,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FriendMatchedLocalCollection {
+    pub id: String,
+    pub name: String,
+    pub kind: FriendCollectionMatchKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub game_id: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub has_local_changes: bool,
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct FriendShareRef {
     pub id: String,
     pub kind: FriendCollectionKind,
@@ -72,6 +106,19 @@ pub struct FriendShareRef {
     pub share_code: String,
     pub share_hash: String,
     pub updated_at: String,
+    /// True when the sender shared this collection only via `SpecificFriends`
+    /// (not `AllFriends`), so local caches preserve it across `AllFriends`-only
+    /// mutual-friend relays.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub specific_friends_only: bool,
+    /// Set by the sender on `ActiveLoadout` when their active loadout corresponds
+    /// to an installed collection synced from the requesting `viewer_peer_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synced_source_collection_id: Option<String>,
+    /// Viewer-side resolution populated by `get_state()` when a friend's active
+    /// loadout matches or is synced to one of the viewer's local collections.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_local_collection: Option<FriendMatchedLocalCollection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,10 +127,39 @@ pub struct SharedFriendRef {
     pub display_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub addr: Option<EndpointAddr>,
+    /// `updated_at` of this friend's `SignedRelayProfile` cached on the sender,
+    /// allowing mutual friends to detect newer offline caches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_updated_at: Option<String>,
 }
 
 fn default_allow_mutual_connections() -> bool {
     true
+}
+
+fn default_allow_cache_relay() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayProfilePayload {
+    pub peer_id: String,
+    pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_picture: Option<String>,
+    pub updated_at: String,
+    pub collections: Vec<FriendShareRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub friends: Option<Vec<SharedFriendRef>>,
+    #[serde(default = "default_allow_mutual_connections")]
+    pub allow_mutual_connections: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedRelayProfile {
+    pub payload: RelayProfilePayload,
+    /// Hex-encoded Ed25519 signature over canonical JSON of `payload`.
+    pub signature: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,6 +178,10 @@ pub struct PeerProfileSummary {
     /// friends lists (visible to friends-of-friends / mutual connections).
     #[serde(default = "default_allow_mutual_connections")]
     pub allow_mutual_connections: bool,
+    /// Signed `AllFriends`-only snapshot that mutual friends may relay when
+    /// this peer is offline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_relay_profile: Option<SignedRelayProfile>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,6 +205,12 @@ pub struct FriendRecord {
     pub last_seen_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_profile: Option<PeerProfileSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub syncing_my_collections: Vec<String>,
+    /// Display name of the mutual friend from whom the current cached profile
+    /// was relayed while this friend was offline (cleared on direct sync).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_via_peer_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -214,6 +300,8 @@ pub struct FriendsStore {
     pub friends_list_visibility: CollectionVisibility,
     #[serde(default = "default_allow_mutual_connections")]
     pub allow_mutual_connections: bool,
+    #[serde(default = "default_allow_cache_relay")]
+    pub allow_cache_relay: bool,
     #[serde(default)]
     pub appear_offline: bool,
     #[serde(default)]
@@ -234,6 +322,7 @@ impl Default for FriendsStore {
             collection_visibility: HashMap::new(),
             friends_list_visibility: default_friends_list_visibility(),
             allow_mutual_connections: default_allow_mutual_connections(),
+            allow_cache_relay: default_allow_cache_relay(),
             appear_offline: false,
             feed_events: Vec::new(),
             feed_last_read_at: None,
@@ -253,7 +342,7 @@ fn is_disallowed_ui_char(c: char) -> bool {
         )
 }
 
-fn sanitize_short_text(raw: &str, max_chars: usize) -> String {
+pub fn sanitize_short_text(raw: &str, max_chars: usize) -> String {
     raw.chars()
         .filter(|&c| !is_disallowed_ui_char(c))
         .collect::<String>()
@@ -287,18 +376,41 @@ fn validate_profile_picture(data_url: &str) -> Result<()> {
     if data_url.len() > MAX_PROFILE_PICTURE_BYTES {
         bail!("Profile picture exceeds 256 KB limit");
     }
-    let b64_payload = data_url
-        .strip_prefix("data:image/png;base64,")
-        .or_else(|| data_url.strip_prefix("data:image/jpeg;base64,"))
-        .or_else(|| data_url.strip_prefix("data:image/webp;base64,"))
-        .or_else(|| data_url.strip_prefix("data:image/gif;base64,"))
-        .ok_or_else(|| anyhow!("Profile picture must be a PNG, JPEG, WebP, or GIF image"))?;
+    #[derive(Clone, Copy)]
+    enum ImageKind {
+        Png,
+        Jpeg,
+        Webp,
+        Gif,
+    }
+    let (kind, b64_payload) = if let Some(p) = data_url.strip_prefix("data:image/png;base64,") {
+        (ImageKind::Png, p)
+    } else if let Some(p) = data_url.strip_prefix("data:image/jpeg;base64,") {
+        (ImageKind::Jpeg, p)
+    } else if let Some(p) = data_url.strip_prefix("data:image/webp;base64,") {
+        (ImageKind::Webp, p)
+    } else if let Some(p) = data_url.strip_prefix("data:image/gif;base64,") {
+        (ImageKind::Gif, p)
+    } else {
+        bail!("Profile picture must be a PNG, JPEG, WebP, or GIF image");
+    };
     if b64_payload.is_empty() {
         bail!("Profile picture payload is empty");
     }
-    base64::engine::general_purpose::STANDARD
+    let decoded = base64::engine::general_purpose::STANDARD
         .decode(b64_payload.as_bytes())
         .context("Profile picture contains invalid base64 data")?;
+    let valid_magic = match kind {
+        ImageKind::Png => decoded.starts_with(b"\x89PNG\r\n\x1a\n"),
+        ImageKind::Jpeg => decoded.starts_with(b"\xFF\xD8\xFF"),
+        ImageKind::Gif => decoded.starts_with(b"GIF87a") || decoded.starts_with(b"GIF89a"),
+        ImageKind::Webp => {
+            decoded.len() >= 12 && &decoded[..4] == b"RIFF" && &decoded[8..12] == b"WEBP"
+        }
+    };
+    if !valid_magic {
+        bail!("Profile picture bytes do not match declared image format");
+    }
     Ok(())
 }
 
@@ -363,6 +475,58 @@ fn join_ticket_addr(addr: &EndpointAddr) -> EndpointAddr {
     }
 }
 
+/// Returns a relay-only `EndpointAddr` for sharing a friend's address with third-party
+/// friends. In production, omits raw IP addresses when no relay is available so home/LAN
+/// IPs are never forwarded to third parties; in tests (`N0DisableRelay`), keeps the
+/// loopback address so local multi-endpoint discovery tests can connect.
+fn shared_friend_addr(addr: &EndpointAddr) -> Option<EndpointAddr> {
+    let relays: BTreeSet<TransportAddr> = addr
+        .addrs
+        .iter()
+        .filter(|ta| matches!(ta, TransportAddr::Relay(_)))
+        .take(MAX_PEER_RELAY_ADDRS)
+        .cloned()
+        .collect();
+    if !relays.is_empty() {
+        Some(EndpointAddr {
+            id: addr.id,
+            addrs: relays,
+        })
+    } else if cfg!(test) {
+        Some(addr.clone())
+    } else {
+        None
+    }
+}
+
+#[derive(Default)]
+struct PeerProfileRateLimiter {
+    buckets: HashMap<String, (f64, Instant)>,
+}
+
+impl PeerProfileRateLimiter {
+    fn allow(&mut self, peer_id: &str) -> bool {
+        let now = Instant::now();
+        if self.buckets.len() > 512 {
+            self.buckets
+                .retain(|_, (_, ts)| now.duration_since(*ts) < Duration::from_secs(300));
+        }
+        let entry = self
+            .buckets
+            .entry(peer_id.to_string())
+            .or_insert((PROFILE_RATE_BURST, now));
+        let elapsed = now.duration_since(entry.1).as_secs_f64();
+        entry.0 = (entry.0 + elapsed * PROFILE_RATE_REFILL_PER_SEC).min(PROFILE_RATE_BURST);
+        entry.1 = now;
+        if entry.0 >= 1.0 {
+            entry.0 -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 #[derive(Default)]
 struct HelloRateLimiter {
     per_peer: HashMap<String, Instant>,
@@ -421,6 +585,8 @@ pub struct FriendsState {
     pub friends_list_visibility: CollectionVisibility,
     #[serde(default = "default_allow_mutual_connections")]
     pub allow_mutual_connections: bool,
+    #[serde(default = "default_allow_cache_relay")]
+    pub allow_cache_relay: bool,
     pub friends: Vec<FriendRecord>,
     pub pending_requests: Vec<PendingFriendRequest>,
     pub local_collections: Vec<LocalShareableCollection>,
@@ -445,6 +611,13 @@ enum P2pRequest {
     },
     GetProfile {
         known_hashes: HashMap<String, String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        synced_collection_ids: Option<Vec<String>>,
+    },
+    GetCachedFriendProfile {
+        target_peer_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        known_updated_at: Option<String>,
     },
 }
 
@@ -457,11 +630,93 @@ enum P2pResponse {
         addr: EndpointAddr,
     },
     Profile(PeerProfileSummary),
+    CachedFriendProfile(SignedRelayProfile),
+    CachedFriendNotNewer,
     Denied(String),
 }
 
 fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
+}
+
+fn is_timestamp_newer(candidate: &str, existing: Option<&str>) -> bool {
+    let Ok(cand_dt) = chrono::DateTime::parse_from_rfc3339(candidate) else {
+        return false;
+    };
+    let Some(existing_str) = existing else {
+        return true;
+    };
+    match chrono::DateTime::parse_from_rfc3339(existing_str) {
+        Ok(exist_dt) => cand_dt > exist_dt,
+        Err(_) => true,
+    }
+}
+
+fn sign_relay_profile(key: &SecretKey, payload: RelayProfilePayload) -> Result<SignedRelayProfile> {
+    let json_bytes = serde_json::to_vec(&payload).context("serialize relay profile payload")?;
+    let mut msg = Vec::with_capacity(RELAY_PROFILE_DOMAIN_PREFIX.len() + json_bytes.len());
+    msg.extend_from_slice(RELAY_PROFILE_DOMAIN_PREFIX);
+    msg.extend_from_slice(&json_bytes);
+    let sig = key.sign(&msg);
+    Ok(SignedRelayProfile {
+        payload,
+        signature: hex::encode(sig.to_bytes()),
+    })
+}
+
+fn validate_relay_profile_payload(payload: &RelayProfilePayload) -> Result<()> {
+    chrono::DateTime::parse_from_rfc3339(&payload.updated_at)
+        .context("invalid relay profile updated_at timestamp")?;
+    if let Some(ref pic) = payload.profile_picture {
+        validate_profile_picture(pic)?;
+    }
+    if payload.collections.len() > MAX_REMOTE_COLLECTIONS {
+        bail!("relay profile exceeds max collections");
+    }
+    let mut total_share_bytes = 0usize;
+    for col in &payload.collections {
+        if col.share_code.len() > share::MAX_SHARE_CODE_BYTES {
+            bail!("relay profile collection share_code exceeds max size");
+        }
+        total_share_bytes = total_share_bytes.saturating_add(col.share_code.len());
+        if total_share_bytes > MAX_FRIEND_CACHED_SHARE_BYTES {
+            bail!("relay profile total share_code bytes exceed budget");
+        }
+    }
+    if let Some(ref friends) = payload.friends {
+        if friends.len() > MAX_REMOTE_FRIENDS {
+            bail!("relay profile exceeds max friends");
+        }
+    }
+    Ok(())
+}
+
+fn verify_signed_relay_profile(expected_peer_id: &str, signed: &SignedRelayProfile) -> Result<()> {
+    if signed.payload.peer_id != expected_peer_id {
+        bail!("Relay profile peer_id does not match target peer");
+    }
+    validate_relay_profile_payload(&signed.payload)?;
+    let pk: EndpointId = expected_peer_id
+        .trim()
+        .parse()
+        .context("invalid target peer_id")?;
+    let sig_bytes = hex::decode(signed.signature.trim()).context("invalid relay signature hex")?;
+    let sig_arr: [u8; 64] = sig_bytes
+        .try_into()
+        .map_err(|_| anyhow!("invalid relay signature length"))?;
+    let sig = iroh::Signature::from_bytes(&sig_arr);
+    let json_bytes =
+        serde_json::to_vec(&signed.payload).context("serialize relay profile payload")?;
+    let mut domain_msg = Vec::with_capacity(RELAY_PROFILE_DOMAIN_PREFIX.len() + json_bytes.len());
+    domain_msg.extend_from_slice(RELAY_PROFILE_DOMAIN_PREFIX);
+    domain_msg.extend_from_slice(&json_bytes);
+    if pk.verify(&domain_msg, &sig).is_ok() {
+        return Ok(());
+    }
+    // Dual-verify legacy unprefixed JSON signatures from older peers for smooth upgrades.
+    pk.verify(&json_bytes, &sig)
+        .map_err(|e| anyhow!("invalid relay profile signature: {e}"))?;
+    Ok(())
 }
 
 fn share_mod_identity(m: &share::ShareModEntry) -> String {
@@ -864,6 +1119,108 @@ pub fn is_friends_list_visible_to(store: &FriendsStore, viewer_peer_id: Option<&
     }
 }
 
+fn resolve_cached_friend_profile_for_peer(
+    store: &FriendsStore,
+    requester_peer_id: &str,
+    target_peer_id: &str,
+    known_updated_at: Option<&str>,
+) -> P2pResponse {
+    let requester_is_friend = store
+        .friends
+        .iter()
+        .any(|f| f.peer_id == requester_peer_id && f.status == FriendStatus::Connected);
+    if !requester_is_friend {
+        return P2pResponse::Denied("Not connected as friends".into());
+    }
+    if !store.allow_cache_relay {
+        return P2pResponse::Denied("Cache relay is disabled by this peer".into());
+    }
+    if requester_peer_id == target_peer_id {
+        return P2pResponse::Denied("Cannot relay your own profile".into());
+    }
+    if !is_friends_list_visible_to(store, Some(requester_peer_id)) {
+        return P2pResponse::Denied("Friends list is not shared".into());
+    }
+    let Some(target) = store
+        .friends
+        .iter()
+        .find(|f| f.peer_id == target_peer_id && f.status == FriendStatus::Connected)
+    else {
+        return P2pResponse::Denied("Target peer is not a connected friend".into());
+    };
+    let Some(ref profile) = target.cached_profile else {
+        return P2pResponse::Denied("No cached profile for target peer".into());
+    };
+    if !profile.allow_mutual_connections {
+        return P2pResponse::Denied("Target peer opted out of mutual connections".into());
+    }
+    let Some(ref relay) = profile.signed_relay_profile else {
+        return P2pResponse::Denied("Target peer has no relayable profile".into());
+    };
+    if verify_signed_relay_profile(target_peer_id, relay).is_err() {
+        return P2pResponse::Denied("Cached relay profile signature invalid".into());
+    }
+    // Check the AllFriends-only relay payload's friends list so a SpecificFriends
+    // list shared only with us cannot be used to infer a hidden friendship.
+    let mutual_confirmed = relay
+        .payload
+        .friends
+        .as_ref()
+        .is_some_and(|list| list.iter().any(|sf| sf.peer_id == requester_peer_id));
+    if !mutual_confirmed {
+        return P2pResponse::Denied("Mutual friendship not confirmed".into());
+    }
+    if !is_timestamp_newer(&relay.payload.updated_at, known_updated_at) {
+        return P2pResponse::CachedFriendNotNewer;
+    }
+    P2pResponse::CachedFriendProfile(relay.clone())
+}
+
+/// Collects local collection IDs (`active:<game_id>` or `saved:<id>`) that are
+/// currently linked via `friend_sync` to the given remote `peer_id`.
+pub fn collect_synced_collection_ids(paths: &Paths, peer_id: &str) -> Vec<String> {
+    let mut ids = HashSet::new();
+    if let Ok(cfg) = load_config(paths) {
+        for game in &cfg.managed_games {
+            if let Ok(cols) = mods::load_collections(paths, &game.id) {
+                for col in cols.collections {
+                    if let Some(sync) = col.friend_sync {
+                        if sync.friend_peer_id == peer_id && !sync.friend_collection_id.trim().is_empty() {
+                            ids.insert(sync.friend_collection_id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut out: Vec<String> = ids.into_iter().collect();
+    out.sort();
+    out.truncate(MAX_REMOTE_COLLECTIONS);
+    out
+}
+
+/// Sanitizes and filters incoming `synced_collection_ids` reported by a friend
+/// so only non-empty, visible collection IDs are stored.
+fn sanitize_synced_collection_ids(
+    store: &FriendsStore,
+    remote_id: &str,
+    ids: Vec<String>,
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for raw in ids.into_iter().take(MAX_REMOTE_COLLECTIONS) {
+        let clean = sanitize_short_text(&raw, MAX_COLLECTION_ID_CHARS);
+        if clean.is_empty() || !is_collection_visible_to(store, &clean, Some(remote_id)) {
+            continue;
+        }
+        if seen.insert(clean.clone()) {
+            out.push(clean);
+        }
+    }
+    out.sort();
+    out
+}
+
 pub fn list_local_shareable_collections(
     paths: &Paths,
     store: &FriendsStore,
@@ -915,20 +1272,62 @@ pub fn list_local_shareable_collections(
     out
 }
 
+fn resolve_active_synced_source_collection_id(
+    paths: &Paths,
+    game_id: &str,
+    active_manifest: &share::ShareManifest,
+    order: &mods::LoadOrder,
+    viewer_peer_id: Option<&str>,
+) -> Option<String> {
+    let viewer = viewer_peer_id?;
+    let installed = mods::list_installed_collections(paths, game_id).ok()?;
+    let enabled_ids: HashSet<&str> = order
+        .mods
+        .iter()
+        .filter(|m| m.enabled)
+        .map(|m| m.id.as_str())
+        .collect();
+    for col in installed {
+        let Some(sync) = col.friend_sync.as_ref() else {
+            continue;
+        };
+        if sync.friend_peer_id != viewer || sync.friend_collection_id.trim().is_empty() {
+            continue;
+        }
+        let matches_manifest = col
+            .profile_code
+            .as_deref()
+            .and_then(|c| share::decode_share_code(c).ok())
+            .is_some_and(|m| share::manifest_mods_match(&active_manifest.mods, &m.mods));
+        let matches_mod_ids = !col.mod_ids.is_empty()
+            && col.mod_ids.len() == enabled_ids.len()
+            && col.mod_ids.iter().all(|id| enabled_ids.contains(id.as_str()));
+        if matches_manifest || matches_mod_ids {
+            return Some(sync.friend_collection_id.clone());
+        }
+    }
+    None
+}
+
 pub fn build_local_profile(
     paths: &Paths,
     peer_id: &str,
     store: &FriendsStore,
     known_hashes: Option<&HashMap<String, String>>,
     viewer_peer_id: Option<&str>,
+    signing_key: Option<&SecretKey>,
 ) -> PeerProfileSummary {
     let mut collections = Vec::new();
+    let mut relay_collections = Vec::new();
     let now = now_rfc3339();
 
     if let Ok(cfg) = load_config(paths) {
         for game in &cfg.managed_games {
             let col_id = format!("active:{}", game.id);
-            if !is_collection_visible_to(store, &col_id, viewer_peer_id) {
+            let vis = resolve_collection_visibility(store, &col_id);
+            let visible_to_viewer = is_collection_visible_to(store, &col_id, viewer_peer_id);
+            let is_all_friends = matches!(vis, CollectionVisibility::AllFriends);
+            if !visible_to_viewer && !(signing_key.is_some() && is_all_friends) {
                 continue;
             }
             if let Ok(order) = mods::load_loadorder(paths, &game.id) {
@@ -945,17 +1344,43 @@ pub fn build_local_profile(
                 manifest.game_versions = game.game_version.as_ref().map(|v| vec![v.clone()]);
                 if let Ok(code) = share::encode_share_manifest(&manifest) {
                     let hash = share::share_hash(&code);
-                    let unchanged = known_hashes
-                        .and_then(|m| m.get(&col_id))
-                        .is_some_and(|h| h == &hash);
-                    collections.push(FriendShareRef {
-                        id: col_id,
-                        kind: FriendCollectionKind::ActiveLoadout,
-                        name,
-                        share_code: if unchanged { String::new() } else { code },
-                        share_hash: hash,
-                        updated_at: now.clone(),
-                    });
+                    if signing_key.is_some() && is_all_friends {
+                        relay_collections.push(FriendShareRef {
+                            id: col_id.clone(),
+                            kind: FriendCollectionKind::ActiveLoadout,
+                            name: name.clone(),
+                            share_code: code.clone(),
+                            share_hash: hash.clone(),
+                            updated_at: now.clone(),
+                            specific_friends_only: false,
+                            synced_source_collection_id: None,
+                            matched_local_collection: None,
+                        });
+                    }
+                    if visible_to_viewer {
+                        let unchanged = known_hashes
+                            .and_then(|m| m.get(&col_id))
+                            .is_some_and(|h| h == &hash);
+                        let synced_source_collection_id =
+                            resolve_active_synced_source_collection_id(
+                                paths,
+                                &game.id,
+                                &manifest,
+                                &order,
+                                viewer_peer_id,
+                            );
+                        collections.push(FriendShareRef {
+                            id: col_id,
+                            kind: FriendCollectionKind::ActiveLoadout,
+                            name,
+                            share_code: if unchanged { String::new() } else { code },
+                            share_hash: hash,
+                            updated_at: now.clone(),
+                            specific_friends_only: matches!(vis, CollectionVisibility::SpecificFriends { .. }),
+                            synced_source_collection_id,
+                            matched_local_collection: None,
+                        });
+                    }
                 }
             }
         }
@@ -964,56 +1389,109 @@ pub fn build_local_profile(
     if let Ok(saved) = share::load_saved_collections(paths) {
         for entry in saved.collections {
             let col_id = format!("saved:{}", entry.id);
-            if !is_collection_visible_to(store, &col_id, viewer_peer_id) {
+            let vis = resolve_collection_visibility(store, &col_id);
+            let visible_to_viewer = is_collection_visible_to(store, &col_id, viewer_peer_id);
+            let is_all_friends = matches!(vis, CollectionVisibility::AllFriends);
+            if !visible_to_viewer && !(signing_key.is_some() && is_all_friends) {
                 continue;
             }
             let hash = share::share_hash(&entry.code);
-            let unchanged = known_hashes
-                .and_then(|m| m.get(&col_id))
-                .is_some_and(|h| h == &hash);
-            collections.push(FriendShareRef {
-                id: col_id,
-                kind: FriendCollectionKind::SavedCollection,
-                name: entry.name,
-                share_code: if unchanged { String::new() } else { entry.code },
-                share_hash: hash,
-                updated_at: entry.updated_at,
-            });
+            if signing_key.is_some() && is_all_friends {
+                relay_collections.push(FriendShareRef {
+                    id: col_id.clone(),
+                    kind: FriendCollectionKind::SavedCollection,
+                    name: entry.name.clone(),
+                    share_code: entry.code.clone(),
+                    share_hash: hash.clone(),
+                    updated_at: entry.updated_at.clone(),
+                    specific_friends_only: false,
+                    synced_source_collection_id: None,
+                    matched_local_collection: None,
+                });
+            }
+            if visible_to_viewer {
+                let unchanged = known_hashes
+                    .and_then(|m| m.get(&col_id))
+                    .is_some_and(|h| h == &hash);
+                collections.push(FriendShareRef {
+                    id: col_id,
+                    kind: FriendCollectionKind::SavedCollection,
+                    name: entry.name,
+                    share_code: if unchanged { String::new() } else { entry.code },
+                    share_hash: hash,
+                    updated_at: entry.updated_at,
+                    specific_friends_only: matches!(vis, CollectionVisibility::SpecificFriends { .. }),
+                    synced_source_collection_id: None,
+                    matched_local_collection: None,
+                });
+            }
         }
     }
 
+    let build_shared_friends = |exclude_peer: Option<&str>, include_updated_at: bool| -> Vec<SharedFriendRef> {
+        store
+            .friends
+            .iter()
+            .filter(|f| {
+                f.status == FriendStatus::Connected
+                    && exclude_peer.is_none_or(|p| f.peer_id != p)
+                    && f.cached_profile
+                        .as_ref()
+                        .is_some_and(|p| p.allow_mutual_connections)
+            })
+            .take(MAX_REMOTE_FRIENDS)
+            .map(|f| SharedFriendRef {
+                peer_id: f.peer_id.clone(),
+                display_name: sanitize_display_name(&f.display_name, "Friend"),
+                addr: shared_friend_addr(&f.addr),
+                profile_updated_at: if include_updated_at {
+                    f.cached_profile
+                        .as_ref()
+                        .and_then(|p| p.signed_relay_profile.as_ref())
+                        .map(|r| r.payload.updated_at.clone())
+                } else {
+                    None
+                },
+            })
+            .collect()
+    };
+
     let friends = if is_friends_list_visible_to(store, viewer_peer_id) {
-        Some(
-            store
-                .friends
-                .iter()
-                .filter(|f| {
-                    f.status == FriendStatus::Connected
-                        && Some(f.peer_id.as_str()) != viewer_peer_id
-                        && f.cached_profile
-                            .as_ref()
-                            .is_none_or(|p| p.allow_mutual_connections)
-                })
-                .take(MAX_REMOTE_FRIENDS)
-                .map(|f| SharedFriendRef {
-                    peer_id: f.peer_id.clone(),
-                    display_name: sanitize_display_name(&f.display_name, "Friend"),
-                    addr: Some(join_ticket_addr(&f.addr)),
-                })
-                .collect(),
-        )
+        Some(build_shared_friends(viewer_peer_id, store.allow_cache_relay))
     } else {
         None
     };
 
+    let display_name = effective_display_name(store);
+    let signed_relay_profile = signing_key.and_then(|key| {
+        let relay_friends = if is_friends_list_visible_to(store, None) {
+            Some(build_shared_friends(None, false))
+        } else {
+            None
+        };
+        let payload = RelayProfilePayload {
+            peer_id: peer_id.to_string(),
+            display_name: display_name.clone(),
+            profile_picture: store.profile_picture.clone(),
+            updated_at: now.clone(),
+            collections: relay_collections,
+            friends: relay_friends,
+            allow_mutual_connections: store.allow_mutual_connections,
+        };
+        sign_relay_profile(key, payload)
+            .map_err(|e| log::warn!("Failed to sign relay profile: {e}"))
+            .ok()
+    });
+
     PeerProfileSummary {
         peer_id: peer_id.to_string(),
-        display_name: effective_display_name(store),
+        display_name,
         profile_picture: store.profile_picture.clone(),
         updated_at: now,
         collections,
         friends,
         allow_mutual_connections: store.allow_mutual_connections,
+        signed_relay_profile,
     }
 }
 
@@ -1075,13 +1553,217 @@ impl Drop for CheckingGuard<'_> {
     }
 }
 
+struct PeerConnGuard<'a> {
+    service: &'a P2pService,
+    peer_id: String,
+}
+
+impl Drop for PeerConnGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut counts) = self.service.active_peer_conns.lock() {
+            if let Some(count) = counts.get_mut(&self.peer_id) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    counts.remove(&self.peer_id);
+                }
+            }
+        }
+    }
+}
+
 pub struct P2pService {
     paths: Paths,
     store: Arc<Mutex<FriendsStore>>,
     endpoint: OnceCell<Endpoint>,
+    secret_key: OnceCell<SecretKey>,
     app: Mutex<Option<AppHandle>>,
     incoming_sem: Arc<Semaphore>,
     hello_limiter: Mutex<HelloRateLimiter>,
+    profile_limiter: Mutex<PeerProfileRateLimiter>,
+    active_peer_conns: Mutex<HashMap<String, usize>>,
+}
+
+struct LocalShareManifestEntry {
+    id: String,
+    name: String,
+    game_id: Option<String>,
+    manifest: share::ShareManifest,
+}
+
+fn find_local_share_by_id<'a>(
+    saved: &'a [LocalShareManifestEntry],
+    active: &'a [LocalShareManifestEntry],
+    id: &str,
+) -> Option<&'a LocalShareManifestEntry> {
+    saved
+        .iter()
+        .chain(active.iter())
+        .find(|entry| entry.id == id)
+}
+
+fn resolve_friend_active_loadouts(paths: &Paths, friends: &mut [FriendRecord]) {
+    let has_active_loadouts = friends.iter().any(|f| {
+        f.cached_profile.as_ref().is_some_and(|p| {
+            p.collections
+                .iter()
+                .any(|c| c.kind == FriendCollectionKind::ActiveLoadout)
+        })
+    });
+    if !has_active_loadouts {
+        return;
+    }
+
+    let mut saved_entries = Vec::new();
+    if let Ok(saved) = share::load_saved_collections(paths) {
+        for entry in saved.collections {
+            if let Ok(manifest) = share::decode_share_code(&entry.code) {
+                saved_entries.push(LocalShareManifestEntry {
+                    id: format!("saved:{}", entry.id),
+                    name: entry.name,
+                    game_id: entry.source_game_id,
+                    manifest,
+                });
+            }
+        }
+    }
+
+    let mut active_entries = Vec::new();
+    let mut installed_entries = Vec::new();
+    if let Ok(cfg) = load_config(paths) {
+        for game in &cfg.managed_games {
+            if let Ok(order) = mods::load_loadorder(paths, &game.id) {
+                let name = format!("{} Loadout", game.title);
+                let (manifest, _, _) = share::build_manifest_from_loadorder_with_selections(
+                    &order,
+                    game,
+                    Some(name.clone()),
+                    true,
+                );
+                if !manifest.mods.is_empty() {
+                    active_entries.push(LocalShareManifestEntry {
+                        id: format!("active:{}", game.id),
+                        name,
+                        game_id: Some(game.id.clone()),
+                        manifest,
+                    });
+                }
+            }
+            if let Ok(installed) = mods::list_installed_collections(paths, &game.id) {
+                for col in installed {
+                    if let Some(code) = col.profile_code.as_deref() {
+                        if let Ok(manifest) = share::decode_share_code(code) {
+                            installed_entries.push(LocalShareManifestEntry {
+                                id: format!("installed:{}:{}", game.id, col.id),
+                                name: col.name,
+                                game_id: Some(game.id.clone()),
+                                manifest,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for friend in friends.iter_mut() {
+        let syncing_ids: HashSet<String> = friend.syncing_my_collections.iter().cloned().collect();
+        let Some(profile) = friend.cached_profile.as_mut() else {
+            continue;
+        };
+        for col in profile.collections.iter_mut() {
+            if col.kind != FriendCollectionKind::ActiveLoadout {
+                col.matched_local_collection = None;
+                continue;
+            }
+            let friend_manifest = (!col.share_code.is_empty())
+                .then(|| share::decode_share_code(&col.share_code).ok())
+                .flatten();
+
+            if let Some(src_id) = col.synced_source_collection_id.as_deref() {
+                if let Some(local) = find_local_share_by_id(&saved_entries, &active_entries, src_id)
+                {
+                    let has_local_changes = friend_manifest.as_ref().is_some_and(|fm| {
+                        !share::manifest_mods_match(&fm.mods, &local.manifest.mods)
+                    });
+                    col.matched_local_collection = Some(FriendMatchedLocalCollection {
+                        id: local.id.clone(),
+                        name: local.name.clone(),
+                        kind: FriendCollectionMatchKind::SyncedToYours,
+                        game_id: local.game_id.clone(),
+                        has_local_changes,
+                    });
+                    continue;
+                }
+            }
+
+            let Some(fm) = friend_manifest.as_ref() else {
+                col.matched_local_collection = None;
+                continue;
+            };
+
+            if let Some(local) = saved_entries
+                .iter()
+                .chain(active_entries.iter())
+                .find(|entry| {
+                    syncing_ids.contains(&entry.id)
+                        && share::manifest_mods_match(&fm.mods, &entry.manifest.mods)
+                })
+            {
+                col.matched_local_collection = Some(FriendMatchedLocalCollection {
+                    id: local.id.clone(),
+                    name: local.name.clone(),
+                    kind: FriendCollectionMatchKind::SyncedToYours,
+                    game_id: local.game_id.clone(),
+                    has_local_changes: false,
+                });
+                continue;
+            }
+
+            if let Some(saved) = saved_entries
+                .iter()
+                .find(|entry| share::manifest_mods_match(&fm.mods, &entry.manifest.mods))
+            {
+                col.matched_local_collection = Some(FriendMatchedLocalCollection {
+                    id: saved.id.clone(),
+                    name: saved.name.clone(),
+                    kind: FriendCollectionMatchKind::MatchesSaved,
+                    game_id: saved.game_id.clone(),
+                    has_local_changes: false,
+                });
+                continue;
+            }
+
+            if let Some(installed) = installed_entries
+                .iter()
+                .find(|entry| share::manifest_mods_match(&fm.mods, &entry.manifest.mods))
+            {
+                col.matched_local_collection = Some(FriendMatchedLocalCollection {
+                    id: installed.id.clone(),
+                    name: installed.name.clone(),
+                    kind: FriendCollectionMatchKind::MatchesInstalled,
+                    game_id: installed.game_id.clone(),
+                    has_local_changes: false,
+                });
+                continue;
+            }
+
+            if let Some(active) = active_entries
+                .iter()
+                .find(|entry| share::manifest_mods_match(&fm.mods, &entry.manifest.mods))
+            {
+                col.matched_local_collection = Some(FriendMatchedLocalCollection {
+                    id: active.id.clone(),
+                    name: active.name.clone(),
+                    kind: FriendCollectionMatchKind::MatchesActiveLoadout,
+                    game_id: active.game_id.clone(),
+                    has_local_changes: false,
+                });
+                continue;
+            }
+
+            col.matched_local_collection = None;
+        }
+    }
 }
 
 impl P2pService {
@@ -1091,9 +1773,12 @@ impl P2pService {
             paths,
             store: Arc::new(Mutex::new(store)),
             endpoint: OnceCell::new(),
+            secret_key: OnceCell::new(),
             app: Mutex::new(None),
             incoming_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_INCOMING)),
             hello_limiter: Mutex::new(HelloRateLimiter::default()),
+            profile_limiter: Mutex::new(PeerProfileRateLimiter::default()),
+            active_peer_conns: Mutex::new(HashMap::new()),
         })
     }
 
@@ -1111,6 +1796,7 @@ impl P2pService {
 
     async fn init_and_serve(self: Arc<Self>) -> Result<()> {
         let key = load_or_create_secret_key(&self.paths)?;
+        let _ = self.secret_key.set(key.clone());
         let ep = Endpoint::builder(presets::N0)
             .secret_key(key)
             .alpns(vec![P2P_ALPN.to_vec()])
@@ -1183,6 +1869,25 @@ impl P2pService {
             .map_err(|_| anyhow!("incoming handshake timed out"))??;
         let remote_endpoint_id = conn.remote_id();
         let remote_id = remote_endpoint_id.to_string();
+
+        let acquired_peer_slot = {
+            let mut counts = self.active_peer_conns.lock().map_err(|e| anyhow!("{e}"))?;
+            let count = counts.entry(remote_id.clone()).or_insert(0);
+            if *count >= MAX_CONCURRENT_PER_PEER {
+                false
+            } else {
+                *count += 1;
+                true
+            }
+        };
+        if !acquired_peer_slot {
+            log::debug!("Rejected P2P connection from {remote_id}: per-peer limit reached");
+            return Ok(());
+        }
+        let _peer_conn_guard = PeerConnGuard {
+            service: self,
+            peer_id: remote_id.clone(),
+        };
 
         let mut stream_count = 0usize;
         while stream_count < MAX_STREAMS_PER_CONN {
@@ -1305,28 +2010,57 @@ impl P2pService {
                         });
                     }
                 }
-                P2pRequest::GetProfile { known_hashes } => {
-                    let (store_snapshot, status_flipped) = {
+                P2pRequest::GetProfile {
+                    known_hashes,
+                    synced_collection_ids,
+                } => {
+                    let allowed = self
+                        .profile_limiter
+                        .lock()
+                        .map(|mut lim| lim.allow(&remote_id))
+                        .unwrap_or(true);
+                    if !allowed {
+                        write_frame(
+                            &mut send,
+                            &P2pResponse::Denied("Too many requests".into()),
+                        )
+                        .await?;
+                        break;
+                    }
+                    let (store_snapshot, status_flipped, sync_list_changed) = {
                         let mut store = self.store.lock().map_err(|e| anyhow!("{e}"))?;
                         let is_friend = store
                             .friends
                             .iter()
                             .any(|f| f.peer_id == remote_id && f.status == FriendStatus::Connected);
                         if !is_friend {
-                            (None, false)
+                            (None, false, false)
                         } else {
+                            let sanitized_sync_ids = synced_collection_ids.map(|ids| {
+                                sanitize_synced_collection_ids(&store, &remote_id, ids)
+                            });
                             let mut flipped = false;
+                            let mut sync_changed = false;
                             if let Some(f) = store.friends.iter_mut().find(|f| f.peer_id == remote_id) {
                                 if !f.online {
                                     flipped = true;
                                 }
                                 f.online = true;
                                 f.last_seen_at = Some(now_rfc3339());
+                                if let Some(next_ids) = sanitized_sync_ids {
+                                    if f.syncing_my_collections != next_ids {
+                                        f.syncing_my_collections = next_ids;
+                                        sync_changed = true;
+                                    }
+                                }
                             }
-                            (Some(store.clone()), flipped)
+                            if sync_changed {
+                                let _ = save_friends_store(&self.paths, &store);
+                            }
+                            (Some(store.clone()), flipped, sync_changed)
                         }
                     };
-                    if status_flipped {
+                    if status_flipped || sync_list_changed {
                         self.emit_changed();
                     }
                     match store_snapshot {
@@ -1334,6 +2068,7 @@ impl P2pService {
                             let paths = self.paths.clone();
                             let local_id = ep.id().to_string();
                             let viewer = remote_id.clone();
+                            let signing_key = self.secret_key.get().cloned();
                             let profile = tokio::task::spawn_blocking(move || {
                                 build_local_profile(
                                     &paths,
@@ -1341,6 +2076,7 @@ impl P2pService {
                                     &snapshot_store,
                                     Some(&known_hashes),
                                     Some(&viewer),
+                                    signing_key.as_ref(),
                                 )
                             })
                             .await
@@ -1356,42 +2092,107 @@ impl P2pService {
                         }
                     }
                 }
+                P2pRequest::GetCachedFriendProfile {
+                    target_peer_id,
+                    known_updated_at,
+                } => {
+                    let allowed = self
+                        .profile_limiter
+                        .lock()
+                        .map(|mut lim| lim.allow(&remote_id))
+                        .unwrap_or(true);
+                    if !allowed {
+                        write_frame(
+                            &mut send,
+                            &P2pResponse::Denied("Too many requests".into()),
+                        )
+                        .await?;
+                        break;
+                    }
+                    let resp = {
+                        let store = self.store.lock().map_err(|e| anyhow!("{e}"))?;
+                        resolve_cached_friend_profile_for_peer(
+                            &store,
+                            &remote_id,
+                            &target_peer_id,
+                            known_updated_at.as_deref(),
+                        )
+                    };
+                    write_frame(&mut send, &resp).await?;
+                }
             }
         }
         Ok(())
     }
 
     pub fn get_state(&self) -> Result<FriendsState> {
-        let store = self.store.lock().map_err(|e| anyhow!("{e}"))?;
-        let (endpoint_ready, peer_id, join_code) = match self.endpoint.get() {
-            Some(ep) => {
-                let addr = join_ticket_addr(&ep.addr());
-                let pid = ep.id().to_string();
-                let ticket = FriendJoinTicket {
-                    addr,
-                    name: effective_display_name(&store),
-                };
-                let code = encode_join_code(&ticket).ok();
-                (true, Some(pid), code)
-            }
-            None => (false, None, None),
-        };
-        let local_collections = list_local_shareable_collections(&self.paths, &store);
-        Ok(FriendsState {
+        let (
             endpoint_ready,
-            appear_offline: store.appear_offline,
             peer_id,
             join_code,
-            display_name: store.display_name.clone(),
-            display_name_set: store.display_name_set,
-            profile_picture: store.profile_picture.clone(),
-            friends_list_visibility: store.friends_list_visibility.clone(),
-            allow_mutual_connections: store.allow_mutual_connections,
-            friends: store.friends.clone(),
-            pending_requests: store.pending_requests.clone(),
+            appear_offline,
+            display_name,
+            display_name_set,
+            profile_picture,
+            friends_list_visibility,
+            allow_mutual_connections,
+            allow_cache_relay,
+            mut friends,
+            pending_requests,
             local_collections,
-            feed_events: store.feed_events.clone(),
-            feed_last_read_at: store.feed_last_read_at.clone(),
+            feed_events,
+            feed_last_read_at,
+        ) = {
+            let store = self.store.lock().map_err(|e| anyhow!("{e}"))?;
+            let (endpoint_ready, peer_id, join_code) = match self.endpoint.get() {
+                Some(ep) => {
+                    let addr = join_ticket_addr(&ep.addr());
+                    let pid = ep.id().to_string();
+                    let ticket = FriendJoinTicket {
+                        addr,
+                        name: effective_display_name(&store),
+                    };
+                    let code = encode_join_code(&ticket).ok();
+                    (true, Some(pid), code)
+                }
+                None => (false, None, None),
+            };
+            let local_collections = list_local_shareable_collections(&self.paths, &store);
+            (
+                endpoint_ready,
+                peer_id,
+                join_code,
+                store.appear_offline,
+                store.display_name.clone(),
+                store.display_name_set,
+                store.profile_picture.clone(),
+                store.friends_list_visibility.clone(),
+                store.allow_mutual_connections,
+                store.allow_cache_relay,
+                store.friends.clone(),
+                store.pending_requests.clone(),
+                local_collections,
+                store.feed_events.clone(),
+                store.feed_last_read_at.clone(),
+            )
+        };
+        resolve_friend_active_loadouts(&self.paths, &mut friends);
+        Ok(FriendsState {
+            endpoint_ready,
+            appear_offline,
+            peer_id,
+            join_code,
+            display_name,
+            display_name_set,
+            profile_picture,
+            friends_list_visibility,
+            allow_mutual_connections,
+            allow_cache_relay,
+            friends,
+            pending_requests,
+            local_collections,
+            feed_events,
+            feed_last_read_at,
         })
     }
 
@@ -1507,6 +2308,16 @@ impl P2pService {
         self.get_state()
     }
 
+    pub fn set_allow_cache_relay(&self, allow: bool) -> Result<FriendsState> {
+        {
+            let mut store = self.store.lock().map_err(|e| anyhow!("{e}"))?;
+            store.allow_cache_relay = allow;
+            save_friends_store(&self.paths, &store)?;
+        }
+        self.emit_changed();
+        self.get_state()
+    }
+
     pub async fn add_friend_by_peer(
         &self,
         peer_id: String,
@@ -1581,6 +2392,8 @@ impl P2pService {
                     online: false,
                     last_seen_at: None,
                     cached_profile: None,
+                    syncing_my_collections: Vec::new(),
+                    cached_via_peer_name: None,
                 });
                 save_friends_store(&self.paths, &store)?;
                 true
@@ -1618,6 +2431,8 @@ impl P2pService {
                     online: false,
                     last_seen_at: None,
                     cached_profile: None,
+                    syncing_my_collections: Vec::new(),
+                    cached_via_peer_name: None,
                 });
             }
             save_friends_store(&self.paths, &store)?;
@@ -1656,6 +2471,8 @@ impl P2pService {
                             online: false,
                             last_seen_at: Some(now_rfc3339()),
                             cached_profile: None,
+                            syncing_my_collections: Vec::new(),
+                            cached_via_peer_name: None,
                         });
                     }
                 }
@@ -1727,6 +2544,7 @@ impl P2pService {
                 peer_ids.iter().map(|pid| self.dial_and_sync_peer(pid)),
             )
             .await;
+            self.pull_newer_caches_from_mutual_friends().await;
         }
         self.get_state()
     }
@@ -1756,6 +2574,7 @@ impl P2pService {
                 }
             }))
             .await;
+            self.pull_newer_caches_from_mutual_friends().await;
         }
         Ok(())
     }
@@ -1776,7 +2595,10 @@ impl P2pService {
         }
     }
 
-    fn peer_context(&self, peer_id: &str) -> Result<Option<(EndpointAddr, String, HashMap<String, String>)>> {
+    fn peer_context(
+        &self,
+        peer_id: &str,
+    ) -> Result<Option<(EndpointAddr, String, HashMap<String, String>, Vec<String>)>> {
         let store = self.store.lock().map_err(|e| anyhow!("{e}"))?;
         let Some(friend) = store.friends.iter().find(|f| f.peer_id == peer_id) else {
             return Ok(None);
@@ -1787,38 +2609,70 @@ impl P2pService {
                 hashes.insert(c.id.clone(), c.share_hash.clone());
             }
         }
-        Ok(Some((
-            friend.addr.clone(),
-            effective_display_name(&store),
-            hashes,
-        )))
+        let addr = friend.addr.clone();
+        let local_name = effective_display_name(&store);
+        drop(store);
+        let synced_ids = collect_synced_collection_ids(&self.paths, peer_id);
+        Ok(Some((addr, local_name, hashes, synced_ids)))
     }
 
-    fn apply_fetched_profile(&self, peer_id: &str, mut profile: PeerProfileSummary) -> Result<bool> {
-        if profile.peer_id != peer_id {
-            bail!("Remote profile peer_id does not match authenticated peer");
-        }
-        profile.display_name = sanitize_display_name(&profile.display_name, "Friend");
-        if let Some(ref pic) = profile.profile_picture {
-            if let Err(e) = validate_profile_picture(pic) {
-                log::warn!("Dropped invalid remote profile picture from {peer_id}: {e}");
-                profile.profile_picture = None;
+    fn enforce_collection_share_budget(peer_id: &str, collections: &mut [FriendShareRef]) {
+        let mut total_share_bytes = 0usize;
+        for col in collections.iter_mut() {
+            if col.share_code.len() > share::MAX_SHARE_CODE_BYTES {
+                log::warn!(
+                    "Dropped oversized share_code from {peer_id} for collection {}",
+                    col.id
+                );
+                col.share_code.clear();
+                continue;
+            }
+            if !col.share_code.is_empty() {
+                if total_share_bytes.saturating_add(col.share_code.len()) > MAX_FRIEND_CACHED_SHARE_BYTES
+                {
+                    log::warn!(
+                        "Dropped share_code from {peer_id} for collection {} (total cache budget exceeded)",
+                        col.id
+                    );
+                    col.share_code.clear();
+                } else {
+                    total_share_bytes += col.share_code.len();
+                }
             }
         }
-        profile.collections.truncate(MAX_REMOTE_COLLECTIONS);
-        for col in &mut profile.collections {
+    }
+
+    fn sanitize_profile_fields(
+        peer_id: &str,
+        local_peer_id: Option<&str>,
+        display_name: &mut String,
+        profile_picture: &mut Option<String>,
+        collections: &mut Vec<FriendShareRef>,
+        friends: &mut Option<Vec<SharedFriendRef>>,
+    ) {
+        *display_name = sanitize_display_name(display_name, "Friend");
+        if let Some(ref pic) = profile_picture {
+            if let Err(e) = validate_profile_picture(pic) {
+                log::warn!("Dropped invalid remote profile picture from {peer_id}: {e}");
+                *profile_picture = None;
+            }
+        }
+        collections.truncate(MAX_REMOTE_COLLECTIONS);
+        for col in collections.iter_mut() {
             col.id = sanitize_short_text(&col.id, MAX_COLLECTION_ID_CHARS);
             col.name = sanitize_short_text(&col.name, MAX_COLLECTION_NAME_CHARS);
             col.share_hash = sanitize_short_text(&col.share_hash, MAX_SHARE_HASH_CHARS);
-            if col.share_code.len() > share::MAX_SHARE_CODE_BYTES {
-                log::warn!("Dropped oversized share_code from {peer_id} for collection {}", col.id);
-                col.share_code.clear();
-            }
+            col.synced_source_collection_id = col
+                .synced_source_collection_id
+                .as_deref()
+                .map(|raw| sanitize_short_text(raw, MAX_COLLECTION_ID_CHARS))
+                .filter(|clean| !clean.is_empty());
+            col.matched_local_collection = None;
         }
-        profile.collections.retain(|c| !c.id.is_empty());
+        collections.retain(|c| !c.id.is_empty());
+        Self::enforce_collection_share_budget(peer_id, collections);
 
-        let local_peer_id = self.endpoint.get().map(|ep| ep.id().to_string());
-        if let Some(ref mut shared_friends) = profile.friends {
+        if let Some(ref mut shared_friends) = friends {
             let mut seen_peers = HashSet::new();
             let mut cleaned = Vec::with_capacity(shared_friends.len().min(MAX_REMOTE_FRIENDS));
             for entry in shared_friends.drain(..).take(MAX_REMOTE_FRIENDS) {
@@ -1826,7 +2680,7 @@ impl P2pService {
                     continue;
                 };
                 let canonical = parsed_id.to_string();
-                if canonical == peer_id || local_peer_id.as_deref() == Some(canonical.as_str()) {
+                if canonical == peer_id || local_peer_id == Some(canonical.as_str()) {
                     continue;
                 }
                 if !seen_peers.insert(canonical.clone()) {
@@ -1837,13 +2691,40 @@ impl P2pService {
                     .addr
                     .as_ref()
                     .and_then(|a| sanitize_peer_addr(parsed_id, a).ok());
+                let sanitized_updated_at = entry
+                    .profile_updated_at
+                    .as_deref()
+                    .filter(|ts| chrono::DateTime::parse_from_rfc3339(ts).is_ok())
+                    .map(str::to_string);
                 cleaned.push(SharedFriendRef {
                     peer_id: canonical,
                     display_name: sanitized_name,
                     addr: sanitized_addr,
+                    profile_updated_at: sanitized_updated_at,
                 });
             }
             *shared_friends = cleaned;
+        }
+    }
+
+    fn apply_fetched_profile(&self, peer_id: &str, mut profile: PeerProfileSummary) -> Result<bool> {
+        if profile.peer_id != peer_id {
+            bail!("Remote profile peer_id does not match authenticated peer");
+        }
+        let local_peer_id = self.endpoint.get().map(|ep| ep.id().to_string());
+        Self::sanitize_profile_fields(
+            peer_id,
+            local_peer_id.as_deref(),
+            &mut profile.display_name,
+            &mut profile.profile_picture,
+            &mut profile.collections,
+            &mut profile.friends,
+        );
+        if let Some(ref relay) = profile.signed_relay_profile {
+            if let Err(e) = verify_signed_relay_profile(peer_id, relay) {
+                log::warn!("Dropped invalid signed_relay_profile from {peer_id}: {e}");
+                profile.signed_relay_profile = None;
+            }
         }
 
         let mut store = self.store.lock().map_err(|e| anyhow!("{e}"))?;
@@ -1866,6 +2747,7 @@ impl P2pService {
                         }
                     }
                 }
+                Self::enforce_collection_share_budget(peer_id, &mut profile.collections);
                 new_feed_events = collect_profile_feed_events(
                     peer_id,
                     &profile.display_name,
@@ -1895,6 +2777,7 @@ impl P2pService {
                 }
             };
             changed = !f.online
+                || f.cached_via_peer_name.is_some()
                 || f.display_name != profile.display_name
                 || f.profile_picture != profile.profile_picture
                 || collections_changed
@@ -1904,6 +2787,7 @@ impl P2pService {
             f.cached_profile = Some(profile);
             f.online = true;
             f.last_seen_at = Some(now);
+            f.cached_via_peer_name = None;
         }
         if let Some(visible_ids) = visible_col_ids {
             // Prune feed items for collections no longer visible from this peer (e.g. made Private or unshared).
@@ -1927,18 +2811,257 @@ impl P2pService {
         Ok(changed)
     }
 
+    fn apply_relayed_profile(
+        &self,
+        target_peer_id: &str,
+        via_peer_name: &str,
+        signed: SignedRelayProfile,
+    ) -> Result<bool> {
+        verify_signed_relay_profile(target_peer_id, &signed)?;
+        let mut payload = signed.payload.clone();
+        let local_peer_id = self.endpoint.get().map(|ep| ep.id().to_string());
+        Self::sanitize_profile_fields(
+            target_peer_id,
+            local_peer_id.as_deref(),
+            &mut payload.display_name,
+            &mut payload.profile_picture,
+            &mut payload.collections,
+            &mut payload.friends,
+        );
+
+        let mut store = self.store.lock().map_err(|e| anyhow!("{e}"))?;
+        let mut changed = false;
+        let mut new_feed_events: Vec<FriendFeedEvent> = Vec::new();
+        let mut visible_col_ids: Option<HashSet<String>> = None;
+
+        if let Some(f) = store.friends.iter_mut().find(|f| f.peer_id == target_peer_id) {
+            if f.online || f.status != FriendStatus::Connected {
+                return Ok(false);
+            }
+            let existing_updated_at = f.cached_profile.as_ref().map(|p| p.updated_at.as_str());
+            if !is_timestamp_newer(&payload.updated_at, existing_updated_at) {
+                return Ok(false);
+            }
+
+            // Preserve any locally cached SpecificFriends collections that would
+            // not appear in an AllFriends-only relay payload.
+            if let Some(prev) = &f.cached_profile {
+                let relay_ids: HashSet<String> =
+                    payload.collections.iter().map(|c| c.id.clone()).collect();
+                for prev_col in &prev.collections {
+                    if prev_col.specific_friends_only
+                        && !relay_ids.contains(&prev_col.id)
+                        && payload.collections.len() < MAX_REMOTE_COLLECTIONS
+                    {
+                        payload.collections.push(prev_col.clone());
+                    }
+                }
+                Self::enforce_collection_share_budget(target_peer_id, &mut payload.collections);
+            }
+
+            let merged_profile = PeerProfileSummary {
+                peer_id: target_peer_id.to_string(),
+                display_name: payload.display_name.clone(),
+                profile_picture: payload.profile_picture.clone(),
+                updated_at: payload.updated_at.clone(),
+                collections: payload.collections,
+                friends: payload.friends,
+                allow_mutual_connections: payload.allow_mutual_connections,
+                signed_relay_profile: Some(signed),
+            };
+
+            if let Some(prev) = &f.cached_profile {
+                new_feed_events = collect_profile_feed_events(
+                    target_peer_id,
+                    &merged_profile.display_name,
+                    prev,
+                    &merged_profile,
+                    &merged_profile.updated_at,
+                );
+            }
+            visible_col_ids = Some(
+                merged_profile
+                    .collections
+                    .iter()
+                    .map(|c| c.id.clone())
+                    .collect(),
+            );
+            f.display_name = merged_profile.display_name.clone();
+            f.profile_picture = merged_profile.profile_picture.clone();
+            if is_timestamp_newer(&merged_profile.updated_at, f.last_seen_at.as_deref()) {
+                f.last_seen_at = Some(merged_profile.updated_at.clone());
+            }
+            f.cached_profile = Some(merged_profile);
+            f.cached_via_peer_name = Some(sanitize_display_name(via_peer_name, "Friend"));
+            // Keep f.online = false since the friend was not reached directly.
+            changed = true;
+        }
+
+        if let Some(visible_ids) = visible_col_ids {
+            let before_len = store.feed_events.len();
+            store.feed_events.retain(|ev| {
+                ev.peer_id != target_peer_id || visible_ids.contains(&ev.collection_id)
+            });
+            if store.feed_events.len() != before_len {
+                changed = true;
+            }
+        }
+        if !new_feed_events.is_empty() {
+            new_feed_events.append(&mut store.feed_events);
+            new_feed_events.truncate(MAX_FEED_EVENTS);
+            store.feed_events = new_feed_events;
+            changed = true;
+        }
+        if changed {
+            let _ = save_friends_store(&self.paths, &store);
+        }
+        Ok(changed)
+    }
+
+    async fn pull_newer_caches_from_mutual_friends(&self) {
+        let Some(ep) = self.endpoint.get() else {
+            return;
+        };
+
+        // Plan: for each offline Connected friend C, collect online Connected
+        // mutual friends B whose advertised `profile_updated_at` for C is
+        // strictly newer than our cached `C.updated_at`, sorted newest-first.
+        let plan: Vec<(String, Option<String>, Vec<(EndpointAddr, String)>)> = {
+            let Ok(store) = self.store.lock() else {
+                return;
+            };
+            let online_friends: Vec<&FriendRecord> = store
+                .friends
+                .iter()
+                .filter(|f| f.status == FriendStatus::Connected && f.online)
+                .collect();
+
+            store
+                .friends
+                .iter()
+                .filter(|f| f.status == FriendStatus::Connected && !f.online)
+                .filter_map(|offline| {
+                    let local_updated = offline
+                        .cached_profile
+                        .as_ref()
+                        .map(|p| p.updated_at.clone());
+                    let mut candidates: Vec<(String, EndpointAddr, String)> = online_friends
+                        .iter()
+                        .filter_map(|mutual| {
+                            let sf = mutual
+                                .cached_profile
+                                .as_ref()?
+                                .friends
+                                .as_ref()?
+                                .iter()
+                                .find(|sf| sf.peer_id == offline.peer_id)?;
+                            let remote_ts = sf.profile_updated_at.as_deref()?;
+                            if is_timestamp_newer(remote_ts, local_updated.as_deref()) {
+                                Some((
+                                    remote_ts.to_string(),
+                                    mutual.addr.clone(),
+                                    mutual.display_name.clone(),
+                                ))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    if candidates.is_empty() {
+                        return None;
+                    }
+                    candidates.sort_by(|a, b| {
+                        let da = chrono::DateTime::parse_from_rfc3339(&a.0).ok();
+                        let db = chrono::DateTime::parse_from_rfc3339(&b.0).ok();
+                        db.cmp(&da)
+                    });
+                    Some((
+                        offline.peer_id.clone(),
+                        local_updated,
+                        candidates
+                            .into_iter()
+                            .map(|(_, addr, name)| (addr, name))
+                            .collect(),
+                    ))
+                })
+                .collect()
+        };
+
+        if plan.is_empty() {
+            return;
+        }
+
+        let mut any_changed = false;
+        let results = futures_util::future::join_all(plan.into_iter().map(
+            |(target_peer_id, known_updated_at, candidates)| async move {
+                for (mutual_addr, mutual_name) in candidates {
+                    let res = tokio::time::timeout(DIAL_TIMEOUT, async {
+                        let conn = Self::connect_peer(ep, &mutual_addr).await?;
+                        let (mut send, mut recv) = conn.open_bi().await?;
+                        write_frame(
+                            &mut send,
+                            &P2pRequest::GetCachedFriendProfile {
+                                target_peer_id: target_peer_id.clone(),
+                                known_updated_at: known_updated_at.clone(),
+                            },
+                        )
+                        .await?;
+                        let resp: P2pResponse = read_frame(&mut recv).await?;
+                        Ok::<_, anyhow::Error>(resp)
+                    })
+                    .await;
+
+                    if let Ok(Ok(P2pResponse::CachedFriendProfile(signed))) = res {
+                        match self.apply_relayed_profile(&target_peer_id, &mutual_name, signed) {
+                            Ok(true) => return true,
+                            Ok(false) => return false,
+                            Err(e) => {
+                                log::warn!(
+                                    "Rejected relayed profile for {target_peer_id} from {mutual_name}: {e}"
+                                );
+                            }
+                        }
+                    }
+                }
+                false
+            },
+        ))
+        .await;
+
+        if results.into_iter().any(|c| c) {
+            any_changed = true;
+        }
+        if any_changed {
+            self.emit_changed();
+        }
+    }
+
+    pub fn notify_peer_sync_state(self: &Arc<Self>, peer_id: String) {
+        let svc = Arc::clone(self);
+        tauri::async_runtime::spawn(async move {
+            let _ = svc.sync_peer_profile_only(&peer_id).await;
+        });
+    }
+
     async fn sync_peer_profile_only(&self, peer_id: &str) -> Result<()> {
         let Some(ep) = self.endpoint.get() else {
             return Ok(());
         };
-        let Some((addr, _, known_hashes)) = self.peer_context(peer_id)? else {
+        let Some((addr, _, known_hashes, synced_ids)) = self.peer_context(peer_id)? else {
             return Ok(());
         };
 
         let profile_res = tokio::time::timeout(DIAL_TIMEOUT, async {
             let conn = Self::connect_peer(ep, &addr).await?;
             let (mut send, mut recv) = conn.open_bi().await?;
-            write_frame(&mut send, &P2pRequest::GetProfile { known_hashes }).await?;
+            write_frame(
+                &mut send,
+                &P2pRequest::GetProfile {
+                    known_hashes,
+                    synced_collection_ids: Some(synced_ids),
+                },
+            )
+            .await?;
             let resp: P2pResponse = read_frame(&mut recv).await?;
             Ok::<_, anyhow::Error>(resp)
         })
@@ -1975,7 +3098,7 @@ impl P2pService {
         let Some(ep) = self.endpoint.get() else {
             return Ok(());
         };
-        let Some((addr, local_name, known_hashes)) = self.peer_context(peer_id)? else {
+        let Some((addr, local_name, known_hashes, synced_ids)) = self.peer_context(peer_id)? else {
             return Ok(());
         };
         let local_addr = ep.addr();
@@ -2001,7 +3124,14 @@ impl P2pService {
 
             let profile_resp = if accepted {
                 let (mut send2, mut recv2) = conn.open_bi().await?;
-                write_frame(&mut send2, &P2pRequest::GetProfile { known_hashes }).await?;
+                write_frame(
+                    &mut send2,
+                    &P2pRequest::GetProfile {
+                        known_hashes,
+                        synced_collection_ids: Some(synced_ids),
+                    },
+                )
+                .await?;
                 Some(read_frame::<P2pResponse>(&mut recv2).await?)
             } else {
                 None
@@ -2183,16 +3313,23 @@ mod tests {
                         share_code: "#emperor1test".into(),
                         share_hash: "abc123".into(),
                         updated_at: "2026-11-20T00:00:00Z".into(),
+                        specific_friends_only: false,
+                        synced_source_collection_id: None,
+                        matched_local_collection: None,
                     }],
                     friends: None,
             allow_mutual_connections: true,
+                    signed_relay_profile: None,
                 }),
+                syncing_my_collections: Vec::new(),
+                cached_via_peer_name: None,
             }],
             pending_requests: vec![],
             hidden_collection_ids: HashSet::new(),
             collection_visibility: HashMap::new(),
             friends_list_visibility: CollectionVisibility::AllFriends,
             allow_mutual_connections: true,
+            allow_cache_relay: true,
             appear_offline: false,
             feed_events: vec![],
             feed_last_read_at: None,
@@ -2456,6 +3593,8 @@ mod tests {
                 online: false,
                 last_seen_at: None,
                 cached_profile: None,
+                syncing_my_collections: Vec::new(),
+                cached_via_peer_name: None,
             });
         }
 
@@ -2471,9 +3610,13 @@ mod tests {
                 share_code: "#emperor1abc".into(),
                 share_hash: "h1".into(),
                 updated_at: "t1".into(),
+                specific_friends_only: false,
+                synced_source_collection_id: None,
+                matched_local_collection: None,
             }],
             friends: None,
             allow_mutual_connections: true,
+            signed_relay_profile: None,
         };
         assert!(svc.apply_fetched_profile(&peer_id, initial).unwrap());
 
@@ -2490,9 +3633,13 @@ mod tests {
                 share_code: String::new(),
                 share_hash: "h1".into(),
                 updated_at: "t2".into(),
+                specific_friends_only: false,
+                synced_source_collection_id: None,
+                matched_local_collection: None,
             }],
             friends: None,
             allow_mutual_connections: true,
+            signed_relay_profile: None,
         };
         assert!(!svc.apply_fetched_profile(&peer_id, delta_same).unwrap());
         assert_eq!(
@@ -2513,9 +3660,13 @@ mod tests {
                 share_code: "#emperor1xyz".into(),
                 share_hash: "h2".into(),
                 updated_at: "t3".into(),
+                specific_friends_only: false,
+                synced_source_collection_id: None,
+                matched_local_collection: None,
             }],
             friends: None,
             allow_mutual_connections: true,
+            signed_relay_profile: None,
         };
         assert!(svc.apply_fetched_profile(&peer_id, updated).unwrap());
         assert_eq!(
@@ -2712,6 +3863,8 @@ mod tests {
                 online: false,
                 last_seen_at: None,
                 cached_profile: None,
+                syncing_my_collections: Vec::new(),
+                cached_via_peer_name: None,
             });
         }
 
@@ -2724,6 +3877,7 @@ mod tests {
             collections: vec![],
             friends: None,
             allow_mutual_connections: true,
+            signed_relay_profile: None,
         };
         assert!(svc.apply_fetched_profile(&peer_id, wrong_peer).is_err());
 
@@ -2736,6 +3890,7 @@ mod tests {
             collections: vec![],
             friends: None,
             allow_mutual_connections: true,
+            signed_relay_profile: None,
         };
         assert!(svc.apply_fetched_profile(&peer_id, malicious).unwrap());
         let state = svc.get_state().unwrap();
@@ -2751,6 +3906,7 @@ mod tests {
             collections: vec![],
             friends: None,
             allow_mutual_connections: true,
+            signed_relay_profile: None,
         };
         let _ = svc.apply_fetched_profile(&peer_id, asset_avatar).unwrap();
         assert!(svc.get_state().unwrap().friends[0].profile_picture.is_none());
@@ -2848,6 +4004,8 @@ mod tests {
                 online: false,
                 last_seen_at: None,
                 cached_profile: None,
+                syncing_my_collections: Vec::new(),
+                cached_via_peer_name: None,
             });
         }
 
@@ -2870,9 +4028,13 @@ mod tests {
                 share_code: code_v1.clone(),
                 share_hash: hash_v1.clone(),
                 updated_at: "2026-11-21T00:00:00Z".into(),
+                specific_friends_only: false,
+                synced_source_collection_id: None,
+                matched_local_collection: None,
             }],
             friends: None,
             allow_mutual_connections: true,
+            signed_relay_profile: None,
         };
         svc.apply_fetched_profile(&peer_id, baseline).unwrap();
         assert!(svc.get_state().unwrap().feed_events.is_empty());
@@ -2890,9 +4052,13 @@ mod tests {
                 share_code: String::new(),
                 share_hash: hash_v1.clone(),
                 updated_at: "2026-11-21T00:01:00Z".into(),
+                specific_friends_only: false,
+                synced_source_collection_id: None,
+                matched_local_collection: None,
             }],
             friends: None,
             allow_mutual_connections: true,
+            signed_relay_profile: None,
         };
         svc.apply_fetched_profile(&peer_id, delta_same).unwrap();
         assert!(svc.get_state().unwrap().feed_events.is_empty());
@@ -2919,6 +4085,9 @@ mod tests {
                     share_code: code_v2.clone(),
                     share_hash: hash_v2.clone(),
                     updated_at: "2026-11-21T00:02:00Z".into(),
+                    specific_friends_only: false,
+                    synced_source_collection_id: None,
+                    matched_local_collection: None,
                 },
                 FriendShareRef {
                     id: "saved:cozy".into(),
@@ -2927,10 +4096,14 @@ mod tests {
                     share_code: code_saved.clone(),
                     share_hash: hash_saved.clone(),
                     updated_at: "2026-11-21T00:02:00Z".into(),
+                    specific_friends_only: false,
+                    synced_source_collection_id: None,
+                    matched_local_collection: None,
                 },
             ],
             friends: None,
             allow_mutual_connections: true,
+            signed_relay_profile: None,
         };
         svc.apply_fetched_profile(&peer_id, updated).unwrap();
         let state = svc.get_state().unwrap();
@@ -2974,6 +4147,9 @@ mod tests {
                     share_code: String::new(),
                     share_hash: hash_v2.clone(),
                     updated_at: "2026-11-21T00:03:00Z".into(),
+                    specific_friends_only: false,
+                    synced_source_collection_id: None,
+                    matched_local_collection: None,
                 },
                 FriendShareRef {
                     id: "saved:cozy".into(),
@@ -2982,10 +4158,14 @@ mod tests {
                     share_code: String::new(),
                     share_hash: hash_saved.clone(),
                     updated_at: "2026-11-21T00:03:00Z".into(),
+                    specific_friends_only: false,
+                    synced_source_collection_id: None,
+                    matched_local_collection: None,
                 },
             ],
             friends: None,
             allow_mutual_connections: true,
+            signed_relay_profile: None,
         };
         svc.apply_fetched_profile(&peer_id, renamed).unwrap();
         let state = svc.get_state().unwrap();
@@ -3007,9 +4187,13 @@ mod tests {
                 share_code: String::new(),
                 share_hash: hash_v2.clone(),
                 updated_at: "2026-11-21T00:04:00Z".into(),
+                specific_friends_only: false,
+                synced_source_collection_id: None,
+                matched_local_collection: None,
             }],
             friends: None,
             allow_mutual_connections: true,
+            signed_relay_profile: None,
         };
         svc.apply_fetched_profile(&peer_id, revoked).unwrap();
         let state = svc.get_state().unwrap();
@@ -3039,6 +4223,9 @@ mod tests {
                     share_code: String::new(),
                     share_hash: hash_v2,
                     updated_at: "2026-11-21T00:05:00Z".into(),
+                    specific_friends_only: false,
+                    synced_source_collection_id: None,
+                    matched_local_collection: None,
                 },
                 FriendShareRef {
                     id: "saved:cozy".into(),
@@ -3047,10 +4234,14 @@ mod tests {
                     share_code: code_saved,
                     share_hash: hash_saved,
                     updated_at: "2026-11-21T00:05:00Z".into(),
+                    specific_friends_only: false,
+                    synced_source_collection_id: None,
+                    matched_local_collection: None,
                 },
             ],
             friends: None,
             allow_mutual_connections: true,
+            signed_relay_profile: None,
         };
         reloaded.apply_fetched_profile(&peer_id, readded).unwrap();
         assert_eq!(reloaded.get_state().unwrap().feed_events.len(), 1);
@@ -3153,6 +4344,8 @@ mod tests {
             online: true,
             last_seen_at: None,
             cached_profile: None,
+            syncing_my_collections: Vec::new(),
+            cached_via_peer_name: None,
         });
         store.friends.push(FriendRecord {
             peer_id: carol_key.public().to_string(),
@@ -3165,7 +4358,18 @@ mod tests {
             status: FriendStatus::Connected,
             online: false,
             last_seen_at: None,
-            cached_profile: None,
+            cached_profile: Some(PeerProfileSummary {
+                peer_id: carol_key.public().to_string(),
+                display_name: "Carol".into(),
+                profile_picture: None,
+                updated_at: "2026-11-21T00:00:00Z".into(),
+                collections: vec![],
+                friends: None,
+                allow_mutual_connections: true,
+                signed_relay_profile: None,
+            }),
+            syncing_my_collections: Vec::new(),
+            cached_via_peer_name: None,
         });
         store.friends.push(FriendRecord {
             peer_id: pending_key.public().to_string(),
@@ -3176,6 +4380,8 @@ mod tests {
             online: false,
             last_seen_at: None,
             cached_profile: None,
+            syncing_my_collections: Vec::new(),
+            cached_via_peer_name: None,
         });
 
         let bob_id = bob_key.public().to_string();
@@ -3185,6 +4391,7 @@ mod tests {
             &store,
             None,
             Some(&bob_id),
+            None,
         );
         let shared = profile.friends.expect("AllFriends should share friends list");
         // Excludes viewer (Bob) and pending outgoing (PendingPete), includes Carol.
@@ -3204,6 +4411,7 @@ mod tests {
             &store,
             None,
             Some(&bob_id),
+            None,
         );
         assert!(private_profile.friends.is_none());
     }
@@ -3235,6 +4443,8 @@ mod tests {
                 online: false,
                 last_seen_at: None,
                 cached_profile: None,
+                syncing_my_collections: Vec::new(),
+                cached_via_peer_name: None,
             });
         }
 
@@ -3250,27 +4460,32 @@ mod tests {
                     peer_id: "not-a-valid-endpoint-id".into(),
                     display_name: "Bad".into(),
                     addr: None,
+                    profile_updated_at: None,
                 },
                 // Self-reference (Bob listing Bob) -> dropped
                 SharedFriendRef {
                     peer_id: bob_id.clone(),
                     display_name: "Bob".into(),
                     addr: None,
+                    profile_updated_at: None,
                 },
                 // Valid friend with bidi chars & mismatched addr -> name sanitized, bad addr dropped
                 SharedFriendRef {
                     peer_id: carol_id.clone(),
                     display_name: "Carol\u{202E}\x07".into(),
                     addr: Some(EndpointAddr::new(bob_key.public())),
+                    profile_updated_at: None,
                 },
                 // Duplicate Carol -> dropped
                 SharedFriendRef {
                     peer_id: carol_id.clone(),
                     display_name: "Carol Dup".into(),
                     addr: None,
+                    profile_updated_at: None,
                 },
             ]),
             allow_mutual_connections: true,
+            signed_relay_profile: None,
         };
 
         assert!(svc.apply_fetched_profile(&bob_id, profile).unwrap());
@@ -3449,7 +4664,10 @@ mod tests {
                 collections: vec![],
                 friends: None,
                 allow_mutual_connections: false,
+                signed_relay_profile: None,
             }),
+            syncing_my_collections: Vec::new(),
+            cached_via_peer_name: None,
         });
         store.friends.push(FriendRecord {
             peer_id: dave_id.clone(),
@@ -3467,7 +4685,10 @@ mod tests {
                 collections: vec![],
                 friends: None,
                 allow_mutual_connections: true,
+                signed_relay_profile: None,
             }),
+            syncing_my_collections: Vec::new(),
+            cached_via_peer_name: None,
         });
 
         let profile_for_alice = build_local_profile(
@@ -3476,10 +4697,1121 @@ mod tests {
             &store,
             None,
             Some(&alice_id),
+            None,
         );
         let shared = profile_for_alice.friends.unwrap();
         assert_eq!(shared.len(), 1);
         assert_eq!(shared[0].peer_id, dave_id);
         assert_eq!(shared[0].display_name, "Dave");
+    }
+
+    #[test]
+    fn get_profile_request_deserializes_with_and_without_synced_ids() {
+        let legacy_json = r#"{"type":"get_profile","known_hashes":{"saved:s1":"h1"}}"#;
+        let legacy: P2pRequest = serde_json::from_str(legacy_json).unwrap();
+        match legacy {
+            P2pRequest::GetProfile {
+                known_hashes,
+                synced_collection_ids,
+            } => {
+                assert_eq!(known_hashes.get("saved:s1").map(String::as_str), Some("h1"));
+                assert_eq!(synced_collection_ids, None);
+            }
+            _ => panic!("expected GetProfile"),
+        }
+
+        let modern_json = r#"{"type":"get_profile","known_hashes":{},"synced_collection_ids":["saved:s1","active:skyrim"]}"#;
+        let modern: P2pRequest = serde_json::from_str(modern_json).unwrap();
+        match modern {
+            P2pRequest::GetProfile {
+                synced_collection_ids,
+                ..
+            } => {
+                assert_eq!(
+                    synced_collection_ids,
+                    Some(vec!["saved:s1".to_string(), "active:skyrim".to_string()])
+                );
+            }
+            _ => panic!("expected GetProfile"),
+        }
+    }
+
+    #[test]
+    fn sanitize_synced_collection_ids_respects_visibility_and_dedups() {
+        let mut store = FriendsStore::default();
+        store
+            .collection_visibility
+            .insert("saved:public".into(), CollectionVisibility::AllFriends);
+        store
+            .collection_visibility
+            .insert("saved:private".into(), CollectionVisibility::Private);
+        store.collection_visibility.insert(
+            "saved:alice_only".into(),
+            CollectionVisibility::SpecificFriends {
+                peer_ids: vec!["alice".into()],
+            },
+        );
+
+        let sanitized = sanitize_synced_collection_ids(
+            &store,
+            "alice",
+            vec![
+                "saved:public".into(),
+                "saved:private".into(),
+                "saved:alice_only".into(),
+                "saved:public".into(),
+                "".into(),
+            ],
+        );
+        assert_eq!(
+            sanitized,
+            vec!["saved:alice_only".to_string(), "saved:public".to_string()]
+        );
+
+        let bob_sanitized = sanitize_synced_collection_ids(
+            &store,
+            "bob",
+            vec!["saved:alice_only".into(), "saved:public".into()],
+        );
+        assert_eq!(bob_sanitized, vec!["saved:public".to_string()]);
+    }
+
+    #[test]
+    fn signed_relay_profile_excludes_specific_friends_collections() {
+        let dir = tempdir().unwrap();
+        let paths = Paths {
+            config_dir: dir.path().join("cfg"),
+            data_dir: dir.path().join("data"),
+            cache_dir: dir.path().join("cache"),
+        };
+        fs::create_dir_all(&paths.data_dir).unwrap();
+
+        let saved_store = crate::share::SavedCollectionsStore {
+            collections: vec![
+                crate::share::SavedCollectionEntry {
+                    id: "pub1".into(),
+                    name: "Public Pack".into(),
+                    code: "#emperor1pub".into(),
+                    created_at: "2026-11-21T00:00:00Z".into(),
+                    updated_at: "2026-11-21T00:00:00Z".into(),
+                    source_game_id: None,
+                    game: crate::share::ShareGameHint::default(),
+                    game_versions: None,
+                    mod_count: 0,
+                    nexus_count: 0,
+                    thunderstore_count: 0,
+                    modio_count: 0,
+                    share_id: None,
+                },
+                crate::share::SavedCollectionEntry {
+                    id: "spec1".into(),
+                    name: "Bob Only Pack".into(),
+                    code: "#emperor1spec".into(),
+                    created_at: "2026-11-21T00:00:00Z".into(),
+                    updated_at: "2026-11-21T00:00:00Z".into(),
+                    source_game_id: None,
+                    game: crate::share::ShareGameHint::default(),
+                    game_versions: None,
+                    mod_count: 0,
+                    nexus_count: 0,
+                    thunderstore_count: 0,
+                    modio_count: 0,
+                    share_id: None,
+                },
+                crate::share::SavedCollectionEntry {
+                    id: "priv1".into(),
+                    name: "Private Pack".into(),
+                    code: "#emperor1priv".into(),
+                    created_at: "2026-11-21T00:00:00Z".into(),
+                    updated_at: "2026-11-21T00:00:00Z".into(),
+                    source_game_id: None,
+                    game: crate::share::ShareGameHint::default(),
+                    game_versions: None,
+                    mod_count: 0,
+                    nexus_count: 0,
+                    thunderstore_count: 0,
+                    modio_count: 0,
+                    share_id: None,
+                },
+            ],
+        };
+        crate::share::save_saved_collections(&paths, &saved_store).unwrap();
+
+        let carol_key = SecretKey::generate();
+        let bob_key = SecretKey::generate();
+        let carol_id = carol_key.public().to_string();
+        let bob_id = bob_key.public().to_string();
+
+        let mut store = FriendsStore::default();
+        store
+            .collection_visibility
+            .insert("saved:pub1".into(), CollectionVisibility::AllFriends);
+        store.collection_visibility.insert(
+            "saved:spec1".into(),
+            CollectionVisibility::SpecificFriends {
+                peer_ids: vec![bob_id.clone()],
+            },
+        );
+        store
+            .collection_visibility
+            .insert("saved:priv1".into(), CollectionVisibility::Private);
+
+        let profile_for_bob = build_local_profile(
+            &paths,
+            &carol_id,
+            &store,
+            None,
+            Some(&bob_id),
+            Some(&carol_key),
+        );
+
+        // Bob sees both pub1 and spec1 directly, with specific_friends_only marked.
+        assert_eq!(profile_for_bob.collections.len(), 2);
+        let spec_ref = profile_for_bob
+            .collections
+            .iter()
+            .find(|c| c.id == "saved:spec1")
+            .unwrap();
+        assert!(spec_ref.specific_friends_only);
+
+        // Signed relay payload only contains AllFriends collection (pub1).
+        let relay = profile_for_bob.signed_relay_profile.as_ref().unwrap();
+        verify_signed_relay_profile(&carol_id, relay).unwrap();
+        assert_eq!(relay.payload.collections.len(), 1);
+        assert_eq!(relay.payload.collections[0].id, "saved:pub1");
+        assert!(!relay.payload.collections[0].specific_friends_only);
+    }
+
+    #[test]
+    fn verify_signed_relay_profile_rejects_tampered_payload_or_wrong_key() {
+        let carol_key = SecretKey::generate();
+        let mallory_key = SecretKey::generate();
+        let carol_id = carol_key.public().to_string();
+
+        let payload = RelayProfilePayload {
+            peer_id: carol_id.clone(),
+            display_name: "Carol".into(),
+            profile_picture: None,
+            updated_at: "2026-11-21T01:00:00Z".into(),
+            collections: vec![],
+            friends: None,
+            allow_mutual_connections: true,
+        };
+        let signed = sign_relay_profile(&carol_key, payload.clone()).unwrap();
+        verify_signed_relay_profile(&carol_id, &signed).unwrap();
+
+        // Tampering with display_name invalidates signature.
+        let mut tampered = signed.clone();
+        tampered.payload.display_name = "Mallory".into();
+        assert!(verify_signed_relay_profile(&carol_id, &tampered).is_err());
+
+        // Signing with a different key is rejected.
+        let forged = sign_relay_profile(&mallory_key, payload).unwrap();
+        assert!(verify_signed_relay_profile(&carol_id, &forged).is_err());
+    }
+
+    #[test]
+    fn apply_relayed_profile_updates_cache_without_marking_online() {
+        let dir = tempdir().unwrap();
+        let paths = Paths {
+            config_dir: dir.path().join("cfg"),
+            data_dir: dir.path().join("data"),
+            cache_dir: dir.path().join("cache"),
+        };
+        fs::create_dir_all(&paths.data_dir).unwrap();
+
+        let carol_key = SecretKey::generate();
+        let carol_id = carol_key.public().to_string();
+        let svc = P2pService::new(paths);
+
+        let code_v1 = make_share_code_with_mods("Skyrim SE", vec![(10, 100, "SkyUI", "5.1")]);
+        let hash_v1 = crate::share::share_hash(&code_v1);
+        let code_spec = make_share_code_with_mods("Skyrim SE", vec![(20, 200, "SecretMod", "1.0")]);
+        let hash_spec = crate::share::share_hash(&code_spec);
+
+        {
+            let mut store = svc.store.lock().unwrap();
+            store.friends.push(FriendRecord {
+                peer_id: carol_id.clone(),
+                display_name: "Carol".into(),
+                profile_picture: None,
+                addr: EndpointAddr::new(carol_key.public()),
+                status: FriendStatus::Connected,
+                online: false,
+                last_seen_at: Some("2026-11-21T00:00:00Z".into()),
+                cached_profile: Some(PeerProfileSummary {
+                    peer_id: carol_id.clone(),
+                    display_name: "Carol".into(),
+                    profile_picture: None,
+                    updated_at: "2026-11-21T00:00:00Z".into(),
+                    collections: vec![
+                        FriendShareRef {
+                            id: "saved:pub".into(),
+                            kind: FriendCollectionKind::SavedCollection,
+                            name: "Public Pack".into(),
+                            share_code: code_v1,
+                            share_hash: hash_v1,
+                            updated_at: "2026-11-21T00:00:00Z".into(),
+                            specific_friends_only: false,
+                            synced_source_collection_id: None,
+                            matched_local_collection: None,
+                        },
+                        FriendShareRef {
+                            id: "saved:spec".into(),
+                            kind: FriendCollectionKind::SavedCollection,
+                            name: "Carol Secret".into(),
+                            share_code: code_spec,
+                            share_hash: hash_spec,
+                            updated_at: "2026-11-21T00:00:00Z".into(),
+                            specific_friends_only: true,
+                            synced_source_collection_id: None,
+                            matched_local_collection: None,
+                        },
+                    ],
+                    friends: None,
+                    allow_mutual_connections: true,
+                    signed_relay_profile: None,
+                }),
+                syncing_my_collections: Vec::new(),
+                cached_via_peer_name: None,
+            });
+        }
+
+        // Stale relay is ignored.
+        let stale = sign_relay_profile(
+            &carol_key,
+            RelayProfilePayload {
+                peer_id: carol_id.clone(),
+                display_name: "Carol Old".into(),
+                profile_picture: None,
+                updated_at: "2026-11-20T23:00:00Z".into(),
+                collections: vec![],
+                friends: None,
+                allow_mutual_connections: true,
+            },
+        )
+        .unwrap();
+        assert!(!svc.apply_relayed_profile(&carol_id, "Bob", stale).unwrap());
+
+        // Newer relay updates cache, emits feed event, preserves SpecificFriends collection, and keeps online = false.
+        let code_v2 = make_share_code_with_mods(
+            "Skyrim SE",
+            vec![(10, 101, "SkyUI", "5.2"), (30, 300, "USSEP", "4.3")],
+        );
+        let hash_v2 = crate::share::share_hash(&code_v2);
+        let newer = sign_relay_profile(
+            &carol_key,
+            RelayProfilePayload {
+                peer_id: carol_id.clone(),
+                display_name: "Carol New".into(),
+                profile_picture: None,
+                updated_at: "2026-11-21T02:00:00Z".into(),
+                collections: vec![FriendShareRef {
+                    id: "saved:pub".into(),
+                    kind: FriendCollectionKind::SavedCollection,
+                    name: "Public Pack".into(),
+                    share_code: code_v2,
+                    share_hash: hash_v2,
+                    updated_at: "2026-11-21T02:00:00Z".into(),
+                    specific_friends_only: false,
+                    synced_source_collection_id: None,
+                    matched_local_collection: None,
+                }],
+                friends: None,
+                allow_mutual_connections: true,
+            },
+        )
+        .unwrap();
+        assert!(svc.apply_relayed_profile(&carol_id, "Bob", newer).unwrap());
+
+        let state = svc.get_state().unwrap();
+        let carol = &state.friends[0];
+        assert!(!carol.online);
+        assert_eq!(carol.display_name, "Carol New");
+        assert_eq!(carol.cached_via_peer_name.as_deref(), Some("Bob"));
+        assert_eq!(carol.last_seen_at.as_deref(), Some("2026-11-21T02:00:00Z"));
+        let cols = &carol.cached_profile.as_ref().unwrap().collections;
+        assert_eq!(cols.len(), 2);
+        assert!(cols.iter().any(|c| c.id == "saved:spec" && c.specific_friends_only));
+        assert_eq!(state.feed_events.len(), 1);
+        assert_eq!(state.feed_events[0].kind, FriendFeedEventKind::CollectionUpdated);
+    }
+
+    #[test]
+    fn get_cached_friend_profile_enforces_mutual_friendship_and_opt_out() {
+        let alice_key = SecretKey::generate();
+        let carol_key = SecretKey::generate();
+        let stranger_key = SecretKey::generate();
+        let alice_id = alice_key.public().to_string();
+        let carol_id = carol_key.public().to_string();
+        let stranger_id = stranger_key.public().to_string();
+
+        let carol_relay = sign_relay_profile(
+            &carol_key,
+            RelayProfilePayload {
+                peer_id: carol_id.clone(),
+                display_name: "Carol".into(),
+                profile_picture: None,
+                updated_at: "2026-11-21T03:00:00Z".into(),
+                collections: vec![],
+                friends: Some(vec![SharedFriendRef {
+                    peer_id: alice_id.clone(),
+                    display_name: "Alice".into(),
+                    addr: None,
+                    profile_updated_at: None,
+                }]),
+                allow_mutual_connections: true,
+            },
+        )
+        .unwrap();
+
+        let mut store = FriendsStore::default();
+        store.friends.push(FriendRecord {
+            peer_id: alice_id.clone(),
+            display_name: "Alice".into(),
+            profile_picture: None,
+            addr: EndpointAddr::new(alice_key.public()),
+            status: FriendStatus::Connected,
+            online: true,
+            last_seen_at: None,
+            cached_profile: None,
+            syncing_my_collections: Vec::new(),
+            cached_via_peer_name: None,
+        });
+        store.friends.push(FriendRecord {
+            peer_id: stranger_id.clone(),
+            display_name: "Stranger".into(),
+            profile_picture: None,
+            addr: EndpointAddr::new(stranger_key.public()),
+            status: FriendStatus::Connected,
+            online: true,
+            last_seen_at: None,
+            cached_profile: None,
+            syncing_my_collections: Vec::new(),
+            cached_via_peer_name: None,
+        });
+        store.friends.push(FriendRecord {
+            peer_id: carol_id.clone(),
+            display_name: "Carol".into(),
+            profile_picture: None,
+            addr: EndpointAddr::new(carol_key.public()),
+            status: FriendStatus::Connected,
+            online: false,
+            last_seen_at: None,
+            cached_profile: Some(PeerProfileSummary {
+                peer_id: carol_id.clone(),
+                display_name: "Carol".into(),
+                profile_picture: None,
+                updated_at: "2026-11-21T03:00:00Z".into(),
+                collections: vec![],
+                friends: Some(vec![SharedFriendRef {
+                    peer_id: alice_id.clone(),
+                    display_name: "Alice".into(),
+                    addr: None,
+                    profile_updated_at: None,
+                }]),
+                allow_mutual_connections: true,
+                signed_relay_profile: Some(carol_relay),
+            }),
+            syncing_my_collections: Vec::new(),
+            cached_via_peer_name: None,
+        });
+
+        // Mutual friend Alice with older cache gets CachedFriendProfile.
+        assert!(matches!(
+            resolve_cached_friend_profile_for_peer(
+                &store,
+                &alice_id,
+                &carol_id,
+                Some("2026-11-21T01:00:00Z"),
+            ),
+            P2pResponse::CachedFriendProfile(_)
+        ));
+
+        // Alice with same/newer cache gets CachedFriendNotNewer.
+        assert!(matches!(
+            resolve_cached_friend_profile_for_peer(
+                &store,
+                &alice_id,
+                &carol_id,
+                Some("2026-11-21T03:00:00Z"),
+            ),
+            P2pResponse::CachedFriendNotNewer
+        ));
+
+        // Connected friend of Bob who is NOT in Carol's friends list is denied.
+        assert!(matches!(
+            resolve_cached_friend_profile_for_peer(&store, &stranger_id, &carol_id, None),
+            P2pResponse::Denied(_)
+        ));
+
+        // Opt-out by Carol denies Alice.
+        store.friends[2].cached_profile.as_mut().unwrap().allow_mutual_connections = false;
+        assert!(matches!(
+            resolve_cached_friend_profile_for_peer(&store, &alice_id, &carol_id, None),
+            P2pResponse::Denied(_)
+        ));
+    }
+
+    #[test]
+    fn build_local_profile_sets_synced_source_collection_id_only_for_matching_viewer() {
+        let dir = tempdir().unwrap();
+        let paths = Paths {
+            config_dir: dir.path().join("cfg"),
+            data_dir: dir.path().join("data"),
+            cache_dir: dir.path().join("cache"),
+        };
+        fs::create_dir_all(&paths.config_dir).unwrap();
+        fs::create_dir_all(&paths.data_dir).unwrap();
+
+        let game = crate::config::ManagedGame {
+            id: "skyrim".into(),
+            title: "Skyrim".into(),
+            nexus_domain: "skyrimspecialedition".into(),
+            install_path: dir.path().join("game").to_string_lossy().into_owned(),
+            launcher: "steam".into(),
+            plugin_id: "skyrimse".into(),
+            cover_path: None,
+            cover_url: None,
+            project_name: None,
+            thunderstore_community: None,
+            modio_game_id: None,
+            tool_overrides: None,
+            game_version: None,
+            ignored_requirements: Vec::new(),
+            launch_executable: None,
+            launch_command_source: Default::default(),
+            custom_env_vars: Vec::new(),
+            custom_wrapper: None,
+            custom_launch_args: None,
+            wine_overrides_dismissed: false,
+        };
+        let mut cfg = crate::config::AppConfig::default();
+        cfg.managed_games.push(game.clone());
+        crate::config::save_config(&paths, &cfg).unwrap();
+
+        let mod_a = crate::mods::StagedMod {
+            id: "m1".into(),
+            name: "SkyUI".into(),
+            enabled: true,
+            source: crate::mods::ModSource::Nexus,
+            domain: "skyrimspecialedition".into(),
+            nexus_mod_id: 12604,
+            nexus_file_id: 35407,
+            ..Default::default()
+        };
+        let order = crate::mods::LoadOrder {
+            mods: vec![mod_a],
+        };
+        crate::mods::save_loadorder(&paths, "skyrim", &order).unwrap();
+
+        let (synced_manifest, _, _) = crate::share::build_manifest_from_loadorder_with_selections(
+            &order,
+            &game,
+            Some("Alice Pack".into()),
+            true,
+        );
+        let synced_code = crate::share::encode_share_manifest(&synced_manifest).unwrap();
+        let synced_hash = crate::share::share_hash(&synced_code);
+
+        let alice_col = crate::mods::InstalledCollection {
+            id: "friend-alice-saved-pack1".into(),
+            source: crate::mods::CollectionSource::Emperor,
+            kind: crate::mods::CollectionKind::Share,
+            name: "Alice Pack".into(),
+            profile_code: Some(synced_code),
+            mod_ids: vec!["m1".into()],
+            friend_sync: Some(crate::mods::FriendSyncMetadata {
+                friend_peer_id: "alice".into(),
+                friend_collection_id: "saved:pack1".into(),
+                last_synced_hash: synced_hash,
+                last_synced_at: "2026-11-21T00:00:00Z".into(),
+                auto_sync: true,
+            }),
+            ..Default::default()
+        };
+        crate::mods::sync_installed_collection(&paths, "skyrim", alice_col, &[]).unwrap();
+
+        let store = FriendsStore::default();
+        let signing_key = SecretKey::generate();
+
+        // Alice (the sync source) receives synced_source_collection_id = Some("saved:pack1"),
+        // while the signed relay profile keeps it None.
+        let for_alice = build_local_profile(
+            &paths,
+            "bob",
+            &store,
+            None,
+            Some("alice"),
+            Some(&signing_key),
+        );
+        assert_eq!(
+            for_alice.collections[0].synced_source_collection_id.as_deref(),
+            Some("saved:pack1")
+        );
+        assert_eq!(
+            for_alice
+                .signed_relay_profile
+                .as_ref()
+                .unwrap()
+                .payload
+                .collections[0]
+                .synced_source_collection_id,
+            None
+        );
+
+        // Carol (unrelated peer) does NOT receive Alice's synced_source_collection_id.
+        let for_carol = build_local_profile(&paths, "bob", &store, None, Some("carol"), None);
+        assert_eq!(for_carol.collections[0].synced_source_collection_id, None);
+    }
+
+    #[test]
+    fn resolve_friend_active_loadouts_resolves_synced_saved_installed_and_active_matches() {
+        let dir = tempdir().unwrap();
+        let paths = Paths {
+            config_dir: dir.path().join("cfg"),
+            data_dir: dir.path().join("data"),
+            cache_dir: dir.path().join("cache"),
+        };
+        fs::create_dir_all(&paths.config_dir).unwrap();
+        fs::create_dir_all(&paths.data_dir).unwrap();
+
+        let game = crate::config::ManagedGame {
+            id: "skyrim".into(),
+            title: "Skyrim".into(),
+            nexus_domain: "skyrimspecialedition".into(),
+            install_path: dir.path().join("game").to_string_lossy().into_owned(),
+            launcher: "steam".into(),
+            plugin_id: "skyrimse".into(),
+            cover_path: None,
+            cover_url: None,
+            project_name: None,
+            thunderstore_community: None,
+            modio_game_id: None,
+            tool_overrides: None,
+            game_version: None,
+            ignored_requirements: Vec::new(),
+            launch_executable: None,
+            launch_command_source: Default::default(),
+            custom_env_vars: Vec::new(),
+            custom_wrapper: None,
+            custom_launch_args: None,
+            wine_overrides_dismissed: false,
+        };
+        let mut cfg = crate::config::AppConfig::default();
+        cfg.managed_games.push(game.clone());
+        crate::config::save_config(&paths, &cfg).unwrap();
+
+        let make_mod = |id: &str, mod_id: u64| crate::mods::StagedMod {
+            id: id.into(),
+            name: id.into(),
+            enabled: true,
+            source: crate::mods::ModSource::Nexus,
+            domain: "skyrimspecialedition".into(),
+            nexus_mod_id: mod_id,
+            nexus_file_id: mod_id * 10,
+            ..Default::default()
+        };
+
+        let mod1 = make_mod("m1", 101);
+        let mod2 = make_mod("m2", 202);
+        let mod3 = make_mod("m3", 303);
+
+        // Local saved collection "Co-op Pack" with mod1.
+        let (saved_manifest, _, _) = crate::share::build_manifest_from_loadorder_with_selections(
+            &crate::mods::LoadOrder {
+                mods: vec![mod1.clone()],
+            },
+            &game,
+            Some("Co-op Pack".into()),
+            true,
+        );
+        let saved_code = crate::share::encode_share_manifest(&saved_manifest).unwrap();
+        let saved_store = crate::share::SavedCollectionsStore {
+            collections: vec![crate::share::SavedCollectionEntry {
+                id: "coop".into(),
+                name: "Co-op Pack".into(),
+                code: saved_code,
+                created_at: "2026-11-21T00:00:00Z".into(),
+                updated_at: "2026-11-21T00:00:00Z".into(),
+                source_game_id: Some("skyrim".into()),
+                game: saved_manifest.game.clone(),
+                game_versions: None,
+                mod_count: 1,
+                nexus_count: 1,
+                thunderstore_count: 0,
+                modio_count: 0,
+                share_id: None,
+            }],
+        };
+        fs::write(
+            paths.data_dir.join("saved_collections.json"),
+            serde_json::to_string(&saved_store).unwrap(),
+        )
+        .unwrap();
+
+        // Local installed collection "Installed Pack" with mod2.
+        let (inst_manifest, _, _) = crate::share::build_manifest_from_loadorder_with_selections(
+            &crate::mods::LoadOrder {
+                mods: vec![mod2.clone()],
+            },
+            &game,
+            Some("Installed Pack".into()),
+            true,
+        );
+        let inst_code = crate::share::encode_share_manifest(&inst_manifest).unwrap();
+        crate::mods::sync_installed_collection(
+            &paths,
+            "skyrim",
+            crate::mods::InstalledCollection {
+                id: "inst1".into(),
+                name: "Installed Pack".into(),
+                profile_code: Some(inst_code),
+                mod_ids: vec!["m2".into()],
+                ..Default::default()
+            },
+            &[],
+        )
+        .unwrap();
+
+        // Local active loadout with mod3.
+        crate::mods::save_loadorder(
+            &paths,
+            "skyrim",
+            &crate::mods::LoadOrder {
+                mods: vec![mod3.clone()],
+            },
+        )
+        .unwrap();
+
+        // Friend active loadout codes (notice generic name "Skyrim Loadout" differs from "Co-op Pack" / "Installed Pack").
+        let encode_active = |m: crate::mods::StagedMod| {
+            let (manifest, _, _) = crate::share::build_manifest_from_loadorder_with_selections(
+                &crate::mods::LoadOrder { mods: vec![m] },
+                &game,
+                Some("Skyrim Loadout".into()),
+                true,
+            );
+            let code = crate::share::encode_share_manifest(&manifest).unwrap();
+            let hash = crate::share::share_hash(&code);
+            (code, hash)
+        };
+        let (f_mod1_code, f_mod1_hash) = encode_active(mod1);
+        let (f_mod2_code, f_mod2_hash) = encode_active(mod2);
+        let (f_mod3_code, f_mod3_hash) = encode_active(mod3);
+
+        let make_friend = |peer_id: &str,
+                           code: String,
+                           hash: String,
+                           syncing: Vec<String>,
+                           synced_src: Option<String>| FriendRecord {
+            peer_id: peer_id.into(),
+            display_name: peer_id.into(),
+            profile_picture: None,
+            addr: EndpointAddr::from(SecretKey::generate().public()),
+            status: FriendStatus::Connected,
+            online: true,
+            last_seen_at: None,
+            cached_profile: Some(PeerProfileSummary {
+                peer_id: peer_id.into(),
+                display_name: peer_id.into(),
+                profile_picture: None,
+                updated_at: "2026-11-21T00:00:00Z".into(),
+                collections: vec![FriendShareRef {
+                    id: "active:skyrim".into(),
+                    kind: FriendCollectionKind::ActiveLoadout,
+                    name: "Skyrim Loadout".into(),
+                    share_code: code,
+                    share_hash: hash,
+                    updated_at: "2026-11-21T00:00:00Z".into(),
+                    specific_friends_only: false,
+                    synced_source_collection_id: synced_src,
+                    matched_local_collection: None,
+                }],
+                friends: None,
+                allow_mutual_connections: true,
+                signed_relay_profile: None,
+            }),
+            syncing_my_collections: syncing,
+            cached_via_peer_name: None,
+        };
+
+        let mut friends = vec![
+            // 1. SyncedToYours via synced_source_collection_id even with outdated mods (mod2 vs saved:coop's mod1)
+            make_friend(
+                "p_synced_stale",
+                f_mod2_code.clone(),
+                f_mod2_hash.clone(),
+                vec!["saved:coop".into()],
+                Some("saved:coop".into()),
+            ),
+            // 2. SyncedToYours via syncing_my_collections + manifest_mods_match (no synced_source_collection_id)
+            make_friend(
+                "p_synced_legacy",
+                f_mod1_code.clone(),
+                f_mod1_hash.clone(),
+                vec!["saved:coop".into()],
+                None,
+            ),
+            // 3. MatchesSaved (not syncing)
+            make_friend("p_saved", f_mod1_code, f_mod1_hash, vec![], None),
+            // 4. MatchesInstalled
+            make_friend("p_installed", f_mod2_code, f_mod2_hash, vec![], None),
+            // 5. MatchesActiveLoadout
+            make_friend("p_active", f_mod3_code, f_mod3_hash, vec![], None),
+        ];
+
+        resolve_friend_active_loadouts(&paths, &mut friends);
+
+        let m0 = friends[0].cached_profile.as_ref().unwrap().collections[0]
+            .matched_local_collection
+            .as_ref()
+            .unwrap();
+        assert_eq!(m0.kind, FriendCollectionMatchKind::SyncedToYours);
+        assert_eq!(m0.id, "saved:coop");
+        assert!(m0.has_local_changes);
+
+        let m1 = friends[1].cached_profile.as_ref().unwrap().collections[0]
+            .matched_local_collection
+            .as_ref()
+            .unwrap();
+        assert_eq!(m1.kind, FriendCollectionMatchKind::SyncedToYours);
+        assert_eq!(m1.id, "saved:coop");
+        assert!(!m1.has_local_changes);
+
+        let m2 = friends[2].cached_profile.as_ref().unwrap().collections[0]
+            .matched_local_collection
+            .as_ref()
+            .unwrap();
+        assert_eq!(m2.kind, FriendCollectionMatchKind::MatchesSaved);
+        assert_eq!(m2.name, "Co-op Pack");
+
+        let m3 = friends[3].cached_profile.as_ref().unwrap().collections[0]
+            .matched_local_collection
+            .as_ref()
+            .unwrap();
+        assert_eq!(m3.kind, FriendCollectionMatchKind::MatchesInstalled);
+        assert_eq!(m3.name, "Installed Pack");
+
+        let m4 = friends[4].cached_profile.as_ref().unwrap().collections[0]
+            .matched_local_collection
+            .as_ref()
+            .unwrap();
+        assert_eq!(m4.kind, FriendCollectionMatchKind::MatchesActiveLoadout);
+        assert_eq!(m4.id, "active:skyrim");
+    }
+
+    #[test]
+    fn allow_cache_relay_opt_out_persists_and_blocks_relay() {
+        let dir = tempdir().unwrap();
+        let paths = Paths {
+            config_dir: dir.path().join("cfg"),
+            data_dir: dir.path().join("data"),
+            cache_dir: dir.path().join("cache"),
+        };
+        fs::create_dir_all(&paths.data_dir).unwrap();
+
+        let svc = P2pService::new(paths.clone());
+        assert!(svc.get_state().unwrap().allow_cache_relay);
+
+        let disabled = svc.set_allow_cache_relay(false).unwrap();
+        assert!(!disabled.allow_cache_relay);
+        let reloaded = P2pService::new(paths.clone());
+        assert!(!reloaded.get_state().unwrap().allow_cache_relay);
+
+        let self_key = SecretKey::generate();
+        let alice_key = SecretKey::generate();
+        let carol_key = SecretKey::generate();
+        let alice_id = alice_key.public().to_string();
+        let carol_id = carol_key.public().to_string();
+
+        let carol_relay = sign_relay_profile(
+            &carol_key,
+            RelayProfilePayload {
+                peer_id: carol_id.clone(),
+                display_name: "Carol".into(),
+                profile_picture: None,
+                updated_at: "2026-11-21T03:00:00Z".into(),
+                collections: vec![],
+                friends: Some(vec![SharedFriendRef {
+                    peer_id: alice_id.clone(),
+                    display_name: "Alice".into(),
+                    addr: None,
+                    profile_updated_at: None,
+                }]),
+                allow_mutual_connections: true,
+            },
+        )
+        .unwrap();
+
+        let mut store = FriendsStore::default();
+        store.allow_cache_relay = false;
+        store.friends.push(FriendRecord {
+            peer_id: alice_id.clone(),
+            display_name: "Alice".into(),
+            profile_picture: None,
+            addr: EndpointAddr::new(alice_key.public()),
+            status: FriendStatus::Connected,
+            online: true,
+            last_seen_at: None,
+            cached_profile: None,
+            syncing_my_collections: Vec::new(),
+            cached_via_peer_name: None,
+        });
+        store.friends.push(FriendRecord {
+            peer_id: carol_id.clone(),
+            display_name: "Carol".into(),
+            profile_picture: None,
+            addr: EndpointAddr::new(carol_key.public()),
+            status: FriendStatus::Connected,
+            online: false,
+            last_seen_at: None,
+            cached_profile: Some(PeerProfileSummary {
+                peer_id: carol_id.clone(),
+                display_name: "Carol".into(),
+                profile_picture: None,
+                updated_at: "2026-11-21T03:00:00Z".into(),
+                collections: vec![],
+                friends: Some(vec![SharedFriendRef {
+                    peer_id: alice_id.clone(),
+                    display_name: "Alice".into(),
+                    addr: None,
+                    profile_updated_at: None,
+                }]),
+                allow_mutual_connections: true,
+                signed_relay_profile: Some(carol_relay),
+            }),
+            syncing_my_collections: Vec::new(),
+            cached_via_peer_name: None,
+        });
+
+        let profile_for_alice = build_local_profile(
+            &paths,
+            &self_key.public().to_string(),
+            &store,
+            None,
+            Some(&alice_id),
+            None,
+        );
+        let shared = profile_for_alice.friends.unwrap();
+        assert_eq!(shared.len(), 1);
+        assert_eq!(shared[0].profile_updated_at, None);
+
+        assert!(matches!(
+            resolve_cached_friend_profile_for_peer(&store, &alice_id, &carol_id, None),
+            P2pResponse::Denied(_)
+        ));
+    }
+
+    #[test]
+    fn build_local_profile_excludes_friends_without_cached_profile() {
+        let dir = tempdir().unwrap();
+        let paths = Paths {
+            config_dir: dir.path().join("cfg"),
+            data_dir: dir.path().join("data"),
+            cache_dir: dir.path().join("cache"),
+        };
+        fs::create_dir_all(&paths.data_dir).unwrap();
+
+        let self_key = SecretKey::generate();
+        let bob_key = SecretKey::generate();
+        let carol_key = SecretKey::generate();
+        let bob_id = bob_key.public().to_string();
+
+        let mut store = FriendsStore::default();
+        store.friends.push(FriendRecord {
+            peer_id: bob_id.clone(),
+            display_name: "Bob".into(),
+            profile_picture: None,
+            addr: EndpointAddr::new(bob_key.public()),
+            status: FriendStatus::Connected,
+            online: true,
+            last_seen_at: None,
+            cached_profile: None,
+            syncing_my_collections: Vec::new(),
+            cached_via_peer_name: None,
+        });
+        store.friends.push(FriendRecord {
+            peer_id: carol_key.public().to_string(),
+            display_name: "Carol".into(),
+            profile_picture: None,
+            addr: EndpointAddr::new(carol_key.public()),
+            status: FriendStatus::Connected,
+            online: false,
+            last_seen_at: None,
+            cached_profile: None,
+            syncing_my_collections: Vec::new(),
+            cached_via_peer_name: None,
+        });
+
+        let profile = build_local_profile(
+            &paths,
+            &self_key.public().to_string(),
+            &store,
+            None,
+            Some(&bob_id),
+            None,
+        );
+        assert!(profile.friends.unwrap().is_empty());
+    }
+
+    #[test]
+    fn validate_profile_picture_checks_magic_bytes() {
+        // Fake PNG (plain text bytes masquerading as PNG) is rejected.
+        assert!(validate_profile_picture("data:image/png;base64,SGVsbG8=").is_err());
+        // Valid JPEG magic bytes accepted.
+        assert!(validate_profile_picture("data:image/jpeg;base64,/9j/4AAQ").is_ok());
+        // Valid GIF89a magic bytes accepted.
+        assert!(validate_profile_picture("data:image/gif;base64,R0lGODlh").is_ok());
+    }
+
+    #[test]
+    fn verify_signed_relay_profile_validates_bounds_and_legacy_dual_verify() {
+        let key = SecretKey::generate();
+        let peer_id = key.public().to_string();
+        let payload = RelayProfilePayload {
+            peer_id: peer_id.clone(),
+            display_name: "Carol".into(),
+            profile_picture: None,
+            updated_at: "2026-11-21T03:00:00Z".into(),
+            collections: vec![],
+            friends: None,
+            allow_mutual_connections: true,
+        };
+
+        // Domain-separated signature verifies.
+        let signed = sign_relay_profile(&key, payload.clone()).unwrap();
+        assert!(verify_signed_relay_profile(&peer_id, &signed).is_ok());
+
+        // Legacy unprefixed signature also verifies (dual-verify).
+        let legacy_bytes = serde_json::to_vec(&payload).unwrap();
+        let legacy_sig = key.sign(&legacy_bytes);
+        let legacy_signed = SignedRelayProfile {
+            payload: payload.clone(),
+            signature: hex::encode(legacy_sig.to_bytes()),
+        };
+        assert!(verify_signed_relay_profile(&peer_id, &legacy_signed).is_ok());
+
+        // Oversized/invalid profile picture in relay payload is rejected even if signed.
+        let mut bad_payload = payload;
+        bad_payload.profile_picture = Some("data:image/png;base64,SGVsbG8=".into());
+        let bad_signed = sign_relay_profile(&key, bad_payload).unwrap();
+        assert!(verify_signed_relay_profile(&peer_id, &bad_signed).is_err());
+    }
+
+    #[test]
+    fn resolve_cached_friend_profile_requires_relay_friends_list() {
+        let alice_key = SecretKey::generate();
+        let carol_key = SecretKey::generate();
+        let alice_id = alice_key.public().to_string();
+        let carol_id = carol_key.public().to_string();
+
+        // Carol's relay payload has friends: None (e.g. SpecificFriends only),
+        // even though Carol shared her friends list directly with us.
+        let carol_relay = sign_relay_profile(
+            &carol_key,
+            RelayProfilePayload {
+                peer_id: carol_id.clone(),
+                display_name: "Carol".into(),
+                profile_picture: None,
+                updated_at: "2026-11-21T03:00:00Z".into(),
+                collections: vec![],
+                friends: None,
+                allow_mutual_connections: true,
+            },
+        )
+        .unwrap();
+
+        let mut store = FriendsStore::default();
+        store.friends.push(FriendRecord {
+            peer_id: alice_id.clone(),
+            display_name: "Alice".into(),
+            profile_picture: None,
+            addr: EndpointAddr::new(alice_key.public()),
+            status: FriendStatus::Connected,
+            online: true,
+            last_seen_at: None,
+            cached_profile: None,
+            syncing_my_collections: Vec::new(),
+            cached_via_peer_name: None,
+        });
+        store.friends.push(FriendRecord {
+            peer_id: carol_id.clone(),
+            display_name: "Carol".into(),
+            profile_picture: None,
+            addr: EndpointAddr::new(carol_key.public()),
+            status: FriendStatus::Connected,
+            online: false,
+            last_seen_at: None,
+            cached_profile: Some(PeerProfileSummary {
+                peer_id: carol_id.clone(),
+                display_name: "Carol".into(),
+                profile_picture: None,
+                updated_at: "2026-11-21T03:00:00Z".into(),
+                collections: vec![],
+                friends: Some(vec![SharedFriendRef {
+                    peer_id: alice_id.clone(),
+                    display_name: "Alice".into(),
+                    addr: None,
+                    profile_updated_at: None,
+                }]),
+                allow_mutual_connections: true,
+                signed_relay_profile: Some(carol_relay),
+            }),
+            syncing_my_collections: Vec::new(),
+            cached_via_peer_name: None,
+        });
+
+        assert!(matches!(
+            resolve_cached_friend_profile_for_peer(&store, &alice_id, &carol_id, None),
+            P2pResponse::Denied(_)
+        ));
+    }
+
+    #[test]
+    fn sanitize_profile_fields_enforces_share_code_budget() {
+        let peer_id = SecretKey::generate().public().to_string();
+        let mut name = "Peer".to_string();
+        let mut pic = None;
+        let mut friends = None;
+        let big_code = "A".repeat(1_500_000);
+        let mut collections = (0..4)
+            .map(|i| FriendShareRef {
+                id: format!("saved:{i}"),
+                kind: FriendCollectionKind::SavedCollection,
+                name: format!("Col {i}"),
+                share_code: big_code.clone(),
+                share_hash: format!("h{i}"),
+                updated_at: "2026-11-21T00:00:00Z".into(),
+                ..Default::default()
+            })
+            .collect();
+
+        P2pService::sanitize_profile_fields(
+            &peer_id,
+            None,
+            &mut name,
+            &mut pic,
+            &mut collections,
+            &mut friends,
+        );
+
+        let total: usize = collections.iter().map(|c| c.share_code.len()).sum();
+        assert!(total <= MAX_FRIEND_CACHED_SHARE_BYTES);
+        assert!(!collections[0].share_code.is_empty());
+        assert!(!collections[1].share_code.is_empty());
+        // 3rd and 4th exceed 4 MB budget so their share_code bodies are cleared.
+        assert!(collections[2].share_code.is_empty());
+        assert!(collections[3].share_code.is_empty());
+    }
+
+    #[test]
+    fn profile_rate_limiter_throttles_bursts() {
+        let mut limiter = PeerProfileRateLimiter::default();
+        for _ in 0..(PROFILE_RATE_BURST as usize) {
+            assert!(limiter.allow("peer-a"));
+        }
+        assert!(!limiter.allow("peer-a"));
+        assert!(limiter.allow("peer-b"));
     }
 }

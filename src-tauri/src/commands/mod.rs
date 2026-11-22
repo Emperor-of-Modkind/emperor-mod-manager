@@ -2891,10 +2891,12 @@ pub async fn save_and_validate_nexus_key(
     }
     let client = NexusClient::new(key.clone()).map_err(|e| e.to_string())?;
     let user = client.validate().await.map_err(|e| e.to_string())?;
+    let file = state.paths.config_dir.join("nexus_api_key");
     if let Err(e) = nexus::store_api_key(&key) {
         log::warn!("keyring store failed: {e}");
-        let file = state.paths.config_dir.join("nexus_api_key");
         nexus::store_api_key_file(&file, &key).map_err(|e| e.to_string())?;
+    } else {
+        let _ = std::fs::remove_file(&file);
     }
     *state.api_key.lock().map_err(|e| e.to_string())? = Some(key);
     *state.user.lock().map_err(|e| e.to_string())? = Some(user.clone());
@@ -2931,10 +2933,12 @@ pub async fn save_and_validate_modio_key(state: &AppState, key: String) -> Resul
     }
     let client = Arc::new(ModioClient::new(&key).map_err(|e| e.to_string())?);
     client.validate().await.map_err(|e| e.to_string())?;
+    let file = state.paths.config_dir.join("modio_api_key");
     if let Err(e) = modio_api::store_api_key(&key) {
         log::warn!("mod.io keyring store failed: {e}");
-        let file = state.paths.config_dir.join("modio_api_key");
         modio_api::store_api_key_file(&file, &key).map_err(|e| e.to_string())?;
+    } else {
+        let _ = std::fs::remove_file(&file);
     }
     *state.modio_api_key.lock().map_err(|e| e.to_string())? = Some(key.clone());
     *state.modio_client.lock().map_err(|e| e.to_string())? = Some((key, client));
@@ -8296,7 +8300,16 @@ pub fn uninstall_collection(
     game_id: String,
     collection_id: String,
 ) -> Result<usize, String> {
-    mods::uninstall_collection(&state.paths, &game_id, &collection_id).map_err(|e| e.to_string())
+    let friend_peer_id = mods::load_collections(&state.paths, &game_id)
+        .ok()
+        .and_then(|s| s.collections.into_iter().find(|c| c.id == collection_id))
+        .and_then(|c| c.friend_sync.map(|fs| fs.friend_peer_id));
+    let removed = mods::uninstall_collection(&state.paths, &game_id, &collection_id)
+        .map_err(|e| e.to_string())?;
+    if let Some(peer_id) = friend_peer_id {
+        state.p2p.notify_peer_sync_state(peer_id);
+    }
+    Ok(removed)
 }
 
 #[tauri::command]
@@ -12458,6 +12471,17 @@ pub fn set_allow_mutual_connections(
 }
 
 #[tauri::command]
+pub fn set_allow_cache_relay(
+    state: State<'_, AppState>,
+    allow: bool,
+) -> Result<crate::p2p::FriendsState, String> {
+    state
+        .p2p
+        .set_allow_cache_relay(allow)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn add_friend_by_code(
     state: State<'_, AppState>,
     code: String,
@@ -12555,6 +12579,11 @@ pub async fn join_or_sync_friend_collection(
     friend_collection_id: String,
     resolutions: Option<CollectionResolutionChoices>,
 ) -> Result<FriendSyncResult, String> {
+    let peer_id = peer_id
+        .trim()
+        .parse::<iroh::EndpointId>()
+        .map_err(|_| "Invalid friend peer ID".to_string())?
+        .to_string();
     let share_code = state
         .p2p
         .get_friend_share_code(&peer_id, &friend_collection_id)
@@ -12562,13 +12591,18 @@ pub async fn join_or_sync_friend_collection(
     let share_hash = share::share_hash(&share_code);
     let manifest = share::decode_share_code(&share_code).map_err(|e| e.to_string())?;
     let local_col_id = friend_collection_local_id(&peer_id, &friend_collection_id);
+    let sanitized_manifest_name = manifest
+        .name
+        .as_deref()
+        .map(|n| crate::p2p::sanitize_short_text(n, 128))
+        .filter(|n| !n.is_empty());
 
     let mut result = import_share_code_inner(
         app,
         state.clone(),
         game_id.clone(),
         share_code.clone(),
-        manifest.name.clone(),
+        sanitized_manifest_name,
         resolutions,
         Some(local_col_id.clone()),
         false,
@@ -12659,15 +12693,21 @@ pub fn finalize_friend_collection_sync(
     friend_collection_id: String,
     share_code: String,
 ) -> Result<InstalledCollection, String> {
+    let peer_id = peer_id
+        .trim()
+        .parse::<iroh::EndpointId>()
+        .map_err(|_| "Invalid friend peer ID".to_string())?
+        .to_string();
     let manifest = share::decode_share_code(&share_code).map_err(|e| e.to_string())?;
     let share_hash = share::share_hash(&share_code);
     let local_col_id = friend_collection_local_id(&peer_id, &friend_collection_id);
     let name = manifest
         .name
-        .clone()
-        .filter(|s| !s.trim().is_empty())
+        .as_deref()
+        .map(|s| crate::p2p::sanitize_short_text(s, 128))
+        .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "Friend Collection".into());
-    record_synced_friend_collection(
+    let installed = record_synced_friend_collection(
         &state.paths,
         &game_id,
         &local_col_id,
@@ -12677,7 +12717,9 @@ pub fn finalize_friend_collection_sync(
         share_code,
         share_hash,
         &manifest,
-    )
+    )?;
+    state.p2p.notify_peer_sync_state(peer_id);
+    Ok(installed)
 }
 
 #[derive(Debug, Clone, Serialize)]

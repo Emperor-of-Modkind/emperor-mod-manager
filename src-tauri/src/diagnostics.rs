@@ -1073,26 +1073,47 @@ fn tail_lines(text: &str, count: usize) -> String {
 }
 
 fn redact(text: &str) -> String {
-    let Some(base) = directories::BaseDirs::new() else {
-        return text.to_string();
-    };
-    let home = base.home_dir().display().to_string();
-    if home.is_empty() {
-        return text.to_string();
-    }
     let mut out = text.to_string();
-    for prefix in [
-        home.clone(),
-        home.replace('\\', "/"),
-        home.replace('/', "\\"),
-    ] {
-        if prefix.is_empty() {
-            continue;
+    if let Some(base) = directories::BaseDirs::new() {
+        let home = base.home_dir().display().to_string();
+        if !home.is_empty() {
+            for prefix in [
+                home.clone(),
+                home.replace('\\', "/"),
+                home.replace('/', "\\"),
+            ] {
+                if prefix.is_empty() {
+                    continue;
+                }
+                out = out.replace(&format!("{prefix}/"), "~/");
+                out = out.replace(&format!("{prefix}\\"), "~\\");
+            }
         }
-        out = out.replace(&format!("{prefix}/"), "~/");
-        out = out.replace(&format!("{prefix}\\"), "~\\");
     }
-    out
+    redact_secrets(&out)
+}
+
+fn redact_secrets(text: &str) -> String {
+    use std::sync::OnceLock;
+    static QUERY_KEY_RE: OnceLock<regex::Regex> = OnceLock::new();
+    static SENTINEL_KEY_RE: OnceLock<regex::Regex> = OnceLock::new();
+    static HEADER_KEY_RE: OnceLock<regex::Regex> = OnceLock::new();
+    static BEARER_RE: OnceLock<regex::Regex> = OnceLock::new();
+
+    let query_re = QUERY_KEY_RE
+        .get_or_init(|| regex::Regex::new(r#"(?i)([?&]api_key=)[^&\s"')]+ "#.trim_end()).unwrap());
+    let sentinel_re = SENTINEL_KEY_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)(capture-(?:api|modio)-key\?key=)[^&\s"')]+ "#.trim_end()).unwrap()
+    });
+    let header_re = HEADER_KEY_RE
+        .get_or_init(|| regex::Regex::new(r#"(?i)(apikey\s*[:=]\s*["']?)[^\s,"']+"#).unwrap());
+    let bearer_re =
+        BEARER_RE.get_or_init(|| regex::Regex::new(r"(?i)(Bearer\s+)[A-Za-z0-9._~+/-]+=*").unwrap());
+
+    let out = query_re.replace_all(text, "${1}[REDACTED]");
+    let out = sentinel_re.replace_all(&out, "${1}[REDACTED]");
+    let out = header_re.replace_all(&out, "${1}[REDACTED]");
+    bearer_re.replace_all(&out, "${1}[REDACTED]").into_owned()
 }
 
 #[cfg(test)]
@@ -1564,5 +1585,22 @@ init complete
             "{}",
             diagnosis.summary
         );
+    }
+
+    #[test]
+    fn redact_strips_api_keys_and_tokens() {
+        let sample = "GET https://api.mod.io/v1/games?api_key=0123456789abcdef0123456789abcdef&limit=1\n\
+                      sentinel=https://emperor-mod-manager.invalid/capture-api-key?key=nexus_secret_xyz\n\
+                      header apikey: nexus_header_secret\n\
+                      Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.secret";
+        let cleaned = redact(sample);
+        assert!(!cleaned.contains("0123456789abcdef0123456789abcdef"));
+        assert!(!cleaned.contains("nexus_secret_xyz"));
+        assert!(!cleaned.contains("nexus_header_secret"));
+        assert!(!cleaned.contains("eyJhbGciOiJIUzI1NiJ9.secret"));
+        assert!(cleaned.contains("api_key=[REDACTED]"));
+        assert!(cleaned.contains("capture-api-key?key=[REDACTED]"));
+        assert!(cleaned.contains("apikey: [REDACTED]"));
+        assert!(cleaned.contains("Bearer [REDACTED]"));
     }
 }

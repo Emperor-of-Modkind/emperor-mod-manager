@@ -7,6 +7,7 @@ import {
   visibilityIcon,
 } from "./CollectionSharingModal";
 import { FriendAvatar, resizeProfilePicture } from "./FriendAvatar";
+import { SettingsToggle } from "./SettingsSection";
 import type { CollectionVisibility, FriendsState } from "./types";
 
 export type SocialSettingsSectionProps = {
@@ -26,12 +27,14 @@ export function SocialSettingsSection({
   const [savingName, setSavingName] = useState(false);
   const [savingPicture, setSavingPicture] = useState(false);
   const [savingMutuals, setSavingMutuals] = useState(false);
+  const [savingCacheRelay, setSavingCacheRelay] = useState(false);
   const [privacyModalOpen, setPrivacyModalOpen] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const friendsListVisibility: CollectionVisibility =
     friendsState?.friends_list_visibility ?? { mode: "all_friends" };
   const allowMutualConnections = friendsState?.allow_mutual_connections !== false;
+  const allowCacheRelay = friendsState?.allow_cache_relay !== false;
 
   useEffect(() => {
     setNameInput(friendsState?.display_name ?? "");
@@ -112,6 +115,24 @@ export function SocialSettingsSection({
       onError(String(err));
     } finally {
       setSavingMutuals(false);
+    }
+  }
+
+  async function handleToggleCacheRelay(allow: boolean) {
+    onError(null);
+    setSavingCacheRelay(true);
+    try {
+      const next = await api.setAllowCacheRelay(allow);
+      onFriendsStateChange(next);
+      onNotice(
+        allow
+          ? "Offline friend cache sharing enabled."
+          : "Offline friend cache sharing disabled.",
+      );
+    } catch (err) {
+      onError(String(err));
+    } finally {
+      setSavingCacheRelay(false);
     }
   }
 
@@ -202,18 +223,31 @@ export function SocialSettingsSection({
 
       <div className="setting-block">
         <span>Allow mutual connections</span>
-        <label className="inline">
-          <input
-            type="checkbox"
-            checked={allowMutualConnections}
-            disabled={savingMutuals}
-            onChange={(e) => void handleToggleMutualConnections(e.target.checked)}
-          />
+        <SettingsToggle
+          checked={allowMutualConnections}
+          disabled={savingMutuals}
+          onChange={(checked) => void handleToggleMutualConnections(checked)}
+        >
           Let friends of friends see me in mutual friends lists
-        </label>
+        </SettingsToggle>
         <p className="note">
           When turned off, your friends will not include you in their shared
           friends lists.
+        </p>
+      </div>
+
+      <div className="setting-block">
+        <span>Share cached friend profiles</span>
+        <SettingsToggle
+          checked={allowCacheRelay}
+          disabled={savingCacheRelay}
+          onChange={(checked) => void handleToggleCacheRelay(checked)}
+        >
+          Allow mutual friends to pull newer cached profiles of offline friends from me
+        </SettingsToggle>
+        <p className="note">
+          When turned off, your client will not share cached profiles of offline
+          friends with mutual friends.
         </p>
       </div>
 

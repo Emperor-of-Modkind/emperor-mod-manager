@@ -45,7 +45,7 @@ Grab the `.deb` or `.AppImage` from the [latest release](https://github.com/Lewi
 ./scripts/install-local.sh
 ```
 
-Or `npm run install:local`. That builds the release binary (`--no-bundle`), installs it to `~/.local/bin/emperor-mod-manager`, installs the `.desktop` entry and icons under `~/.local/share/`, and registers `nxm://` and `emperor://` links. Pass `--skip-build` to reinstall an existing build or `--uninstall` to remove the local install.
+Or `npm run install:local`. That builds the release binary (`--no-bundle`), installs it to `~/.local/bin/emperor-mod-manager`, installs the `.desktop` entry and icons under `~/.local/share/`, and registers `nxm://` and `emperor://` links. Pass `--skip-build` to reinstall an existing build, `--clean` to remove build artifacts after installing, or `--uninstall` to remove the local install.
 
 ### Windows
 

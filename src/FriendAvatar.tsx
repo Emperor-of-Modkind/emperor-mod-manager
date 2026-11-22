@@ -27,7 +27,7 @@ export function FriendAvatar({
   name: string;
   src?: string | null;
   online?: boolean;
-  size?: "sm" | "md" | "lg";
+  size?: "xs" | "sm" | "md" | "lg";
   showStatus?: boolean;
 }) {
   const initials = getInitials(name);

@@ -24,6 +24,11 @@ import {
 } from "@fortawesome/free-solid-svg-icons";
 import { api } from "./api";
 import {
+  formatActiveLoadoutMatchLabel,
+  getCollectionsSyncedByFriend,
+  getFriendActiveLoadoutMatches,
+} from "./collectionSyncers";
+import {
   formatMutualSummary,
   getMutualFriends,
   getMutualFriendsForPeerId,
@@ -844,6 +849,21 @@ export function FriendsPage({
                         ? "Active Loadout"
                         : "Saved Collection"}
                     </span>
+                    {(() => {
+                      if (ev.collection_kind !== "active_loadout") return null;
+                      const activeCol = liveFriend?.cached_profile?.collections.find(
+                        (c) => c.id === ev.collection_id,
+                      );
+                      const match = activeCol?.matched_local_collection;
+                      if (!match) return null;
+                      return (
+                        <span
+                          className={`pill ${match.has_local_changes ? "warn" : "ok"}`}
+                        >
+                          {formatActiveLoadoutMatchLabel(match)}
+                        </span>
+                      );
+                    })()}
                     {ev.game_title ? (
                       <span className="pill">{ev.game_title}</span>
                     ) : null}
@@ -1047,8 +1067,14 @@ export function FriendsPage({
       matchedManaged?.title ??
       decodedPreview?.game.title ??
       "Shared Collection";
+    const activeMatch =
+      selectedCol.kind === "active_loadout"
+        ? selectedCol.matched_local_collection ?? null
+        : null;
     const isInstalled = Boolean(
       linkedInstalled ||
+        activeMatch?.kind === "matches_installed" ||
+        activeMatch?.kind === "matches_active_loadout" ||
         (selectedCol.share_code &&
           installedShareIds?.has(selectedCol.share_code.trim())),
     );
@@ -1104,6 +1130,16 @@ export function FriendsPage({
                   {" "}
                   <span className={`pill ${hasUpdate ? "warn" : "ok"}`}>
                     {hasUpdate ? "Update available" : "Synced"}
+                  </span>
+                </>
+              ) : null}
+              {activeMatch ? (
+                <>
+                  {" "}
+                  <span
+                    className={`pill ${activeMatch.has_local_changes ? "warn" : "ok"}`}
+                  >
+                    {formatActiveLoadoutMatchLabel(activeMatch)}
                   </span>
                 </>
               ) : null}
@@ -1318,7 +1354,35 @@ export function FriendsPage({
         </div>
       )}
       {selectedFriend && !selectedCol && (
-        <div className="friends-tabs-row">
+        <>
+          {(() => {
+            const synced = getCollectionsSyncedByFriend(
+              selectedFriend,
+              state?.local_collections,
+            );
+            const activeMatches = getFriendActiveLoadoutMatches(selectedFriend);
+            if (synced.length === 0 && activeMatches.length === 0) return null;
+            return (
+              <div className="friends-detail-syncing-banner">
+                {synced.length > 0 && (
+                  <span className="pill ok">
+                    Syncing your{" "}
+                    {synced.length === 1 ? "collection" : "collections"}:{" "}
+                    {synced.map((c) => c.name).join(", ")}
+                  </span>
+                )}
+                {activeMatches.map(({ col, match }) => (
+                  <span
+                    key={col.id}
+                    className={`pill ${match.has_local_changes ? "warn" : "ok"}`}
+                  >
+                    Active loadout: {formatActiveLoadoutMatchLabel(match)}
+                  </span>
+                ))}
+              </div>
+            );
+          })()}
+          <div className="friends-tabs-row">
           <Segment>
             <SegmentTab
               layoutId="friend-detail-tabs"
@@ -1352,6 +1416,7 @@ export function FriendsPage({
             </SegmentTab>
           </Segment>
         </div>
+        </>
       )}
       </div>
 
@@ -1420,6 +1485,11 @@ export function FriendsPage({
                     f.profile_picture ?? f.cached_profile?.profile_picture;
                   const mutualSuffix =
                     mutualCount > 0 ? ` · ${mutualCount} mutual` : "";
+                  const syncingMine = getCollectionsSyncedByFriend(
+                    f,
+                    state.local_collections,
+                  );
+                  const activeMatches = getFriendActiveLoadoutMatches(f);
                   return (
                     <div key={f.peer_id} className="friends-friend-card">
                       <button
@@ -1452,6 +1522,34 @@ export function FriendsPage({
                           {f.status !== "pending_outgoing" && !f.online && (
                             <div className="muted friends-friend-card-seen">
                               Last seen {formatLastSeen(f.last_seen_at)}
+                            </div>
+                          )}
+                          {syncingMine.length > 0 && (
+                            <div
+                              className="friends-friend-card-syncing"
+                              title={`Syncing your ${syncingMine.map((c) => c.name).join(", ")}`}
+                            >
+                              Syncing your:{" "}
+                              {syncingMine.map((c) => c.name).join(", ")}
+                            </div>
+                          )}
+                          {activeMatches.length > 0 && (
+                            <div
+                              className="friends-friend-card-syncing"
+                              title={activeMatches
+                                .map(({ match }) =>
+                                  formatActiveLoadoutMatchLabel(match),
+                                )
+                                .join(" · ")}
+                            >
+                              Active loadout:{" "}
+                              {activeMatches
+                                .map(({ match }) =>
+                                  match.kind === "matches_active_loadout"
+                                    ? "Your active loadout"
+                                    : match.name,
+                                )
+                                .join(", ")}
                             </div>
                           )}
                         </div>
@@ -1540,7 +1638,9 @@ export function FriendsPage({
                 <span className={`pill ${selectedFriend.online ? "ok" : ""}`}>
                   {selectedFriend.online
                     ? "Online"
-                    : `Offline · Cached (${formatLastSeen(selectedFriend.last_seen_at)})`}
+                    : selectedFriend.cached_via_peer_name
+                      ? `Offline · Cached via ${selectedFriend.cached_via_peer_name} (${formatLastSeen(selectedFriend.last_seen_at)})`
+                      : `Offline · Cached (${formatLastSeen(selectedFriend.last_seen_at)})`}
                 </span>
               </p>
             </div>
@@ -1691,7 +1791,9 @@ export function FriendsPage({
             <span className={`pill ${selectedFriend.online ? "ok" : ""}`}>
               {selectedFriend.online
                 ? "Online"
-                : `Offline · Cached (${formatLastSeen(selectedFriend.last_seen_at)})`}
+                : selectedFriend.cached_via_peer_name
+                  ? `Offline · Cached via ${selectedFriend.cached_via_peer_name} (${formatLastSeen(selectedFriend.last_seen_at)})`
+                  : `Offline · Cached (${formatLastSeen(selectedFriend.last_seen_at)})`}
             </span>
           </p>
           {decodingLibrary && friendGameGroups.length === 0 ? (
@@ -1739,8 +1841,15 @@ export function FriendsPage({
                   linked &&
                     linked.friend_sync?.last_synced_hash !== col.share_hash,
                 );
+                const rowActiveMatch =
+                  col.kind === "active_loadout"
+                    ? col.matched_local_collection ?? null
+                    : null;
                 const installed = Boolean(
-                  linked || installedShareIds?.has(col.share_code.trim()),
+                  linked ||
+                    rowActiveMatch?.kind === "matches_installed" ||
+                    rowActiveMatch?.kind === "matches_active_loadout" ||
+                    installedShareIds?.has(col.share_code.trim()),
                 );
                 const updatedDate = formatCollectionDate(col.updated_at);
                 const busyHere = rowBusyKey === col.id;
@@ -1778,6 +1887,13 @@ export function FriendsPage({
                             className={`pill ${rowHasUpdate ? "warn" : "ok"}`}
                           >
                             {rowHasUpdate ? "Update available" : "Synced"}
+                          </span>
+                        ) : null}
+                        {rowActiveMatch ? (
+                          <span
+                            className={`pill ${rowActiveMatch.has_local_changes ? "warn" : "ok"}`}
+                          >
+                            {formatActiveLoadoutMatchLabel(rowActiveMatch)}
                           </span>
                         ) : null}
                       </strong>

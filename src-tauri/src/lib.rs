@@ -248,6 +248,7 @@ pub fn run() {
             commands::set_collection_sharing,
             commands::set_friends_list_visibility,
             commands::set_allow_mutual_connections,
+            commands::set_allow_cache_relay,
             commands::add_friend_by_code,
             commands::add_friend_by_peer,
             commands::respond_friend_request,

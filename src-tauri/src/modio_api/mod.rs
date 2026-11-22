@@ -99,10 +99,10 @@ impl ModioClient {
             .get_games()
             .filter(with_limit(1))
             .await
-            .context("mod.io get_games")?
+            .map_err(|e| sanitize_modio_err("mod.io get_games", e))?
             .data()
             .await
-            .context("mod.io get_games body")?;
+            .map_err(|e| sanitize_modio_err("mod.io get_games body", e))?;
         let _ = list;
         Ok(())
     }
@@ -436,32 +436,21 @@ pub fn clear_api_key() -> Result<()> {
     }
 }
 
+pub fn sanitize_modio_error_text(raw: &str) -> String {
+    let re = regex::Regex::new(r#"(?i)([?&]api_key=)[^&\s"')]+"#).expect("valid regex");
+    re.replace_all(raw, "${1}[REDACTED]").into_owned()
+}
+
+fn sanitize_modio_err(ctx: &str, err: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::anyhow!("{ctx}: {}", sanitize_modio_error_text(&err.to_string()))
+}
+
 pub fn store_api_key_file(path: &Path, key: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, key.trim())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(path)?.permissions();
-        perms.set_mode(0o600);
-        std::fs::set_permissions(path, perms)?;
-    }
-    Ok(())
+    crate::config::secret_store::store_encrypted_secret(path, key)
 }
 
 pub fn load_api_key_file(path: &Path) -> Result<Option<String>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let s = std::fs::read_to_string(path)?;
-    let s = s.trim().to_string();
-    if s.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(s))
-    }
+    crate::config::secret_store::load_encrypted_secret(path)
 }
 
 /// Known plugin_id → mod.io game id seeds (manual override still wins).
