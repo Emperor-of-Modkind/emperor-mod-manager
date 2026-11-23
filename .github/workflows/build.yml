@@ -83,13 +83,94 @@ jobs:
             src-tauri/target/release/emperor-mod-manager.exe
           if-no-files-found: warn
 
+  build-android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Android SDK & NDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK & Build-Tools
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018"
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build Android APK
+        run: ./scripts/build-android-apk.sh --all-targets --skip-rustup
+        env:
+          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.2.12479018
+
+      - name: Sign & package Android APK
+        run: |
+          mkdir -p dist-android
+          VERSION="$(node -p "require('./package.json').version")"
+          SRC_APK="$(find src-tauri/gen/android/app/build/outputs/apk -type f -name '*.apk' | head -n 1)"
+          if [[ -z "$SRC_APK" ]]; then
+            echo "No APK produced" >&2
+            exit 1
+          fi
+          OUT_APK="dist-android/emperor-mod-manager-${VERSION}-universal.apk"
+          if [[ -n "${ANDROID_KEYSTORE_BASE64:-}" ]]; then
+            echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > /tmp/release.keystore
+            APKSIGNER="${ANDROID_HOME}/build-tools/35.0.0/apksigner"
+            "$APKSIGNER" sign \
+              --ks /tmp/release.keystore \
+              --ks-pass "env:ANDROID_KEYSTORE_PASSWORD" \
+              --ks-key-alias "${ANDROID_KEY_ALIAS}" \
+              --key-pass "env:ANDROID_KEY_PASSWORD" \
+              --out "$OUT_APK" \
+              "$SRC_APK"
+            rm -f /tmp/release.keystore
+          else
+            cp "$SRC_APK" "dist-android/emperor-mod-manager-${VERSION}-universal-unsigned.apk"
+          fi
+          (cd dist-android && sha256sum *.apk > SHA256SUMS-android)
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+
+      - name: Upload Android artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: emperor-mod-manager-android
+          path: dist-android/*
+          if-no-files-found: warn
+
   release:
     if: >
       github.event_name == 'push' &&
       (github.ref == 'refs/heads/main' ||
        github.ref == 'refs/heads/master' ||
        startsWith(github.ref, 'refs/tags/v'))
-    needs: build
+    needs: [build, build-android]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -123,6 +204,7 @@ jobs:
           files: |
             artifacts/emperor-mod-manager-linux/**
             artifacts/emperor-mod-manager-windows/**
+            artifacts/emperor-mod-manager-android/**
             artifacts/arch/PKGBUILD
           generate_release_notes: true
         env:

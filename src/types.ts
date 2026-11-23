@@ -22,10 +22,17 @@ export type AppInfo = {
   name: string;
   version: string;
   platform: string;
+  is_mobile?: boolean;
   linux_only: boolean;
 };
 
-export type AppInstallVia = "pacman" | "deb" | "appimage" | "portable" | "nsis";
+export type AppInstallVia =
+  | "pacman"
+  | "deb"
+  | "appimage"
+  | "portable"
+  | "nsis"
+  | "android";
 
 export type AppUpdateStatus = {
   current_version: string;
@@ -1392,3 +1399,125 @@ export type LootSortResult = {
   used_masterlist: boolean;
   warnings: string[];
 };
+
+export type PairedDevice = {
+  peer_id: string;
+  device_name: string;
+  device_model: string;
+  paired_at: string;
+  last_seen_at: string;
+  allow_remote_launch: boolean;
+  connected: boolean;
+};
+
+export type MobilePairingSession = {
+  code: string;
+  expires_at: string;
+  ttl_secs: number;
+  host_name: string;
+  desktop_endpoint_id: string;
+  lan_addrs: string[];
+  remaining_attempts: number;
+};
+
+export type DiscoveredDesktop = {
+  host_name: string;
+  desktop_endpoint_id: string;
+  lan_addrs: string[];
+  pairing_active: boolean;
+  app_version: string;
+};
+
+export type MobileConnectionMode =
+  | "disconnected"
+  | "connecting"
+  | "lan_direct"
+  | "iroh_relay";
+
+export type MobileConnectionState = {
+  paired: boolean;
+  desktop_name: string | null;
+  desktop_peer_id: string | null;
+  mode: MobileConnectionMode;
+  last_synced_at: string | null;
+  last_error: string | null;
+  allow_remote_launch: boolean;
+};
+
+export type RemoteAccountSummary = {
+  nexus_connected: boolean;
+  nexus_user: NexusUser | null;
+  modio_connected: boolean;
+  p2p_display_name: string;
+  p2p_profile_picture: string | null;
+  theme: ThemePreference;
+  theme_style: ThemeStyle;
+  accent_color: string;
+  adult_content: boolean;
+  game_version_warnings: boolean;
+  auto_sort_before_deploy: boolean;
+};
+
+export type DesktopSnapshot = {
+  rev: number;
+  synced_at: string;
+  desktop_name: string;
+  app_version: string;
+  allow_remote_launch: boolean;
+  account: RemoteAccountSummary;
+  active_game_id: string | null;
+  managed_games: ManagedGame[];
+  mods_by_game: Record<string, StagedMod[]>;
+  installed_collections_by_game: Record<string, InstalledCollection[]>;
+  saved_collections: SavedCollectionEntry[];
+  bethesda_plugins_by_game: Record<string, BethesdaPluginsState>;
+  downloads: DownloadItem[];
+  friends: FriendsState | null;
+  launch_states: Record<string, GameLaunchState>;
+};
+
+export type RemoteDownloadRequest =
+  | {
+      kind: "nexus_mod";
+      game_id: string;
+      domain: string;
+      mod_id: number;
+      file_id: number;
+      mod_name: string;
+      file_name?: string | null;
+      version?: string | null;
+    }
+  | {
+      kind: "thunderstore_mod";
+      game_id: string;
+      community: string;
+      namespace: string;
+      name: string;
+    }
+  | {
+      kind: "modio_mod";
+      game_id: string;
+      modio_game_id: number;
+      mod_id: number;
+      file_id?: number | null;
+    }
+  | {
+      kind: "nexus_collection";
+      game_id: string;
+      slug: string;
+      revision?: number | null;
+    }
+  | {
+      kind: "import_share_code";
+      game_id: string;
+      code: string;
+    };
+
+export type RemoteDownloadControl =
+  | { action: "pause"; id: string }
+  | { action: "resume"; id: string }
+  | { action: "cancel"; id: string }
+  | { action: "cancel_batch"; batch_id: string }
+  | { action: "restart"; id: string }
+  | { action: "remove"; id: string }
+  | { action: "clear_recent" };

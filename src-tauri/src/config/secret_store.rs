@@ -160,6 +160,7 @@ fn derive_key(seed: &[u8; 32]) -> Zeroizing<[u8; 32]> {
 
 fn machine_user_bindings() -> Vec<String> {
     let mut bindings = Vec::new();
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     if let Some(base) = directories::BaseDirs::new() {
         bindings.push(base.home_dir().to_string_lossy().into_owned());
     }

@@ -11,6 +11,8 @@
     "tauri": "tauri",
     "build:host": "tauri build",
     "build:release": "node scripts/build-release.mjs",
+    "build:android": "node scripts/build-android-apk.mjs",
+    "build:android:debug": "node scripts/build-android-apk.mjs --debug",
     "install:local": "bash scripts/install-local.sh",
     "package:linux-tarball": "node scripts/package-linux-tarball.mjs",
     "clean": "node scripts/clean.mjs",

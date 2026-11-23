@@ -19,6 +19,7 @@ dist-packages/
 # Rust / Cargo
 target/
 **/*.rs.bk
+src-tauri/gen/android/
 
 # Local caches and scratch dirs
 .cargo-tmp/

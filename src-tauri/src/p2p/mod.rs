@@ -2700,6 +2700,8 @@ pub struct P2pService {
     endpoint: OnceCell<Endpoint>,
     secret_key: OnceCell<SecretKey>,
     app: Mutex<Option<AppHandle>>,
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    remote_host: OnceCell<Arc<crate::remote::host::RemoteHostService>>,
     incoming_sem: Arc<Semaphore>,
     hello_limiter: Mutex<HelloRateLimiter>,
     profile_limiter: Mutex<PeerProfileRateLimiter>,
@@ -2898,11 +2900,18 @@ impl P2pService {
             endpoint: OnceCell::new(),
             secret_key: OnceCell::new(),
             app: Mutex::new(None),
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            remote_host: OnceCell::new(),
             incoming_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_INCOMING)),
             hello_limiter: Mutex::new(HelloRateLimiter::default()),
             profile_limiter: Mutex::new(PeerProfileRateLimiter::default()),
             active_peer_conns: Mutex::new(HashMap::new()),
         })
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub fn set_remote_host(&self, host: Arc<crate::remote::host::RemoteHostService>) {
+        let _ = self.remote_host.set(host);
     }
 
     pub fn start(self: &Arc<Self>, app: AppHandle) {
@@ -2958,11 +2967,18 @@ impl P2pService {
         let _ = self.secret_key.set(key.clone());
         let ep = Endpoint::builder(presets::N0)
             .secret_key(key)
-            .alpns(vec![P2P_ALPN.to_vec()])
+            .alpns(vec![
+                P2P_ALPN.to_vec(),
+                crate::remote::protocol::REMOTE_ALPN.to_vec(),
+            ])
             .bind()
             .await
             .context("bind iroh endpoint")?;
         let _ = self.endpoint.set(ep.clone());
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        if let Some(host) = self.remote_host.get() {
+            host.attach_endpoint(ep.clone());
+        }
         let _ = tokio::time::timeout(Duration::from_secs(3), ep.online()).await;
         self.emit_changed();
 
@@ -3019,13 +3035,20 @@ impl P2pService {
     }
 
     async fn handle_incoming(self: &Arc<Self>, incoming: Incoming) -> Result<()> {
-        if self.is_appear_offline() {
-            drop(incoming);
-            return Ok(());
-        }
         let conn = tokio::time::timeout(DIAL_TIMEOUT, incoming)
             .await
             .map_err(|_| anyhow!("incoming handshake timed out"))??;
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        if conn.alpn() == crate::remote::protocol::REMOTE_ALPN {
+            if let Some(host) = self.remote_host.get() {
+                return Arc::clone(host).handle_connection(conn).await;
+            }
+            return Ok(());
+        }
+        if self.is_appear_offline() {
+            conn.close(0u32.into(), b"offline");
+            return Ok(());
+        }
         let remote_endpoint_id = conn.remote_id();
         let remote_id = remote_endpoint_id.to_string();
 

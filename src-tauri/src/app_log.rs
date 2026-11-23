@@ -1,3 +1,4 @@
+#![cfg_attr(any(target_os = "android", target_os = "ios"), allow(dead_code))]
 //! Manager log file. Windows GUI builds discard stderr, so diagnosis reports
 //! read this file instead.
 

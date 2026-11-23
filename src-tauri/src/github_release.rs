@@ -40,6 +40,7 @@ fn download_client() -> Result<reqwest::Client> {
         .context("building download HTTP client")
 }
 
+#[cfg_attr(any(target_os = "android", target_os = "ios"), allow(dead_code))]
 pub async fn fetch_release_by_tag(repo: &str, tag: &str) -> Result<Option<GhRelease>> {
     let url = format!("https://api.github.com/repos/{repo}/releases/tags/{tag}");
     let client = api_client()?;
@@ -114,6 +115,8 @@ pub enum UpdateChannel {
     Portable,
     #[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
     Nsis,
+    #[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
+    Android,
 }
 
 /// Asset that matches the install channel, not merely the operating system.
@@ -127,6 +130,7 @@ pub fn pick_update_asset<'a>(
         UpdateChannel::Appimage => pick_appimage(release),
         UpdateChannel::Portable => release.assets.iter().find(|a| is_release_tarball(&a.name)),
         UpdateChannel::Nsis => pick_nsis(release),
+        UpdateChannel::Android => pick_android_apk(release, std::env::consts::ARCH),
     }
 }
 
@@ -174,6 +178,109 @@ fn pick_nsis(release: &GhRelease) -> Option<&GhAsset> {
 fn is_release_tarball(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
     n.starts_with("emperor-mod-manager-") && n.ends_with("-x86_64.tar.gz")
+}
+
+/// Pick the best Android `.apk` asset for the device's CPU architecture,
+/// preferring signed APKs matching the ABI and falling back to universal.
+pub fn pick_android_apk<'a>(release: &'a GhRelease, arch: &str) -> Option<&'a GhAsset> {
+    let abi_tokens: &[&str] = match arch {
+        "aarch64" => &["arm64-v8a", "aarch64", "arm64"],
+        "arm" => &["armeabi-v7a", "armv7"],
+        "x86_64" => &["x86_64", "x64"],
+        "x86" => &["x86"],
+        _ => &[],
+    };
+
+    let apks: Vec<&GhAsset> = release
+        .assets
+        .iter()
+        .filter(|a| a.name.to_ascii_lowercase().ends_with(".apk"))
+        .collect();
+    if apks.is_empty() {
+        return None;
+    }
+
+    apks.into_iter().min_by_key(|a| {
+        let n = a.name.to_ascii_lowercase();
+        let unsigned_penalty = if n.contains("-unsigned") { 100 } else { 0 };
+        let abi_rank = if abi_tokens.iter().any(|t| n.contains(t)) {
+            0
+        } else if n.contains("universal") {
+            10
+        } else if !["arm64", "aarch64", "armeabi", "armv7", "x86_64", "x86"]
+            .iter()
+            .any(|other| n.contains(other))
+        {
+            20
+        } else {
+            50
+        };
+        unsigned_penalty + abi_rank
+    })
+}
+
+/// Locate a SHA-256 checksum manifest asset on the release if published.
+#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
+pub fn pick_android_checksums_asset(release: &GhRelease) -> Option<&GhAsset> {
+    release
+        .assets
+        .iter()
+        .find(|a| a.name == "SHA256SUMS-android")
+        .or_else(|| release.assets.iter().find(|a| a.name == "SHA256SUMS"))
+}
+
+/// Extract the expected lowercase SHA-256 hex digest for `asset_name` from a `sha256sum`-format text file.
+#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
+pub fn parse_sha256_for_asset(sums_text: &str, asset_name: &str) -> Option<String> {
+    for line in sums_text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut parts = trimmed.split_whitespace();
+        let Some(hash) = parts.next() else { continue };
+        let Some(file_col) = parts.next() else { continue };
+        let file_base = Path::new(file_col.trim_start_matches('*'))
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(file_col);
+        if file_base == asset_name
+            && hash.len() == 64
+            && hash.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            return Some(hash.to_ascii_lowercase());
+        }
+    }
+    None
+}
+
+/// Verify a downloaded file's SHA-256 digest against `expected_hex`.
+#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
+pub fn verify_file_sha256(path: &Path, expected_hex: &str) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("opening {} for checksum verification", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let actual = hex::encode(hasher.finalize());
+    if !actual.eq_ignore_ascii_case(expected_hex.trim()) {
+        return Err(anyhow!(
+            "SHA-256 mismatch for {}: expected {}, got {}",
+            path.display(),
+            expected_hex.trim(),
+            actual
+        ));
+    }
+    Ok(())
 }
 
 /// Prefer AppImage on Linux and NSIS setup.exe on Windows.
@@ -380,5 +487,62 @@ mod tests {
             pick_update_asset(&release, UpdateChannel::Deb).map(|a| a.name.as_str()),
             Some("Emperor.Mod.Manager_0.4.0_amd64.deb")
         );
+    }
+
+    #[test]
+    fn pick_android_apk_prefers_matching_abi_and_signed() {
+        let release = GhRelease {
+            tag_name: "v0.9.2".into(),
+            prerelease: false,
+            html_url: None,
+            assets: vec![
+                GhAsset {
+                    name: "emperor-mod-manager-0.9.2-arm64-v8a-unsigned.apk".into(),
+                    browser_download_url: "https://example/unsigned".into(),
+                },
+                GhAsset {
+                    name: "emperor-mod-manager-0.9.2-universal.apk".into(),
+                    browser_download_url: "https://example/universal".into(),
+                },
+                GhAsset {
+                    name: "emperor-mod-manager-0.9.2-arm64-v8a.apk".into(),
+                    browser_download_url: "https://example/arm64".into(),
+                },
+                GhAsset {
+                    name: "emperor-mod-manager-0.9.2-x86_64.apk".into(),
+                    browser_download_url: "https://example/x86_64".into(),
+                },
+            ],
+        };
+        assert_eq!(
+            pick_android_apk(&release, "aarch64").map(|a| a.name.as_str()),
+            Some("emperor-mod-manager-0.9.2-arm64-v8a.apk")
+        );
+        assert_eq!(
+            pick_android_apk(&release, "x86_64").map(|a| a.name.as_str()),
+            Some("emperor-mod-manager-0.9.2-x86_64.apk")
+        );
+        assert_eq!(
+            pick_android_apk(&release, "arm").map(|a| a.name.as_str()),
+            Some("emperor-mod-manager-0.9.2-universal.apk")
+        );
+    }
+
+    #[test]
+    fn parse_and_verify_sha256_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("app.apk");
+        std::fs::write(&file, b"hello android update").unwrap();
+
+        use sha2::{Digest, Sha256};
+        let digest = hex::encode(Sha256::digest(b"hello android update"));
+        let sums = format!("{digest}  dist/emperor-mod-manager-0.9.2-universal.apk\n");
+
+        assert_eq!(
+            parse_sha256_for_asset(&sums, "emperor-mod-manager-0.9.2-universal.apk").as_deref(),
+            Some(digest.as_str())
+        );
+        assert!(verify_file_sha256(&file, &digest).is_ok());
+        assert!(verify_file_sha256(&file, &"0".repeat(64)).is_err());
     }
 }

@@ -187,6 +187,8 @@ pub struct AppState {
     pub close_flags: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     /// Serverless P2P social service (iroh).
     pub p2p: Arc<crate::p2p::P2pService>,
+    /// Mobile companion remote host service (iroh `emperor-remote/1`).
+    pub remote_host: Arc<crate::remote::host::RemoteHostService>,
 }
 
 /// Enough to keep a fast link busy without starving any single transfer.
@@ -324,7 +326,9 @@ impl AppState {
             save_recent_downloads(&paths, &recent);
             save_recent_restart_meta(&paths, &recent, &restart_meta, now_unix_secs());
         }
+        let remote_host = Arc::new(crate::remote::host::RemoteHostService::new(&paths));
         let p2p = crate::p2p::P2pService::new(paths.clone());
+        p2p.set_remote_host(remote_host.clone());
         Ok(Self {
             paths,
             config: Mutex::new(config),
@@ -369,6 +373,7 @@ impl AppState {
             launch_states: Arc::new(Mutex::new(HashMap::new())),
             close_flags: Arc::new(Mutex::new(HashMap::new())),
             p2p,
+            remote_host,
         })
     }
 
@@ -1104,8 +1109,68 @@ pub fn get_app_info() -> serde_json::Value {
         "name": APP_NAME,
         "version": env!("CARGO_PKG_VERSION"),
         "platform": std::env::consts::OS,
+        "is_mobile": false,
         "linux_only": false,
     })
+}
+
+#[tauri::command]
+pub fn start_mobile_pairing(
+    state: State<'_, AppState>,
+) -> Result<crate::remote::protocol::MobilePairingSession, String> {
+    state.remote_host.start_pairing().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn get_active_mobile_pairing(
+    state: State<'_, AppState>,
+) -> Option<crate::remote::protocol::MobilePairingSession> {
+    state.remote_host.active_pairing_session()
+}
+
+#[tauri::command]
+pub fn cancel_mobile_pairing(state: State<'_, AppState>) {
+    state.remote_host.cancel_pairing();
+}
+
+#[tauri::command]
+pub fn list_paired_devices(
+    state: State<'_, AppState>,
+) -> Vec<crate::remote::protocol::PairedDevice> {
+    state.remote_host.list_paired_devices()
+}
+
+#[tauri::command]
+pub fn revoke_paired_device(state: State<'_, AppState>, peer_id: String) -> Result<bool, String> {
+    state
+        .remote_host
+        .revoke_paired_device(&peer_id)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn set_paired_device_permissions(
+    state: State<'_, AppState>,
+    peer_id: String,
+    allow_remote_launch: bool,
+) -> Result<crate::remote::protocol::PairedDevice, String> {
+    state
+        .remote_host
+        .set_device_permissions(&peer_id, allow_remote_launch)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn get_remote_allow_relay(state: State<'_, AppState>) -> Result<bool, String> {
+    let cfg = state.config.lock().map_err(|e| e.to_string())?;
+    Ok(cfg.remote_allow_relay)
+}
+
+#[tauri::command]
+pub fn set_remote_allow_relay(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
+    let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
+    cfg.remote_allow_relay = enabled;
+    config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())
 }
 
 /// Steam covers typically live under Program Files, outside the default `$HOME`

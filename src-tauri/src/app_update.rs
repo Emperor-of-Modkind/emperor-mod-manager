@@ -5,12 +5,12 @@
 //! swapped from the release tarball. Anything else is left alone.
 
 use std::path::{Path, PathBuf};
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 use std::process::Command;
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager};
 
-use crate::commands::AppState;
 use crate::config::APP_VERSION;
 use crate::github_release::{self, GhRelease, UpdateChannel};
 
@@ -133,6 +133,7 @@ fn missing_asset(via: UpdateChannel) -> String {
         UpdateChannel::Nsis => {
             "No NSIS setup (.exe) asset found on the latest GitHub release".into()
         }
+        UpdateChannel::Android => "No .apk asset found on the latest GitHub release".into(),
     }
 }
 
@@ -145,11 +146,15 @@ fn current_install_channel() -> Option<UpdateChannel> {
     {
         return Some(UpdateChannel::Nsis);
     }
+    #[cfg(target_os = "android")]
+    {
+        return Some(UpdateChannel::Android);
+    }
     #[cfg(target_os = "linux")]
     {
         return classify_install(&probe_current());
     }
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "android")))]
     {
         None
     }
@@ -299,12 +304,9 @@ pub struct AppInstallResult {
 }
 
 #[tauri::command]
-pub async fn install_app_update(
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> Result<AppInstallResult, String> {
+pub async fn install_app_update(app: AppHandle) -> Result<AppInstallResult, String> {
     let via = current_install_channel().ok_or_else(|| {
-        "This install cannot be updated from inside the app. It is not an AppImage, a pacman or apt package, or a user-writable copy.".to_string()
+        "This install cannot be updated from inside the app. It is not an AppImage, a pacman or apt package, an Android APK, or a user-writable copy.".to_string()
     })?;
 
     emit_progress(&app, "Downloading…");
@@ -324,13 +326,32 @@ pub async fn install_app_update(
     let asset =
         github_release::pick_update_asset(&release, via).ok_or_else(|| missing_asset(via))?;
 
-    let updates_dir = state.paths.cache_dir.join("app-updates").join(&latest);
+    let cache_root = app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| format!("failed to resolve app cache directory: {e}"))?;
+    let updates_dir = cache_root.join("app-updates").join(&latest);
     std::fs::create_dir_all(&updates_dir).map_err(|e| e.to_string())?;
     let dest = updates_dir.join(asset_file_name(&asset.name));
 
     github_release::download_to_path(&asset.browser_download_url, &dest)
         .await
         .map_err(|e| e.to_string())?;
+
+    #[cfg(target_os = "android")]
+    if via == UpdateChannel::Android {
+        if let Some(sums_asset) = github_release::pick_android_checksums_asset(&release) {
+            emit_progress(&app, "Verifying APK checksum…");
+            let sums_bytes = github_release::download_bytes(&sums_asset.browser_download_url)
+                .await
+                .map_err(|e| format!("Failed to download checksums: {e}"))?;
+            let sums_text = String::from_utf8_lossy(&sums_bytes);
+            if let Some(expected) = github_release::parse_sha256_for_asset(&sums_text, &asset.name) {
+                github_release::verify_file_sha256(&dest, &expected)
+                    .map_err(|e| format!("APK integrity check failed: {e}"))?;
+            }
+        }
+    }
 
     dispatch_install(&app, via, &updates_dir, &dest).await
 }
@@ -349,6 +370,14 @@ async fn dispatch_install(
         }
         return apply_windows(app, downloaded);
     }
+    #[cfg(target_os = "android")]
+    {
+        let _ = workdir;
+        if via != UpdateChannel::Android {
+            return Err("In-app updates on Android use the APK installer.".into());
+        }
+        return apply_android(app, downloaded).await;
+    }
     #[cfg(target_os = "linux")]
     {
         return match via {
@@ -357,13 +386,44 @@ async fn dispatch_install(
             UpdateChannel::Appimage => apply_appimage(app, downloaded).await,
             UpdateChannel::Portable => apply_portable(app, downloaded).await,
             UpdateChannel::Nsis => Err("The Windows installer cannot run on Linux.".into()),
+            UpdateChannel::Android => Err("Android APKs cannot run on Linux.".into()),
         };
     }
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "android")))]
     {
         let _ = (app, via, workdir, downloaded);
         Err("In-app updates are not supported on this OS".into())
     }
+}
+
+#[cfg(target_os = "android")]
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AndroidInstallResponse {
+    installed: bool,
+    #[allow(dead_code)]
+    needs_permission: bool,
+    message: String,
+}
+
+#[cfg(target_os = "android")]
+async fn apply_android(app: &AppHandle, apk: &Path) -> Result<AppInstallResult, String> {
+    use tauri::plugin::PluginHandle;
+    emit_progress(app, "Opening Android installer…");
+    let handle = app
+        .try_state::<PluginHandle<tauri::Wry>>()
+        .ok_or_else(|| "Android AppUpdatePlugin is not registered".to_string())?;
+    let resp: AndroidInstallResponse = handle
+        .run_mobile_plugin(
+            "installApk",
+            serde_json::json!({ "path": apk.display().to_string() }),
+        )
+        .map_err(|e| format!("Failed to launch Android APK installer: {e}"))?;
+    Ok(AppInstallResult {
+        message: resp.message,
+        path: Some(apk.display().to_string()),
+        will_exit: resp.installed,
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -583,7 +643,7 @@ async fn apply_portable(app: &AppHandle, tarball: &Path) -> Result<AppInstallRes
 }
 
 /// Pull `emperor-mod-manager` out of `emperor-mod-manager-<version>-x86_64.tar.gz`.
-#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+#[cfg(any(target_os = "linux", test))]
 fn extract_release_binary(archive_path: &Path, dest: &Path) -> Result<(), String> {
     let file = std::fs::File::open(archive_path).map_err(|e| e.to_string())?;
     let decoder = flate2::read::GzDecoder::new(file);
@@ -922,6 +982,7 @@ fn apply_windows(app: &AppHandle, downloaded: &Path) -> Result<AppInstallResult,
     })
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn schedule_exit(app: &AppHandle) {
     let handle = app.clone();
     std::thread::spawn(move || {
@@ -1156,5 +1217,25 @@ source=("https://evil.example/emperor-mod-manager.tar.gz")
         let dest = dir.path().join("out-bin");
         extract_release_binary(&archive_path, &dest).unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), b"#!/bin/true\n");
+    }
+
+    #[test]
+    fn status_uses_android_apk_asset() {
+        let release = GhRelease {
+            tag_name: "v99.0.0".into(),
+            prerelease: false,
+            html_url: None,
+            assets: vec![GhAsset {
+                name: "emperor-mod-manager-99.0.0-universal.apk".into(),
+                browser_download_url: "https://example/app.apk".into(),
+            }],
+        };
+        let status = status_from_release(Some(&release), Some(UpdateChannel::Android));
+        assert!(status.update_available);
+        assert_eq!(
+            status.asset_name.as_deref(),
+            Some("emperor-mod-manager-99.0.0-universal.apk")
+        );
+        assert_eq!(status.install_via, Some(UpdateChannel::Android));
     }
 }

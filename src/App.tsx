@@ -71,6 +71,8 @@ import {
 import { FriendsPage } from "./FriendsPage";
 import { SettingsSection, SettingsToggle } from "./SettingsSection";
 import { SocialSettingsSection } from "./SocialSettingsSection";
+import { MobileDevicesSettings } from "./MobileDevicesSettings";
+import { useFoldableLayout } from "./useFoldableLayout";
 import { Throbber } from "./Throbber";
 import { CheckingFriendUpdatesToast, CheckingUpdatesToast, UpdateToast } from "./UpdateToast";
 import { api } from "./api";
@@ -1678,6 +1680,8 @@ function installViaLabel(via: AppInstallVia): string {
       return "a direct binary replacement";
     case "nsis":
       return "a silent Windows update";
+    case "android":
+      return "an Android APK install";
   }
 }
 
@@ -1730,6 +1734,7 @@ function SavedCollectionDetailBody({
 }
 
 export default function App() {
+  useFoldableLayout();
   const [tab, setTabState] = useState<Tab | null>(null);
   const [settings, setSettings] = useState<Settings | null>(null);
   const [customBannerTimeouts, setCustomBannerTimeouts] = useState<
@@ -13557,6 +13562,7 @@ export default function App() {
                 onError={(msg) => setError(msg)}
               />
             </SettingsSection>
+            {!appInfo?.is_mobile && <MobileDevicesSettings />}
             <SettingsSection title="Accounts">
               {accountConnections}
             </SettingsSection>

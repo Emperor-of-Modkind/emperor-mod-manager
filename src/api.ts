@@ -91,6 +91,13 @@ import type {
   CollectionConflictPlan,
   CollectionPlanSource,
   CollectionResolutionChoices,
+  PairedDevice,
+  MobilePairingSession,
+  DiscoveredDesktop,
+  MobileConnectionState,
+  DesktopSnapshot,
+  RemoteDownloadRequest,
+  RemoteDownloadControl,
 } from "./types";
 
 export const api = {
@@ -778,4 +785,60 @@ export const api = {
       enabled,
       protectModIds: protectModIds ?? null,
     }),
+
+  // Desktop <-> Mobile companion pairing & management
+  startMobilePairing: () => invoke<MobilePairingSession>("start_mobile_pairing"),
+  getActiveMobilePairing: () =>
+    invoke<MobilePairingSession | null>("get_active_mobile_pairing"),
+  cancelMobilePairing: () => invoke<void>("cancel_mobile_pairing"),
+  listPairedDevices: () => invoke<PairedDevice[]>("list_paired_devices"),
+  revokePairedDevice: (peerId: string) =>
+    invoke<boolean>("revoke_paired_device", { peerId }),
+  setPairedDevicePermissions: (peerId: string, allowRemoteLaunch: boolean) =>
+    invoke<PairedDevice>("set_paired_device_permissions", {
+      peerId,
+      allowRemoteLaunch,
+    }),
+  getRemoteAllowRelay: () => invoke<boolean>("get_remote_allow_relay"),
+  setRemoteAllowRelay: (enabled: boolean) =>
+    invoke<void>("set_remote_allow_relay", { enabled }),
+
+  // Mobile-side discovery, pairing & iroh remote sync
+  discoverLanDesktops: () => invoke<DiscoveredDesktop[]>("discover_lan_desktops"),
+  pairWithDesktop: (args: {
+    desktopEndpointId: string;
+    lanAddrs: string[];
+    code: string;
+    deviceName: string;
+    deviceModel: string;
+  }) => invoke<MobileConnectionState>("pair_with_desktop", args),
+  unpairDesktop: () => invoke<void>("unpair_desktop"),
+  getMobileConnectionState: () =>
+    invoke<MobileConnectionState>("get_mobile_connection_state"),
+  getMobileSnapshot: () => invoke<DesktopSnapshot | null>("get_mobile_snapshot"),
+  syncMobileNow: () => invoke<DesktopSnapshot>("sync_mobile_now"),
+  mobileQueueDownload: (request: RemoteDownloadRequest) =>
+    invoke<unknown>("mobile_queue_download", { request }),
+  mobileControlDownload: (control: RemoteDownloadControl) =>
+    invoke<unknown>("mobile_control_download", { control }),
+  mobileSetModEnabled: (gameId: string, modId: string, enabled: boolean) =>
+    invoke<unknown>("mobile_set_mod_enabled", { gameId, modId, enabled }),
+  mobileSetLoadOrder: (gameId: string, orderedIds: string[]) =>
+    invoke<unknown>("mobile_set_load_order", { gameId, orderedIds }),
+  mobileSetCollectionEnabled: (
+    gameId: string,
+    collectionId: string,
+    enabled: boolean,
+  ) =>
+    invoke<unknown>("mobile_set_collection_enabled", {
+      gameId,
+      collectionId,
+      enabled,
+    }),
+  mobileSetActiveGame: (gameId: string | null) =>
+    invoke<unknown>("mobile_set_active_game", { gameId }),
+  mobileLaunchGame: (gameId: string, modded: boolean) =>
+    invoke<unknown>("mobile_launch_game", { gameId, modded }),
+  mobileCloseGame: (gameId: string) =>
+    invoke<unknown>("mobile_close_game", { gameId }),
 };

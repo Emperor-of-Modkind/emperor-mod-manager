@@ -1,13 +1,20 @@
 mod app_log;
 mod app_update;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod assist;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod commands;
 mod config;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod deep_link;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod detection;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod diagnostics;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod games;
 mod github_release;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod launch;
 #[cfg(any(
     target_os = "linux",
@@ -19,21 +26,119 @@ mod launch;
 mod linux_embed;
 #[cfg(target_os = "linux")]
 mod linux_startup;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod migration;
+#[cfg(any(target_os = "android", target_os = "ios"))]
+mod mobile_commands;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod modio_api;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod mods;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod nexus;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod p2p;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod rate_limit;
+mod remote;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod share;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod system_theme;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod thunderstore;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod tools;
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 use commands::AppState;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 use tauri_plugin_deep_link::DeepLinkExt;
 
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
+#[cfg(any(target_os = "android", target_os = "ios"))]
+#[tauri::mobile_entry_point]
+pub fn run() {
+    app_log::init(None);
+
+    let mut builder = tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_deep_link::init());
+
+    #[cfg(target_os = "android")]
+    {
+        builder = builder
+            .plugin(
+                tauri::plugin::Builder::<tauri::Wry, ()>::new("app-update")
+                    .setup(|app, api| {
+                        use tauri::Manager;
+                        let handle = api.register_android_plugin(
+                            "dev.emperormodmanager.mobile",
+                            "AppUpdatePlugin",
+                        )?;
+                        app.manage(handle);
+                        Ok(())
+                    })
+                    .build(),
+            )
+            .plugin(
+                tauri::plugin::Builder::<tauri::Wry, ()>::new("foldable")
+                    .setup(|_app, api| {
+                        let _ = api.register_android_plugin(
+                            "dev.emperormodmanager.mobile",
+                            "FoldablePlugin",
+                        )?;
+                        Ok(())
+                    })
+                    .build(),
+            );
+    }
+
+    builder
+        .invoke_handler(tauri::generate_handler![
+            mobile_commands::get_app_info,
+            app_update::check_app_update,
+            app_update::install_app_update,
+            mobile_commands::discover_lan_desktops,
+            mobile_commands::pair_with_desktop,
+            mobile_commands::unpair_desktop,
+            mobile_commands::get_mobile_connection_state,
+            mobile_commands::get_mobile_snapshot,
+            mobile_commands::sync_mobile_now,
+            mobile_commands::mobile_queue_download,
+            mobile_commands::mobile_control_download,
+            mobile_commands::mobile_set_mod_enabled,
+            mobile_commands::mobile_set_load_order,
+            mobile_commands::mobile_set_collection_enabled,
+            mobile_commands::mobile_set_active_game,
+            mobile_commands::mobile_launch_game,
+            mobile_commands::mobile_close_game,
+        ])
+        .setup(|app| {
+            use tauri::Manager;
+            let config_dir = app.path().app_config_dir()?;
+            let data_dir = app.path().app_data_dir()?;
+            let cache_dir = app.path().app_cache_dir()?;
+            let paths = config::Paths::from_dirs(config_dir, data_dir, cache_dir)?;
+            let remote = std::sync::Arc::new(remote::client::RemoteClientService::new(paths));
+            if remote.connection_state().paired {
+                let bg_remote = std::sync::Arc::clone(&remote);
+                let bg_app = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    use tauri::Emitter;
+                    if let Ok(snap) = bg_remote.sync_now().await {
+                        let _ = bg_app.emit("remote-connection-changed", bg_remote.connection_state());
+                        let _ = bg_app.emit("remote-snapshot-synced", &snap);
+                    }
+                });
+            }
+            app.manage(mobile_commands::MobileAppState { remote });
+            Ok(())
+        })
+        .run(tauri::generate_context!())
+        .expect("error while running tauri mobile application");
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn run() {
     // Must run before GTK/Tauri: a full /tmp (quota) makes icon load assert-abort.
     #[cfg(target_os = "linux")]
@@ -271,11 +376,22 @@ pub fn run() {
             commands::get_friend_collection_sync_states,
             commands::plan_collection_resolution,
             commands::set_collection_enabled,
+            commands::start_mobile_pairing,
+            commands::get_active_mobile_pairing,
+            commands::cancel_mobile_pairing,
+            commands::list_paired_devices,
+            commands::revoke_paired_device,
+            commands::set_paired_device_permissions,
+            commands::get_remote_allow_relay,
+            commands::set_remote_allow_relay,
         ])
         .setup(|app| {
             {
                 use tauri::Manager;
                 let st = app.state::<AppState>();
+                st.remote_host.attach_backend(std::sync::Arc::new(
+                    remote::desktop_backend::TauriDesktopBackend::new(app.handle().clone()),
+                ));
                 st.p2p.start(app.handle().clone());
                 let games = st
                     .config

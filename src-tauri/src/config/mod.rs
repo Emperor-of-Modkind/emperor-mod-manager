@@ -1,3 +1,4 @@
+#![cfg_attr(any(target_os = "android", target_os = "ios"), allow(dead_code))]
 //! Path helpers and persistent app configuration.
 
 pub mod secret_store;
@@ -5,6 +6,7 @@ pub mod secret_store;
 use std::{fs, path::PathBuf};
 
 use anyhow::{Context, Result};
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
@@ -158,6 +160,9 @@ pub struct AppConfig {
     /// When true, automatically sort staged mods by requirements before deploying.
     #[serde(default)]
     pub auto_sort_before_deploy: bool,
+    /// When true, paired mobile devices may also connect outside the local network via iroh relay.
+    #[serde(default = "default_true")]
+    pub remote_allow_relay: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -312,6 +317,7 @@ impl Default for AppConfig {
             nexus_website_signed_in: false,
             modio_website_signed_in: false,
             auto_sort_before_deploy: false,
+            remote_allow_relay: true,
         }
     }
 }
@@ -398,21 +404,70 @@ pub struct Paths {
 }
 
 impl Paths {
-    pub fn resolve() -> Result<Self> {
-        let dirs = ProjectDirs::from("dev", "emperormodmanager", APP_NAME)
-            .context("failed to resolve project directories")?;
+    /// Initialize from explicit directories (used by Android/Tauri path resolver and tests).
+    pub fn from_dirs(config_dir: PathBuf, data_dir: PathBuf, cache_dir: PathBuf) -> Result<Self> {
         let paths = Self {
-            config_dir: dirs.config_dir().to_path_buf(),
-            data_dir: dirs.data_dir().to_path_buf(),
-            cache_dir: dirs.cache_dir().to_path_buf(),
+            config_dir,
+            data_dir,
+            cache_dir,
         };
         fs::create_dir_all(&paths.config_dir)?;
         fs::create_dir_all(&paths.data_dir)?;
         fs::create_dir_all(&paths.cache_dir)?;
         fs::create_dir_all(paths.downloads_dir())?;
-        fs::create_dir_all(paths.assist_webview_dir())?;
-        fs::create_dir_all(paths.modio_webview_dir())?;
+        fs::create_dir_all(paths.remote_covers_dir())?;
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            fs::create_dir_all(paths.assist_webview_dir())?;
+            fs::create_dir_all(paths.modio_webview_dir())?;
+        }
         Ok(paths)
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub fn resolve() -> Result<Self> {
+        let dirs = ProjectDirs::from("dev", "emperormodmanager", APP_NAME)
+            .context("failed to resolve project directories")?;
+        Self::from_dirs(
+            dirs.config_dir().to_path_buf(),
+            dirs.data_dir().to_path_buf(),
+            dirs.cache_dir().to_path_buf(),
+        )
+    }
+
+    /// Paired mobile devices allowed to connect to this desktop via `emperor-remote/1`.
+    pub fn paired_devices_file(&self) -> PathBuf {
+        self.config_dir.join("paired_devices.json")
+    }
+
+    /// Mobile-side persisted paired desktop peer info.
+    pub fn paired_host_file(&self) -> PathBuf {
+        self.config_dir.join("paired_host.json")
+    }
+
+    /// Mobile-side persistent Ed25519 iroh secret key.
+    pub fn mobile_secret_key_file(&self) -> PathBuf {
+        self.config_dir.join("mobile_iroh_key.enc")
+    }
+
+    /// Mobile-side offline snapshot cache.
+    pub fn remote_cache_file(&self) -> PathBuf {
+        self.data_dir.join("remote_cache.json")
+    }
+
+    /// Mobile-side cached game cover thumbnails synced from desktop.
+    pub fn remote_covers_dir(&self) -> PathBuf {
+        self.cache_dir.join("remote-covers")
+    }
+
+    /// Mobile-side encrypted Nexus API key file (AES-256-GCM via secret_store).
+    pub fn mobile_nexus_key_file(&self) -> PathBuf {
+        self.config_dir.join("mobile_nexus_api_key.enc")
+    }
+
+    /// Mobile-side encrypted mod.io API key file (AES-256-GCM via secret_store).
+    pub fn mobile_modio_key_file(&self) -> PathBuf {
+        self.config_dir.join("mobile_modio_api_key.enc")
     }
 
     pub fn config_file(&self) -> PathBuf {
