@@ -117,6 +117,21 @@ describe("friendConnections", () => {
     expect(players[1].relationship).toBe("pending_outgoing");
     expect(players[2].relationship).toBe("pending_incoming");
     expect(players[3].relationship).toBe("none");
+
+    const queuedState: FriendsState = {
+      ...state,
+      queued_invites: [
+        {
+          peer_id: "peer_frank",
+          display_name: "Frank",
+          queued_at: "2026-11-22T00:00:00Z",
+        },
+      ],
+    };
+    const queuedPlayers = getDiscoverablePlayers(queuedState);
+    expect(
+      queuedPlayers.find((p) => p.peer_id === "peer_frank")?.relationship,
+    ).toBe("queued_outgoing");
   });
 
   it("validates 64-char hex peer ID format", () => {

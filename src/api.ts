@@ -1,9 +1,14 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { EmperorOpenMod } from "./modDeepLink";
 import type {
+  AutoSortResult,
   AuthorSuggestion,
   BannerPersistence,
   BannerTimeouts,
+  BethesdaPluginsState,
+  LootSortResult,
+  MasterlistStatus,
+  SavedPluginEntry,
   BrowseMeta,
   BrowseSearchOpts,
   CatalogSearchPage,
@@ -103,6 +108,8 @@ export const api = {
     invoke<void>("set_adult_content", { enabled }),
   setGameVersionWarnings: (enabled: boolean) =>
     invoke<void>("set_game_version_warnings", { enabled }),
+  setAutoSortBeforeDeploy: (enabled: boolean) =>
+    invoke<void>("set_auto_sort_before_deploy", { enabled }),
   setAutoclickFreeDownload: (enabled: boolean) =>
     invoke<void>("set_autoclick_free_download", { enabled }),
   setTheme: (theme: ThemePreference) => invoke<void>("set_theme", { theme }),
@@ -587,6 +594,16 @@ export const api = {
     invoke<void>("set_mod_enabled", { gameId, modId, enabled }),
   setLoadOrder: (gameId: string, orderedIds: string[]) =>
     invoke<void>("set_load_order", { gameId, orderedIds }),
+  autoSortStagedMods: (gameId: string) =>
+    invoke<AutoSortResult>("auto_sort_staged_mods", { gameId }),
+  getBethesdaPlugins: (gameId: string) =>
+    invoke<BethesdaPluginsState>("get_bethesda_plugins", { gameId }),
+  setBethesdaPluginOrder: (gameId: string, plugins: SavedPluginEntry[]) =>
+    invoke<BethesdaPluginsState>("set_bethesda_plugin_order", { gameId, plugins }),
+  sortBethesdaPlugins: (gameId: string) =>
+    invoke<LootSortResult>("sort_bethesda_plugins", { gameId }),
+  updateLootMasterlist: (gameId: string) =>
+    invoke<MasterlistStatus>("update_loot_masterlist", { gameId }),
   getModOptions: (gameId: string, modId: string) =>
     invoke<ModOptionsView | null>("get_mod_options", { gameId, modId }),
   setModOptions: (gameId: string, modId: string, selection: ModOptionSelection) =>
@@ -686,6 +703,8 @@ export const api = {
     invoke<FriendsState>("set_allow_mutual_connections", { allow }),
   setAllowCacheRelay: (allow: boolean) =>
     invoke<FriendsState>("set_allow_cache_relay", { allow }),
+  setShareActiveLoadoutsInFeed: (share: boolean) =>
+    invoke<FriendsState>("set_share_active_loadouts_in_feed", { share }),
   addFriendByCode: (code: string) =>
     invoke<FriendsState>("add_friend_by_code", { code }),
   addFriendByPeer: (peerId: string, displayName?: string | null) =>
@@ -693,6 +712,8 @@ export const api = {
       peerId,
       displayName: displayName ?? null,
     }),
+  cancelQueuedFriendInvite: (peerId: string) =>
+    invoke<FriendsState>("cancel_queued_friend_invite", { peerId }),
   respondFriendRequest: (peerId: string, accept: boolean) =>
     invoke<FriendsState>("respond_friend_request", { peerId, accept }),
   removeFriend: (peerId: string) =>

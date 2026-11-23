@@ -28,6 +28,7 @@ export function SocialSettingsSection({
   const [savingPicture, setSavingPicture] = useState(false);
   const [savingMutuals, setSavingMutuals] = useState(false);
   const [savingCacheRelay, setSavingCacheRelay] = useState(false);
+  const [savingActiveLoadoutsFeed, setSavingActiveLoadoutsFeed] = useState(false);
   const [privacyModalOpen, setPrivacyModalOpen] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -35,6 +36,8 @@ export function SocialSettingsSection({
     friendsState?.friends_list_visibility ?? { mode: "all_friends" };
   const allowMutualConnections = friendsState?.allow_mutual_connections !== false;
   const allowCacheRelay = friendsState?.allow_cache_relay !== false;
+  const shareActiveLoadoutsInFeed =
+    friendsState?.share_active_loadouts_in_feed !== false;
 
   useEffect(() => {
     setNameInput(friendsState?.display_name ?? "");
@@ -133,6 +136,24 @@ export function SocialSettingsSection({
       onError(String(err));
     } finally {
       setSavingCacheRelay(false);
+    }
+  }
+
+  async function handleToggleShareActiveLoadoutsInFeed(share: boolean) {
+    onError(null);
+    setSavingActiveLoadoutsFeed(true);
+    try {
+      const next = await api.setShareActiveLoadoutsInFeed(share);
+      onFriendsStateChange(next);
+      onNotice(
+        share
+          ? "Active loadouts will appear in your feed."
+          : "Active loadouts hidden from your feed.",
+      );
+    } catch (err) {
+      onError(String(err));
+    } finally {
+      setSavingActiveLoadoutsFeed(false);
     }
   }
 
@@ -248,6 +269,23 @@ export function SocialSettingsSection({
         <p className="note">
           When turned off, your client will not share cached profiles of offline
           friends with mutual friends.
+        </p>
+      </div>
+
+      <div className="setting-block">
+        <span>Share active loadouts to feed</span>
+        <SettingsToggle
+          checked={shareActiveLoadoutsInFeed}
+          disabled={savingActiveLoadoutsFeed}
+          onChange={(checked) =>
+            void handleToggleShareActiveLoadoutsInFeed(checked)
+          }
+        >
+          Post active loadout updates to your activity feed and friends&apos; feeds
+        </SettingsToggle>
+        <p className="note">
+          When turned off, active loadout changes are hidden from your feed and
+          not broadcast to friends&apos; feeds. Saved collection updates still appear.
         </p>
       </div>
 

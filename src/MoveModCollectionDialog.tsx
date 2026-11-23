@@ -27,11 +27,17 @@ export function MoveModCollectionDialog({
     return (mod.collection_ids ?? []).filter((id) => valid.has(id));
   }, [mod.collection_ids, collections]);
 
+  const initialIdSet = useMemo(() => new Set(initialIds), [initialIds]);
+
   const [selectedIds, setSelectedIds] = useState<string[]>(initialIds);
 
   const unchanged = sameCollectionSelection(selectedIds, initialIds);
 
   function toggleCollection(id: string) {
+    const col = collections.find((c) => c.id === id);
+    if (col?.friend_sync) {
+      return;
+    }
     setSelectedIds((prev) =>
       prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id],
     );
@@ -71,22 +77,36 @@ export function MoveModCollectionDialog({
       <div className="move-collection-list" role="group" aria-label="Installed collections">
         {collections.map((col) => {
           const checked = selectedIds.includes(col.id);
+          const isSynced = Boolean(col.friend_sync);
+          const isAlreadyMember = initialIdSet.has(col.id);
           return (
             <label
               key={col.id}
-              className={
-                checked
-                  ? "move-collection-option is-selected"
-                  : "move-collection-option"
+              className={[
+                "move-collection-option",
+                checked ? "is-selected" : "",
+                isSynced ? "is-disabled" : "",
+              ]
+                .filter(Boolean)
+                .join(" ")}
+              title={
+                isSynced
+                  ? isAlreadyMember
+                    ? "Membership in this synced collection is managed by its author"
+                    : "Mods cannot be added to a synced collection"
+                  : undefined
               }
             >
               <input
                 type="checkbox"
                 checked={checked}
-                disabled={busy}
+                disabled={busy || isSynced}
                 onChange={() => toggleCollection(col.id)}
               />
               <span className="move-collection-option-name">{col.name}</span>
+              {isSynced && (
+                <span className="installed-collection-sync-pill">Synced</span>
+              )}
               <span className="move-collection-option-meta">
                 {col.mod_ids.length} mod{col.mod_ids.length === 1 ? "" : "s"}
               </span>

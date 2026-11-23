@@ -2626,6 +2626,7 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<serde_json::Value, Str
         "initial_setup_complete": initial_setup_complete,
         "nexus_website_signed_in": cfg.nexus_website_signed_in,
         "modio_website_signed_in": cfg.modio_website_signed_in,
+        "auto_sort_before_deploy": cfg.auto_sort_before_deploy,
         "user": user,
         "config_dir": state.paths.config_dir,
         "data_dir": state.paths.data_dir,
@@ -2686,6 +2687,16 @@ pub fn set_adult_content(state: State<'_, AppState>, enabled: bool) -> Result<()
 pub fn set_game_version_warnings(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
     let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
     cfg.game_version_warnings = enabled;
+    config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn set_auto_sort_before_deploy(
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
+    cfg.auto_sort_before_deploy = enabled;
     config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())
 }
 
@@ -8182,6 +8193,14 @@ pub async fn update_staged_mod(
     game_id: String,
     staged_id: String,
 ) -> Result<StagedMod, String> {
+    if let Some(col_name) =
+        mods::synced_collection_for_mod(&state.paths, &game_id, &staged_id)
+            .map_err(|e| e.to_string())?
+    {
+        return Err(format!(
+            "Cannot update a mod managed by synced collection \"{col_name}\". Sync the collection to get updates from the author."
+        ));
+    }
     let order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
     let staged = order
         .mods
@@ -8342,6 +8361,12 @@ fn save_collection_snapshot_inner(
             .iter_mut()
             .find(|c| c.id == collection_id)
             .ok_or_else(|| anyhow::anyhow!("Installed collection not found: {collection_id}"))?;
+        if col.friend_sync.is_some() {
+            anyhow::bail!(
+                "Cannot save local changes to synced collection \"{}\".",
+                col.name
+            );
+        }
 
         let mut members: Vec<&mods::StagedMod> = order
             .mods
@@ -8412,7 +8437,10 @@ pub async fn save_collection_changes(
 ) -> Result<InstalledCollection, String> {
     let paths = state.paths.clone();
     let game = managed_game(&state, &game_id)?;
-    blocking(move || save_collection_snapshot_inner(&paths, &game, &collection_id)).await
+    let res =
+        blocking(move || save_collection_snapshot_inner(&paths, &game, &collection_id)).await?;
+    state.p2p.trigger_local_activity_sync();
+    Ok(res)
 }
 
 #[tauri::command]
@@ -9131,6 +9159,7 @@ pub fn export_share_code(
     let saved =
         share::entry_from_code(&code, name, Some(game_id.clone())).map_err(|e| e.to_string())?;
     let saved = share::add_saved_collection(&state.paths, saved).map_err(|e| e.to_string())?;
+    state.p2p.trigger_local_activity_sync();
     let collection_id = share::emperor_share_id(&code);
     let collection = InstalledCollection {
         id: collection_id.clone(),
@@ -10006,7 +10035,9 @@ pub fn save_collection_code(
     }
     let entry =
         share::entry_from_code(code.trim(), name, source_game_id).map_err(|e| e.to_string())?;
-    share::add_saved_collection(&state.paths, entry).map_err(|e| e.to_string())
+    let saved = share::add_saved_collection(&state.paths, entry).map_err(|e| e.to_string())?;
+    state.p2p.trigger_local_activity_sync();
+    Ok(saved)
 }
 
 #[tauri::command]
@@ -10056,6 +10087,7 @@ pub fn rename_saved_collection(
             &renamed.entry.code,
         );
     }
+    state.p2p.trigger_local_activity_sync();
     Ok(renamed.entry)
 }
 
@@ -10080,6 +10112,7 @@ pub fn rename_installed_collection(
             renamed.collection.profile_code.as_deref(),
         );
     }
+    state.p2p.trigger_local_activity_sync();
     Ok(renamed.collection)
 }
 
@@ -10096,6 +10129,7 @@ pub fn delete_saved_collection(state: State<'_, AppState>, id: String) -> Result
     let code = entry.code.trim().to_string();
 
     share::delete_saved_collection(&state.paths, &id).map_err(|e| e.to_string())?;
+    state.p2p.trigger_local_activity_sync();
 
     let game_ids: Vec<String> = {
         let cfg = state.config.lock().map_err(|e| e.to_string())?;
@@ -10130,6 +10164,14 @@ pub fn set_mod_enabled(
     mod_id: String,
     enabled: bool,
 ) -> Result<(), String> {
+    if let Some(col_name) =
+        mods::synced_collection_for_mod(&state.paths, &game_id, &mod_id)
+            .map_err(|e| e.to_string())?
+    {
+        return Err(format!(
+            "Cannot toggle a mod managed by synced collection \"{col_name}\". Use the collection switch instead."
+        ));
+    }
     mods::set_enabled(&state.paths, &game_id, &mod_id, enabled).map_err(|e| e.to_string())?;
     if let Ok(game) = managed_game(&state, &game_id) {
         let _ = maybe_auto_save_collections(&state.paths, &game);
@@ -10143,11 +10185,167 @@ pub fn set_load_order(
     game_id: String,
     ordered_ids: Vec<String>,
 ) -> Result<(), String> {
+    mods::ensure_load_order_preserves_synced_collections(&state.paths, &game_id, &ordered_ids)
+        .map_err(|e| e.to_string())?;
     mods::set_load_order(&state.paths, &game_id, &ordered_ids).map_err(|e| e.to_string())?;
     if let Ok(game) = managed_game(&state, &game_id) {
         let _ = maybe_auto_save_collections(&state.paths, &game);
     }
     Ok(())
+}
+
+async fn run_auto_sort_staged_mods(
+    state: &AppState,
+    game_id: &str,
+) -> Result<mods::autosort::AutoSortResult, String> {
+    let game = managed_game(state, game_id)?;
+    let order = mods::load_loadorder(&state.paths, game_id).map_err(|e| e.to_string())?;
+    let mut extra_edges: Vec<(String, String)> = Vec::new();
+    let mut extra_warnings: Vec<String> = Vec::new();
+
+    // 1. Bethesda MAST plugin header dependencies across staged mods.
+    if games::loot::supports_loot(&game.plugin_id) {
+        extra_edges.extend(mods::autosort::collect_bethesda_mast_edges(
+            &order.mods,
+            &state.paths.mods_dir(game_id),
+        ));
+    }
+
+    // 2. Nexus mod requirements (maps required Nexus mods to staged mod IDs).
+    let staged_nexus = staged_nexus_mods(&order.mods);
+    let nexus_seeds: Vec<RequirementSeed> = order
+        .mods
+        .iter()
+        .filter(|m| m.enabled)
+        .filter_map(seed_from_staged)
+        .collect();
+    if !nexus_seeds.is_empty() && state.api_key.lock().map(|k| k.is_some()).unwrap_or(false) {
+        let missing = collect_requirement_seeds(state, nexus_seeds, staged_nexus).await;
+        for note in missing.staged {
+            for dep_id in note.required_by {
+                extra_edges.push((dep_id, note.staged_id.clone()));
+            }
+        }
+        if let Some(err) = missing.error {
+            extra_warnings.push(format!(
+                "Some Nexus requirements could not be fetched ({err}); sorted with available data."
+            ));
+        }
+    }
+
+    // 3. Mod.io dependencies.
+    let modio_by_key: HashMap<(u32, u64), String> = order
+        .mods
+        .iter()
+        .filter(|m| m.enabled)
+        .filter_map(|m| Some(((m.modio_game_id?, m.modio_mod_id?), m.id.clone())))
+        .collect();
+    if !modio_by_key.is_empty() {
+        if let Ok(client) = state.modio_client() {
+            for m in order.mods.iter().filter(|m| m.enabled) {
+                let (Some(mg), Some(mm)) = (m.modio_game_id, m.modio_mod_id) else {
+                    continue;
+                };
+                if let Ok(dep_ids) = client.dependency_mod_ids(mg, mm).await {
+                    for req_mod_id in dep_ids {
+                        if let Some(req_staged_id) = modio_by_key.get(&(mg, req_mod_id)) {
+                            extra_edges.push((m.id.clone(), req_staged_id.clone()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut result = mods::autosort::sort_staged_mods(&order.mods, &extra_edges);
+    result.warnings.extend(extra_warnings);
+
+    if result.moved_count > 0 {
+        mods::ensure_load_order_preserves_synced_collections(
+            &state.paths,
+            game_id,
+            &result.ordered_ids,
+        )
+        .map_err(|e| e.to_string())?;
+        mods::set_load_order(&state.paths, game_id, &result.ordered_ids)
+            .map_err(|e| e.to_string())?;
+        let _ = maybe_auto_save_collections(&state.paths, &game);
+    }
+
+    Ok(result)
+}
+
+#[tauri::command]
+pub async fn auto_sort_staged_mods(
+    state: State<'_, AppState>,
+    game_id: String,
+) -> Result<mods::autosort::AutoSortResult, String> {
+    run_auto_sort_staged_mods(&state, &game_id).await
+}
+
+#[tauri::command]
+pub fn get_bethesda_plugins(
+    state: State<'_, AppState>,
+    game_id: String,
+) -> Result<games::loot::BethesdaPluginsState, String> {
+    let game = managed_game(&state, &game_id)?;
+    let order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
+    games::loot::list_bethesda_plugins(
+        &state.paths,
+        &game_id,
+        &game.plugin_id,
+        Path::new(&game.install_path),
+        &order.mods,
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn set_bethesda_plugin_order(
+    state: State<'_, AppState>,
+    game_id: String,
+    plugins: Vec<games::loot::SavedPluginEntry>,
+) -> Result<games::loot::BethesdaPluginsState, String> {
+    let game = managed_game(&state, &game_id)?;
+    let order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
+    games::loot::set_bethesda_plugin_order(
+        &state.paths,
+        &game_id,
+        &game.plugin_id,
+        Path::new(&game.install_path),
+        &order.mods,
+        plugins,
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn sort_bethesda_plugins(
+    state: State<'_, AppState>,
+    game_id: String,
+) -> Result<games::loot::LootSortResult, String> {
+    let game = managed_game(&state, &game_id)?;
+    let order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
+    games::loot::sort_bethesda_plugins(
+        &state.paths,
+        &game_id,
+        &game.plugin_id,
+        Path::new(&game.install_path),
+        &order.mods,
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn update_loot_masterlist(
+    state: State<'_, AppState>,
+    game_id: String,
+) -> Result<games::loot::MasterlistStatus, String> {
+    let game = managed_game(&state, &game_id)?;
+    games::loot::update_masterlist(&state.paths, &game.plugin_id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[derive(Debug, Serialize)]
@@ -10289,6 +10487,14 @@ pub fn set_mod_options(
     mod_id: String,
     selection: ModOptionSelection,
 ) -> Result<ModOptionSelection, String> {
+    if let Some(col_name) =
+        mods::synced_collection_for_mod(&state.paths, &game_id, &mod_id)
+            .map_err(|e| e.to_string())?
+    {
+        return Err(format!(
+            "Cannot change options for a mod managed by synced collection \"{col_name}\"."
+        ));
+    }
     let plugin = plugin_for_game(&state, &game_id)?;
     let order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
     let staged = order
@@ -10371,6 +10577,14 @@ pub fn set_fomod_selection(
     mod_id: String,
     selection: FomodSelection,
 ) -> Result<FomodSelection, String> {
+    if let Some(col_name) =
+        mods::synced_collection_for_mod(&state.paths, &game_id, &mod_id)
+            .map_err(|e| e.to_string())?
+    {
+        return Err(format!(
+            "Cannot change FOMOD options for a mod managed by synced collection \"{col_name}\"."
+        ));
+    }
     let plugin = plugin_for_game(&state, &game_id)?;
     let order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
     let staged = order
@@ -10438,6 +10652,14 @@ pub fn remove_mod(
     game_id: String,
     mod_id: String,
 ) -> Result<(), String> {
+    if let Some(col_name) =
+        mods::synced_collection_for_mod(&state.paths, &game_id, &mod_id)
+            .map_err(|e| e.to_string())?
+    {
+        return Err(format!(
+            "Cannot remove a mod managed by synced collection \"{col_name}\". Uninstall the collection instead."
+        ));
+    }
     mods::remove_mod(&state.paths, &game_id, &mod_id).map_err(|e| e.to_string())?;
     if let Ok(game) = managed_game(&state, &game_id) {
         let _ = maybe_auto_save_collections(&state.paths, &game);
@@ -10532,14 +10754,19 @@ async fn deploy_game_inner(
     state: &AppState,
     game_id: &str,
 ) -> Result<(mods::DeployResult, ManagedGame), String> {
-    let mut game = {
+    let (mut game, auto_sort_before_deploy) = {
         let cfg = state.config.lock().map_err(|e| e.to_string())?;
-        cfg.managed_games
+        let found = cfg
+            .managed_games
             .iter()
             .find(|g| g.id == game_id)
             .cloned()
-            .ok_or_else(|| "Managed game not found".to_string())?
+            .ok_or_else(|| "Managed game not found".to_string())?;
+        (found, cfg.auto_sort_before_deploy)
     };
+    if auto_sort_before_deploy {
+        let _ = run_auto_sort_staged_mods(state, game_id).await;
+    }
     let repair_warnings = repair_damaged_staging(app, state, game_id).await;
     let install = PathBuf::from(&game.install_path);
     let Some(saved_plugin) = games::plugin_by_id(&game.plugin_id) else {
@@ -12482,6 +12709,17 @@ pub fn set_allow_cache_relay(
 }
 
 #[tauri::command]
+pub fn set_share_active_loadouts_in_feed(
+    state: State<'_, AppState>,
+    share: bool,
+) -> Result<crate::p2p::FriendsState, String> {
+    state
+        .p2p
+        .set_share_active_loadouts_in_feed(share)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn add_friend_by_code(
     state: State<'_, AppState>,
     code: String,
@@ -12502,6 +12740,18 @@ pub async fn add_friend_by_peer(
     state
         .p2p
         .add_friend_by_peer(peer_id, display_name)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn cancel_queued_friend_invite(
+    state: State<'_, AppState>,
+    peer_id: String,
+) -> Result<crate::p2p::FriendsState, String> {
+    state
+        .p2p
+        .cancel_queued_friend_invite(peer_id)
         .await
         .map_err(|e| e.to_string())
 }

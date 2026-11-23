@@ -969,6 +969,14 @@ export type SharedFriendRef = {
   peer_id: string;
   display_name: string;
   profile_updated_at?: string | null;
+  online?: boolean | null;
+};
+
+export type QueuedFriendInvite = {
+  peer_id: string;
+  display_name: string;
+  queued_at: string;
+  relayed_via_peer_ids?: string[];
 };
 
 export type PeerProfileSummary = {
@@ -990,6 +998,7 @@ export type FriendRecord = {
   status: FriendStatus;
   online: boolean;
   last_seen_at?: string | null;
+  added_at?: string | null;
   cached_profile?: PeerProfileSummary | null;
   syncing_my_collections?: string[];
   cached_via_peer_name?: string | null;
@@ -1035,6 +1044,7 @@ export type FriendFeedEvent = {
   id: string;
   peer_id: string;
   friend_display_name: string;
+  is_self?: boolean;
   kind: FriendFeedEventKind;
   collection_id: string;
   collection_kind: FriendCollectionKind;
@@ -1058,8 +1068,10 @@ export type FriendsState = {
   friends_list_visibility?: CollectionVisibility;
   allow_mutual_connections?: boolean;
   allow_cache_relay?: boolean;
+  share_active_loadouts_in_feed?: boolean;
   friends: FriendRecord[];
   pending_requests: PendingFriendRequest[];
+  queued_invites?: QueuedFriendInvite[];
   local_collections: LocalShareableCollection[];
   feed_events?: FriendFeedEvent[];
   feed_last_read_at?: string | null;
@@ -1300,6 +1312,7 @@ export type PersistedBanner = {
 export type Settings = {
   adult_content: boolean;
   game_version_warnings: boolean;
+  auto_sort_before_deploy?: boolean;
   autoclick_free_download: boolean;
   last_active_game_id: string | null;
   theme?: ThemePreference;
@@ -1323,4 +1336,59 @@ export type Settings = {
   cache_dir: string;
   platform_linux?: boolean;
   platform_windows?: boolean;
+};
+
+export type AutoSortResult = {
+  ordered_ids: string[];
+  previous_ordered_ids: string[];
+  moved_count: number;
+  dependency_edges_used: number;
+  warnings: string[];
+  cycles: string[][];
+};
+
+export type SavedPluginEntry = {
+  name: string;
+  enabled: boolean;
+};
+
+export type LootPluginMessage = {
+  kind: "info" | "warn" | "error" | string;
+  text: string;
+};
+
+export type PluginEntry = {
+  name: string;
+  enabled: boolean;
+  order: number;
+  is_master: boolean;
+  is_light: boolean;
+  is_medium: boolean;
+  is_vanilla: boolean;
+  owner_mod_id: string | null;
+  owner_mod_name: string | null;
+  masters: string[];
+  missing_masters: string[];
+  messages: LootPluginMessage[];
+  dirty_info: string[];
+};
+
+export type MasterlistStatus = {
+  cached: boolean;
+  updated_at: string | null;
+  repo: string;
+};
+
+export type BethesdaPluginsState = {
+  plugins: PluginEntry[];
+  masterlist: MasterlistStatus;
+  warnings: string[];
+};
+
+export type LootSortResult = {
+  state: BethesdaPluginsState;
+  previous_order: SavedPluginEntry[];
+  moved_count: number;
+  used_masterlist: boolean;
+  warnings: string[];
 };

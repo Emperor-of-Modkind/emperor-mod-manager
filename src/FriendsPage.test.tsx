@@ -17,6 +17,7 @@ vi.mock("./api", () => ({
     setCollectionVisibility: vi.fn(),
     addFriendByCode: vi.fn(),
     addFriendByPeer: vi.fn(),
+    cancelQueuedFriendInvite: vi.fn(),
     respondFriendRequest: vi.fn(),
     removeFriend: vi.fn(),
     refreshFriends: vi.fn(),
@@ -1123,6 +1124,396 @@ describe("FriendsPage", () => {
     // Collections tab shows the match pill on the Active Loadout row.
     await clickFriendsTab(host, "Collections");
     expect(host.textContent).toContain('Synced to your "Co-op Essentials"');
+
+    await act(async () => {
+      root.unmount();
+    });
+    host.remove();
+  });
+
+  it("queues friend-of-friend invites when target is offline, shows Queued pill & card, and supports Cancel", async () => {
+    const carolId = "c".repeat(64);
+    const initialState: FriendsState = {
+      ...sampleState,
+      peer_id: "0".repeat(64),
+      queued_invites: [],
+      friends: [
+        {
+          peer_id: "a".repeat(64),
+          display_name: "Alice",
+          status: "connected",
+          online: true,
+          cached_profile: {
+            peer_id: "a".repeat(64),
+            display_name: "Alice",
+            updated_at: "2026-11-22T12:00:00Z",
+            collections: [],
+            friends: [{ peer_id: carolId, display_name: "Carol", online: false }],
+          },
+        },
+      ],
+    };
+    const queuedState: FriendsState = {
+      ...initialState,
+      queued_invites: [
+        {
+          peer_id: carolId,
+          display_name: "Carol",
+          queued_at: "2026-11-22T12:05:00Z",
+          relayed_via_peer_ids: ["a".repeat(64)],
+        },
+      ],
+    };
+
+    vi.mocked(api.getFriendsState).mockResolvedValue(initialState);
+    vi.mocked(api.addFriendByPeer).mockResolvedValue(queuedState);
+    vi.mocked(api.cancelQueuedFriendInvite).mockResolvedValue(initialState);
+
+    const onNotice = vi.fn();
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const root: Root = createRoot(host);
+
+    await act(async () => {
+      root.render(
+        <FriendsPage
+          active={true}
+          managed={[]}
+          activeGameId={null}
+          onError={() => {}}
+          onNotice={onNotice}
+          onCollectionSynced={() => {}}
+        />,
+      );
+    });
+    await flush();
+
+    // Open Friends tab -> Alice's profile -> Alice's Friends sub-tab.
+    await clickFriendsTab(host, "Friends");
+    const aliceCard = host.querySelector<HTMLButtonElement>(
+      ".friends-friend-card-main",
+    );
+    await act(async () => {
+      aliceCard!.click();
+    });
+    await flush();
+    await clickFriendsTab(host, "Friends");
+
+    // Click Add Friend on offline Carol -> should show Queued pill and queued notice.
+    const addBtn = [...host.querySelectorAll("button")].find((b) =>
+      b.textContent?.includes("Add Friend"),
+    );
+    expect(addBtn).toBeTruthy();
+    await act(async () => {
+      addBtn!.click();
+    });
+    await flush();
+
+    expect(api.addFriendByPeer).toHaveBeenCalledWith(carolId, "Carol");
+    expect(onNotice).toHaveBeenCalledWith(
+      "Friend request queued — will be sent when they're online.",
+    );
+    expect(host.textContent).toContain("Queued");
+
+    // Go back to Friends list -> verify "Queued Outgoing Requests" card with relay info & Cancel.
+    const backBtn = [...host.querySelectorAll("button")].find(
+      (b) => b.textContent?.trim() === "Back",
+    );
+    await act(async () => {
+      backBtn!.click();
+    });
+    await flush();
+
+    expect(host.textContent).toContain("Queued Outgoing Requests");
+    expect(host.textContent).toContain("Waiting for them to come online");
+    expect(host.textContent).toContain("Relayed via Alice");
+
+    const cancelBtn = [...host.querySelectorAll("button")].find((b) =>
+      b.textContent?.includes("Cancel"),
+    );
+    expect(cancelBtn).toBeTruthy();
+    await act(async () => {
+      cancelBtn!.click();
+    });
+    await flush();
+
+    expect(api.cancelQueuedFriendInvite).toHaveBeenCalledWith(carolId);
+    expect(host.textContent).not.toContain("Queued Outgoing Requests");
+
+    await act(async () => {
+      root.unmount();
+    });
+    host.remove();
+  });
+
+  it("shows the user's own feed events in the global feed without unread badge, even with no friends", async () => {
+    const selfOnlyState: FriendsState = {
+      ...sampleState,
+      friends: [],
+      feed_last_read_at: null,
+      feed_events: [
+        {
+          id: "self:local-1",
+          peer_id: "peer_self",
+          friend_display_name: "PlayerOne",
+          is_self: true,
+          kind: "collection_updated",
+          collection_id: "active:skyrim",
+          collection_kind: "active_loadout",
+          collection_name: "My Skyrim Loadout",
+          game_title: "Skyrim SE",
+          mod_count: 4,
+          share_hash: "self_hash_1",
+          diff: {
+            mods_added: ["SKSE"],
+            mods_added_count: 1,
+            mods_removed: [],
+            mods_removed_count: 0,
+            mods_updated: [],
+            mods_updated_count: 0,
+          },
+          occurred_at: "2026-11-22T15:00:00Z",
+        },
+      ],
+    };
+    vi.mocked(api.getFriendsState).mockResolvedValue(selfOnlyState);
+
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const root: Root = createRoot(host);
+
+    await act(async () => {
+      root.render(
+        <FriendsPage
+          active={true}
+          managed={[]}
+          activeGameId={null}
+          onError={() => {}}
+          onNotice={() => {}}
+          onCollectionSynced={() => {}}
+        />,
+      );
+    });
+    await flush();
+
+    // Renders own feed item even with 0 friends, with You pill and static container.
+    expect(host.textContent).toContain("PlayerOne");
+    expect(host.textContent).toContain("My Skyrim Loadout");
+    expect(host.textContent).toContain("+1 added: SKSE");
+    expect(host.querySelector(".friends-feed-item-static")).toBeTruthy();
+    expect(host.querySelector(".friends-feed-item-btn")).toBeNull();
+    expect(host.querySelector(".friends-feed-item.unread")).toBeNull();
+    expect(host.querySelector(".friends-feed-badge")).toBeNull();
+    expect(api.markFriendFeedRead).not.toHaveBeenCalled();
+
+    const pills = [...host.querySelectorAll(".friends-feed-meta .pill")].map(
+      (el) => el.textContent?.trim(),
+    );
+    expect(pills).toContain("You");
+
+    await act(async () => {
+      root.unmount();
+    });
+    host.remove();
+  });
+
+  it("filters global feed by You vs friend and excludes own events from per-friend feed", async () => {
+    const mixedState: FriendsState = {
+      ...sampleState,
+      feed_last_read_at: "2026-11-22T20:00:00Z",
+      feed_events: [
+        {
+          id: "self:local-1",
+          peer_id: "peer_self",
+          friend_display_name: "PlayerOne",
+          is_self: true,
+          kind: "collection_added",
+          collection_id: "saved:my-pack",
+          collection_kind: "saved_collection",
+          collection_name: "My Own Pack",
+          game_title: "Skyrim SE",
+          mod_count: 2,
+          share_hash: "self_hash",
+          occurred_at: "2026-11-22T16:00:00Z",
+        },
+        {
+          id: "alice:ev-1",
+          peer_id: "peer_alice",
+          friend_display_name: "Alice",
+          is_self: false,
+          kind: "collection_updated",
+          collection_id: "active:skyrim",
+          collection_kind: "active_loadout",
+          collection_name: "Skyrim Loadout",
+          game_title: "Skyrim SE",
+          mod_count: 1,
+          share_hash: "hash1",
+          occurred_at: "2026-11-22T15:00:00Z",
+        },
+      ],
+    };
+    vi.mocked(api.getFriendsState).mockResolvedValue(mixedState);
+
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const root: Root = createRoot(host);
+
+    await act(async () => {
+      root.render(
+        <FriendsPage
+          active={true}
+          managed={[]}
+          activeGameId={null}
+          onError={() => {}}
+          onNotice={() => {}}
+          onCollectionSynced={() => {}}
+        />,
+      );
+    });
+    await flush();
+
+    // Both own and friend events appear in the global feed.
+    expect(host.textContent).toContain("My Own Pack");
+    expect(host.textContent).toContain("Skyrim Loadout");
+
+    // Filter dropdown lets the user filter to You (PlayerOne) or Alice.
+    const filterSelect = host.querySelector<HTMLSelectElement>(
+      'select[aria-label="Filter feed by friend"]',
+    );
+    expect(filterSelect).toBeTruthy();
+    const optionTexts = [...filterSelect!.options].map((o) => o.textContent);
+    expect(optionTexts).toContain("Everyone");
+    expect(optionTexts).toContain("You (PlayerOne)");
+    expect(optionTexts).toContain("Alice");
+
+    await act(async () => {
+      filterSelect!.value = "self";
+      filterSelect!.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    await flush();
+
+    expect(host.textContent).toContain("My Own Pack");
+    expect(host.textContent).not.toContain("Skyrim Loadout");
+
+    // Reset filter and open Alice's per-friend Feed tab: own event must not appear.
+    await clickFriendsTab(host, "Friends");
+    const aliceBtn = [...host.querySelectorAll("button")].find((b) =>
+      b.textContent?.includes("Alice"),
+    );
+    expect(aliceBtn).toBeTruthy();
+    await act(async () => {
+      aliceBtn!.click();
+    });
+    await flush();
+
+    expect(host.textContent).toContain("Alice's Feed");
+    expect(host.textContent).toContain("Skyrim Loadout");
+    expect(host.textContent).not.toContain("My Own Pack");
+
+    await act(async () => {
+      root.unmount();
+    });
+    host.remove();
+  });
+
+  it("renders alternating timeline with date milestones and deduplicates matching active loadout against saved collection", async () => {
+    const dedupeState: FriendsState = {
+      ...sampleState,
+      feed_last_read_at: "2026-11-22T20:00:00Z",
+      feed_events: [
+        {
+          id: "self:saved-inc",
+          peer_id: "peer_self",
+          friend_display_name: "PlayerOne",
+          is_self: true,
+          kind: "collection_updated",
+          collection_id: "saved:inc",
+          collection_kind: "saved_collection",
+          collection_name: "INC",
+          game_title: "Cyberpunk 2077",
+          mod_count: 70,
+          share_hash: "h_inc",
+          diff: {
+            mods_added: [],
+            mods_added_count: 0,
+            mods_removed: [],
+            mods_removed_count: 0,
+            mods_updated: ["ArchiveXL"],
+            mods_updated_count: 1,
+          },
+          occurred_at: "2026-11-22T16:00:00Z",
+        },
+        {
+          id: "self:active-cp",
+          peer_id: "peer_self",
+          friend_display_name: "PlayerOne",
+          is_self: true,
+          kind: "collection_updated",
+          collection_id: "active:cyberpunk2077",
+          collection_kind: "active_loadout",
+          collection_name: "Cyberpunk 2077 Loadout",
+          game_title: "Cyberpunk 2077",
+          mod_count: 70,
+          share_hash: "h_active",
+          diff: {
+            mods_added: [],
+            mods_added_count: 0,
+            mods_removed: [],
+            mods_removed_count: 0,
+            mods_updated: ["ArchiveXL"],
+            mods_updated_count: 1,
+          },
+          occurred_at: "2026-11-22T16:00:05Z",
+        },
+        {
+          id: "alice:ev-older",
+          peer_id: "peer_alice",
+          friend_display_name: "Alice",
+          is_self: false,
+          kind: "collection_updated",
+          collection_id: "active:skyrim",
+          collection_kind: "active_loadout",
+          collection_name: "Skyrim Loadout",
+          game_title: "Skyrim SE",
+          mod_count: 1,
+          share_hash: "hash1",
+          occurred_at: "2026-11-18T12:00:00Z",
+        },
+      ],
+    };
+    vi.mocked(api.getFriendsState).mockResolvedValue(dedupeState);
+
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const root: Root = createRoot(host);
+
+    await act(async () => {
+      root.render(
+        <FriendsPage
+          active={true}
+          managed={[]}
+          activeGameId={null}
+          onError={() => {}}
+          onNotice={() => {}}
+          onCollectionSynced={() => {}}
+        />,
+      );
+    });
+    await flush();
+
+    // Duplicate ActiveLoadout ("Cyberpunk 2077 Loadout") is collapsed into SavedCollection ("INC").
+    expect(host.textContent).toContain("INC");
+    expect(host.textContent).not.toContain("Cyberpunk 2077 Loadout");
+    expect(host.textContent).toContain("Skyrim Loadout");
+
+    // Timeline renders date milestones and alternating left/right rows.
+    expect(host.querySelector(".friends-timeline")).toBeTruthy();
+    const milestones = host.querySelectorAll(".friends-timeline-milestone-badge");
+    expect(milestones.length).toBe(2);
+    const rows = host.querySelectorAll(".friends-timeline-row");
+    expect(rows.length).toBe(2);
+    expect(rows[0].classList.contains("left")).toBe(true);
+    expect(rows[1].classList.contains("right")).toBe(true);
 
     await act(async () => {
       root.unmount();

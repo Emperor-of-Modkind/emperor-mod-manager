@@ -155,6 +155,9 @@ pub struct AppConfig {
     /// mod.io website session captured by the sign-in window.
     #[serde(default)]
     pub modio_website_signed_in: bool,
+    /// When true, automatically sort staged mods by requirements before deploying.
+    #[serde(default)]
+    pub auto_sort_before_deploy: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -308,6 +311,7 @@ impl Default for AppConfig {
             initial_setup_complete: None,
             nexus_website_signed_in: false,
             modio_website_signed_in: false,
+            auto_sort_before_deploy: false,
         }
     }
 }
@@ -454,6 +458,14 @@ impl Paths {
 
     pub fn loadorder_file(&self, game_id: &str) -> PathBuf {
         self.game_data_dir(game_id).join("loadorder.json")
+    }
+
+    pub fn plugins_order_file(&self, game_id: &str) -> PathBuf {
+        self.game_data_dir(game_id).join("plugins_order.json")
+    }
+
+    pub fn loot_dir(&self) -> PathBuf {
+        self.data_dir.join("loot")
     }
 
     pub fn collections_file(&self, game_id: &str) -> PathBuf {

@@ -15,6 +15,7 @@ import { createPortal } from "react-dom";
 import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
 import {
   faArrowDown,
+  faArrowDownWideShort,
   faArrowUp,
   faBars,
   faCaretDown,
@@ -27,14 +28,20 @@ import {
   faFloppyDisk,
   faGear,
   faLink,
+  faLock,
   faMagnifyingGlass,
   faPlay,
   faPlus,
   faRightLeft,
+  faRotateLeft,
   faStop,
   faTrashCan,
   faXmark,
 } from "@fortawesome/free-solid-svg-icons";
+import {
+  BethesdaPluginsView,
+  isBethesdaLootPluginId,
+} from "./BethesdaPluginsView";
 import { useReducedMotion } from "motion/react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -2602,6 +2609,30 @@ export default function App() {
     return map;
   }, [collectionsByModId]);
 
+  const syncedCollectionNameByModId = useMemo(() => {
+    const map = new Map<string, string>();
+    const syncedById = new Map<string, string>();
+    for (const col of installedCollections) {
+      if (!col.friend_sync) continue;
+      syncedById.set(col.id, col.name);
+      for (const modId of col.mod_ids) {
+        if (!map.has(modId)) map.set(modId, col.name);
+      }
+    }
+    if (syncedById.size === 0) return map;
+    for (const m of mods) {
+      if (map.has(m.id)) continue;
+      for (const cid of m.collection_ids ?? []) {
+        const name = syncedById.get(cid);
+        if (name) {
+          map.set(m.id, name);
+          break;
+        }
+      }
+    }
+    return map;
+  }, [installedCollections, mods]);
+
   const deferredModsQuery = useDeferredValue(modsQuery);
 
   const visibleMods = useMemo(
@@ -2691,8 +2722,13 @@ export default function App() {
   });
 
   const stagedUpdateCount = useMemo(
-    () => mods.reduce((n, m) => n + (modUpdates[m.id] ? 1 : 0), 0),
-    [mods, modUpdates],
+    () =>
+      mods.reduce(
+        (n, m) =>
+          n + (modUpdates[m.id] && !syncedCollectionNameByModId.has(m.id) ? 1 : 0),
+        0,
+      ),
+    [mods, modUpdates, syncedCollectionNameByModId],
   );
 
   const unmanagedSuggestKey = unmanaged
@@ -2951,22 +2987,26 @@ export default function App() {
     }
   }, [refreshWineAdvice]);
 
-  const openModInstaller = useCallback(async (m: StagedMod) => {
-    if (!activeGameRef.current) return;
-    const gameId = activeGameRef.current.id;
-    try {
-      const fomod = await api.getFomodInstaller(gameId, m.id);
-      if (fomod) {
-        const next = { mod: m, pass: null };
-        fomodDialogRef.current = next;
-        setFomodDialog(next);
-        return;
+  const openModInstaller = useCallback(
+    async (m: StagedMod) => {
+      if (!activeGameRef.current) return;
+      if (syncedCollectionNameByModId.has(m.id)) return;
+      const gameId = activeGameRef.current.id;
+      try {
+        const fomod = await api.getFomodInstaller(gameId, m.id);
+        if (fomod) {
+          const next = { mod: m, pass: null };
+          fomodDialogRef.current = next;
+          setFomodDialog(next);
+          return;
+        }
+      } catch (e) {
+        console.warn("get_fomod_installer failed", e);
       }
-    } catch (e) {
-      console.warn("get_fomod_installer failed", e);
-    }
-    setModOptionsFor(m);
-  }, []);
+      setModOptionsFor(m);
+    },
+    [syncedCollectionNameByModId],
+  );
 
   const refreshModUpdates = useCallback(async (gameId: string) => {
     const req = ++modUpdatesReqRef.current;
@@ -8187,6 +8227,7 @@ export default function App() {
     const apiIds: string[] = [];
 
     for (const [stagedId, upd] of pending) {
+      if (syncedCollectionNameByModId.has(stagedId)) continue;
       const m = mods.find((x) => x.id === stagedId);
       if (!m) continue;
       if (
@@ -8349,8 +8390,79 @@ export default function App() {
     };
   }, [importModalOpen, activeGame?.id]);
 
+  const [autoSortingMods, setAutoSortingMods] = useState(false);
+  const [autoSortUndoIds, setAutoSortUndoIds] = useState<string[] | null>(null);
+  const [gameDetailSubTab, setGameDetailSubTab] = useState<"mods" | "plugins">("mods");
+  const [bethesdaPluginCount, setBethesdaPluginCount] = useState<number | null>(null);
+
+  useEffect(() => {
+    setAutoSortUndoIds(null);
+    setGameDetailSubTab("mods");
+    setBethesdaPluginCount(null);
+  }, [activeGame?.id]);
+
+  const notifyFromPlugins = useCallback(
+    (kind: "info" | "warn" | "error", message: string, details?: string[]) => {
+      if (kind === "error") {
+        setError(message);
+      } else {
+        setNotice({
+          kind: kind === "info" ? "ok" : "warn",
+          message,
+          details,
+        });
+      }
+    },
+    [setError, setNotice],
+  );
+
+  async function autoSortStagedModsNow() {
+    if (!activeGame || autoSortingMods) return;
+    setAutoSortingMods(true);
+    setError(null);
+    try {
+      const res = await api.autoSortStagedMods(activeGame.id);
+      await refreshMods(activeGame.id);
+      if (res.moved_count > 0) {
+        setAutoSortUndoIds(res.previous_ordered_ids);
+        setNotice({
+          kind: res.warnings.length > 0 ? "warn" : "ok",
+          message: `Auto-sorted load order: moved ${res.moved_count} mod${res.moved_count === 1 ? "" : "s"} (${res.dependency_edges_used} requirement${res.dependency_edges_used === 1 ? "" : "s"} applied).`,
+          details: res.warnings.length > 0 ? res.warnings : undefined,
+        });
+      } else {
+        setAutoSortUndoIds(null);
+        setNotice({
+          kind: res.warnings.length > 0 ? "warn" : "ok",
+          message:
+            res.dependency_edges_used > 0
+              ? "Load order already satisfies all detected mod requirements."
+              : "No mod requirement order changes needed.",
+          details: res.warnings.length > 0 ? res.warnings : undefined,
+        });
+      }
+    } catch (e) {
+      setError(`Auto-sort failed: ${String(e)}`);
+    } finally {
+      setAutoSortingMods(false);
+    }
+  }
+
+  async function undoAutoSortStagedMods() {
+    if (!activeGame || !autoSortUndoIds) return;
+    const prev = autoSortUndoIds;
+    setAutoSortUndoIds(null);
+    try {
+      await api.setLoadOrder(activeGame.id, prev);
+      await refreshMods(activeGame.id);
+      setNotice({ kind: "ok", message: "Restored previous load order." });
+    } catch (e) {
+      setError(`Could not restore previous load order: ${String(e)}`);
+    }
+  }
+
   async function toggleMod(m: StagedMod) {
-    if (!activeGame) return;
+    if (!activeGame || syncedCollectionNameByModId.has(m.id)) return;
     await api.setModEnabled(activeGame.id, m.id, !m.enabled);
     await refreshMods(activeGame.id);
   }
@@ -8384,7 +8496,7 @@ export default function App() {
   }
 
   async function moveMod(modId: string, dir: -1 | 1) {
-    if (!activeGame || !canReorderMods) return;
+    if (!activeGame || !canReorderMods || syncedCollectionNameByModId.has(modId)) return;
     const next = reorderStagedMods(mods, modId, dir);
     if (!next) return;
     await api.setLoadOrder(
@@ -9909,22 +10021,24 @@ export default function App() {
                                   <strong className="installed-collection-card-name">
                                     {c.name}
                                   </strong>
-                                  <span
-                                    className={
-                                      isSaving
-                                        ? "installed-collection-save-status is-saving"
-                                        : isUnsaved
-                                          ? "installed-collection-save-status is-unsaved"
-                                          : "installed-collection-save-status is-saved"
-                                    }
-                                    title={savedStatusLabel}
-                                    aria-label={savedStatusLabel}
-                                  >
-                                    <FontAwesomeIcon
-                                      icon={faFloppyDisk}
-                                      aria-hidden="true"
-                                    />
-                                  </span>
+                                  {!c.friend_sync && (
+                                    <span
+                                      className={
+                                        isSaving
+                                          ? "installed-collection-save-status is-saving"
+                                          : isUnsaved
+                                            ? "installed-collection-save-status is-unsaved"
+                                            : "installed-collection-save-status is-saved"
+                                      }
+                                      title={savedStatusLabel}
+                                      aria-label={savedStatusLabel}
+                                    >
+                                      <FontAwesomeIcon
+                                        icon={faFloppyDisk}
+                                        aria-hidden="true"
+                                      />
+                                    </span>
+                                  )}
                                 </div>
                                 <div className="installed-collection-card-actions">
                                   {canUpdateSource && (
@@ -10111,6 +10225,39 @@ export default function App() {
                         />
                       ) : null}
                     </Reveal>
+                    {isBethesdaLootPluginId(libraryDetail.game.plugin_id) && (
+                      <div className="game-detail-subtabs" role="tablist" aria-label="Mod views">
+                        <button
+                          type="button"
+                          role="tab"
+                          aria-selected={gameDetailSubTab === "mods"}
+                          className={
+                            gameDetailSubTab === "mods"
+                              ? "game-detail-subtab active"
+                              : "game-detail-subtab"
+                          }
+                          onClick={() => setGameDetailSubTab("mods")}
+                        >
+                          Staged Mods ({mods.length})
+                        </button>
+                        <button
+                          type="button"
+                          role="tab"
+                          aria-selected={gameDetailSubTab === "plugins"}
+                          className={
+                            gameDetailSubTab === "plugins"
+                              ? "game-detail-subtab active"
+                              : "game-detail-subtab"
+                          }
+                          onClick={() => setGameDetailSubTab("plugins")}
+                        >
+                          Plugins (LOOT)
+                          {bethesdaPluginCount !== null ? ` (${bethesdaPluginCount})` : ""}
+                        </button>
+                      </div>
+                    )}
+                    {(!isBethesdaLootPluginId(libraryDetail.game.plugin_id) ||
+                      gameDetailSubTab === "mods") && (
                     <div className="mods-toolbar">
                       <div className="mods-toolbar-actions">
                         <div className="mods-toolbar-actions-left">
@@ -10123,6 +10270,23 @@ export default function App() {
                           >
                             <FontAwesomeIcon icon={faFileImport} />
                           </button>
+                          <button
+                            type="button"
+                            disabled={autoSortingMods || mods.length < 2}
+                            title="Sort staged mods so dependencies load before the mods that require them"
+                            onClick={() => void autoSortStagedModsNow()}
+                          >
+                            <FontAwesomeIcon icon={faArrowDownWideShort} />{" "}
+                            {autoSortingMods ? "Sorting…" : "Auto-Sort"}
+                          </button>
+                          {autoSortUndoIds && (
+                            <button
+                              type="button"
+                              onClick={() => void undoAutoSortStagedMods()}
+                            >
+                              <FontAwesomeIcon icon={faRotateLeft} /> Undo sort
+                            </button>
+                          )}
                           <button
                             type="button"
                             disabled={checkingModUpdates}
@@ -10304,7 +10468,10 @@ export default function App() {
                         </p>
                       )}
                     </div>
-                    {ignoredRequirements.length > 0 && (
+                    )}
+                    {(!isBethesdaLootPluginId(libraryDetail.game.plugin_id) ||
+                      gameDetailSubTab === "mods") &&
+                      ignoredRequirements.length > 0 && (
                       <button
                         type="button"
                         className="linkish ignored-requirements-link"
@@ -10345,7 +10512,14 @@ export default function App() {
                     />
                   </div>
                   <div className="page-scroll" ref={libraryDetailScrollRef}>
-                    {showMods ? (
+                    {isBethesdaLootPluginId(libraryDetail.game.plugin_id) &&
+                    gameDetailSubTab === "plugins" ? (
+                      <BethesdaPluginsView
+                        gameId={libraryDetail.game.id}
+                        onNotify={notifyFromPlugins}
+                        onPluginCountChange={setBethesdaPluginCount}
+                      />
+                    ) : showMods ? (
                       <div className="results-fill">
                     {mods.length === 0 ? (
                       <ul className="list mods">
@@ -10368,28 +10542,35 @@ export default function App() {
                       }
                       estimateSize={estimateStagedModRowHeight()}
                       getKey={(m) => m.id}
-                      onRowPointerDown={(m, event) =>
-                        modDrag.onDragPointerDown(m.id, event)
-                      }
+                      onRowPointerDown={(m, event) => {
+                        if (syncedCollectionNameByModId.has(m.id)) return;
+                        modDrag.onDragPointerDown(m.id, event);
+                      }}
                       rowClassName={(m) =>
                         [
                           m.enabled
                             ? "list-row-poster"
                             : "mod-disabled list-row-poster",
-                          canReorderMods ? "mod-drag-ready" : "",
+                          canReorderMods && !syncedCollectionNameByModId.has(m.id)
+                            ? "mod-drag-ready"
+                            : "",
                           modDrag.draggingId === m.id ? "mod-drag-placeholder" : "",
                         ]
                           .filter(Boolean)
                           .join(" ")
                       }
                       renderItem={(m) => {
+                        const syncedCollectionName =
+                          syncedCollectionNameByModId.get(m.id) ?? null;
                         const idx = modIndexById.get(m.id) ?? -1;
                         const canMoveUp =
                           canReorderMods &&
+                          !syncedCollectionName &&
                           idx >= 0 &&
                           sameEnabledNeighborIndex(modsInLoadOrder, idx, -1) >= 0;
                         const canMoveDown =
                           canReorderMods &&
+                          !syncedCollectionName &&
                           idx >= 0 &&
                           sameEnabledNeighborIndex(modsInLoadOrder, idx, 1) >= 0;
                         const pageHit = activeGame
@@ -10428,6 +10609,21 @@ export default function App() {
                                   ))}
                                 </div>
                               )}
+                              {syncedCollectionName && (
+                                <small
+                                  className="mod-synced-lock-note"
+                                  title={`This mod is managed by synced collection "${syncedCollectionName}" and cannot be modified individually`}
+                                >
+                                  <FontAwesomeIcon
+                                    icon={faLock}
+                                    aria-hidden="true"
+                                  />
+                                  <span>
+                                    Locked by synced collection (
+                                    {syncedCollectionName})
+                                  </span>
+                                </small>
+                              )}
                               {versionWarning && (
                                 <small className="mod-version-warn">
                                   {versionWarning.message}
@@ -10438,10 +10634,18 @@ export default function App() {
                         );
                         const rowBody = (
                           <>
-                            <label className="check">
+                            <label
+                              className="check"
+                              title={
+                                syncedCollectionName
+                                  ? `Managed by synced collection "${syncedCollectionName}" — use the collection switch to enable or disable`
+                                  : undefined
+                              }
+                            >
                               <input
                                 type="checkbox"
                                 checked={m.enabled}
+                                disabled={Boolean(syncedCollectionName)}
                                 aria-label={`Enable ${m.name}`}
                                 onChange={() => toggleMod(m)}
                               />
@@ -10452,7 +10656,7 @@ export default function App() {
                                 role="button"
                                 tabIndex={0}
                                 title={
-                                  canReorderMods
+                                  canReorderMods && !syncedCollectionName
                                     ? "Click and hold to drag in load order"
                                     : undefined
                                 }
@@ -10473,14 +10677,14 @@ export default function App() {
                               <div
                                 className="mod-identity"
                                 title={
-                                  canReorderMods
+                                  canReorderMods && !syncedCollectionName
                                     ? "Click and hold to drag in load order"
                                     : undefined
                                 }
                               >{identity}</div>
                             )}
                             <div className="actions">
-                              {modUpdates[m.id] && (
+                              {!syncedCollectionName && modUpdates[m.id] && (
                                 <button
                                   type="button"
                                   className="accent"
@@ -10500,24 +10704,38 @@ export default function App() {
                                 <button
                                   type="button"
                                   className="icon-btn"
+                                  disabled={Boolean(syncedCollectionName)}
                                   onClick={() => void openModInstaller(m)}
                                   aria-label="Mod options"
-                                  title="Choose which parts of this mod install"
+                                  title={
+                                    syncedCollectionName
+                                      ? `Options are managed by synced collection "${syncedCollectionName}"`
+                                      : "Choose which parts of this mod install"
+                                  }
                                 >
                                   <FontAwesomeIcon icon={faGear} />
                                 </button>
                               )}
-                              {installedCollections.length > 1 && (
-                                <button
-                                  type="button"
-                                  className="icon-btn"
-                                  onClick={() => setMoveCollectionMod(m)}
-                                  aria-label={`Move ${m.name} between collections`}
-                                  title="Move between collections"
-                                >
-                                  <FontAwesomeIcon icon={faRightLeft} />
-                                </button>
-                              )}
+                              {installedCollections.length > 1 && (() => {
+                                const canMoveModCollections =
+                                  installedCollections.some((c) => !c.friend_sync);
+                                return (
+                                  <button
+                                    type="button"
+                                    className="icon-btn"
+                                    disabled={!canMoveModCollections}
+                                    onClick={() => setMoveCollectionMod(m)}
+                                    aria-label={`Move ${m.name} between collections`}
+                                    title={
+                                      canMoveModCollections
+                                        ? "Move between collections"
+                                        : "Synced collection membership cannot be changed"
+                                    }
+                                  >
+                                    <FontAwesomeIcon icon={faRightLeft} />
+                                  </button>
+                                );
+                              })()}
                               <button
                                 type="button"
                                 className="icon-btn"
@@ -10525,9 +10743,11 @@ export default function App() {
                                 disabled={!canMoveUp}
                                 aria-label="Move up in load order"
                                 title={
-                                  canReorderMods
-                                    ? "Move up in load order"
-                                    : "Clear filters and use Load order to reorder"
+                                  syncedCollectionName
+                                    ? `Load order is managed by synced collection "${syncedCollectionName}"`
+                                    : canReorderMods
+                                      ? "Move up in load order"
+                                      : "Clear filters and use Load order to reorder"
                                 }
                               >
                                 <FontAwesomeIcon icon={faArrowUp} />
@@ -10539,9 +10759,11 @@ export default function App() {
                                 disabled={!canMoveDown}
                                 aria-label="Move down in load order"
                                 title={
-                                  canReorderMods
-                                    ? "Move down in load order"
-                                    : "Clear filters and use Load order to reorder"
+                                  syncedCollectionName
+                                    ? `Load order is managed by synced collection "${syncedCollectionName}"`
+                                    : canReorderMods
+                                      ? "Move down in load order"
+                                      : "Clear filters and use Load order to reorder"
                                 }
                               >
                                 <FontAwesomeIcon icon={faArrowDown} />
@@ -10549,8 +10771,13 @@ export default function App() {
                               <button
                                 type="button"
                                 className="danger icon-btn"
+                                disabled={Boolean(syncedCollectionName)}
                                 aria-label={`Remove ${m.name}`}
-                                title="Remove"
+                                title={
+                                  syncedCollectionName
+                                    ? `Managed by synced collection "${syncedCollectionName}" — uninstall the collection to remove`
+                                    : "Remove"
+                                }
                                 onClick={() =>
                                   withBusy("Removing mod…", async () => {
                                     if (!activeGame) return;
@@ -13233,6 +13460,17 @@ export default function App() {
               >
                 Warn when a mod does not match the game version
               </SettingsToggle>
+              <SettingsToggle
+                checked={Boolean(settings?.auto_sort_before_deploy)}
+                onChange={(checked) =>
+                  void withBusy("Saving…", async () => {
+                    await api.setAutoSortBeforeDeploy(checked);
+                    await refreshSettings();
+                  })
+                }
+              >
+                Auto-sort staged mods by requirements before deploying
+              </SettingsToggle>
             </SettingsSection>
             <SettingsSection title="Data & maintenance">
               {settings && (
@@ -13946,7 +14184,7 @@ export default function App() {
                                     </span>
                                   </>
                                 ) : null}
-                                {hasUnsaved && !autoSaveOn ? (
+                                {!c.friend_sync && hasUnsaved && !autoSaveOn ? (
                                   <>
                                     {" · "}
                                     <span className="installed-collection-sync-pill is-update">
@@ -14006,7 +14244,7 @@ export default function App() {
                               </small>
                             </div>
                             <div className="actions">
-                              {!autoSaveOn && (
+                              {!c.friend_sync && !autoSaveOn && (
                                 <button
                                   type="button"
                                   className={hasUnsaved ? "accent" : ""}
@@ -14021,28 +14259,30 @@ export default function App() {
                                   {isSaving ? "Saving…" : "Save"}
                                 </button>
                               )}
-                              <button
-                                type="button"
-                                role="switch"
-                                aria-checked={autoSaveOn}
-                                disabled={isSaving}
-                                className="collection-autosave-toggle"
-                                title="Automatically save changes to load order, member mods, and FOMOD options"
-                                onClick={() =>
-                                  void toggleInstalledCollectionAutoSave(
-                                    c,
-                                    !autoSaveOn,
-                                  )
-                                }
-                              >
-                                <span
-                                  className="switch-track"
-                                  aria-hidden="true"
+                              {!c.friend_sync && (
+                                <button
+                                  type="button"
+                                  role="switch"
+                                  aria-checked={autoSaveOn}
+                                  disabled={isSaving}
+                                  className="collection-autosave-toggle"
+                                  title="Automatically save changes to load order, member mods, and FOMOD options"
+                                  onClick={() =>
+                                    void toggleInstalledCollectionAutoSave(
+                                      c,
+                                      !autoSaveOn,
+                                    )
+                                  }
                                 >
-                                  <span className="switch-thumb" />
-                                </span>
-                                <span>Auto-save</span>
-                              </button>
+                                  <span
+                                    className="switch-track"
+                                    aria-hidden="true"
+                                  >
+                                    <span className="switch-thumb" />
+                                  </span>
+                                  <span>Auto-save</span>
+                                </button>
+                              )}
                               {canUpdateSource && (
                                 <button
                                   type="button"

@@ -12,6 +12,7 @@ vi.mock("./api", () => ({
     setFriendsListVisibility: vi.fn(),
     setAllowMutualConnections: vi.fn(),
     setAllowCacheRelay: vi.fn(),
+    setShareActiveLoadoutsInFeed: vi.fn(),
   },
 }));
 
@@ -269,7 +270,7 @@ describe("SocialSettingsSection", () => {
     const toggles = host.querySelectorAll<HTMLButtonElement>(
       'button[role="switch"]',
     );
-    expect(toggles.length).toBe(2);
+    expect(toggles.length).toBe(3);
     const relayToggle = toggles[1];
     expect(relayToggle.getAttribute("aria-checked")).toBe("true");
 
@@ -285,6 +286,57 @@ describe("SocialSettingsSection", () => {
     });
     expect(onNotice).toHaveBeenCalledWith(
       "Offline friend cache sharing disabled.",
+    );
+
+    await act(async () => {
+      root.unmount();
+    });
+    host.remove();
+  });
+
+  it("toggles share active loadouts to feed setting", async () => {
+    const onFriendsStateChange = vi.fn();
+    const onNotice = vi.fn();
+    const onError = vi.fn();
+    vi.mocked(api.setShareActiveLoadoutsInFeed).mockResolvedValue({
+      ...baseState,
+      share_active_loadouts_in_feed: false,
+    });
+
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const root: Root = createRoot(host);
+
+    await act(async () => {
+      root.render(
+        <SocialSettingsSection
+          friendsState={baseState}
+          onFriendsStateChange={onFriendsStateChange}
+          onNotice={onNotice}
+          onError={onError}
+        />,
+      );
+    });
+
+    const toggles = host.querySelectorAll<HTMLButtonElement>(
+      'button[role="switch"]',
+    );
+    expect(toggles.length).toBe(3);
+    const activeLoadoutFeedToggle = toggles[2];
+    expect(activeLoadoutFeedToggle.getAttribute("aria-checked")).toBe("true");
+
+    await act(async () => {
+      activeLoadoutFeedToggle.click();
+    });
+    await flush();
+
+    expect(api.setShareActiveLoadoutsInFeed).toHaveBeenCalledWith(false);
+    expect(onFriendsStateChange).toHaveBeenCalledWith({
+      ...baseState,
+      share_active_loadouts_in_feed: false,
+    });
+    expect(onNotice).toHaveBeenCalledWith(
+      "Active loadouts hidden from your feed.",
     );
 
     await act(async () => {

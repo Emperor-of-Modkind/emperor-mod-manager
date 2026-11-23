@@ -1,5 +1,6 @@
 //! Mod staging, extraction, load order, and deploy.
 
+pub mod autosort;
 pub mod fomod;
 pub mod game_version;
 pub mod options;
@@ -1440,6 +1441,12 @@ pub fn set_collection_auto_save(
             .iter_mut()
             .find(|c| c.id == collection_id)
             .ok_or_else(|| anyhow::anyhow!("Collection not found: {collection_id}"))?;
+        if col.friend_sync.is_some() {
+            bail!(
+                "cannot change auto-save for synced collection \"{}\"",
+                col.name
+            );
+        }
         col.auto_save = auto_save;
         Ok(col.clone())
     })
@@ -1513,6 +1520,103 @@ pub fn sync_installed_collection_rename(
     })
 }
 
+/// Return the name of the first synced friend collection (`friend_sync.is_some()`)
+/// that includes `mod_uid` (via either `InstalledCollection.mod_ids` or
+/// `StagedMod.collection_ids`), if any.
+pub fn synced_collection_for_mod(
+    paths: &Paths,
+    game_id: &str,
+    mod_uid: &str,
+) -> Result<Option<String>> {
+    let store = load_collections(paths, game_id)?;
+    let synced_cols: Vec<&InstalledCollection> = store
+        .collections
+        .iter()
+        .filter(|c| c.friend_sync.is_some())
+        .collect();
+    if synced_cols.is_empty() {
+        return Ok(None);
+    }
+    for col in &synced_cols {
+        if col.mod_ids.iter().any(|id| id == mod_uid) {
+            return Ok(Some(col.name.clone()));
+        }
+    }
+    let order = load_loadorder(paths, game_id)?;
+    if let Some(m) = order.mods.iter().find(|m| m.id == mod_uid) {
+        for col in &synced_cols {
+            if m.collection_ids.iter().any(|cid| cid == &col.id) {
+                return Ok(Some(col.name.clone()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Ensure that `ordered_ids` preserves the current relative load order of every
+/// synced friend collection's member mods.
+pub fn ensure_load_order_preserves_synced_collections(
+    paths: &Paths,
+    game_id: &str,
+    ordered_ids: &[String],
+) -> Result<()> {
+    let store = load_collections(paths, game_id)?;
+    let synced_cols: Vec<&InstalledCollection> = store
+        .collections
+        .iter()
+        .filter(|c| c.friend_sync.is_some())
+        .collect();
+    if synced_cols.is_empty() {
+        return Ok(());
+    }
+    let order = load_loadorder(paths, game_id)?;
+    let mut current_sorted: Vec<&StagedMod> = order.mods.iter().collect();
+    current_sorted.sort_by_key(|m| m.order);
+
+    // Build the resulting full order the same way `set_load_order` does.
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut next_order: Vec<&str> = Vec::with_capacity(order.mods.len());
+    for id in ordered_ids {
+        if order.mods.iter().any(|m| m.id == *id) && seen.insert(id.as_str()) {
+            next_order.push(id.as_str());
+        }
+    }
+    for m in &current_sorted {
+        if seen.insert(m.id.as_str()) {
+            next_order.push(m.id.as_str());
+        }
+    }
+
+    for col in synced_cols {
+        let mut member_set: HashSet<&str> = col.mod_ids.iter().map(|s| s.as_str()).collect();
+        for m in &order.mods {
+            if m.collection_ids.iter().any(|cid| cid == &col.id) {
+                member_set.insert(m.id.as_str());
+            }
+        }
+        if member_set.len() < 2 {
+            continue;
+        }
+        let current_rel: Vec<&str> = current_sorted
+            .iter()
+            .filter(|m| member_set.contains(m.id.as_str()))
+            .map(|m| m.id.as_str())
+            .collect();
+        let next_rel: Vec<&str> = next_order
+            .iter()
+            .copied()
+            .filter(|id| member_set.contains(*id))
+            .collect();
+        if current_rel != next_rel {
+            bail!(
+                "cannot reorder mods in synced collection \"{}\"",
+                col.name
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Update which installed collections a staged mod belongs to, keeping both
 /// `StagedMod.collection_ids` (plus `independent`) and `InstalledCollection.mod_ids`
 /// in sync.
@@ -1528,17 +1632,34 @@ pub fn set_mod_collections(
         with_game_collections(game_id, || {
             let mut store = read_collections(paths, game_id)?;
 
+            let Some(m) = order.mods.iter_mut().find(|m| m.id == mod_uid) else {
+                bail!("staged mod not found: {mod_uid}");
+            };
+
             let mut target_ids: Vec<String> = Vec::new();
             for id in collection_ids {
-                if !store.collections.iter().any(|c| &c.id == id) {
+                let Some(col) = store.collections.iter().find(|c| &c.id == id) else {
                     bail!("collection not found: {id}");
+                };
+                let already_member = m.collection_ids.iter().any(|existing| existing == id)
+                    || col.mod_ids.iter().any(|existing| existing == mod_uid);
+                if col.friend_sync.is_some() && !already_member {
+                    bail!("cannot add a mod to synced collection \"{}\"", col.name);
                 }
                 push_unique(&mut target_ids, id.clone());
             }
 
-            let Some(m) = order.mods.iter_mut().find(|m| m.id == mod_uid) else {
-                bail!("staged mod not found: {mod_uid}");
-            };
+            for col in &store.collections {
+                if col.friend_sync.is_none() {
+                    continue;
+                }
+                let currently_member = m.collection_ids.iter().any(|existing| existing == &col.id)
+                    || col.mod_ids.iter().any(|existing| existing == mod_uid);
+                if currently_member && !target_ids.iter().any(|id| id == &col.id) {
+                    bail!("cannot remove a mod from synced collection \"{}\"", col.name);
+                }
+            }
+
             m.collection_ids = target_ids.clone();
             m.independent = target_ids.is_empty();
             let updated = m.clone();
@@ -3705,6 +3826,20 @@ pub fn deploy(
     }
 
     warnings.extend(plugin.after_deploy(install_path, &enabled_mod_folders)?);
+    if crate::games::loot::supports_loot(plugin.info().id) {
+        if let Ok(sync_warnings) = crate::games::loot::sync_plugins_txt_from_saved_order(
+            paths,
+            game_id,
+            plugin.info().id,
+            install_path,
+        ) {
+            for w in sync_warnings {
+                if !warnings.contains(&w) {
+                    warnings.push(w);
+                }
+            }
+        }
+    }
     let plugin_skips = plugin.plugin_skips(install_path);
 
     // Warn about the tree we just produced, not the one we started from: a pack
@@ -6956,6 +7091,417 @@ mod tests {
         assert_eq!(order.mods[0].collection_ids, vec!["col-a".to_string()]);
         let cols = list_installed_collections(&paths, game_id).unwrap();
         assert_eq!(cols[0].mod_ids, vec!["A".to_string()]);
+    }
+
+    #[test]
+    fn set_mod_collections_rejects_adding_mod_to_synced_collection() {
+        let (_dir, paths) = test_paths();
+        let game_id = "game-synced-reject";
+        crate::config::ensure_game_dirs(&paths, game_id).unwrap();
+        let staging_root = paths.mods_dir(game_id);
+        for id in ["A", "B"] {
+            std::fs::create_dir_all(staging_root.join(id)).unwrap();
+        }
+        save_loadorder(
+            &paths,
+            game_id,
+            &LoadOrder {
+                mods: vec![
+                    StagedMod {
+                        id: "A".into(),
+                        name: "A".into(),
+                        staging_path: staging_root.join("A").to_string_lossy().into(),
+                        independent: true,
+                        collection_ids: vec![],
+                        ..Default::default()
+                    },
+                    StagedMod {
+                        id: "B".into(),
+                        name: "B".into(),
+                        staging_path: staging_root.join("B").to_string_lossy().into(),
+                        independent: false,
+                        collection_ids: vec!["col-local".into()],
+                        ..Default::default()
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        save_collections(
+            &paths,
+            game_id,
+            &InstalledCollections {
+                collections: vec![
+                    InstalledCollection {
+                        id: "col-local".into(),
+                        source: CollectionSource::Nexus,
+                        kind: CollectionKind::Collection,
+                        name: "Local Pack".into(),
+                        mod_ids: vec!["B".into()],
+                        installed_at: "t".into(),
+                        friend_sync: None,
+                        ..Default::default()
+                    },
+                    InstalledCollection {
+                        id: "col-synced".into(),
+                        source: CollectionSource::Emperor,
+                        kind: CollectionKind::Share,
+                        name: "Friend Pack".into(),
+                        mod_ids: vec![],
+                        installed_at: "t".into(),
+                        friend_sync: Some(FriendSyncMetadata {
+                            friend_peer_id: "peer-1".into(),
+                            friend_collection_id: "saved:1".into(),
+                            last_synced_hash: "h1".into(),
+                            last_synced_at: "t1".into(),
+                            auto_sync: false,
+                        }),
+                        ..Default::default()
+                    },
+                ],
+            },
+        )
+        .unwrap();
+
+        let err_standalone =
+            set_mod_collections(&paths, game_id, "A", &["col-synced".into()]).unwrap_err();
+        assert!(
+            err_standalone
+                .to_string()
+                .contains("cannot add a mod to synced collection \"Friend Pack\""),
+            "unexpected error: {err_standalone}"
+        );
+
+        let err_other = set_mod_collections(
+            &paths,
+            game_id,
+            "B",
+            &["col-local".into(), "col-synced".into()],
+        )
+        .unwrap_err();
+        assert!(
+            err_other
+                .to_string()
+                .contains("cannot add a mod to synced collection \"Friend Pack\""),
+            "unexpected error: {err_other}"
+        );
+
+        let order = load_loadorder(&paths, game_id).unwrap();
+        assert!(order.mods[0].collection_ids.is_empty());
+        assert!(order.mods[0].independent);
+        assert_eq!(order.mods[1].collection_ids, vec!["col-local".to_string()]);
+        let cols = list_installed_collections(&paths, game_id).unwrap();
+        assert_eq!(cols[0].mod_ids, vec!["B".to_string()]);
+        assert!(cols[1].mod_ids.is_empty());
+    }
+
+    #[test]
+    fn set_mod_collections_allows_keeping_existing_synced_collection_membership() {
+        let (_dir, paths) = test_paths();
+        let game_id = "game-synced-keep";
+        crate::config::ensure_game_dirs(&paths, game_id).unwrap();
+        let staging_root = paths.mods_dir(game_id);
+        std::fs::create_dir_all(staging_root.join("A")).unwrap();
+        save_loadorder(
+            &paths,
+            game_id,
+            &LoadOrder {
+                mods: vec![StagedMod {
+                    id: "A".into(),
+                    name: "A".into(),
+                    staging_path: staging_root.join("A").to_string_lossy().into(),
+                    independent: false,
+                    collection_ids: vec!["col-synced".into()],
+                    ..Default::default()
+                }],
+            },
+        )
+        .unwrap();
+        save_collections(
+            &paths,
+            game_id,
+            &InstalledCollections {
+                collections: vec![
+                    InstalledCollection {
+                        id: "col-local".into(),
+                        source: CollectionSource::Nexus,
+                        kind: CollectionKind::Collection,
+                        name: "Local Pack".into(),
+                        mod_ids: vec![],
+                        installed_at: "t".into(),
+                        friend_sync: None,
+                        ..Default::default()
+                    },
+                    InstalledCollection {
+                        id: "col-synced".into(),
+                        source: CollectionSource::Emperor,
+                        kind: CollectionKind::Share,
+                        name: "Friend Pack".into(),
+                        mod_ids: vec!["A".into()],
+                        installed_at: "t".into(),
+                        friend_sync: Some(FriendSyncMetadata {
+                            friend_peer_id: "peer-1".into(),
+                            friend_collection_id: "saved:1".into(),
+                            last_synced_hash: "h1".into(),
+                            last_synced_at: "t1".into(),
+                            auto_sync: false,
+                        }),
+                        ..Default::default()
+                    },
+                ],
+            },
+        )
+        .unwrap();
+
+        let updated = set_mod_collections(
+            &paths,
+            game_id,
+            "A",
+            &["col-synced".into(), "col-local".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            updated.collection_ids,
+            vec!["col-synced".to_string(), "col-local".to_string()]
+        );
+        let cols = list_installed_collections(&paths, game_id).unwrap();
+        assert_eq!(cols[0].mod_ids, vec!["A".to_string()]);
+        assert_eq!(cols[1].mod_ids, vec!["A".to_string()]);
+    }
+
+    #[test]
+    fn set_mod_collections_rejects_removing_mod_from_synced_collection() {
+        let (_dir, paths) = test_paths();
+        let game_id = "game-synced-remove";
+        crate::config::ensure_game_dirs(&paths, game_id).unwrap();
+        let staging_root = paths.mods_dir(game_id);
+        std::fs::create_dir_all(staging_root.join("A")).unwrap();
+        save_loadorder(
+            &paths,
+            game_id,
+            &LoadOrder {
+                mods: vec![StagedMod {
+                    id: "A".into(),
+                    name: "A".into(),
+                    staging_path: staging_root.join("A").to_string_lossy().into(),
+                    independent: false,
+                    collection_ids: vec!["col-synced".into()],
+                    ..Default::default()
+                }],
+            },
+        )
+        .unwrap();
+        save_collections(
+            &paths,
+            game_id,
+            &InstalledCollections {
+                collections: vec![InstalledCollection {
+                    id: "col-synced".into(),
+                    source: CollectionSource::Emperor,
+                    kind: CollectionKind::Share,
+                    name: "Friend Pack".into(),
+                    mod_ids: vec!["A".into()],
+                    installed_at: "t".into(),
+                    friend_sync: Some(FriendSyncMetadata {
+                        friend_peer_id: "peer-1".into(),
+                        friend_collection_id: "saved:1".into(),
+                        last_synced_hash: "h1".into(),
+                        last_synced_at: "t1".into(),
+                        auto_sync: false,
+                    }),
+                    ..Default::default()
+                }],
+            },
+        )
+        .unwrap();
+
+        let err = set_mod_collections(&paths, game_id, "A", &[]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot remove a mod from synced collection \"Friend Pack\""),
+            "unexpected error: {err}"
+        );
+        let order = load_loadorder(&paths, game_id).unwrap();
+        assert_eq!(order.mods[0].collection_ids, vec!["col-synced".to_string()]);
+        let cols = list_installed_collections(&paths, game_id).unwrap();
+        assert_eq!(cols[0].mod_ids, vec!["A".to_string()]);
+    }
+
+    #[test]
+    fn synced_collection_for_mod_detects_synced_membership() {
+        let (_dir, paths) = test_paths();
+        let game_id = "game-synced-detect";
+        crate::config::ensure_game_dirs(&paths, game_id).unwrap();
+        let staging_root = paths.mods_dir(game_id);
+        for id in ["S1", "L1", "IND"] {
+            std::fs::create_dir_all(staging_root.join(id)).unwrap();
+        }
+        save_loadorder(
+            &paths,
+            game_id,
+            &LoadOrder {
+                mods: vec![
+                    StagedMod {
+                        id: "S1".into(),
+                        name: "S1".into(),
+                        staging_path: staging_root.join("S1").to_string_lossy().into(),
+                        collection_ids: vec!["col-synced".into()],
+                        ..Default::default()
+                    },
+                    StagedMod {
+                        id: "L1".into(),
+                        name: "L1".into(),
+                        staging_path: staging_root.join("L1").to_string_lossy().into(),
+                        collection_ids: vec!["col-local".into()],
+                        ..Default::default()
+                    },
+                    StagedMod {
+                        id: "IND".into(),
+                        name: "IND".into(),
+                        staging_path: staging_root.join("IND").to_string_lossy().into(),
+                        independent: true,
+                        ..Default::default()
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        save_collections(
+            &paths,
+            game_id,
+            &InstalledCollections {
+                collections: vec![
+                    InstalledCollection {
+                        id: "col-local".into(),
+                        source: CollectionSource::Nexus,
+                        kind: CollectionKind::Collection,
+                        name: "Local Pack".into(),
+                        mod_ids: vec!["L1".into()],
+                        installed_at: "t".into(),
+                        friend_sync: None,
+                        ..Default::default()
+                    },
+                    InstalledCollection {
+                        id: "col-synced".into(),
+                        source: CollectionSource::Emperor,
+                        kind: CollectionKind::Share,
+                        name: "Friend Pack".into(),
+                        mod_ids: vec!["S1".into()],
+                        installed_at: "t".into(),
+                        friend_sync: Some(FriendSyncMetadata {
+                            friend_peer_id: "peer-1".into(),
+                            friend_collection_id: "saved:1".into(),
+                            last_synced_hash: "h1".into(),
+                            last_synced_at: "t1".into(),
+                            auto_sync: false,
+                        }),
+                        ..Default::default()
+                    },
+                ],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            synced_collection_for_mod(&paths, game_id, "S1").unwrap(),
+            Some("Friend Pack".to_string())
+        );
+        assert_eq!(synced_collection_for_mod(&paths, game_id, "L1").unwrap(), None);
+        assert_eq!(synced_collection_for_mod(&paths, game_id, "IND").unwrap(), None);
+    }
+
+    #[test]
+    fn ensure_load_order_preserves_synced_collections_blocks_reordering_synced_members_but_allows_standalone() {
+        let (_dir, paths) = test_paths();
+        let game_id = "game-synced-order";
+        crate::config::ensure_game_dirs(&paths, game_id).unwrap();
+        let staging_root = paths.mods_dir(game_id);
+        for id in ["S1", "S2", "M1"] {
+            std::fs::create_dir_all(staging_root.join(id)).unwrap();
+        }
+        save_loadorder(
+            &paths,
+            game_id,
+            &LoadOrder {
+                mods: vec![
+                    StagedMod {
+                        id: "S1".into(),
+                        name: "S1".into(),
+                        staging_path: staging_root.join("S1").to_string_lossy().into(),
+                        order: 1,
+                        collection_ids: vec!["col-synced".into()],
+                        ..Default::default()
+                    },
+                    StagedMod {
+                        id: "S2".into(),
+                        name: "S2".into(),
+                        staging_path: staging_root.join("S2").to_string_lossy().into(),
+                        order: 2,
+                        collection_ids: vec!["col-synced".into()],
+                        ..Default::default()
+                    },
+                    StagedMod {
+                        id: "M1".into(),
+                        name: "M1".into(),
+                        staging_path: staging_root.join("M1").to_string_lossy().into(),
+                        order: 3,
+                        independent: true,
+                        ..Default::default()
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        save_collections(
+            &paths,
+            game_id,
+            &InstalledCollections {
+                collections: vec![InstalledCollection {
+                    id: "col-synced".into(),
+                    source: CollectionSource::Emperor,
+                    kind: CollectionKind::Share,
+                    name: "Friend Pack".into(),
+                    mod_ids: vec!["S1".into(), "S2".into()],
+                    installed_at: "t".into(),
+                    friend_sync: Some(FriendSyncMetadata {
+                        friend_peer_id: "peer-1".into(),
+                        friend_collection_id: "saved:1".into(),
+                        last_synced_hash: "h1".into(),
+                        last_synced_at: "t1".into(),
+                        auto_sync: false,
+                    }),
+                    ..Default::default()
+                }],
+            },
+        )
+        .unwrap();
+
+        // Moving standalone M1 between or before S1/S2 keeps S1 before S2 -> allowed.
+        ensure_load_order_preserves_synced_collections(
+            &paths,
+            game_id,
+            &["M1".into(), "S1".into(), "S2".into()],
+        )
+        .unwrap();
+        ensure_load_order_preserves_synced_collections(
+            &paths,
+            game_id,
+            &["S1".into(), "M1".into(), "S2".into()],
+        )
+        .unwrap();
+
+        // Swapping S2 before S1 -> blocked.
+        let err = ensure_load_order_preserves_synced_collections(
+            &paths,
+            game_id,
+            &["S2".into(), "S1".into(), "M1".into()],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot reorder mods in synced collection \"Friend Pack\""),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

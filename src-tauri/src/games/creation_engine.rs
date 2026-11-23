@@ -923,7 +923,7 @@ fn extender_preflight(install_path: &Path, title: CreationTitle) -> Vec<String> 
     }
 }
 
-fn is_plugin_file(name: &str) -> bool {
+pub(crate) fn is_plugin_file(name: &str) -> bool {
     let lower = name.to_lowercase();
     lower.ends_with(".esp") || lower.ends_with(".esm") || lower.ends_with(".esl")
 }
@@ -1120,6 +1120,195 @@ fn resolve_obr_deploy(install_path: &Path, relative: &Path) -> PathBuf {
     join_ce_components(&data, &originals)
 }
 
+pub(crate) struct CreationEnginePaths {
+    pub data_dir: PathBuf,
+    pub plugins_txt: Option<PathBuf>,
+    pub local_dir: Option<PathBuf>,
+    pub required_masters: &'static [&'static str],
+    pub asterisk_enabled: bool,
+}
+
+pub(crate) fn creation_engine_paths(
+    plugin_id: &str,
+    install_path: &Path,
+) -> Option<CreationEnginePaths> {
+    match plugin_id {
+        "skyrimspecialedition" => Some(CreationEnginePaths {
+            data_dir: install_path.join("Data"),
+            plugins_txt: plugins_txt_path(install_path, SKYRIM_SE),
+            local_dir: local_appdata_game_dir(
+                install_path,
+                SKYRIM_SE.steam_app_id,
+                SKYRIM_SE.local_appdata_game,
+            ),
+            required_masters: SKYRIM_SE.required_masters,
+            asterisk_enabled: SKYRIM_SE.asterisk_enabled,
+        }),
+        "skyrim" => Some(CreationEnginePaths {
+            data_dir: install_path.join("Data"),
+            plugins_txt: plugins_txt_path(install_path, SKYRIM_LE),
+            local_dir: local_appdata_game_dir(
+                install_path,
+                SKYRIM_LE.steam_app_id,
+                SKYRIM_LE.local_appdata_game,
+            ),
+            required_masters: SKYRIM_LE.required_masters,
+            asterisk_enabled: SKYRIM_LE.asterisk_enabled,
+        }),
+        "fallout4" => Some(CreationEnginePaths {
+            data_dir: install_path.join("Data"),
+            plugins_txt: plugins_txt_path(install_path, FALLOUT4),
+            local_dir: local_appdata_game_dir(
+                install_path,
+                FALLOUT4.steam_app_id,
+                FALLOUT4.local_appdata_game,
+            ),
+            required_masters: FALLOUT4.required_masters,
+            asterisk_enabled: FALLOUT4.asterisk_enabled,
+        }),
+        "starfield" => Some(CreationEnginePaths {
+            data_dir: install_path.join("Data"),
+            plugins_txt: plugins_txt_path(install_path, STARFIELD),
+            local_dir: local_appdata_game_dir(
+                install_path,
+                STARFIELD.steam_app_id,
+                STARFIELD.local_appdata_game,
+            ),
+            required_masters: STARFIELD.required_masters,
+            asterisk_enabled: STARFIELD.asterisk_enabled,
+        }),
+        "newvegas" => Some(CreationEnginePaths {
+            data_dir: install_path.join("Data"),
+            plugins_txt: plugins_txt_path(install_path, FALLOUT_NV),
+            local_dir: local_appdata_game_dir(
+                install_path,
+                FALLOUT_NV.steam_app_id,
+                FALLOUT_NV.local_appdata_game,
+            ),
+            required_masters: FALLOUT_NV.required_masters,
+            asterisk_enabled: FALLOUT_NV.asterisk_enabled,
+        }),
+        "fallout3" => Some(CreationEnginePaths {
+            data_dir: install_path.join("Data"),
+            plugins_txt: plugins_txt_path(install_path, FALLOUT3),
+            local_dir: local_appdata_game_dir(
+                install_path,
+                FALLOUT3.steam_app_id,
+                FALLOUT3.local_appdata_game,
+            ),
+            required_masters: FALLOUT3.required_masters,
+            asterisk_enabled: FALLOUT3.asterisk_enabled,
+        }),
+        "oblivion" => Some(CreationEnginePaths {
+            data_dir: install_path.join("Data"),
+            plugins_txt: plugins_txt_path(install_path, OBLIVION),
+            local_dir: local_appdata_game_dir(
+                install_path,
+                OBLIVION.steam_app_id,
+                OBLIVION.local_appdata_game,
+            ),
+            required_masters: OBLIVION.required_masters,
+            asterisk_enabled: OBLIVION.asterisk_enabled,
+        }),
+        "oblivionremastered" => {
+            let data = obr_data_dir(install_path).unwrap_or_else(|| install_path.join("Data"));
+            Some(CreationEnginePaths {
+                plugins_txt: Some(data.join("Plugins.txt")),
+                local_dir: Some(data.clone()),
+                data_dir: data,
+                required_masters: OBLIVION_REMASTERED_MASTERS,
+                asterisk_enabled: false,
+            })
+        }
+        "morrowind" => Some(CreationEnginePaths {
+            data_dir: install_path.join("Data Files"),
+            plugins_txt: None,
+            local_dir: Some(install_path.to_path_buf()),
+            required_masters: MORROWIND_MASTERS,
+            asterisk_enabled: false,
+        }),
+        _ => None,
+    }
+}
+
+/// Write `Plugins.txt` honoring a saved `(plugin_name, enabled)` order.
+/// Required vanilla masters are always emitted first when present on disk; saved
+/// enabled plugins follow in saved order; newly discovered plugins are appended
+/// alphabetically; disabled plugins are omitted.
+pub(crate) fn write_plugins_file_with_order(
+    path: &Path,
+    data_dir: &Path,
+    required_masters: &[&str],
+    asterisk: bool,
+    saved_order: &[(String, bool)],
+) -> Result<Vec<String>> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let mut found = list_plugin_files(data_dir);
+    for master in required_masters {
+        if data_dir.join(master).is_file() && !found.iter().any(|f| f.eq_ignore_ascii_case(master))
+        {
+            found.push((*master).to_string());
+        }
+    }
+    let (loadable, warnings, _) = loadable_plugins(data_dir, &found);
+    let loadable_by_lower: std::collections::HashMap<String, String> = loadable
+        .iter()
+        .map(|n| (n.to_lowercase(), n.clone()))
+        .collect();
+    let disabled_set: std::collections::HashSet<String> = saved_order
+        .iter()
+        .filter(|(_, enabled)| !enabled)
+        .map(|(name, _)| name.to_lowercase())
+        .collect();
+
+    let mut body = String::from("# Auto-generated by Emperor Mod Manager.\n");
+    let mut emitted = std::collections::HashSet::<String>::new();
+
+    for master in required_masters {
+        let key = master.to_lowercase();
+        let Some(actual) = loadable_by_lower.get(&key) else {
+            continue;
+        };
+        push_plugin_line(&mut body, actual, asterisk);
+        emitted.insert(key);
+    }
+
+    for (name, enabled) in saved_order {
+        if !enabled {
+            continue;
+        }
+        let key = name.to_lowercase();
+        if emitted.contains(&key) {
+            continue;
+        }
+        let Some(actual) = loadable_by_lower.get(&key) else {
+            continue;
+        };
+        push_plugin_line(&mut body, actual, asterisk);
+        emitted.insert(key);
+    }
+
+    let mut rest: Vec<String> = loadable
+        .into_iter()
+        .filter(|n| {
+            let key = n.to_lowercase();
+            !emitted.contains(&key) && !disabled_set.contains(&key)
+        })
+        .collect();
+    rest.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+    for name in rest {
+        let key = name.to_lowercase();
+        if emitted.insert(key) {
+            push_plugin_line(&mut body, &name, asterisk);
+        }
+    }
+
+    std::fs::write(path, body).with_context(|| format!("write {}", path.display()))?;
+    Ok(warnings)
+}
+
 fn write_plugins_txt(
     install_path: &Path,
     title: CreationTitle,
@@ -1270,7 +1459,7 @@ fn loadable_plugins(
 }
 
 /// `TES4` master filenames. `None` when the file is not a readable plugin header.
-fn plugin_masters(path: &Path) -> Option<Vec<String>> {
+pub(crate) fn plugin_masters(path: &Path) -> Option<Vec<String>> {
     use std::io::Read;
 
     let mut file = std::fs::File::open(path).ok()?;
@@ -1322,7 +1511,7 @@ fn push_plugin_line(body: &mut String, name: &str, asterisk: bool) {
     body.push('\n');
 }
 
-fn list_plugin_files(data_dir: &Path) -> Vec<String> {
+pub(crate) fn list_plugin_files(data_dir: &Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(data_dir) else {
         return Vec::new();
     };

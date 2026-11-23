@@ -2,6 +2,7 @@ import type { FriendRecord, FriendsState } from "./types";
 
 export type DiscoverableRelationship =
   | "none"
+  | "queued_outgoing"
   | "pending_outgoing"
   | "pending_incoming";
 
@@ -94,6 +95,9 @@ export function getDiscoverablePlayers(
   const pendingIncomingIds = new Set(
     state.pending_requests.map((r) => r.peer_id),
   );
+  const queuedOutgoingIds = new Set(
+    (state.queued_invites ?? []).map((q) => q.peer_id),
+  );
 
   const byPeer = new Map<
     string,
@@ -141,9 +145,11 @@ export function getDiscoverablePlayers(
       entry.peer_id,
     )
       ? "pending_incoming"
-      : pendingOutgoingIds.has(entry.peer_id)
-        ? "pending_outgoing"
-        : "none";
+      : queuedOutgoingIds.has(entry.peer_id)
+        ? "queued_outgoing"
+        : pendingOutgoingIds.has(entry.peer_id)
+          ? "pending_outgoing"
+          : "none";
     players.push({
       peer_id: entry.peer_id,
       display_name: entry.display_name,

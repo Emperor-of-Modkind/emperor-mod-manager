@@ -12,6 +12,7 @@ import { listen } from "@tauri-apps/api/event";
 import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
 import {
   faCheck,
+  faChevronRight,
   faCopy,
   faLock,
   faRotate,
@@ -157,6 +158,90 @@ function formatRelativeTime(iso: string): string {
   const diffDays = Math.floor(diffHr / 24);
   if (diffDays < 7) return `${diffDays}d ago`;
   return d.toLocaleDateString();
+}
+
+function formatTimelineMilestone(iso: string): { key: string; label: string } {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) {
+    return { key: "unknown", label: "Recent" };
+  }
+  const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  const now = new Date();
+  const todayKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+  const yesterday = new Date(now);
+  yesterday.setDate(now.getDate() - 1);
+  const yesterdayKey = `${yesterday.getFullYear()}-${String(yesterday.getMonth() + 1).padStart(2, "0")}-${String(yesterday.getDate()).padStart(2, "0")}`;
+  if (key === todayKey) return { key, label: "Today" };
+  if (key === yesterdayKey) return { key, label: "Yesterday" };
+  const label = d.toLocaleDateString(undefined, {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  });
+  return { key, label };
+}
+
+function formatTimelineDate(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const diffMs = Date.now() - d.getTime();
+  if (diffMs >= 0 && diffMs < 24 * 60 * 60 * 1000) {
+    return formatRelativeTime(iso);
+  }
+  return d.toLocaleDateString(undefined, {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  });
+}
+
+function feedDiffsEqual(
+  a?: FriendFeedDiff | null,
+  b?: FriendFeedDiff | null,
+): boolean {
+  if (!a && !b) return true;
+  if (!a || !b) return false;
+  return (
+    a.mods_added_count === b.mods_added_count &&
+    a.mods_removed_count === b.mods_removed_count &&
+    a.mods_updated_count === b.mods_updated_count &&
+    a.mods_added.length === b.mods_added.length &&
+    a.mods_removed.length === b.mods_removed.length &&
+    a.mods_updated.length === b.mods_updated.length &&
+    a.mods_added.every((v, i) => v === b.mods_added[i]) &&
+    a.mods_removed.every((v, i) => v === b.mods_removed[i]) &&
+    a.mods_updated.every((v, i) => v === b.mods_updated[i])
+  );
+}
+
+const FEED_DEDUPE_WINDOW_MS = 5 * 60 * 1000;
+
+function dedupeActiveLoadoutEvents(
+  events: FriendFeedEvent[],
+): FriendFeedEvent[] {
+  const saved = events.filter((ev) => ev.collection_kind === "saved_collection");
+  if (saved.length === 0) return events;
+  return events.filter((ev) => {
+    if (ev.collection_kind !== "active_loadout") return true;
+    const evTime = Date.parse(ev.occurred_at);
+    return !saved.some((s) => {
+      if (
+        Boolean(s.is_self) !== Boolean(ev.is_self) ||
+        s.peer_id !== ev.peer_id ||
+        s.kind !== ev.kind ||
+        (s.game_title ?? null) !== (ev.game_title ?? null) ||
+        (s.mod_count ?? null) !== (ev.mod_count ?? null) ||
+        !feedDiffsEqual(s.diff, ev.diff)
+      ) {
+        return false;
+      }
+      const sTime = Date.parse(s.occurred_at);
+      if (Number.isNaN(evTime) || Number.isNaN(sTime)) {
+        return s.occurred_at === ev.occurred_at;
+      }
+      return Math.abs(sTime - evTime) <= FEED_DEDUPE_WINDOW_MS;
+    });
+  });
 }
 
 function formatDiffNames(names: string[], total: number): string {
@@ -308,7 +393,8 @@ export function FriendsPage({
   const feedEvents: FriendFeedEvent[] = useMemo(() => {
     const raw = state?.feed_events ?? [];
     if (raw.length === 0) return [];
-    return raw.filter((ev) => {
+    const visible = raw.filter((ev) => {
+      if (ev.is_self) return true;
       const friend = friendsById.get(ev.peer_id);
       if (!friend) return false;
       // Ensure collection is still currently visible in the friend's cached profile.
@@ -318,19 +404,28 @@ export function FriendsPage({
       }
       return true;
     });
+    return dedupeActiveLoadoutEvents(visible);
   }, [state, friendsById]);
 
   const feedLastReadAt = state?.feed_last_read_at ?? null;
 
   const unreadFeedCount = useMemo(() => {
-    if (feedEvents.length === 0) return 0;
-    if (!feedLastReadAt) return feedEvents.length;
-    return feedEvents.filter((ev) => ev.occurred_at > feedLastReadAt).length;
+    const friendEvents = feedEvents.filter((ev) => !ev.is_self);
+    if (friendEvents.length === 0) return 0;
+    if (!feedLastReadAt) return friendEvents.length;
+    return friendEvents.filter((ev) => ev.occurred_at > feedLastReadAt).length;
   }, [feedEvents, feedLastReadAt]);
 
   const feedFilterFriends = useMemo(() => {
     const seen = new Map<string, string>();
     for (const ev of feedEvents) {
+      if (ev.is_self) {
+        if (!seen.has("self")) {
+          const selfName = state?.display_name || ev.friend_display_name;
+          seen.set("self", selfName ? `You (${selfName})` : "You");
+        }
+        continue;
+      }
       if (!seen.has(ev.peer_id)) {
         const live = friendsById.get(ev.peer_id);
         seen.set(ev.peer_id, live?.display_name ?? ev.friend_display_name);
@@ -340,16 +435,23 @@ export function FriendsPage({
       peer_id,
       display_name,
     }));
-  }, [feedEvents, friendsById]);
+  }, [feedEvents, friendsById, state?.display_name]);
 
   const filteredFeedEvents = useMemo(() => {
     if (feedFriendFilter === "all") return feedEvents;
-    return feedEvents.filter((ev) => ev.peer_id === feedFriendFilter);
+    if (feedFriendFilter === "self") {
+      return feedEvents.filter((ev) => Boolean(ev.is_self));
+    }
+    return feedEvents.filter(
+      (ev) => !ev.is_self && ev.peer_id === feedFriendFilter,
+    );
   }, [feedEvents, feedFriendFilter]);
 
   const selectedFriendFeedEvents = useMemo(() => {
     if (!selectedFriend) return [];
-    return feedEvents.filter((ev) => ev.peer_id === selectedFriend.peer_id);
+    return feedEvents.filter(
+      (ev) => !ev.is_self && ev.peer_id === selectedFriend.peer_id,
+    );
   }, [feedEvents, selectedFriend]);
 
   useEffect(() => {
@@ -371,7 +473,8 @@ export function FriendsPage({
     ) {
       return;
     }
-    const latestTs = feedEvents[0]?.occurred_at ?? null;
+    const latestTs =
+      feedEvents.find((ev) => !ev.is_self)?.occurred_at ?? null;
     if (!latestTs || lastMarkedFeedTsRef.current === latestTs) return;
     lastMarkedFeedTsRef.current = latestTs;
     void api
@@ -703,15 +806,31 @@ export function FriendsPage({
       );
       const next = await api.addFriendByPeer(peerId, displayName);
       setState(next);
+      const isQueued = Boolean(
+        next.queued_invites?.some((q) => q.peer_id === peerId),
+      );
       onNotice(
         wasIncoming
           ? "Friend request accepted! Connecting via P2P..."
-          : "Friend request sent! Connecting via P2P...",
+          : isQueued
+            ? "Friend request queued — will be sent when they're online."
+            : "Friend request sent! Connecting via P2P...",
       );
     } catch (err) {
       onError(String(err));
     } finally {
       setAddingPeerId(null);
+    }
+  }
+
+  async function handleCancelQueuedInvite(peerId: string) {
+    onError(null);
+    try {
+      const next = await api.cancelQueuedFriendInvite(peerId);
+      setState(next);
+      onNotice("Queued friend request cancelled.");
+    } catch (err) {
+      onError(String(err));
     }
   }
 
@@ -774,150 +893,224 @@ export function FriendsPage({
   }
 
   function renderFeedList(events: FriendFeedEvent[], fromGlobalFeed: boolean) {
-    return (
-      <ul className="friends-feed-list">
-        {events.map((ev, idx) => {
-          const liveFriend = friendsById.get(ev.peer_id);
-          const friendName = liveFriend?.display_name ?? ev.friend_display_name;
-          const avatarSrc =
-            liveFriend?.profile_picture ??
-            liveFriend?.cached_profile?.profile_picture;
-          const isUnread = !feedLastReadAt || ev.occurred_at > feedLastReadAt;
-          const diff = hasFeedDiffDetails(ev.diff) ? ev.diff : null;
+    const rows: ReactNode[] = [];
+    let lastMilestoneKey: string | null = null;
 
-          return (
-            <li
-              key={ev.id}
-              className={`friends-feed-item stagger-item${
-                isUnread ? " unread" : ""
-              }`}
-              style={staggerStyle(idx)}
-            >
-              <button
-                type="button"
-                className="friends-feed-item-btn"
-                onClick={() => handleOpenFeedEvent(ev, fromGlobalFeed)}
-              >
-                <FriendAvatar
-                  name={friendName}
-                  src={avatarSrc}
-                  online={liveFriend?.online ?? false}
-                  size="md"
-                  showStatus={Boolean(liveFriend)}
-                />
-                <div className="friends-feed-item-body">
-                  <div className="friends-feed-item-headline">
-                    <span className="friends-feed-item-text">
-                      <strong>{friendName}</strong>{" "}
-                      {ev.kind === "collection_added" ? (
-                        <>
-                          shared a new collection{" "}
-                          <strong>{ev.collection_name}</strong>
-                        </>
-                      ) : ev.kind === "collection_renamed" ? (
-                        <>
-                          renamed{" "}
-                          <strong>{ev.previous_name ?? "a collection"}</strong>{" "}
-                          to <strong>{ev.collection_name}</strong>
-                        </>
-                      ) : (
-                        <>
-                          updated <strong>{ev.collection_name}</strong>
-                          {ev.previous_name ? (
-                            <>
-                              {" "}
-                              <span className="muted">
-                                (renamed from {ev.previous_name})
-                              </span>
-                            </>
-                          ) : null}
-                        </>
-                      )}
-                    </span>
-                    <time
-                      className="muted friends-feed-time"
-                      dateTime={ev.occurred_at}
-                      title={formatLastSeen(ev.occurred_at)}
-                    >
-                      {formatRelativeTime(ev.occurred_at)}
-                    </time>
-                  </div>
+    events.forEach((ev, idx) => {
+      const milestone = formatTimelineMilestone(ev.occurred_at);
+      if (milestone.key !== lastMilestoneKey) {
+        lastMilestoneKey = milestone.key;
+        rows.push(
+          <li
+            key={`milestone:${milestone.key}`}
+            className="friends-timeline-milestone"
+          >
+            <span className="friends-timeline-milestone-badge">
+              {milestone.label}
+            </span>
+          </li>,
+        );
+      }
 
-                  <div className="friends-feed-meta">
-                    <span className="pill">
-                      {ev.collection_kind === "active_loadout"
-                        ? "Active Loadout"
-                        : "Saved Collection"}
-                    </span>
-                    {(() => {
-                      if (ev.collection_kind !== "active_loadout") return null;
-                      const activeCol = liveFriend?.cached_profile?.collections.find(
-                        (c) => c.id === ev.collection_id,
-                      );
-                      const match = activeCol?.matched_local_collection;
-                      if (!match) return null;
-                      return (
-                        <span
-                          className={`pill ${match.has_local_changes ? "warn" : "ok"}`}
-                        >
-                          {formatActiveLoadoutMatchLabel(match)}
+      const side = idx % 2 === 0 ? "left" : "right";
+      const isSelf = Boolean(ev.is_self);
+      const liveFriend = isSelf ? undefined : friendsById.get(ev.peer_id);
+      const friendName = isSelf
+        ? state?.display_name || ev.friend_display_name || "You"
+        : (liveFriend?.display_name ?? ev.friend_display_name);
+      const avatarSrc = isSelf
+        ? state?.profile_picture
+        : (liveFriend?.profile_picture ??
+          liveFriend?.cached_profile?.profile_picture);
+      const isUnread =
+        !isSelf && (!feedLastReadAt || ev.occurred_at > feedLastReadAt);
+      const diff = hasFeedDiffDetails(ev.diff) ? ev.diff : null;
+      const dateLabel = formatTimelineDate(ev.occurred_at);
+      const fullDateTitle = formatLastSeen(ev.occurred_at);
+
+      const itemContent = (
+        <>
+          <FriendAvatar
+            name={friendName}
+            src={avatarSrc}
+            online={liveFriend?.online ?? false}
+            size="md"
+            showStatus={Boolean(liveFriend)}
+          />
+          <div className="friends-feed-item-body">
+            <div className="friends-feed-item-headline">
+              <span className="friends-feed-item-text">
+                <strong>{friendName}</strong>{" "}
+                {ev.kind === "collection_added" ? (
+                  <>
+                    shared a new collection{" "}
+                    <strong>{ev.collection_name}</strong>
+                  </>
+                ) : ev.kind === "collection_renamed" ? (
+                  <>
+                    renamed{" "}
+                    <strong>{ev.previous_name ?? "a collection"}</strong> to{" "}
+                    <strong>{ev.collection_name}</strong>
+                  </>
+                ) : (
+                  <>
+                    updated <strong>{ev.collection_name}</strong>
+                    {ev.previous_name ? (
+                      <>
+                        {" "}
+                        <span className="muted">
+                          (renamed from {ev.previous_name})
                         </span>
-                      );
-                    })()}
-                    {ev.game_title ? (
-                      <span className="pill">{ev.game_title}</span>
+                      </>
                     ) : null}
-                    {ev.mod_count != null ? (
-                      <span className="muted">
-                        {ev.mod_count} {ev.mod_count === 1 ? "mod" : "mods"}
-                      </span>
-                    ) : null}
-                  </div>
+                  </>
+                )}
+              </span>
+              <time
+                className="muted friends-feed-time friends-feed-time-inline"
+                dateTime={ev.occurred_at}
+                title={fullDateTitle}
+              >
+                {dateLabel}
+              </time>
+            </div>
 
-                  {diff && (
-                    <div className="friends-feed-diff">
-                      {diff.mods_added_count > 0 && (
-                        <div className="friends-feed-diff-line added">
-                          +{diff.mods_added_count} added
-                          {diff.mods_added.length > 0
-                            ? `: ${formatDiffNames(
-                                diff.mods_added,
-                                diff.mods_added_count,
-                              )}`
-                            : ""}
-                        </div>
-                      )}
-                      {diff.mods_removed_count > 0 && (
-                        <div className="friends-feed-diff-line removed">
-                          -{diff.mods_removed_count} removed
-                          {diff.mods_removed.length > 0
-                            ? `: ${formatDiffNames(
-                                diff.mods_removed,
-                                diff.mods_removed_count,
-                              )}`
-                            : ""}
-                        </div>
-                      )}
-                      {diff.mods_updated_count > 0 && (
-                        <div className="friends-feed-diff-line updated">
-                          ~{diff.mods_updated_count} updated
-                          {diff.mods_updated.length > 0
-                            ? `: ${formatDiffNames(
-                                diff.mods_updated,
-                                diff.mods_updated_count,
-                              )}`
-                            : ""}
-                        </div>
-                      )}
-                    </div>
-                  )}
-                </div>
-              </button>
-            </li>
-          );
-        })}
-      </ul>
-    );
+            <div className="friends-feed-meta">
+              {isSelf ? <span className="pill">You</span> : null}
+              <span className="pill">
+                {ev.collection_kind === "active_loadout"
+                  ? "Active Loadout"
+                  : "Saved Collection"}
+              </span>
+              {(() => {
+                if (isSelf || ev.collection_kind !== "active_loadout") {
+                  return null;
+                }
+                const activeCol = liveFriend?.cached_profile?.collections.find(
+                  (c) => c.id === ev.collection_id,
+                );
+                const match = activeCol?.matched_local_collection;
+                if (!match) return null;
+                return (
+                  <span
+                    className={`pill ${match.has_local_changes ? "warn" : "ok"}`}
+                  >
+                    {formatActiveLoadoutMatchLabel(match)}
+                  </span>
+                );
+              })()}
+              {ev.game_title ? (
+                <span className="pill">{ev.game_title}</span>
+              ) : null}
+              {ev.mod_count != null ? (
+                <span className="muted">
+                  {ev.mod_count} {ev.mod_count === 1 ? "mod" : "mods"}
+                </span>
+              ) : null}
+            </div>
+
+            {diff && (
+              <div className="friends-feed-diff">
+                {diff.mods_added_count > 0 && (
+                  <div className="friends-feed-diff-line added">
+                    +{diff.mods_added_count} added
+                    {diff.mods_added.length > 0
+                      ? `: ${formatDiffNames(
+                          diff.mods_added,
+                          diff.mods_added_count,
+                        )}`
+                      : ""}
+                  </div>
+                )}
+                {diff.mods_removed_count > 0 && (
+                  <div className="friends-feed-diff-line removed">
+                    -{diff.mods_removed_count} removed
+                    {diff.mods_removed.length > 0
+                      ? `: ${formatDiffNames(
+                          diff.mods_removed,
+                          diff.mods_removed_count,
+                        )}`
+                      : ""}
+                  </div>
+                )}
+                {diff.mods_updated_count > 0 && (
+                  <div className="friends-feed-diff-line updated">
+                    ~{diff.mods_updated_count} updated
+                    {diff.mods_updated.length > 0
+                      ? `: ${formatDiffNames(
+                          diff.mods_updated,
+                          diff.mods_updated_count,
+                        )}`
+                      : ""}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+          {!isSelf ? (
+            <FontAwesomeIcon
+              icon={faChevronRight}
+              className="friends-timeline-chevron"
+              aria-hidden="true"
+            />
+          ) : null}
+        </>
+      );
+
+      const cardEl = (
+        <div
+          className={`friends-timeline-card${isUnread ? " unread" : ""}`}
+        >
+          {isSelf ? (
+            <div className="friends-feed-item-static">{itemContent}</div>
+          ) : (
+            <button
+              type="button"
+              className="friends-feed-item-btn"
+              onClick={() => handleOpenFeedEvent(ev, fromGlobalFeed)}
+            >
+              {itemContent}
+            </button>
+          )}
+        </div>
+      );
+
+      const dateEl = (
+        <div className="friends-timeline-date-col">
+          <time
+            className="muted friends-timeline-date"
+            dateTime={ev.occurred_at}
+            title={fullDateTitle}
+          >
+            {dateLabel}
+          </time>
+        </div>
+      );
+
+      rows.push(
+        <li
+          key={ev.id}
+          className={`friends-feed-item friends-timeline-row ${side} stagger-item${
+            isUnread ? " unread" : ""
+          }`}
+          style={staggerStyle(idx)}
+        >
+          <div className="friends-timeline-slot-left">
+            {side === "left" ? cardEl : dateEl}
+          </div>
+          <div className="friends-timeline-axis" aria-hidden="true">
+            <span
+              className={`friends-timeline-dot${isUnread ? " unread" : ""}`}
+            />
+          </div>
+          <div className="friends-timeline-slot-right">
+            {side === "right" ? cardEl : dateEl}
+          </div>
+        </li>,
+      );
+    });
+
+    return <ul className="friends-feed-list friends-timeline">{rows}</ul>;
   }
 
   async function handleJoinOrSync() {
@@ -1469,6 +1662,59 @@ export function FriendsPage({
             </div>
           )}
 
+          {state && (state.queued_invites?.length ?? 0) > 0 && (
+            <div className="card friends-card">
+              <h3>Queued Outgoing Requests</h3>
+              <div className="friends-list">
+                {state.queued_invites!.map((q) => {
+                  const qMutuals = getMutualFriendsForPeerId(state, q.peer_id);
+                  const relayNames = (q.relayed_via_peer_ids ?? [])
+                    .map(
+                      (mid) =>
+                        state.friends.find((f) => f.peer_id === mid)
+                          ?.display_name,
+                    )
+                    .filter((n): n is string => Boolean(n));
+                  return (
+                    <div key={q.peer_id} className="friends-row">
+                      <div className="friends-row-identity">
+                        <FriendAvatar name={q.display_name} size="sm" />
+                        <div>
+                          <strong>
+                            {q.display_name}{" "}
+                            <span className="pill warn">Queued</span>
+                          </strong>
+                          <div className="muted friends-mutual-label">
+                            Waiting for them to come online
+                            {relayNames.length > 0
+                              ? ` · Relayed via ${relayNames.join(", ")}`
+                              : ""}
+                          </div>
+                          {qMutuals.length > 0 && (
+                            <div className="muted friends-mutual-label">
+                              {formatMutualSummary(qMutuals)}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                      <div className="friends-row-actions">
+                        <button
+                          type="button"
+                          className="danger"
+                          onClick={() =>
+                            void handleCancelQueuedInvite(q.peer_id)
+                          }
+                        >
+                          <FontAwesomeIcon icon={faXmark} /> Cancel
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
           <div className="card friends-card">
             <h3>Connected Friends</h3>
             {!state || state.friends.length === 0 ? (
@@ -1581,7 +1827,8 @@ export function FriendsPage({
             <div>
               <h3>Friend Feed</h3>
               <p className="muted friends-feed-subtitle">
-                Recent collection updates and new shares from your friends.
+                Recent collection updates and new shares from you and your
+                friends.
               </p>
             </div>
             {feedEvents.length > 0 && (
@@ -1592,7 +1839,7 @@ export function FriendsPage({
                     value={feedFriendFilter}
                     onChange={(e) => setFeedFriendFilter(e.target.value)}
                   >
-                    <option value="all">All friends</option>
+                    <option value="all">Everyone</option>
                     {feedFilterFriends.map((f) => (
                       <option key={f.peer_id} value={f.peer_id}>
                         {f.display_name}
@@ -1611,18 +1858,19 @@ export function FriendsPage({
             )}
           </div>
 
-          {!state || state.friends.length === 0 ? (
+          {filteredFeedEvents.length > 0 ? (
+            renderFeedList(filteredFeedEvents, true)
+          ) : !state || state.friends.length === 0 ? (
             <p className="muted">
               No friends connected yet. Add friends to see their collection
-              updates here.
-            </p>
-          ) : filteredFeedEvents.length === 0 ? (
-            <p className="muted">
-              No recent activity yet. New collections, updates, and renames from
-              friends&apos; shared collections will appear here automatically.
+              updates here, or update your shared collections to see your own
+              activity.
             </p>
           ) : (
-            renderFeedList(filteredFeedEvents, true)
+            <p className="muted">
+              No recent activity yet. New collections, updates, and renames from
+              your shared collections and friends will appear here automatically.
+            </p>
           )}
         </div>
       )}
@@ -1698,6 +1946,11 @@ export function FriendsPage({
                         (f) => f.peer_id === sf.peer_id,
                       );
                       const isMutual = mutualIds.has(sf.peer_id);
+                      const isQueuedOut = Boolean(
+                        state?.queued_invites?.some(
+                          (q) => q.peer_id === sf.peer_id,
+                        ),
+                      );
                       const isPendingOut =
                         localFriend?.status === "pending_outgoing";
                       const isPendingIn = Boolean(
@@ -1709,14 +1962,18 @@ export function FriendsPage({
                       const avatarSrc =
                         localFriend?.profile_picture ??
                         localFriend?.cached_profile?.profile_picture;
+                      const showOnlineDot =
+                        isMutual || typeof sf.online === "boolean";
+                      const isOnline =
+                        localFriend?.online ?? sf.online ?? false;
                       return (
                         <div key={sf.peer_id} className="friends-row">
                           <div className="friends-row-identity">
                             <FriendAvatar
                               name={localFriend?.display_name ?? sf.display_name}
                               src={avatarSrc}
-                              online={localFriend?.online}
-                              showStatus={isMutual}
+                              online={isOnline}
+                              showStatus={showOnlineDot}
                               size="sm"
                             />
                             <div>
@@ -1744,6 +2001,8 @@ export function FriendsPage({
                               >
                                 View Profile
                               </button>
+                            ) : isQueuedOut ? (
+                              <span className="pill warn">Queued</span>
                             ) : isPendingOut ? (
                               <span className="pill">Request Sent</span>
                             ) : isPendingIn ? (
