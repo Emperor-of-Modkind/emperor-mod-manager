@@ -516,6 +516,27 @@ impl ThunderstoreClient {
     }
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn ts_incoming_is_newer(existing: Option<&str>, incoming: &str) -> bool {
+    crate::mods::incoming_is_newer(existing, incoming)
+}
+
+#[cfg(any(target_os = "android", target_os = "ios"))]
+fn ts_incoming_is_newer(existing: Option<&str>, incoming: &str) -> bool {
+    let parse = |s: &str| -> Vec<u64> {
+        s.trim()
+            .trim_start_matches(['v', 'V'])
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|p| !p.is_empty())
+            .filter_map(|p| p.parse::<u64>().ok())
+            .collect()
+    };
+    let Some(ex) = existing.map(str::trim).filter(|s| !s.is_empty()) else {
+        return true;
+    };
+    parse(incoming) > parse(ex)
+}
+
 /// True when `version` is semver-equal to or newer than `min`.
 fn version_satisfies_min(version: &str, min: &str) -> bool {
     let version = version.trim();
@@ -523,7 +544,7 @@ fn version_satisfies_min(version: &str, min: &str) -> bool {
     if version.is_empty() || min.is_empty() {
         return false;
     }
-    version == min || crate::mods::incoming_is_newer(Some(min), version)
+    version == min || ts_incoming_is_newer(Some(min), version)
 }
 
 /// Merge a newly requested minimum into the recorded floor (highest wins).
@@ -537,7 +558,7 @@ fn raise_version_floor(
         return false;
     };
     match floors.get(key).map(|s| s.as_str()) {
-        Some(existing) if !crate::mods::incoming_is_newer(Some(existing), wanted) => false,
+        Some(existing) if !ts_incoming_is_newer(Some(existing), wanted) => false,
         _ => {
             floors.insert(key.to_string(), wanted.to_string());
             true
@@ -1001,6 +1022,7 @@ impl ThunderstoreClient {
     }
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn extract_profile_zip(bytes: &[u8], dest: &Path) -> Result<ProfileManifest> {
     if dest.exists() {
         fs::remove_dir_all(dest)?;

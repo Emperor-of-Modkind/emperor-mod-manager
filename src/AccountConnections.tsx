@@ -1,4 +1,4 @@
-import type { Settings } from "./types";
+import type { Settings, SteamSyncStatus } from "./types";
 
 type AccountConnectionsProps = {
   settings: Settings | null;
@@ -15,6 +15,15 @@ type AccountConnectionsProps = {
   onModioSignIn: () => void;
   onClearWebsiteSession: () => void;
   onClearModioWebsiteSession: () => void;
+  steamSync?: SteamSyncStatus | null;
+  steamIdInput?: string;
+  onSteamIdInput?: (value: string) => void;
+  steamApiKeyInput?: string;
+  onSteamApiKeyInput?: (value: string) => void;
+  steamSyncBusy?: boolean;
+  onSaveSteamSync?: (enabled: boolean) => void;
+  onClearSteamApiKey?: () => void;
+  onSyncSteamNow?: () => void;
 };
 
 export function AccountConnections({
@@ -32,6 +41,15 @@ export function AccountConnections({
   onModioSignIn,
   onClearWebsiteSession,
   onClearModioWebsiteSession,
+  steamSync,
+  steamIdInput = "",
+  onSteamIdInput,
+  steamApiKeyInput = "",
+  onSteamApiKeyInput,
+  steamSyncBusy = false,
+  onSaveSteamSync,
+  onClearSteamApiKey,
+  onSyncSteamNow,
 }: AccountConnectionsProps) {
   return (
     <>
@@ -201,6 +219,105 @@ export function AccountConnections({
           </button>
         </div>
       </details>
+
+      {onSaveSteamSync && (
+        <>
+          <h2 style={{ marginTop: "1.5rem" }}>Steam Library Sync (optional)</h2>
+          <p>
+            Emperor reads your local Steam cache automatically. Enable remote sync
+            to fetch your full owned Steam library (via public Steam profile or a
+            Steam Web API key).
+          </p>
+          {steamSync && (
+            <div className="status-card" data-testid="steam-sync-status-card">
+              <span className={steamSync.sync_enabled ? "pill ok" : "pill muted"}>
+                {steamSync.sync_enabled ? "Remote sync: Enabled" : "Local cache only"}
+              </span>
+              <span className={steamSync.effective_steam_id ? "pill ok" : "pill warn"}>
+                {steamSync.effective_steam_id
+                  ? `SteamID64: ${steamSync.effective_steam_id}`
+                  : "SteamID64: Not detected"}
+              </span>
+              <span className={steamSync.has_api_key ? "pill ok" : "pill muted"}>
+                {steamSync.has_api_key
+                  ? "Steam API key: Saved"
+                  : "Steam API key: Not set (uses public profile)"}
+              </span>
+            </div>
+          )}
+          <div className="actions">
+            <button
+              type="button"
+              disabled={steamSyncBusy}
+              onClick={() => onSaveSteamSync(!(steamSync?.sync_enabled ?? false))}
+            >
+              {steamSync?.sync_enabled ? "Disable remote sync" : "Enable remote sync"}
+            </button>
+            {steamSync?.sync_enabled && onSyncSteamNow && (
+              <button
+                type="button"
+                className="secondary"
+                disabled={steamSyncBusy}
+                onClick={onSyncSteamNow}
+              >
+                {steamSyncBusy ? "Syncing…" : "Sync Steam library now"}
+              </button>
+            )}
+            {steamSync?.has_api_key && onClearSteamApiKey && (
+              <button
+                type="button"
+                className="danger"
+                onClick={onClearSteamApiKey}
+              >
+                Clear Steam API key
+              </button>
+            )}
+          </div>
+          <details style={{ marginTop: "1rem" }}>
+            <summary style={{ cursor: "pointer" }}>
+              SteamID64 override &amp; Steam Web API key
+            </summary>
+            <p style={{ marginTop: "0.75rem" }}>
+              Optional: override the auto-detected SteamID64 or add a personal{" "}
+              <a
+                href="https://steamcommunity.com/dev/apikey"
+                target="_blank"
+                rel="noreferrer"
+              >
+                Steam Web API key
+              </a>{" "}
+              (required if your Steam Game Details are set to private).
+            </p>
+            <div className="row" style={{ marginBottom: "0.5rem" }}>
+              <input
+                type="text"
+                placeholder={
+                  steamSync?.detected_steam_id
+                    ? `SteamID64 (detected: ${steamSync.detected_steam_id})`
+                    : "SteamID64 (e.g. 76561198000000000)"
+                }
+                value={steamIdInput}
+                onChange={(e) => onSteamIdInput?.(e.target.value)}
+              />
+            </div>
+            <div className="row">
+              <input
+                type="password"
+                placeholder="Steam Web API key (optional)"
+                value={steamApiKeyInput}
+                onChange={(e) => onSteamApiKeyInput?.(e.target.value)}
+              />
+              <button
+                type="button"
+                disabled={steamSyncBusy}
+                onClick={() => onSaveSteamSync(true)}
+              >
+                Save &amp; sync
+              </button>
+            </div>
+          </details>
+        </>
+      )}
     </>
   );
 }

@@ -93,6 +93,8 @@ export function useDecodedImageReveal(src: string | null) {
 export const MediaCard = memo(function MediaCard(props: {
   title: string;
   imageSrc: string | null;
+  fallbackImageSrcs?: string[];
+  onImageExhausted?: () => void;
   badge?: string | null;
   overlay?: string | null;
   tags?: string[];
@@ -116,6 +118,8 @@ export const MediaCard = memo(function MediaCard(props: {
   const {
     title,
     imageSrc,
+    fallbackImageSrcs,
+    onImageExhausted,
     badge,
     overlay,
     tags,
@@ -133,6 +137,21 @@ export const MediaCard = memo(function MediaCard(props: {
     enterIndex,
     plain,
   } = props;
+  const [fallbackIndex, setFallbackIndex] = useState(0);
+  const exhaustedRef = useRef(false);
+  const onImageExhaustedRef = useRef(onImageExhausted);
+  onImageExhaustedRef.current = onImageExhausted;
+
+  useEffect(() => {
+    setFallbackIndex(0);
+    exhaustedRef.current = false;
+  }, [imageSrc]);
+
+  const currentImageSrc =
+    fallbackIndex === 0
+      ? imageSrc
+      : (fallbackImageSrcs?.[fallbackIndex - 1] ?? null);
+
   const {
     imgRef,
     activeSrc,
@@ -141,7 +160,21 @@ export const MediaCard = memo(function MediaCard(props: {
     handleImgLoad,
     markFailed,
     handleTransitionEnd,
-  } = useDecodedImageReveal(imageSrc);
+  } = useDecodedImageReveal(currentImageSrc);
+
+  useEffect(() => {
+    if (status !== "error" || !currentImageSrc) return;
+    const totalFallbacks = fallbackImageSrcs?.length ?? 0;
+    if (fallbackIndex < totalFallbacks) {
+      setFallbackIndex((idx) => idx + 1);
+      return;
+    }
+    if (!exhaustedRef.current) {
+      exhaustedRef.current = true;
+      onImageExhaustedRef.current?.();
+    }
+  }, [status, currentImageSrc, fallbackIndex, fallbackImageSrcs]);
+
   const [glowActive, setGlowActive] = useState(false);
   const [glowMounted, setGlowMounted] = useState(false);
   const [glowVisible, setGlowVisible] = useState(false);
@@ -149,7 +182,7 @@ export const MediaCard = memo(function MediaCard(props: {
   const stackRef = useRef<HTMLDivElement | null>(null);
   const glowRef = useRef<HTMLImageElement | null>(null);
 
-  const coverSrc = imageSrc && status !== "error" ? imageSrc : null;
+  const coverSrc = currentImageSrc && status !== "error" ? currentImageSrc : null;
   const canGlow = Boolean(onClick && coverSrc && status === "ready");
 
   const activateGlow = useCallback(() => {

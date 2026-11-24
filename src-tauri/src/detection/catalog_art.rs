@@ -248,6 +248,44 @@ pub fn apply_cached_catalog_covers(games: &mut [DetectedGame], covers_dir: &Path
     }
 }
 
+/// Attach previously cached catalog posters onto uninstalled library games that lack
+/// a local cover (or append the cached remote URL as a fallback when Steam/store art may 404).
+pub fn apply_cached_catalog_covers_to_libraries(
+    sections: &mut [super::libraries::LibrarySection],
+    covers_dir: &Path,
+) {
+    let cache = CatalogCoverCache::load(covers_dir);
+    if cache.is_empty() {
+        return;
+    }
+    let now = now_unix_secs();
+    for section in sections {
+        for game in &mut section.games {
+            if game.cover_path.is_some() {
+                continue;
+            }
+            let CacheLookup::Hit(entry) =
+                cache.lookup(game.nexus_domain.as_deref(), None, now)
+            else {
+                continue;
+            };
+            if game.cover_url.is_none() {
+                if entry.cover_path.is_some() {
+                    game.cover_path = entry.cover_path;
+                } else if let Some(url) = entry.cover_url {
+                    game.cover_url = Some(url);
+                }
+            } else if let Some(url) = entry.cover_url {
+                if game.cover_url.as_deref() != Some(url.as_str())
+                    && !game.cover_fallbacks.contains(&url)
+                {
+                    game.cover_fallbacks.push(url);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

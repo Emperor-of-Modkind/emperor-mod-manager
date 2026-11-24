@@ -148,4 +148,46 @@ describe("MediaCard glow portal", () => {
 
     await view.unmount();
   });
+
+  it("advances through fallbackImageSrcs on error and fires onImageExhausted once all fail", async () => {
+    const onExhausted = vi.fn();
+    const view = await render(
+      <MediaCard
+        plain
+        title="Half-Life 2"
+        imageSrc="https://example.test/missing-1.jpg"
+        fallbackImageSrcs={[
+          "https://example.test/missing-2.jpg",
+          "https://example.test/missing-3.jpg",
+        ]}
+        onImageExhausted={onExhausted}
+      />,
+    );
+
+    const img1 = view.host.querySelector<HTMLImageElement>(".media-cover img")!;
+    expect(img1.getAttribute("src")).toBe("https://example.test/missing-1.jpg");
+
+    await act(async () => {
+      img1.dispatchEvent(new Event("error"));
+    });
+    expect(onExhausted).not.toHaveBeenCalled();
+
+    const img2 = view.host.querySelector<HTMLImageElement>(".media-cover img")!;
+    expect(img2.getAttribute("src")).toBe("https://example.test/missing-2.jpg");
+
+    await act(async () => {
+      img2.dispatchEvent(new Event("error"));
+    });
+    expect(onExhausted).not.toHaveBeenCalled();
+
+    const img3 = view.host.querySelector<HTMLImageElement>(".media-cover img")!;
+    expect(img3.getAttribute("src")).toBe("https://example.test/missing-3.jpg");
+
+    await act(async () => {
+      img3.dispatchEvent(new Event("error"));
+    });
+    expect(onExhausted).toHaveBeenCalledTimes(1);
+
+    await view.unmount();
+  });
 });

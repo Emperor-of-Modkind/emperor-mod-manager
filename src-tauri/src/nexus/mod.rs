@@ -22,7 +22,9 @@ use crate::rate_limit::{
     backoff_with_jitter, is_retryable_status, parse_retry_after, sleep_interruptible, RateLimitGate,
 };
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub mod requirements;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub use requirements::{collect_missing, MissingRequirements, RequirementRoot, StagedNexusMod};
 
 const REST_BASE: &str = "https://api.nexusmods.com/v1";
@@ -2104,8 +2106,16 @@ impl NexusClient {
                                 t.get("name").and_then(|v| v.as_str()).map(str::to_string)
                             })
                             .filter(|t| {
-                                looks_like_version(t)
-                                    || crate::mods::game_version::is_line_alias(domain, t)
+                                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                                {
+                                    looks_like_version(t)
+                                        || crate::mods::game_version::is_line_alias(domain, t)
+                                }
+                                #[cfg(any(target_os = "android", target_os = "ios"))]
+                                {
+                                    let _ = domain;
+                                    looks_like_version(t)
+                                }
                             })
                             .collect()
                     })

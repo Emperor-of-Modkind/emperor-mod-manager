@@ -1001,7 +1001,8 @@ ul.list.browse-virtual {
 }
 
 .browse-nsfw-toggle,
-.collection-autosave-toggle {
+.collection-autosave-toggle,
+.filter-switch-toggle {
   display: inline-flex;
   align-items: center;
   gap: 0.45rem;
@@ -1019,24 +1020,28 @@ ul.list.browse-virtual {
   cursor: pointer;
 }
 
-.browse-nsfw-toggle {
+.browse-nsfw-toggle,
+.filter-switch-toggle {
   align-self: flex-end;
 }
 
 .browse-nsfw-toggle:focus-visible,
-.collection-autosave-toggle:focus-visible {
+.collection-autosave-toggle:focus-visible,
+.filter-switch-toggle:focus-visible {
   outline: none;
   box-shadow: var(--focus-ring);
 }
 
 .browse-nsfw-toggle[aria-checked="true"],
-.collection-autosave-toggle[aria-checked="true"] {
+.collection-autosave-toggle[aria-checked="true"],
+.filter-switch-toggle[aria-checked="true"] {
   background: color-mix(in srgb, var(--accent) 14%, var(--surface-control));
   color: var(--accent-ink, var(--accent));
 }
 
 button.browse-nsfw-toggle[aria-checked="true"]:hover:not(:disabled),
-button.collection-autosave-toggle[aria-checked="true"]:hover:not(:disabled) {
+button.collection-autosave-toggle[aria-checked="true"]:hover:not(:disabled),
+button.filter-switch-toggle[aria-checked="true"]:hover:not(:disabled) {
   background-color: color-mix(in srgb, var(--accent) 20%, var(--surface-control));
   color: var(--accent-ink, var(--accent));
 }
@@ -1092,7 +1097,8 @@ button.collection-autosave-toggle[aria-checked="true"]:hover:not(:disabled) {
   margin-bottom: 0.35rem;
 }
 
-.mods-toolbar .filters > .row {
+.mods-toolbar .filters > .row,
+.launcher-libraries-root .filters > .row {
   flex: 1 1 100%;
   margin: 0;
   min-width: 12rem;
@@ -2167,6 +2173,7 @@ button.tag-picker-trigger:focus-visible {
 
 input[type="password"],
 input[type="text"],
+input[type="search"],
 .row input {
   flex: 1;
   border: 0;
@@ -5862,7 +5869,7 @@ li.list-row-poster > .list-poster.skeleton,
   position: relative;
   border-radius: 10px;
   border: 1px solid var(--border);
-  background: var(--bg-soft, rgba(255, 255, 255, 0.03));
+  background: color-mix(in srgb, var(--ink) 3%, var(--panel, var(--bg)));
   transition: border-color 140ms ease, background-color 140ms ease;
 }
 
@@ -6001,6 +6008,8 @@ li.list-row-poster > .list-poster.skeleton,
 
 .friends-feed-item-btn,
 .friends-feed-item-static {
+  position: relative;
+  z-index: 1;
   width: 100%;
   display: flex;
   align-items: flex-start;
@@ -7864,4 +7873,235 @@ li.list-row-poster > .list-poster.skeleton,
   display: inline-flex;
   align-items: center;
   justify-content: center;
+}
+
+/* Launcher Libraries (uninstalled titles below Unmanaged) */
+.launcher-libraries-root {
+  margin-top: 2rem;
+}
+
+.launcher-libraries-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 0.75rem 1rem;
+  margin-bottom: 0.75rem;
+}
+
+.launcher-libraries-header h2 {
+  margin-bottom: 0.25rem;
+}
+
+.launcher-libraries-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.launcher-libraries-toolbar button {
+  height: 2.25rem;
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding-block: 0;
+}
+
+.launcher-libraries-toolbar .mods-toolbar-icon-btn {
+  gap: 0;
+}
+
+.launcher-libraries-filter-summary {
+  margin: 0 0 0.75rem;
+}
+
+.launcher-library-section {
+  margin-bottom: 0.75rem;
+  border: 0;
+  border-radius: var(--shape-field);
+  background: var(--bg-2);
+  overflow: hidden;
+}
+
+.launcher-library-toggle {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.75rem 1rem;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  color: var(--ink);
+  font-size: 1rem;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+
+.launcher-library-toggle:hover {
+  background: var(--surface-control);
+}
+
+.launcher-library-toggle:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.launcher-library-title {
+  flex: 1;
+}
+
+.launcher-library-body {
+  padding: 0.25rem 1rem 1rem;
+  border: 0;
+}
+
+.launcher-library-warning {
+  margin-bottom: 0.75rem;
+}
+
+.link-button {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--accent);
+  text-decoration: underline;
+  cursor: pointer;
+  font: inherit;
+}
+
+/* Launcher Install Options Modal */
+.launcher-install-modal {
+  max-width: 36rem;
+  width: 92vw;
+}
+
+.install-modal-hero {
+  display: flex;
+  gap: 1rem;
+  align-items: flex-start;
+  margin-bottom: 1rem;
+}
+
+.install-modal-poster {
+  width: 5.5rem;
+  height: 8.25rem;
+  object-fit: cover;
+  border-radius: 0.4rem;
+  flex-shrink: 0;
+  background: var(--bg-2);
+}
+
+.install-modal-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  min-width: 0;
+}
+
+.install-options-form {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  margin-top: 0.75rem;
+}
+
+.install-option-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.install-option-group h4,
+.install-option-group > label {
+  margin: 0;
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.radio-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  cursor: pointer;
+}
+
+.steam-library-folders {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.steam-library-folders li {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.4rem 0.6rem;
+  background: var(--bg-2);
+  border-radius: 0.35rem;
+  font-size: 0.85rem;
+}
+
+.install-dlc-list {
+  list-style: none;
+  margin: 0;
+  padding: 0.5rem;
+  max-height: 10rem;
+  overflow-y: auto;
+  border: 0;
+  border-radius: var(--shape-field);
+  background: var(--bg-2);
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.install-dlc-list label {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.88rem;
+  cursor: pointer;
+}
+
+.install-progress-card {
+  padding: 0.75rem 0.9rem;
+  border: 0;
+  border-radius: var(--shape-field);
+  background: var(--bg-2);
+  margin-top: 0.75rem;
+}
+
+.install-progress-head {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.9rem;
+  margin-bottom: 0.4rem;
+}
+
+.install-progress-track {
+  width: 100%;
+  height: 0.45rem;
+  background: var(--surface-control);
+  border-radius: 999px;
+  overflow: hidden;
+  margin-bottom: 0.4rem;
+}
+
+.install-progress-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 180ms ease;
+}
+
+.error-text {
+  color: var(--danger, #e5484d);
+  font-size: 0.9rem;
 }

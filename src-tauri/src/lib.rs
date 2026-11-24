@@ -16,6 +16,8 @@ mod games;
 mod github_release;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod launch;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+mod launcher_install;
 #[cfg(any(
     target_os = "linux",
     target_os = "dragonfly",
@@ -267,6 +269,13 @@ pub fn run() {
             app_update::check_app_update,
             app_update::install_app_update,
             commands::scan_games,
+            commands::scan_launcher_libraries,
+            commands::get_launcher_install_options,
+            commands::request_launcher_install,
+            commands::cancel_launcher_install,
+            commands::get_steam_sync_status,
+            commands::set_steam_sync_config,
+            commands::clear_steam_api_key,
             commands::resolve_catalog_covers,
             commands::resolve_share_mod_metadata,
             commands::list_plugins,
@@ -438,6 +447,7 @@ pub fn run() {
             commands::set_allow_mutual_connections,
             commands::set_allow_cache_relay,
             commands::set_share_active_loadouts_in_feed,
+            commands::set_share_playing_status,
             commands::add_friend_by_code,
             commands::add_friend_by_peer,
             commands::cancel_queued_friend_invite,

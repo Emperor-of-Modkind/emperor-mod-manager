@@ -89,6 +89,12 @@ import type {
   FriendsState,
   FriendSyncResult,
   FriendCollectionSyncStatus,
+  LibrarySection,
+  LibrarySource,
+  LauncherInstallOptions,
+  LauncherInstallRequest,
+  LauncherInstallResult,
+  SteamSyncStatus,
   CollectionConflictPlan,
   CollectionPlanSource,
   CollectionResolutionChoices,
@@ -147,6 +153,24 @@ export const api = {
   recoverLegacyModData: () =>
     invoke<RecoveryReport>("recover_legacy_mod_data"),
   scanGames: () => invoke<DetectedGame[]>("scan_games"),
+  scanLauncherLibraries: (refreshRemote = false) =>
+    invoke<LibrarySection[]>("scan_launcher_libraries", { refreshRemote }),
+  getLauncherInstallOptions: (source: LibrarySource, externalId: string) =>
+    invoke<LauncherInstallOptions>("get_launcher_install_options", {
+      source,
+      externalId,
+    }),
+  requestLauncherInstall: (request: LauncherInstallRequest) =>
+    invoke<LauncherInstallResult>("request_launcher_install", { request }),
+  cancelLauncherInstall: (jobId: string) =>
+    invoke<void>("cancel_launcher_install", { jobId }),
+  getSteamSyncStatus: () => invoke<SteamSyncStatus>("get_steam_sync_status"),
+  setSteamSyncConfig: (args: {
+    steamIdOverride: string | null;
+    apiKey: string | null;
+    enabled: boolean;
+  }) => invoke<SteamSyncStatus>("set_steam_sync_config", args),
+  clearSteamApiKey: () => invoke<SteamSyncStatus>("clear_steam_api_key"),
   resolveCatalogCovers: (requests: CatalogCoverRequest[]) =>
     invoke<CatalogCoverHit[]>("resolve_catalog_covers", { requests }),
   resolveShareModMetadata: (mods: ShareModEntry[]) =>
@@ -713,6 +737,8 @@ export const api = {
     invoke<FriendsState>("set_allow_cache_relay", { allow }),
   setShareActiveLoadoutsInFeed: (share: boolean) =>
     invoke<FriendsState>("set_share_active_loadouts_in_feed", { share }),
+  setSharePlayingStatus: (share: boolean) =>
+    invoke<FriendsState>("set_share_playing_status", { share }),
   addFriendByCode: (code: string) =>
     invoke<FriendsState>("add_friend_by_code", { code }),
   addFriendByPeer: (peerId: string, displayName?: string | null) =>

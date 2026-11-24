@@ -155,6 +155,8 @@ import {
   type CatalogMatchSubmit,
 } from "./CatalogMatchDialog";
 import { LoadLogDialog } from "./LoadLogDialog";
+import { LauncherLibrariesSection } from "./LauncherLibrariesSection";
+import { LauncherInstallModal } from "./LauncherInstallModal";
 import { FomodConfigureBanner, FomodDialog } from "./FomodDialog";
 import {
   cancelFomodPass,
@@ -223,6 +225,10 @@ import type {
   CollectionResolutionChoices,
   CollectionVisibility,
   DetectedGame,
+  LibraryGame,
+  LibrarySection,
+  LauncherInstallProgress,
+  SteamSyncStatus,
   DownloadItem,
   FriendsState,
   GameHealth,
@@ -3248,6 +3254,125 @@ export default function App() {
     void fillCatalogCovers(detected, managed, catalogSuggestions);
   }, [catalogSuggestions, detected, managed, fillCatalogCovers]);
 
+  const [librarySections, setLibrarySections] = useState<LibrarySection[]>([]);
+  const [librarySectionsLoading, setLibrarySectionsLoading] = useState(false);
+  const [installModalGame, setInstallModalGame] = useState<LibraryGame | null>(null);
+  const [launcherInstalls, setLauncherInstalls] = useState<
+    Record<string, LauncherInstallProgress>
+  >({});
+  const [steamSync, setSteamSync] = useState<SteamSyncStatus | null>(null);
+  const [steamIdInput, setSteamIdInput] = useState("");
+  const [steamApiKeyInput, setSteamApiKeyInput] = useState("");
+  const [steamSyncBusy, setSteamSyncBusy] = useState(false);
+
+  const libraryCoverAttemptedRef = useRef<Set<string>>(new Set());
+  const libraryCoverQueueRef = useRef<Map<string, LibraryGame>>(new Map());
+  const libraryCoverFlushTimerRef = useRef<number | null>(null);
+
+  const flushLibraryCatalogCovers = useCallback(async () => {
+    libraryCoverFlushTimerRef.current = null;
+    const queued = Array.from(libraryCoverQueueRef.current.values());
+    libraryCoverQueueRef.current.clear();
+    if (queued.length === 0) return;
+    const requests = queued
+      .filter((g) => Boolean(g.nexus_domain))
+      .map((g) => ({
+        id: g.id,
+        nexus_domain: g.nexus_domain,
+        modio_game_id: null,
+        icon_path: null,
+      }));
+    if (requests.length === 0) return;
+    try {
+      const hits = await api.resolveCatalogCovers(requests);
+      if (hits.length === 0) return;
+      const byId = new Map(hits.map((h) => [h.id, h]));
+      startTransition(() => {
+        setLibrarySections((prev) =>
+          prev.map((sec) => {
+            let changed = false;
+            const games = sec.games.map((g) => {
+              const hit = byId.get(g.id);
+              if (!hit) return g;
+              changed = true;
+              return {
+                ...g,
+                cover_path: hit.cover_path ?? g.cover_path,
+                cover_url: hit.cover_path ? null : hit.cover_url,
+                cover_fallbacks: [],
+              };
+            });
+            return changed ? { ...sec, games } : sec;
+          }),
+        );
+      });
+    } catch (e) {
+      console.warn("resolve_catalog_covers (library fallback) failed", e);
+    }
+  }, []);
+
+  const queueLibraryCatalogCover = useCallback(
+    (game: LibraryGame) => {
+      if (!game.nexus_domain) return;
+      const key = `${game.id}:${game.nexus_domain}`;
+      if (libraryCoverAttemptedRef.current.has(key)) return;
+      libraryCoverAttemptedRef.current.add(key);
+      libraryCoverQueueRef.current.set(game.id, game);
+      if (libraryCoverFlushTimerRef.current == null) {
+        libraryCoverFlushTimerRef.current = window.setTimeout(() => {
+          void flushLibraryCatalogCovers();
+        }, 120);
+      }
+    },
+    [flushLibraryCatalogCovers],
+  );
+
+  useEffect(() => {
+    return () => {
+      if (libraryCoverFlushTimerRef.current != null) {
+        window.clearTimeout(libraryCoverFlushTimerRef.current);
+      }
+    };
+  }, []);
+
+  const refreshLauncherLibraries = useCallback(
+    async (refreshRemote = false) => {
+      setLibrarySectionsLoading(true);
+      try {
+        const sections = await api.scanLauncherLibraries(refreshRemote);
+        startTransition(() => {
+          setLibrarySections(sections);
+        });
+        for (const sec of sections) {
+          for (const g of sec.games) {
+            if (!g.cover_path && !g.cover_url && g.nexus_domain) {
+              queueLibraryCatalogCover(g);
+            }
+          }
+        }
+      } catch (e) {
+        console.warn("scan_launcher_libraries failed", e);
+      } finally {
+        setLibrarySectionsLoading(false);
+      }
+    },
+    [queueLibraryCatalogCover],
+  );
+
+  const refreshSteamSync = useCallback(async () => {
+    try {
+      const status = await api.getSteamSyncStatus();
+      setSteamSync(status);
+      setSteamIdInput(status.steam_id_override ?? "");
+    } catch (e) {
+      console.warn("get_steam_sync_status failed", e);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshSteamSync();
+  }, [refreshSteamSync]);
+
   const scanInFlightRef = useRef<Promise<void> | null>(null);
 
   const performScan = useCallback(
@@ -3269,6 +3394,7 @@ export default function App() {
         await fillCatalogCovers(found, managedList, catalogSuggestionsRef.current);
         await refreshGameHealth();
         navTtlRef.current.mark("library-scan");
+        void refreshLauncherLibraries(false);
       } catch (e) {
         if (quiet) {
           console.warn("scan_games failed", e);
@@ -3280,8 +3406,27 @@ export default function App() {
         setLibraryListsReady(true);
       }
     },
-    [fillCatalogCovers, refreshGameHealth, refreshManaged, setError],
+    [fillCatalogCovers, refreshGameHealth, refreshLauncherLibraries, refreshManaged, setError],
   );
+
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    void listen<LauncherInstallProgress>("launcher-install-progress", (event) => {
+      const p = event.payload;
+      setLauncherInstalls((prev) => ({ ...prev, [p.game_id]: p }));
+      if (p.phase === "completed") {
+        setNotice({ kind: "ok", message: `Finished installing ${p.title}. Rescanning library…` });
+        void performScan(true);
+      } else if (p.phase === "failed" && p.error) {
+        setError(p.error);
+      }
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => {
+      unlisten?.();
+    };
+  }, [performScan, setError]);
 
   const scan = useCallback(async () => {
     navTtlRef.current.invalidate("library-scan");
@@ -9474,6 +9619,54 @@ export default function App() {
       }}
       onClearWebsiteSession={() => void clearNexusWebsiteSession()}
       onClearModioWebsiteSession={() => void clearModioWebsiteSession()}
+      steamSync={steamSync}
+      steamIdInput={steamIdInput}
+      onSteamIdInput={setSteamIdInput}
+      steamApiKeyInput={steamApiKeyInput}
+      onSteamApiKeyInput={setSteamApiKeyInput}
+      steamSyncBusy={steamSyncBusy}
+      onSaveSteamSync={(enabled) => {
+        void (async () => {
+          setSteamSyncBusy(true);
+          try {
+            const status = await api.setSteamSyncConfig({
+              steamIdOverride: steamIdInput.trim() || null,
+              apiKey: steamApiKeyInput.trim() || null,
+              enabled,
+            });
+            setSteamSync(status);
+            setSteamApiKeyInput("");
+            await refreshLauncherLibraries(enabled);
+          } catch (e) {
+            setError(String(e));
+          } finally {
+            setSteamSyncBusy(false);
+          }
+        })();
+      }}
+      onClearSteamApiKey={() => {
+        void (async () => {
+          setSteamSyncBusy(true);
+          try {
+            const status = await api.clearSteamApiKey();
+            setSteamSync(status);
+          } catch (e) {
+            setError(String(e));
+          } finally {
+            setSteamSyncBusy(false);
+          }
+        })();
+      }}
+      onSyncSteamNow={() => {
+        void (async () => {
+          setSteamSyncBusy(true);
+          try {
+            await refreshLauncherLibraries(true);
+          } finally {
+            setSteamSyncBusy(false);
+          }
+        })();
+      }}
     />
   );
 
@@ -11031,6 +11224,18 @@ export default function App() {
                     />
                     )}
                 </div>
+                <LauncherLibrariesSection
+                  sections={librarySections}
+                  loading={librarySectionsLoading}
+                  active={tab === "library"}
+                  scrollRef={libraryHomeScrollRef}
+                  installsByGameId={launcherInstalls}
+                  resolveCoverSrc={gameCoverSrc}
+                  onSelectGame={setInstallModalGame}
+                  onCoverExhausted={queueLibraryCatalogCover}
+                  onRefresh={(refreshRemote) => void refreshLauncherLibraries(refreshRemote)}
+                  onOpenSettings={() => setTab("settings")}
+                />
                 </>
                 ) : null}
                 </ResultsReveal>
@@ -15067,6 +15272,21 @@ export default function App() {
             const { resolve } = conflictPrompt;
             setConflictPrompt(null);
             resolve(null);
+          }}
+        />
+      )}
+      {installModalGame && (
+        <LauncherInstallModal
+          game={installModalGame}
+          coverSrc={gameCoverSrc(installModalGame)}
+          progress={launcherInstalls[installModalGame.id] ?? null}
+          onClose={() => setInstallModalGame(null)}
+          onRescan={() => void scan()}
+          onInstallStarted={(res) => {
+            setNotice({ kind: "ok", message: res.message });
+          }}
+          onCancelInstall={(jobId) => {
+            void api.cancelLauncherInstall(jobId).catch((e) => setError(String(e)));
           }}
         />
       )}

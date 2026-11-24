@@ -13,6 +13,7 @@ use modio::Client;
 use serde::Serialize;
 use tokio::io::{AsyncWriteExt, BufWriter};
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 use crate::config::KEYRING_SERVICE;
 use crate::rate_limit::backoff_with_jitter;
 
