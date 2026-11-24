@@ -838,6 +838,7 @@ export type StagedMod = {
   depends_on?: string[];
   option_selection?: ModOptionSelection | null;
   fomod_selection?: FomodSelection | null;
+  fomod_pending?: FomodPendingReview | null;
   /** File chooser title or archive name, when it differs from the mod title. */
   file_name?: string | null;
   /** Catalog poster. Null means not looked up yet; empty means there is no image. */
@@ -928,11 +929,18 @@ export type FomodSelection = {
   selected: Record<string, string[]>;
 };
 
+export type FomodPendingReview = {
+  new_group_ids: string[];
+  new_plugin_ids: string[];
+  invalidated_group_ids: string[];
+};
+
 export type FomodInstallerView = {
   module_name: string;
   steps: FomodStepView[];
   selection: FomodSelection;
   unsupported_scripted: boolean;
+  pending_review?: FomodPendingReview | null;
 };
 
 export type StagedModUpdate = {
@@ -1458,6 +1466,14 @@ export type RemoteAccountSummary = {
   auto_sort_before_deploy: boolean;
 };
 
+export type RemoteBanner = {
+  id: number;
+  kind: "info" | "warn" | "error";
+  message: string;
+  details?: string[];
+  created_at?: number | null;
+};
+
 export type DesktopSnapshot = {
   rev: number;
   synced_at: string;
@@ -1474,6 +1490,8 @@ export type DesktopSnapshot = {
   downloads: DownloadItem[];
   friends: FriendsState | null;
   launch_states: Record<string, GameLaunchState>;
+  banners?: RemoteBanner[];
+  mods_needing_fomod_by_game?: Record<string, string[]>;
 };
 
 export type RemoteDownloadRequest =

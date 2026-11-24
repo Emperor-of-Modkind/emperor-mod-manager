@@ -1864,6 +1864,33 @@ export default function App() {
     const toSave = filterPersistableBanners(banners, persistence);
     void api.savePersistedBanners(toSave).catch(() => {});
   }, [banners, settings]);
+
+  useEffect(() => {
+    void api
+      .syncDesktopBanners(
+        banners.map((b) => ({
+          id: b.id,
+          kind: b.kind,
+          message: b.message,
+          details: b.details ?? [],
+          created_at: b.createdAt ?? null,
+        })),
+      )
+      .catch(() => {});
+  }, [banners]);
+
+  useEffect(() => {
+    let disposed = false;
+    const unlisten = listen<number>("remote-dismiss-banner", (event) => {
+      if (!disposed && typeof event.payload === "number") {
+        dismissBannerById(event.payload);
+      }
+    });
+    return () => {
+      disposed = true;
+      void unlisten.then((fn) => fn());
+    };
+  }, [dismissBannerById]);
   const [busy, setBusy] = useState<string | null>(null);
   const [apiKeyInput, setApiKeyInput] = useState("");
   const [detected, setDetected] = useState<DetectedGame[]>([]);
@@ -2692,7 +2719,7 @@ export default function App() {
     return shownFomodNeedingIds.flatMap((id) => {
       const mod = byId.get(id);
       // A refresh that started before Finish can still list a mod whose choice is already stored.
-      if (!mod || mod.fomod_selection) return [];
+      if (!mod || (mod.fomod_selection && !mod.fomod_pending)) return [];
       return [mod];
     });
   }, [mods, shownFomodNeedingIds]);
@@ -4076,7 +4103,15 @@ export default function App() {
       const deadline = Date.now() + maxMs;
       while (Date.now() < deadline) {
         await new Promise<void>((resolve) => {
-          requestAnimationFrame(() => resolve());
+          let done = false;
+          const finish = () => {
+            if (done) return;
+            done = true;
+            window.clearTimeout(timer);
+            resolve();
+          };
+          const timer = window.setTimeout(finish, 50);
+          requestAnimationFrame(finish);
         });
         const host = useSidebar
           ? sidebarAssistHostRef.current
@@ -4738,6 +4773,66 @@ export default function App() {
     },
     [openAssistAtHead, setAssistQueueState],
   );
+
+  useEffect(() => {
+    let disposed = false;
+    const unlistenAssist = listen<{
+      batch_label?: string | null;
+      entries?: Array<{
+        game_id: string;
+        domain: string;
+        mod_id: number;
+        file_id: number;
+        name: string;
+        version?: string | null;
+        replace_staged_id?: string | null;
+        file_name?: string | null;
+      }>;
+    }>("remote-enqueue-assist", (event) => {
+      if (disposed) return;
+      const rawEntries = event.payload?.entries ?? [];
+      if (rawEntries.length === 0) return;
+      const entries = rawEntries.map((e) =>
+        createQueueEntry(
+          e.game_id,
+          e.domain,
+          e.mod_id,
+          e.file_id,
+          e.name,
+          e.version ?? null,
+          e.replace_staged_id ?? null,
+          e.file_name ?? null,
+        ),
+      );
+      void enqueueAssistEntries(entries, event.payload?.batch_label ?? null).catch(
+        (err) => setError(String(err)),
+      );
+    });
+    return () => {
+      disposed = true;
+      void unlistenAssist.then((fn) => fn());
+    };
+  }, [enqueueAssistEntries]);
+
+  useEffect(() => {
+    let timer: number | null = null;
+    const unlistenRemote = listen("remote-state-changed", () => {
+      if (timer != null) return;
+      timer = window.setTimeout(() => {
+        timer = null;
+        void refreshManaged();
+        void refreshDownloads();
+        if (activeId) {
+          void refreshMods(activeId);
+          void refreshCollections(activeId);
+        }
+      }, 120);
+    });
+    return () => {
+      if (timer != null) window.clearTimeout(timer);
+      void unlistenRemote.then((fn) => fn());
+    };
+  }, [activeId, refreshManaged, refreshDownloads, refreshMods, refreshCollections]);
 
   useEffect(() => {
     // A dependency closure emits one event per package; coalesce the bursts.
@@ -8723,7 +8818,7 @@ export default function App() {
     for (const id of updatedIds) {
       if (seen.has(id) || !needingSet.has(id)) continue;
       const mod = byId.get(id);
-      if (!mod || mod.fomod_selection) continue;
+      if (!mod || (mod.fomod_selection && !mod.fomod_pending)) continue;
       seen.add(id);
       toOpen.push(mod);
     }
@@ -8821,7 +8916,7 @@ export default function App() {
     const byId = new Map(currentMods.map((mod) => [mod.id, mod]));
     const needingMods = needingIds.flatMap((id) => {
       const mod = byId.get(id);
-      if (!mod || mod.fomod_selection) return [];
+      if (!mod || (mod.fomod_selection && !mod.fomod_pending)) return [];
       return [mod];
     });
     const pending = fomodModsForDeploy(needingMods);
@@ -14892,7 +14987,9 @@ export default function App() {
             if (!savedId) return;
             setMods((prev) =>
               prev.map((m) =>
-                m.id === savedId ? { ...m, fomod_selection: selection } : m,
+                m.id === savedId
+                  ? { ...m, fomod_selection: selection, fomod_pending: null }
+                  : m,
               ),
             );
             setFomodNeedingIds((ids) => ids.filter((id) => id !== savedId));

@@ -7,6 +7,7 @@ import {
 } from "@fortawesome/free-solid-svg-icons";
 import { api } from "./api";
 import type { DiscoveredDesktop, MobileConnectionState } from "./types";
+import appLogo from "./assets/app-logo.png";
 
 type MobilePairingViewProps = {
   onPaired: (state: MobileConnectionState) => void;
@@ -87,7 +88,15 @@ export function MobilePairingView({ onPaired }: MobilePairingViewProps) {
     <div className="mobile-pairing-screen">
       <div className="mobile-pairing-card">
         <div className="mobile-pairing-header">
-          <FontAwesomeIcon icon={faWifi} />
+          <div
+            className="brand mobile-pairing-logo"
+            role="img"
+            aria-label="Emperor Mod Manager"
+            style={{ "--brand-mask": `url(${appLogo})` } as React.CSSProperties}
+          />
+          <span className="mobile-pairing-badge">
+            <FontAwesomeIcon icon={faWifi} /> Companion Pairing
+          </span>
           <h2>Pair with Desktop</h2>
           <p className="muted">
             On your PC, open <strong>Settings → Mobile Companion → Pair Mobile Device</strong>{" "}

@@ -997,16 +997,15 @@ fn report_download_progress(
     } else {
         return;
     };
-    let _ = app.emit(
-        "download-progress",
-        serde_json::json!({
-            "id": id,
-            "bytes_downloaded": bytes_downloaded,
-            "bytes_total": bytes_total,
-            "speed_bps": speed_bps,
-            "status": status,
-        }),
-    );
+    let payload = serde_json::json!({
+        "id": id,
+        "bytes_downloaded": bytes_downloaded,
+        "bytes_total": bytes_total,
+        "speed_bps": speed_bps,
+        "status": status,
+    });
+    let _ = app.emit("download-progress", &payload);
+    state.remote_host.emit_download_progress_throttled(id, payload);
 }
 
 fn is_cancel_err(msg: &str) -> bool {
@@ -1171,6 +1170,14 @@ pub fn set_remote_allow_relay(state: State<'_, AppState>, enabled: bool) -> Resu
     let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
     cfg.remote_allow_relay = enabled;
     config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn sync_desktop_banners(
+    state: State<'_, AppState>,
+    banners: Vec<crate::remote::protocol::RemoteBanner>,
+) {
+    state.remote_host.set_desktop_banners(banners);
 }
 
 /// Steam covers typically live under Program Files, outside the default `$HOME`
@@ -2954,7 +2961,11 @@ pub fn set_active_game(state: State<'_, AppState>, id: String) -> Result<(), Str
         return Err("Game is not managed".into());
     }
     cfg.last_active_game_id = Some(id);
-    config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())
+    let res = config::save_config(&state.paths, &cfg).map_err(|e| e.to_string());
+    if res.is_ok() {
+        state.remote_host.notify_state_invalidated();
+    }
+    res
 }
 
 pub async fn save_and_validate_nexus_key(
@@ -10241,6 +10252,7 @@ pub fn set_mod_enabled(
     if let Ok(game) = managed_game(&state, &game_id) {
         let _ = maybe_auto_save_collections(&state.paths, &game);
     }
+    state.remote_host.notify_state_invalidated();
     Ok(())
 }
 
@@ -10256,6 +10268,7 @@ pub fn set_load_order(
     if let Ok(game) = managed_game(&state, &game_id) {
         let _ = maybe_auto_save_collections(&state.paths, &game);
     }
+    state.remote_host.notify_state_invalidated();
     Ok(())
 }
 
@@ -10632,7 +10645,8 @@ pub fn get_fomod_installer(
         return Ok(None);
     };
     let effective = selection.as_ref().or(staged.fomod_selection.as_ref());
-    fomod::installer_view(&root, effective).map_err(|e| e.to_string())
+    fomod::installer_view(&root, effective, staged.fomod_pending.as_ref())
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -10675,6 +10689,7 @@ pub fn set_fomod_selection(
     if let Ok(game) = managed_game(&state, &game_id) {
         let _ = maybe_auto_save_collections(&state.paths, &game);
     }
+    state.remote_host.notify_state_invalidated();
     Ok(normalized)
 }
 
@@ -10694,7 +10709,7 @@ pub async fn list_mods_needing_fomod(
             .mods
             .iter()
             .filter(|staged| {
-                if staged.fomod_selection.is_some() {
+                if staged.fomod_selection.is_some() && staged.fomod_pending.is_none() {
                     return false;
                 }
                 let Some(root) = staged_content_root(staged, plugin) else {
@@ -13367,8 +13382,10 @@ pub fn set_collection_enabled(
     protect_mod_ids: Option<Vec<String>>,
 ) -> Result<usize, String> {
     let protect = protect_mod_ids.unwrap_or_default();
-    mods::set_collection_enabled(&state.paths, &game_id, &collection_id, enabled, &protect)
-        .map_err(|e| e.to_string())
+    let count = mods::set_collection_enabled(&state.paths, &game_id, &collection_id, enabled, &protect)
+        .map_err(|e| e.to_string())?;
+    state.remote_host.notify_state_invalidated();
+    Ok(count)
 }
 
 #[cfg(test)]

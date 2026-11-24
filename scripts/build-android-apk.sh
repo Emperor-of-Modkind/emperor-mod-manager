@@ -21,6 +21,8 @@ FOLDABLE_SRC="$SRC_TAURI/android-plugin/FoldablePlugin.kt"
 FOLDABLE_DEST="$GEN_ANDROID/app/src/main/java/dev/emperormodmanager/mobile/FoldablePlugin.kt"
 UPDATE_SRC="$SRC_TAURI/android-plugin/AppUpdatePlugin.kt"
 UPDATE_DEST="$GEN_ANDROID/app/src/main/java/dev/emperormodmanager/mobile/AppUpdatePlugin.kt"
+THEME_SRC="$SRC_TAURI/android-plugin/ThemePlugin.kt"
+THEME_DEST="$GEN_ANDROID/app/src/main/java/dev/emperormodmanager/mobile/ThemePlugin.kt"
 FILE_PATHS_SRC="$SRC_TAURI/android-plugin/file_paths.xml"
 FILE_PATHS_DEST="$GEN_ANDROID/app/src/main/res/xml/file_paths.xml"
 
@@ -173,10 +175,19 @@ if [[ -f "$UPDATE_SRC" ]]; then
   cp "$UPDATE_SRC" "$UPDATE_DEST"
   log "Synced AppUpdatePlugin.kt -> ${UPDATE_DEST#"$ROOT/"}"
 fi
+if [[ -f "$THEME_SRC" ]]; then
+  mkdir -p "$(dirname "$THEME_DEST")"
+  cp "$THEME_SRC" "$THEME_DEST"
+  log "Synced ThemePlugin.kt -> ${THEME_DEST#"$ROOT/"}"
+fi
 if [[ -f "$FILE_PATHS_SRC" ]]; then
   mkdir -p "$(dirname "$FILE_PATHS_DEST")"
   cp "$FILE_PATHS_SRC" "$FILE_PATHS_DEST"
   log "Synced file_paths.xml -> ${FILE_PATHS_DEST#"$ROOT/"}"
+fi
+if [[ -d "$SRC_TAURI/icons/android" ]]; then
+  cp -rf "$SRC_TAURI/icons/android/." "$GEN_ANDROID/app/src/main/res/"
+  log "Synced Android launcher icons -> ${GEN_ANDROID#"$ROOT/"}/app/src/main/res/"
 fi
 
 MANIFEST="$GEN_ANDROID/app/src/main/AndroidManifest.xml"

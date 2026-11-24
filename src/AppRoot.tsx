@@ -9,7 +9,12 @@ const MobileApp = lazy(() => import("./MobileApp"));
 function BootSplash() {
   return (
     <div className="boot-splash">
-      <img src={appLogo} alt="Emperor Mod Manager" className="boot-splash-logo" />
+      <div
+        className="brand boot-splash-logo"
+        role="img"
+        aria-label="Emperor Mod Manager"
+        style={{ "--brand-mask": `url(${appLogo})` } as React.CSSProperties}
+      />
     </div>
   );
 }

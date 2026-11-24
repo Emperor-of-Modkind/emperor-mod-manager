@@ -23,7 +23,7 @@ use super::protocol::{
     REMOTE_ALPN,
 };
 
-const DIAL_LAN_TIMEOUT: Duration = Duration::from_secs(4);
+const DIAL_LAN_TIMEOUT: Duration = Duration::from_millis(1500);
 const DIAL_RELAY_TIMEOUT: Duration = Duration::from_secs(10);
 const RPC_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -44,6 +44,8 @@ pub struct RemoteClientService {
     cache: Mutex<Option<DesktopSnapshot>>,
     conn_state: Mutex<MobileConnectionState>,
     active_conn: tokio::sync::Mutex<Option<Connection>>,
+    /// Serializes connection establishment so concurrent callers reuse a single dial.
+    connect_lock: tokio::sync::Mutex<()>,
 }
 
 impl RemoteClientService {
@@ -75,6 +77,7 @@ impl RemoteClientService {
             cache: Mutex::new(cache),
             conn_state: Mutex::new(conn_state),
             active_conn: tokio::sync::Mutex::new(None),
+            connect_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -226,6 +229,18 @@ impl RemoteClientService {
             }
         }
 
+        // Deduplicate concurrent dials so startup sync, event subscriber, and
+        // UI calls share a single QUIC connection attempt.
+        let _dial_guard = self.connect_lock.lock().await;
+        {
+            let guard = self.active_conn.lock().await;
+            if let Some(conn) = guard.as_ref() {
+                if conn.close_reason().is_none() {
+                    return Ok(conn.clone());
+                }
+            }
+        }
+
         let host = self
             .paired_host
             .lock()
@@ -287,7 +302,7 @@ impl RemoteClientService {
         Ok(conn)
     }
 
-    /// Perform a snapshot + encrypted API key sync from the paired desktop.
+    /// Perform a snapshot + conditional encrypted API key sync from the paired desktop.
     pub async fn sync_now(&self) -> Result<DesktopSnapshot> {
         let conn = self.connect_or_get().await?;
         let since_rev = self.cache.lock().ok().and_then(|c| c.as_ref().map(|s| s.rev));
@@ -309,11 +324,18 @@ impl RemoteClientService {
             other => bail!("unexpected sync response: {other:?}"),
         };
 
-        // Sync API keys over the same authenticated QUIC connection and store encrypted at rest.
-        if let Ok(RemoteResponse::AccountSecrets(secrets)) =
-            rpc_on_conn(&conn, &RemoteRequest::GetAccountSecrets).await
-        {
-            self.persist_account_secrets(&secrets)?;
+        // Only fetch API secrets when local key presence disagrees with the
+        // desktop's connected-account state (avoids an extra RPC on every sync).
+        let has_local_nexus = self.paths.mobile_nexus_key_file().exists();
+        let has_local_modio = self.paths.mobile_modio_key_file().exists();
+        let secrets_out_of_sync = snap.account.nexus_connected != has_local_nexus
+            || snap.account.modio_connected != has_local_modio;
+        if secrets_out_of_sync {
+            if let Ok(RemoteResponse::AccountSecrets(secrets)) =
+                rpc_on_conn(&conn, &RemoteRequest::GetAccountSecrets).await
+            {
+                self.persist_account_secrets(&secrets)?;
+            }
         }
 
         let now = Utc::now().to_rfc3339();
@@ -344,6 +366,102 @@ impl RemoteClientService {
             }
         }
         Ok(resp)
+    }
+
+    /// Fetch (or return cached) game cover thumbnail as a `data:<mime>;base64,...` URL.
+    pub async fn get_cover_data_url(&self, game_id: &str) -> Result<Option<String>> {
+        let safe_id: String = game_id
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .collect();
+        let cache_file = self.paths.remote_covers_dir().join(format!("{safe_id}.dataurl"));
+        if let Ok(existing) = fs::read_to_string(&cache_file) {
+            if existing.starts_with("data:image/") {
+                return Ok(Some(existing));
+            }
+        }
+        match self
+            .send_request(&RemoteRequest::GetCoverThumb {
+                game_id: game_id.to_string(),
+            })
+            .await?
+        {
+            RemoteResponse::CoverThumb { mime, data_b64 } => {
+                let data_url = format!("data:{mime};base64,{data_b64}");
+                let _ = fs::create_dir_all(self.paths.remote_covers_dir());
+                let _ = fs::write(&cache_file, &data_url);
+                Ok(Some(data_url))
+            }
+            RemoteResponse::Error { .. } => Ok(None),
+            _ => Ok(None),
+        }
+    }
+
+    /// Update the local cached snapshot in-place when a live event arrives.
+    pub fn apply_event_to_cache(&self, evt: &RemoteEvent) {
+        let mut guard = match self.cache.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let Some(snap) = guard.as_mut() else {
+            return;
+        };
+        match evt {
+            RemoteEvent::BannersChanged { rev, banners } => {
+                snap.rev = *rev;
+                snap.banners = banners.clone();
+            }
+            RemoteEvent::DownloadsChanged { rev, downloads } => {
+                snap.rev = *rev;
+                snap.downloads = downloads.clone();
+            }
+            RemoteEvent::ModsChanged { rev, game_id, mods } => {
+                snap.rev = *rev;
+                snap.mods_by_game.insert(game_id.clone(), mods.clone());
+            }
+            RemoteEvent::CollectionsChanged {
+                rev,
+                game_id,
+                installed,
+            } => {
+                snap.rev = *rev;
+                snap.installed_collections_by_game
+                    .insert(game_id.clone(), installed.clone());
+            }
+            RemoteEvent::SavedCollectionsChanged { rev, saved } => {
+                snap.rev = *rev;
+                snap.saved_collections = saved.clone();
+            }
+            RemoteEvent::GamesChanged { rev, games } => {
+                snap.rev = *rev;
+                snap.managed_games = games.clone();
+            }
+            RemoteEvent::FriendsChanged { rev, friends } => {
+                snap.rev = *rev;
+                snap.friends = Some(friends.clone());
+            }
+            RemoteEvent::LaunchStateChanged {
+                rev,
+                game_id,
+                state,
+            } => {
+                snap.rev = *rev;
+                snap.launch_states.insert(game_id.clone(), state.clone());
+            }
+            _ => return,
+        }
+        let snap_clone = snap.clone();
+        drop(guard);
+        let cache_path = self.paths.remote_cache_file();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn_blocking(move || {
+                if let Ok(json) = serde_json::to_string(&snap_clone) {
+                    let _ = fs::write(cache_path, json);
+                }
+            });
+        } else if let Ok(json) = serde_json::to_string(&snap_clone) {
+            let _ = fs::write(cache_path, json);
+        }
     }
 
     /// Open a live event subscription stream from the paired desktop.

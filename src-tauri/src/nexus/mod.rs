@@ -62,6 +62,7 @@ pub struct NexusClient {
     /// Public mod pages sit behind a Cloudflare check that rejects the API
     /// client's rustls fingerprint. This client impersonates Chrome and does
     /// not carry the API key.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     page_http: wreq::Client,
     rate_limit: Arc<RateLimitGate>,
     is_anonymous: bool,
@@ -365,6 +366,7 @@ impl NexusClient {
             .connect_timeout(Duration::from_secs(30))
             .read_timeout(Duration::from_secs(60))
             .build()?;
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         let page_http = wreq::Client::builder()
             .emulation(wreq_util::Emulation::Chrome136)
             .connect_timeout(Duration::from_secs(30))
@@ -374,6 +376,7 @@ impl NexusClient {
         Ok(Self {
             http,
             cdn_http,
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
             page_http,
             rate_limit,
             is_anonymous: api_key.is_none(),
@@ -913,7 +916,10 @@ impl NexusClient {
             bail!("invalid nexus domain");
         }
         let url = format!("https://www.nexusmods.com/{domain}/mods/{mod_id}");
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         let resp = self.page_http.get(&url).send().await?;
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        let resp = self.cdn_http.get(&url).send().await?;
         if !resp.status().is_success() {
             bail!("mod page gallery failed ({})", resp.status());
         }
@@ -3096,12 +3102,14 @@ pub fn parse_nxm(url_str: &str) -> Result<NxmLink> {
     })
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn store_api_key(key: &str) -> Result<()> {
     let entry = keyring::Entry::new(crate::config::KEYRING_SERVICE, crate::config::KEYRING_USER)?;
     entry.set_password(key.trim())?;
     Ok(())
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn load_api_key() -> Result<Option<String>> {
     let entry = keyring::Entry::new(crate::config::KEYRING_SERVICE, crate::config::KEYRING_USER)?;
     match entry.get_password() {
@@ -3116,6 +3124,7 @@ pub fn load_api_key() -> Result<Option<String>> {
     }
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn clear_api_key() -> Result<()> {
     let entry = keyring::Entry::new(crate::config::KEYRING_SERVICE, crate::config::KEYRING_USER)?;
     match entry.delete_credential() {

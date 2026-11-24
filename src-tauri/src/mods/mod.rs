@@ -25,7 +25,7 @@ use crate::{
         rewrite_ror2_bepinexpack_dest, DeployContext, GamePlugin,
     },
     mods::{
-        fomod::FomodSelection,
+        fomod::{FomodPendingReview, FomodSelection},
         options::{IncludeFilter, ModOptionSelection},
     },
 };
@@ -91,6 +91,10 @@ pub struct StagedMod {
     /// FOMOD installer picks. `None` means no ModuleConfig, or defaults not saved yet.
     #[serde(default)]
     pub fomod_selection: Option<FomodSelection>,
+    /// Pending FOMOD settings added or invalidated by a mod update.
+    /// Cleared once the user saves choices in the FOMOD configurator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fomod_pending: Option<FomodPendingReview>,
     /// Name of the file that was staged, when it is distinct from the mod title.
     /// The file chooser's title is preferred; the archive name is the fallback.
     #[serde(default)]
@@ -136,6 +140,7 @@ impl Default for StagedMod {
             staged_file_count: None,
             option_selection: None,
             fomod_selection: None,
+            fomod_pending: None,
             file_name: None,
             picture_url: None,
             supported_game_versions: None,
@@ -260,6 +265,7 @@ struct StagingProvenance {
     order: Option<u32>,
     option_selection: Option<ModOptionSelection>,
     fomod_selection: Option<FomodSelection>,
+    fomod_pending: Option<FomodPendingReview>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -850,7 +856,8 @@ fn collapse_load_order(paths: &Paths, game_id: &str, order: &mut LoadOrder) -> R
 
 fn provenance_from_removed(
     old: Option<StagedMod>,
-    _new_staging: &Path,
+    old_fomod_module: Option<&fomod::FomodModule>,
+    new_staging: &Path,
     preserve_fomod_selection: bool,
 ) -> StagingProvenance {
     let Some(old) = old else {
@@ -859,6 +866,24 @@ fn provenance_from_removed(
             enabled: true,
             ..Default::default()
         };
+    };
+    let (fomod_selection, fomod_pending) = if preserve_fomod_selection {
+        (old.fomod_selection, old.fomod_pending)
+    } else if let Some(ref old_sel) = old.fomod_selection {
+        match fomod::load_module_in_staging(new_staging).ok().flatten() {
+            Some(ref new_module) if !new_module.unsupported_scripted => {
+                let migrated = fomod::migrate_selection(
+                    old_fomod_module,
+                    old_sel,
+                    old.fomod_pending.as_ref(),
+                    new_module,
+                );
+                (Some(migrated.selection), migrated.pending)
+            }
+            _ => (None, None),
+        }
+    } else {
+        (None, None)
     };
     StagingProvenance {
         collection_ids: old.collection_ids,
@@ -870,14 +895,8 @@ fn provenance_from_removed(
         // the same options keeps the user's picks. Anything the new manifest
         // dropped is discarded when the selection is normalized.
         option_selection: old.option_selection,
-        // FOMOD updates can add, reorder, or rename steps/options (shifting
-        // index-based ids), so only preserve choices when re-staging the exact
-        // same version/file (e.g. damaged-staging repair).
-        fomod_selection: if preserve_fomod_selection {
-            old.fomod_selection
-        } else {
-            None
-        },
+        fomod_selection,
+        fomod_pending,
     }
 }
 
@@ -1905,9 +1924,19 @@ pub fn stage_overlay_dir(
         return Err(e);
     }
     let committed = mutate_load_order(paths, game_id, |order| {
+        let old_fomod_module = order
+            .mods
+            .iter()
+            .find(|m| m.id == id)
+            .and_then(|old| fomod::load_module_in_staging(Path::new(&old.staging_path)).ok().flatten());
         swap_extracted_dir(&temp, &staging)?;
         let removed = take_rows(order, |m| m.id == id);
-        let provenance = provenance_from_removed(removed.first().cloned(), &staging, false);
+        let provenance = provenance_from_removed(
+            removed.first().cloned(),
+            old_fomod_module.as_ref(),
+            &staging,
+            false,
+        );
         let next_order = provenance
             .order
             .unwrap_or_else(|| order.mods.iter().map(|m| m.order).max().unwrap_or(0) + 1);
@@ -1927,6 +1956,7 @@ pub fn stage_overlay_dir(
             depends_on: provenance.depends_on,
             option_selection: provenance.option_selection,
             fomod_selection: provenance.fomod_selection,
+            fomod_pending: provenance.fomod_pending,
             picture_url: resolve_picture_url(None, &removed),
             ..Default::default()
         };
@@ -2349,7 +2379,19 @@ fn stage_filled_mod(
                     && old.nexus_file_id == file_id
                     && (version.is_none() || old.version == version)
             });
-        let provenance = provenance_from_removed(removed.first().cloned(), &staging, same_file);
+        let old_fomod_module = (!same_file).then(|| {
+            removed.first().and_then(|old| {
+                (Path::new(&old.staging_path) != staging.as_path())
+                    .then(|| fomod::load_module_in_staging(Path::new(&old.staging_path)).ok().flatten())
+                    .flatten()
+            })
+        }).flatten();
+        let provenance = provenance_from_removed(
+            removed.first().cloned(),
+            old_fomod_module.as_ref(),
+            &staging,
+            same_file,
+        );
         let next_order = provenance
             .order
             .unwrap_or_else(|| order.mods.iter().map(|m| m.order).max().unwrap_or(0) + 1);
@@ -2376,6 +2418,7 @@ fn stage_filled_mod(
             staged_file_count: Some(count_staged_files(&staging)),
             option_selection: provenance.option_selection,
             fomod_selection: provenance.fomod_selection,
+            fomod_pending: provenance.fomod_pending,
             file_name: stored_file_name,
             picture_url: resolve_picture_url(None, &removed),
             supported_game_versions: removed
@@ -2906,7 +2949,19 @@ pub fn stage_thunderstore_mod_with_mode(
         let same_version = removed
             .first()
             .is_some_and(|old| old.version.as_deref() == Some(version));
-        let provenance = provenance_from_removed(removed.first().cloned(), &staging, same_version);
+        let old_fomod_module = (!same_version).then(|| {
+            removed.first().and_then(|old| {
+                (Path::new(&old.staging_path) != staging.as_path())
+                    .then(|| fomod::load_module_in_staging(Path::new(&old.staging_path)).ok().flatten())
+                    .flatten()
+            })
+        }).flatten();
+        let provenance = provenance_from_removed(
+            removed.first().cloned(),
+            old_fomod_module.as_ref(),
+            &staging,
+            same_version,
+        );
         let next_order = provenance
             .order
             .unwrap_or_else(|| order.mods.iter().map(|m| m.order).max().unwrap_or(0) + 1);
@@ -2933,6 +2988,7 @@ pub fn stage_thunderstore_mod_with_mode(
             staged_file_count: Some(count_staged_files(&staging)),
             option_selection: provenance.option_selection,
             fomod_selection: provenance.fomod_selection,
+            fomod_pending: provenance.fomod_pending,
             file_name,
             picture_url: resolve_picture_url(picture_url, &removed),
             supported_game_versions: None,
@@ -3042,7 +3098,19 @@ pub fn stage_modio_mod_with_mode(
         let same_file = removed
             .first()
             .is_some_and(|old| old.modio_file_id == Some(modio_file_id));
-        let provenance = provenance_from_removed(removed.first().cloned(), &staging, same_file);
+        let old_fomod_module = (!same_file).then(|| {
+            removed.first().and_then(|old| {
+                (Path::new(&old.staging_path) != staging.as_path())
+                    .then(|| fomod::load_module_in_staging(Path::new(&old.staging_path)).ok().flatten())
+                    .flatten()
+            })
+        }).flatten();
+        let provenance = provenance_from_removed(
+            removed.first().cloned(),
+            old_fomod_module.as_ref(),
+            &staging,
+            same_file,
+        );
         let next_order = provenance
             .order
             .unwrap_or_else(|| order.mods.iter().map(|m| m.order).max().unwrap_or(0) + 1);
@@ -3069,6 +3137,7 @@ pub fn stage_modio_mod_with_mode(
             staged_file_count: Some(count_staged_files(&staging)),
             option_selection: provenance.option_selection,
             fomod_selection: provenance.fomod_selection,
+            fomod_pending: provenance.fomod_pending,
             file_name,
             picture_url: resolve_picture_url(picture_url, &removed),
             supported_game_versions: None,
@@ -3249,6 +3318,7 @@ pub fn set_fomod_selection(
             bail!("mod not found: {mod_uid}");
         };
         m.fomod_selection = Some(selection);
+        m.fomod_pending = None;
         Ok(())
     })
 }
@@ -3306,6 +3376,7 @@ pub fn apply_collection_order_and_selections(
                 if let Some(sel) = selection_map.get(m.id.as_str()) {
                     if let Some(fomod) = &sel.fomod_selection {
                         m.fomod_selection = Some(fomod.clone());
+                        m.fomod_pending = None;
                     }
                     if let Some(opts) = &sel.option_selection {
                         m.option_selection = Some(opts.clone());
@@ -4568,19 +4639,27 @@ mod tests {
             &v2_zip,
         )
         .unwrap();
-        assert!(
-            staged_v2.fomod_selection.is_none(),
-            "updating to a new Nexus file must clear stale FOMOD selection"
-        );
-
+        let pending = staged_v2
+            .fomod_pending
+            .as_ref()
+            .expect("renaming selected options must require FOMOD review");
         let m2 = fomod::load_module(Path::new(&staged_v2.staging_path))
             .unwrap()
             .unwrap();
         let g2 = &m2.steps[0].groups[0];
+        assert!(pending.invalidated_group_ids.contains(&g2.id));
+
         let mut sel2 = fomod::default_selection(&m2);
         sel2.selected
             .insert(g2.id.clone(), vec![g2.plugins[1].id.clone()]);
         set_fomod_selection(&paths, game_id, &staged_v2.id, sel2).unwrap();
+        let saved_v2 = load_loadorder(&paths, game_id)
+            .unwrap()
+            .mods
+            .into_iter()
+            .find(|m| m.id == staged_v2.id)
+            .unwrap();
+        assert!(saved_v2.fomod_pending.is_none());
 
         let res2 = deploy(&paths, game_id, "cyberpunk2077", install.path(), None).unwrap();
         assert_eq!(res2.file_count, 1, "warnings: {:?}", res2.warnings);
@@ -4590,6 +4669,137 @@ mod tests {
         );
         assert_eq!(
             std::fs::read(install.path().join("r6/scripts/v2_alt.reds")).unwrap(),
+            b"v2-alt"
+        );
+    }
+
+    #[test]
+    fn fomod_update_preserves_compatible_selection_without_reconfiguration() {
+        let (tmp, paths) = test_paths();
+        let game_id = "cp_fomod_compat_update";
+        let install = tempfile::tempdir().unwrap();
+
+        let write_fomod_zip = |path: &Path, entries: &[(&str, &[u8])]| {
+            let file = std::fs::File::create(path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            for (name, body) in entries {
+                zip.start_file::<_, ()>(*name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                std::io::Write::write_all(&mut zip, body).unwrap();
+            }
+            zip.finish().unwrap();
+        };
+
+        let v1_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<config>
+  <moduleName>Mod v1</moduleName>
+  <installSteps order="Explicit">
+    <installStep name="Variant">
+      <optionalFileGroups>
+        <group name="Style" type="SelectExactlyOne">
+          <plugins>
+            <plugin name="Classic">
+              <files><folder source="Classic" destination=""/></files>
+              <typeDescriptor><type name="Recommended"/></typeDescriptor>
+            </plugin>
+            <plugin name="Alt">
+              <files><folder source="Alt" destination=""/></files>
+              <typeDescriptor><type name="Optional"/></typeDescriptor>
+            </plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+  </installSteps>
+</config>"#;
+        // v2 reorders options (Alt moves to index 0) with updated file contents.
+        let v2_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<config>
+  <moduleName>Mod v2</moduleName>
+  <installSteps order="Explicit">
+    <installStep name="Variant">
+      <optionalFileGroups>
+        <group name="Style" type="SelectExactlyOne">
+          <plugins>
+            <plugin name="Alt">
+              <files><folder source="Alt" destination=""/></files>
+              <typeDescriptor><type name="Optional"/></typeDescriptor>
+            </plugin>
+            <plugin name="Classic">
+              <files><folder source="Classic" destination=""/></files>
+              <typeDescriptor><type name="Recommended"/></typeDescriptor>
+            </plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+  </installSteps>
+</config>"#;
+
+        let v1_zip = tmp.path().join("v1.zip");
+        write_fomod_zip(
+            &v1_zip,
+            &[
+                ("fomod/ModuleConfig.xml", v1_xml.as_bytes()),
+                ("Classic/r6/scripts/classic.reds", b"v1-classic"),
+                ("Alt/r6/scripts/alt.reds", b"v1-alt"),
+            ],
+        );
+        let staged_v1 = stage_mod(
+            &paths,
+            game_id,
+            "My FOMOD",
+            "cyberpunk2077",
+            99,
+            100,
+            Some("1.0".into()),
+            Some("v1.zip".into()),
+            &v1_zip,
+        )
+        .unwrap();
+        let m1 = fomod::load_module(Path::new(&staged_v1.staging_path))
+            .unwrap()
+            .unwrap();
+        let g1 = &m1.steps[0].groups[0];
+        let mut sel1 = fomod::default_selection(&m1);
+        sel1.selected
+            .insert(g1.id.clone(), vec![g1.plugins[1].id.clone()]); // Alt
+        set_fomod_selection(&paths, game_id, &staged_v1.id, sel1).unwrap();
+
+        let v2_zip = tmp.path().join("v2.zip");
+        write_fomod_zip(
+            &v2_zip,
+            &[
+                ("fomod/ModuleConfig.xml", v2_xml.as_bytes()),
+                ("Classic/r6/scripts/classic.reds", b"v2-classic"),
+                ("Alt/r6/scripts/alt.reds", b"v2-alt"),
+            ],
+        );
+        let staged_v2 = stage_mod_replacing(
+            &paths,
+            game_id,
+            &staged_v1.id,
+            "My FOMOD",
+            "cyberpunk2077",
+            99,
+            200,
+            Some("2.0".into()),
+            Some("v2.zip".into()),
+            &v2_zip,
+        )
+        .unwrap();
+
+        assert!(
+            staged_v2.fomod_pending.is_none(),
+            "reordered options with no new settings should not require reconfiguration"
+        );
+        assert!(staged_v2.fomod_selection.is_some());
+
+        // Deploying immediately uses the migrated "Alt" choice.
+        let res = deploy(&paths, game_id, "cyberpunk2077", install.path(), None).unwrap();
+        assert_eq!(res.file_count, 1, "warnings: {:?}", res.warnings);
+        assert_eq!(
+            std::fs::read(install.path().join("r6/scripts/alt.reds")).unwrap(),
             b"v2-alt"
         );
     }

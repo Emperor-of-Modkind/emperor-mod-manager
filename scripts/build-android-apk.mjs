@@ -61,6 +61,22 @@ const UPDATE_PLUGIN_DEST = path.join(
   "mobile",
   "AppUpdatePlugin.kt",
 );
+const THEME_PLUGIN_SRC = path.join(
+  SRC_TAURI,
+  "android-plugin",
+  "ThemePlugin.kt",
+);
+const THEME_PLUGIN_DEST = path.join(
+  GEN_ANDROID,
+  "app",
+  "src",
+  "main",
+  "java",
+  "dev",
+  "emperormodmanager",
+  "mobile",
+  "ThemePlugin.kt",
+);
 const FILE_PATHS_SRC = path.join(
   SRC_TAURI,
   "android-plugin",
@@ -239,6 +255,7 @@ function syncFoldablePluginAndConfig() {
   for (const [src, dest, label] of [
     [FOLDABLE_PLUGIN_SRC, FOLDABLE_PLUGIN_DEST, "FoldablePlugin.kt"],
     [UPDATE_PLUGIN_SRC, UPDATE_PLUGIN_DEST, "AppUpdatePlugin.kt"],
+    [THEME_PLUGIN_SRC, THEME_PLUGIN_DEST, "ThemePlugin.kt"],
     [FILE_PATHS_SRC, FILE_PATHS_DEST, "file_paths.xml"],
   ]) {
     if (fs.existsSync(src)) {
@@ -246,6 +263,14 @@ function syncFoldablePluginAndConfig() {
       fs.copyFileSync(src, dest);
       log(`Synced ${label} -> ${path.relative(ROOT, dest)}`);
     }
+  }
+
+  // 1b. Sync Emperor Android launcher icons from src-tauri/icons/android -> gen/android/app/src/main/res
+  const iconsSrcDir = path.join(SRC_TAURI, "icons", "android");
+  const androidResDir = path.join(GEN_ANDROID, "app", "src", "main", "res");
+  if (fs.existsSync(iconsSrcDir)) {
+    fs.cpSync(iconsSrcDir, androidResDir, { recursive: true, force: true });
+    log(`Synced Android launcher icons -> ${path.relative(ROOT, androidResDir)}`);
   }
 
   // 2. Ensure AndroidManifest.xml has LAN discovery, network, and APK install permissions + FileProvider

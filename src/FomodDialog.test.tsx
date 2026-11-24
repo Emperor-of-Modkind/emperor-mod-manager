@@ -310,4 +310,101 @@ describe("FomodDialog", () => {
     });
     host.remove();
   });
+
+  it("filters to only new settings on update, supports showing all settings, and preserves hidden picks on finish", async () => {
+    const updateView: FomodInstallerView = {
+      ...view,
+      selection: {
+        selected: {
+          "0-voice-language.0-language": ["0-voice-language.0-language.1-russian"],
+          "1-voice-set.0-voices": ["1-voice-set.0-voices.0-all-voices"],
+        },
+      },
+      pending_review: {
+        new_group_ids: ["1-voice-set.0-voices"],
+        new_plugin_ids: [],
+        invalidated_group_ids: [],
+      },
+    };
+    getFomodInstaller.mockResolvedValue(updateView);
+
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const root: Root = createRoot(host);
+    const onSaved = vi.fn();
+    const onClose = vi.fn();
+
+    await act(async () => {
+      root.render(
+        <FomodDialog
+          gameId="cyberpunk2077"
+          mod={mod}
+          onClose={onClose}
+          onSaved={onSaved}
+        />,
+      );
+    });
+    await flush();
+
+    // Unchanged Step 1 ("Voice Language") is skipped; Step 2 ("Voice Set") is shown directly with Finish.
+    expect(document.body.textContent).toContain("Voice Set");
+    expect(document.body.textContent).not.toContain("English");
+    expect(document.body.textContent).toContain("New");
+    expect(document.body.textContent).toContain("Show all settings");
+
+    // Toggling "Show all settings" reveals Step 1 and Next/Back navigation.
+    const showAll = Array.from(document.body.querySelectorAll("button")).find(
+      (b) => b.textContent === "Show all settings",
+    )!;
+    await act(async () => {
+      showAll.click();
+    });
+    const back = Array.from(document.body.querySelectorAll("button")).find(
+      (b) => b.textContent === "Back",
+    );
+    expect(back).toBeTruthy();
+
+    // Switch back to only new settings, pick "Jackie only", and click Finish.
+    const showOnlyNew = Array.from(document.body.querySelectorAll("button")).find(
+      (b) => b.textContent === "Show only new settings",
+    )!;
+    await act(async () => {
+      showOnlyNew.click();
+    });
+
+    const jackie = Array.from(document.body.querySelectorAll("label")).find((el) =>
+      el.textContent?.includes("Jackie only"),
+    )!;
+    await act(async () => {
+      jackie.querySelector("input")!.click();
+    });
+    await flush();
+
+    const finish = Array.from(document.body.querySelectorAll("button")).find(
+      (b) => b.textContent === "Finish",
+    )!;
+    await act(async () => {
+      finish.click();
+    });
+    await flush();
+
+    expect(setFomodSelection).toHaveBeenCalled();
+    const saved = setFomodSelection.mock.calls[0][2] as {
+      selected: Record<string, string[]>;
+    };
+    // Hidden Step 1 choice ("Russian") is preserved alongside the newly chosen Step 2 pick.
+    expect(saved.selected["0-voice-language.0-language"]).toEqual([
+      "0-voice-language.0-language.1-russian",
+    ]);
+    expect(saved.selected["1-voice-set.0-voices"]).toEqual([
+      "1-voice-set.0-voices.1-jackie-only",
+    ]);
+    expect(onSaved).toHaveBeenCalled();
+    expect(onClose).toHaveBeenCalledWith("saved");
+
+    await act(async () => {
+      root.unmount();
+    });
+    host.remove();
+  });
 });

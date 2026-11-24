@@ -28,24 +28,22 @@ mod linux_embed;
 mod linux_startup;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod migration;
+#[cfg(any(target_os = "android", target_os = "ios", test))]
+mod mobile_catalog;
 #[cfg(any(target_os = "android", target_os = "ios"))]
 mod mobile_commands;
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod modio_api;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod mods;
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod nexus;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod p2p;
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod rate_limit;
 mod remote;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod share;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod system_theme;
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod thunderstore;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod tools;
@@ -90,12 +88,27 @@ pub fn run() {
                         Ok(())
                     })
                     .build(),
+            )
+            .plugin(
+                tauri::plugin::Builder::<tauri::Wry, ()>::new("theme")
+                    .setup(|app, api| {
+                        use tauri::Manager;
+                        if let Ok(handle) = api.register_android_plugin(
+                            "dev.emperormodmanager.mobile",
+                            "ThemePlugin",
+                        ) {
+                            app.manage(mobile_commands::AndroidThemeHandle(handle));
+                        }
+                        Ok(())
+                    })
+                    .build(),
             );
     }
 
     builder
         .invoke_handler(tauri::generate_handler![
             mobile_commands::get_app_info,
+            mobile_commands::get_mobile_system_palette,
             app_update::check_app_update,
             app_update::install_app_update,
             mobile_commands::discover_lan_desktops,
@@ -112,6 +125,24 @@ pub fn run() {
             mobile_commands::mobile_set_active_game,
             mobile_commands::mobile_launch_game,
             mobile_commands::mobile_close_game,
+            mobile_commands::mobile_get_game_cover,
+            mobile_commands::mobile_catalog_rpc,
+            mobile_commands::mobile_auto_sort_mods,
+            mobile_commands::mobile_sort_bethesda_plugins,
+            mobile_commands::mobile_check_mod_updates,
+            mobile_commands::mobile_update_mod,
+            mobile_commands::mobile_update_all_mods,
+            mobile_commands::mobile_get_fomod_installer,
+            mobile_commands::mobile_set_fomod_selection,
+            mobile_commands::mobile_get_fomod_image,
+            mobile_commands::mobile_get_saved_collection,
+            mobile_commands::mobile_check_collection_integrity,
+            mobile_commands::mobile_sync_friend_collection,
+            mobile_commands::mobile_save_collection_changes,
+            mobile_commands::mobile_set_collection_auto_save,
+            mobile_commands::mobile_rename_installed_collection,
+            mobile_commands::mobile_uninstall_collection,
+            mobile_commands::mobile_dismiss_banner,
         ])
         .setup(|app| {
             use tauri::Manager;
@@ -120,18 +151,64 @@ pub fn run() {
             let cache_dir = app.path().app_cache_dir()?;
             let paths = config::Paths::from_dirs(config_dir, data_dir, cache_dir)?;
             let remote = std::sync::Arc::new(remote::client::RemoteClientService::new(paths));
-            if remote.connection_state().paired {
+            {
                 let bg_remote = std::sync::Arc::clone(&remote);
                 let bg_app = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     use tauri::Emitter;
-                    if let Ok(snap) = bg_remote.sync_now().await {
+                    loop {
+                        if !bg_remote.connection_state().paired {
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                            continue;
+                        }
+                        if let Ok(snap) = bg_remote.sync_now().await {
+                            let _ = bg_app.emit("remote-connection-changed", bg_remote.connection_state());
+                            let _ = bg_app.emit("remote-snapshot-synced", &snap);
+                        }
+                        let evt_remote = std::sync::Arc::clone(&bg_remote);
+                        let evt_app = bg_app.clone();
+                        let res = bg_remote
+                            .subscribe_events(move |evt| {
+                                use crate::remote::protocol::RemoteEvent;
+                                evt_remote.apply_event_to_cache(&evt);
+                                match evt {
+                                    RemoteEvent::BannersChanged { banners, .. } => {
+                                        let _ = evt_app.emit("remote-banners-changed", &banners);
+                                    }
+                                    RemoteEvent::DownloadProgress { item } => {
+                                        let _ = evt_app.emit("remote-download-progress", &item);
+                                    }
+                                    RemoteEvent::SnapshotInvalidated { .. } => {
+                                        let r = std::sync::Arc::clone(&evt_remote);
+                                        let a = evt_app.clone();
+                                        tauri::async_runtime::spawn(async move {
+                                            if let Ok(snap) = r.sync_now().await {
+                                                let _ = a.emit("remote-connection-changed", r.connection_state());
+                                                let _ = a.emit("remote-snapshot-synced", &snap);
+                                            }
+                                        });
+                                    }
+                                    RemoteEvent::Revoked => {
+                                        let _ = evt_app.emit("remote-connection-changed", evt_remote.connection_state());
+                                    }
+                                    _ => {
+                                        if let Some(snap) = evt_remote.cached_snapshot() {
+                                            let _ = evt_app.emit("remote-snapshot-synced", &snap);
+                                        }
+                                    }
+                                }
+                            })
+                            .await;
                         let _ = bg_app.emit("remote-connection-changed", bg_remote.connection_state());
-                        let _ = bg_app.emit("remote-snapshot-synced", &snap);
+                        let backoff = if res.is_ok() { 2 } else { 4 };
+                        tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
                     }
                 });
             }
-            app.manage(mobile_commands::MobileAppState { remote });
+            let catalog = std::sync::Arc::new(mobile_catalog::MobileCatalogService::new(
+                std::sync::Arc::clone(&remote),
+            ));
+            app.manage(mobile_commands::MobileAppState { remote, catalog });
             Ok(())
         })
         .run(tauri::generate_context!())
@@ -384,6 +461,7 @@ pub fn run() {
             commands::set_paired_device_permissions,
             commands::get_remote_allow_relay,
             commands::set_remote_allow_relay,
+            commands::sync_desktop_banners,
         ])
         .setup(|app| {
             {

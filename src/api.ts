@@ -55,6 +55,7 @@ import type {
   NexusUser,
   OrphanScan,
   PersistedBanner,
+  RemoteBanner,
   RecoveryReport,
   ClearDownloadCacheResult,
   Settings,
@@ -802,6 +803,8 @@ export const api = {
   getRemoteAllowRelay: () => invoke<boolean>("get_remote_allow_relay"),
   setRemoteAllowRelay: (enabled: boolean) =>
     invoke<void>("set_remote_allow_relay", { enabled }),
+  syncDesktopBanners: (banners: RemoteBanner[]) =>
+    invoke<void>("sync_desktop_banners", { banners }),
 
   // Mobile-side discovery, pairing & iroh remote sync
   discoverLanDesktops: () => invoke<DiscoveredDesktop[]>("discover_lan_desktops"),
@@ -817,8 +820,10 @@ export const api = {
     invoke<MobileConnectionState>("get_mobile_connection_state"),
   getMobileSnapshot: () => invoke<DesktopSnapshot | null>("get_mobile_snapshot"),
   syncMobileNow: () => invoke<DesktopSnapshot>("sync_mobile_now"),
+  getMobileSystemPalette: () =>
+    invoke<SystemPalette | null>("get_mobile_system_palette"),
   mobileQueueDownload: (request: RemoteDownloadRequest) =>
-    invoke<unknown>("mobile_queue_download", { request }),
+    invoke<{ queued_assist?: number } | unknown>("mobile_queue_download", { request }),
   mobileControlDownload: (control: RemoteDownloadControl) =>
     invoke<unknown>("mobile_control_download", { control }),
   mobileSetModEnabled: (gameId: string, modId: string, enabled: boolean) =>
@@ -841,4 +846,93 @@ export const api = {
     invoke<unknown>("mobile_launch_game", { gameId, modded }),
   mobileCloseGame: (gameId: string) =>
     invoke<unknown>("mobile_close_game", { gameId }),
+  mobileGetGameCover: (gameId: string) =>
+    invoke<string | null>("mobile_get_game_cover", { gameId }),
+  mobileCatalogRpc: <T = unknown>(
+    method: string,
+    params: Record<string, unknown> = {},
+  ) => invoke<T>("mobile_catalog_rpc", { method, params }),
+  mobileAutoSortMods: (gameId: string) =>
+    invoke<AutoSortResult>("mobile_auto_sort_mods", { gameId }),
+  mobileSortBethesdaPlugins: (gameId: string) =>
+    invoke<LootSortResult>("mobile_sort_bethesda_plugins", { gameId }),
+  mobileCheckModUpdates: (gameId: string) =>
+    invoke<StagedModUpdate[]>("mobile_check_mod_updates", { gameId }),
+  mobileUpdateMod: (gameId: string, modId: string) =>
+    invoke<StagedMod & { queued_assist?: number }>("mobile_update_mod", { gameId, modId }),
+  mobileUpdateAllMods: (gameId: string) =>
+    invoke<{ updated: number; queued_assist?: number; errors: string[] }>(
+      "mobile_update_all_mods",
+      {
+        gameId,
+      },
+    ),
+  mobileGetFomodInstaller: (gameId: string, modId: string) =>
+    invoke<FomodInstallerView>("mobile_get_fomod_installer", { gameId, modId }),
+  mobileSetFomodSelection: (
+    gameId: string,
+    modId: string,
+    selection: FomodSelection,
+  ) =>
+    invoke<FomodSelection>("mobile_set_fomod_selection", {
+      gameId,
+      modId,
+      selection,
+    }),
+  mobileGetFomodImage: (path: string) =>
+    invoke<{ data_url: string }>("mobile_get_fomod_image", { path }),
+  mobileGetSavedCollection: (id: string) =>
+    invoke<SavedCollectionDetail>("mobile_get_saved_collection", { id }),
+  mobileCheckCollectionIntegrity: (gameId: string, collectionId: string) =>
+    invoke<CollectionIntegrityReport>("mobile_check_collection_integrity", {
+      gameId,
+      collectionId,
+    }),
+  mobileSyncFriendCollection: (
+    gameId: string,
+    peerId: string,
+    friendCollectionId: string,
+  ) =>
+    invoke<unknown>("mobile_sync_friend_collection", {
+      gameId,
+      peerId,
+      friendCollectionId,
+    }),
+  mobileSaveCollectionChanges: (gameId: string, collectionId: string) =>
+    invoke<InstalledCollection>("mobile_save_collection_changes", {
+      gameId,
+      collectionId,
+    }),
+  mobileSetCollectionAutoSave: (
+    gameId: string,
+    collectionId: string,
+    autoSave: boolean,
+  ) =>
+    invoke<InstalledCollection>("mobile_set_collection_auto_save", {
+      gameId,
+      collectionId,
+      autoSave,
+    }),
+  mobileRenameInstalledCollection: (
+    gameId: string,
+    collectionId: string,
+    name: string,
+  ) =>
+    invoke<InstalledCollection>("mobile_rename_installed_collection", {
+      gameId,
+      collectionId,
+      name,
+    }),
+  mobileUninstallCollection: (
+    gameId: string,
+    collectionId: string,
+    removeMods: boolean,
+  ) =>
+    invoke<unknown>("mobile_uninstall_collection", {
+      gameId,
+      collectionId,
+      removeMods,
+    }),
+  mobileDismissBanner: (id: number) =>
+    invoke<unknown>("mobile_dismiss_banner", { id }),
 };

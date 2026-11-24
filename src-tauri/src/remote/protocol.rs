@@ -254,6 +254,18 @@ impl Drop for RemoteAccountSecrets {
     }
 }
 
+/// A status banner replicated from desktop (green `info`, amber `warn`, red `error`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteBanner {
+    pub id: u64,
+    pub kind: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub details: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<u64>,
+}
+
 /// Full desktop state snapshot synced to mobile.
 /// Uses `serde_json::Value` for complex desktop domain types so the mobile binary
 /// stays decoupled from desktop-only crates while keeping exact JSON schema parity.
@@ -274,6 +286,10 @@ pub struct DesktopSnapshot {
     pub downloads: Vec<serde_json::Value>,
     pub friends: Option<serde_json::Value>,
     pub launch_states: HashMap<String, serde_json::Value>,
+    #[serde(default)]
+    pub banners: Vec<RemoteBanner>,
+    #[serde(default)]
+    pub mods_needing_fomod_by_game: HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -385,6 +401,39 @@ pub enum RemoteRequest {
     UpdateStagedMod {
         game_id: String,
         mod_id: String,
+    },
+    CheckStagedModUpdates {
+        game_id: String,
+    },
+    UpdateAllStagedMods {
+        game_id: String,
+    },
+    GetFomodInstaller {
+        game_id: String,
+        mod_id: String,
+    },
+    SetFomodSelection {
+        game_id: String,
+        mod_id: String,
+        selection: serde_json::Value,
+    },
+    GetFomodImage {
+        path: String,
+    },
+    GetSavedCollectionDetail {
+        id: String,
+    },
+    CheckCollectionIntegrity {
+        game_id: String,
+        collection_id: String,
+    },
+    JoinOrSyncFriendCollection {
+        game_id: String,
+        peer_id: String,
+        friend_collection_id: String,
+    },
+    DismissDesktopBanner {
+        id: u64,
     },
     SetCollectionEnabled {
         game_id: String,
@@ -518,6 +567,10 @@ pub enum RemoteEvent {
         rev: u64,
         game_id: String,
         state: serde_json::Value,
+    },
+    BannersChanged {
+        rev: u64,
+        banners: Vec<RemoteBanner>,
     },
     SnapshotInvalidated {
         rev: u64,

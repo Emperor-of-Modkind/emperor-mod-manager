@@ -29,7 +29,7 @@ use super::lan_discovery::{
 use super::pairing::PairingManager;
 use super::protocol::{
     is_local_network_ip, read_frame, write_frame, DesktopSnapshot, MobilePairingSession,
-    PairedDevice, RemoteAccountSecrets, RemoteEvent, RemoteRequest, RemoteResponse,
+    PairedDevice, RemoteAccountSecrets, RemoteBanner, RemoteEvent, RemoteRequest, RemoteResponse,
 };
 
 const STREAM_IO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -60,6 +60,7 @@ pub struct RemoteHostService {
     rev: AtomicU64,
     events_tx: broadcast::Sender<RemoteEvent>,
     last_progress_emit: Mutex<HashMap<String, Instant>>,
+    banners: Mutex<Vec<RemoteBanner>>,
     lan_responder_started: AtomicBool,
     backend: Mutex<Option<Arc<dyn RemoteBackend>>>,
     endpoint: Mutex<Option<Endpoint>>,
@@ -74,6 +75,7 @@ impl RemoteHostService {
             rev: AtomicU64::new(1),
             events_tx,
             last_progress_emit: Mutex::new(HashMap::new()),
+            banners: Mutex::new(Vec::new()),
             lan_responder_started: AtomicBool::new(false),
             backend: Mutex::new(None),
             endpoint: Mutex::new(None),
@@ -133,6 +135,39 @@ impl RemoteHostService {
     pub fn notify_state_invalidated(&self) {
         let rev = self.bump_rev();
         let _ = self.events_tx.send(RemoteEvent::SnapshotInvalidated { rev });
+    }
+
+    pub fn set_desktop_banners(&self, banners: Vec<RemoteBanner>) {
+        if let Ok(mut guard) = self.banners.lock() {
+            if *guard == banners {
+                return;
+            }
+            *guard = banners.clone();
+        }
+        let rev = self.bump_rev();
+        let _ = self
+            .events_tx
+            .send(RemoteEvent::BannersChanged { rev, banners });
+    }
+
+    pub fn desktop_banners(&self) -> Vec<RemoteBanner> {
+        self.banners
+            .lock()
+            .map(|b| b.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn dismiss_desktop_banner(&self, id: u64) {
+        let next = if let Ok(mut guard) = self.banners.lock() {
+            guard.retain(|b| b.id != id);
+            guard.clone()
+        } else {
+            return;
+        };
+        let rev = self.bump_rev();
+        let _ = self
+            .events_tx
+            .send(RemoteEvent::BannersChanged { rev, banners: next });
     }
 
     pub fn start_pairing(&self) -> Result<MobilePairingSession> {
@@ -297,26 +332,42 @@ impl RemoteHostService {
             .ok_or_else(|| anyhow!("desktop endpoint not attached"))?;
         let desktop_id = ep.id().to_string();
 
-        loop {
-            let Ok(Ok((mut send, mut recv))) =
-                tokio::time::timeout(Duration::from_secs(120), conn.accept_bi()).await
-            else {
-                break;
-            };
+        // Accept bi-directional QUIC streams concurrently until the connection closes.
+        while let Ok((send, recv)) = conn.accept_bi().await {
+            let svc = Arc::clone(self);
+            let ep_clone = ep.clone();
+            let desktop_id = desktop_id.clone();
+            let remote_id = remote_id.to_string();
+            tokio::spawn(async move {
+                svc.handle_stream(send, recv, ep_clone, desktop_id, remote_id)
+                    .await;
+            });
+        }
+        Ok(())
+    }
 
-            let req: RemoteRequest = match tokio::time::timeout(STREAM_IO_TIMEOUT, read_frame(&mut recv)).await {
+    async fn handle_stream(
+        self: Arc<Self>,
+        mut send: iroh::endpoint::SendStream,
+        mut recv: iroh::endpoint::RecvStream,
+        ep: Endpoint,
+        desktop_id: String,
+        remote_id: String,
+    ) {
+        let req: RemoteRequest =
+            match tokio::time::timeout(STREAM_IO_TIMEOUT, read_frame(&mut recv)).await {
                 Ok(Ok(r)) => r,
-                _ => break,
+                _ => return,
             };
 
-            match req {
-                RemoteRequest::PairInit {
-                    device_name,
-                    device_model,
-                } => {
-                    let resp = {
-                        let mut pairing = self.pairing.lock().map_err(|e| anyhow!("{e}"))?;
-                        match pairing.create_challenge(remote_id, device_name, device_model) {
+        match req {
+            RemoteRequest::PairInit {
+                device_name,
+                device_model,
+            } => {
+                let resp = match self.pairing.lock() {
+                    Ok(mut pairing) => {
+                        match pairing.create_challenge(&remote_id, device_name, device_model) {
                             Ok((nonce, desktop_name)) => RemoteResponse::PairChallenge {
                                 nonce,
                                 desktop_name,
@@ -326,19 +377,25 @@ impl RemoteHostService {
                                 message: e.to_string(),
                             },
                         }
-                    };
-                    let _ = write_frame(&mut send, &resp).await;
-                    let _ = send.finish();
-                }
+                    }
+                    Err(e) => RemoteResponse::Error {
+                        code: "internal".into(),
+                        message: e.to_string(),
+                    },
+                };
+                let _ = write_frame(&mut send, &resp).await;
+                let _ = send.finish();
+            }
 
-                RemoteRequest::PairVerify { nonce, proof_hex } => {
-                    let backend = self.backend.lock().ok().and_then(|g| g.clone());
-                    let resp = {
-                        let mut pairing = self.pairing.lock().map_err(|e| anyhow!("{e}"))?;
-                        match pairing.verify_challenge(&desktop_id, remote_id, &nonce, &proof_hex) {
+            RemoteRequest::PairVerify { nonce, proof_hex } => {
+                let backend = self.backend.lock().ok().and_then(|g| g.clone());
+                let resp = match self.pairing.lock() {
+                    Ok(mut pairing) => {
+                        match pairing.verify_challenge(&desktop_id, &remote_id, &nonce, &proof_hex)
+                        {
                             Ok(device) => {
                                 if let Ok(mut set) = self.connected_peers.lock() {
-                                    set.insert(remote_id.to_string());
+                                    set.insert(remote_id.clone());
                                 }
                                 if let Some(b) = backend.as_ref() {
                                     b.on_paired(&device);
@@ -363,144 +420,170 @@ impl RemoteHostService {
                                 }
                             }
                         }
-                    };
-                    let _ = write_frame(&mut send, &resp).await;
-                    let _ = send.finish();
-                }
-
-                RemoteRequest::SubscribeEvents => {
-                    if !self.is_authorized(remote_id) {
-                        let _ = write_frame(
-                            &mut send,
-                            &RemoteResponse::Error {
-                                code: "unauthorized".into(),
-                                message: "Device is not paired".into(),
-                            },
-                        )
-                        .await;
-                        let _ = send.finish();
-                        break;
                     }
-                    let rev = self.current_rev();
-                    if write_frame(&mut send, &RemoteResponse::Subscribed { rev })
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                    let svc = Arc::clone(self);
-                    let peer = remote_id.to_string();
-                    tokio::spawn(async move {
-                        let mut rx = svc.events_tx.subscribe();
-                        while let Ok(evt) = rx.recv().await {
-                            let revoked = !svc.is_authorized(&peer);
-                            let out = if revoked { RemoteEvent::Revoked } else { evt };
-                            if write_frame(&mut send, &out).await.is_err() {
-                                break;
-                            }
-                            if revoked {
-                                let _ = send.finish();
-                                break;
-                            }
-                        }
-                    });
-                }
+                    Err(e) => RemoteResponse::Error {
+                        code: "internal".into(),
+                        message: e.to_string(),
+                    },
+                };
+                let _ = write_frame(&mut send, &resp).await;
+                let _ = send.finish();
+            }
 
-                other => {
-                    let device = self
-                        .pairing
-                        .lock()
-                        .ok()
-                        .and_then(|p| p.get_device(remote_id).cloned());
-                    let Some(device) = device else {
-                        let _ = write_frame(
-                            &mut send,
-                            &RemoteResponse::Error {
-                                code: "unauthorized".into(),
-                                message: "Device is not paired".into(),
-                            },
-                        )
-                        .await;
-                        let _ = send.finish();
-                        break;
-                    };
-
-                    let backend = self.backend.lock().ok().and_then(|g| g.clone());
-                    let Some(backend) = backend else {
-                        let _ = write_frame(
-                            &mut send,
-                            &RemoteResponse::Error {
-                                code: "not_ready".into(),
-                                message: "Desktop backend not initialized".into(),
-                            },
-                        )
-                        .await;
-                        let _ = send.finish();
-                        continue;
-                    };
-
-                    let resp = match other {
-                        RemoteRequest::Ping => RemoteResponse::Pong {
-                            rev: self.current_rev(),
+            RemoteRequest::SubscribeEvents => {
+                if !self.is_authorized(&remote_id) {
+                    let _ = write_frame(
+                        &mut send,
+                        &RemoteResponse::Error {
+                            code: "unauthorized".into(),
+                            message: "Device is not paired".into(),
                         },
-                        RemoteRequest::GetSyncSnapshot { since_rev } => {
-                            let rev = self.current_rev();
-                            if since_rev == Some(rev) {
-                                RemoteResponse::SnapshotUnchanged { rev }
-                            } else {
-                                RemoteResponse::Snapshot(
-                                    backend.build_snapshot(device.allow_remote_launch, rev),
-                                )
-                            }
-                        }
-                        RemoteRequest::GetAccountSecrets => {
-                            RemoteResponse::AccountSecrets(backend.account_secrets())
-                        }
-                        RemoteRequest::GetCoverThumb { game_id } => {
-                            match backend.cover_thumb(&game_id) {
-                                Ok((mime, bytes)) if bytes.len() <= MAX_COVER_BYTES => {
-                                    RemoteResponse::CoverThumb {
-                                        mime,
-                                        data_b64: base64::engine::general_purpose::STANDARD
-                                            .encode(bytes),
-                                    }
-                                }
-                                Ok(_) => RemoteResponse::Error {
-                                    code: "cover_too_large".into(),
-                                    message: "Cover image exceeds thumbnail size limit".into(),
-                                },
-                                Err(e) => RemoteResponse::Error {
-                                    code: "cover_missing".into(),
-                                    message: e.to_string(),
-                                },
-                            }
-                        }
-                        mutation => {
-                            match backend
-                                .execute_request(mutation, device.allow_remote_launch)
-                                .await
-                            {
-                                Ok(data) => {
-                                    let rev = self.bump_rev();
-                                    let _ = self
-                                        .events_tx
-                                        .send(RemoteEvent::SnapshotInvalidated { rev });
-                                    RemoteResponse::Ok { data, rev }
-                                }
-                                Err(e) => RemoteResponse::Error {
-                                    code: "rpc_failed".into(),
-                                    message: e.to_string(),
-                                },
-                            }
-                        }
-                    };
-
-                    let _ = write_frame(&mut send, &resp).await;
+                    )
+                    .await;
                     let _ = send.finish();
+                    return;
+                }
+                let rev = self.current_rev();
+                if write_frame(&mut send, &RemoteResponse::Subscribed { rev })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                let mut rx = self.events_tx.subscribe();
+                while let Ok(evt) = rx.recv().await {
+                    let revoked = !self.is_authorized(&remote_id);
+                    let out = if revoked { RemoteEvent::Revoked } else { evt };
+                    if write_frame(&mut send, &out).await.is_err() {
+                        break;
+                    }
+                    if revoked {
+                        let _ = send.finish();
+                        break;
+                    }
                 }
             }
+
+            other => {
+                let device = self
+                    .pairing
+                    .lock()
+                    .ok()
+                    .and_then(|p| p.get_device(&remote_id).cloned());
+                let Some(device) = device else {
+                    let _ = write_frame(
+                        &mut send,
+                        &RemoteResponse::Error {
+                            code: "unauthorized".into(),
+                            message: "Device is not paired".into(),
+                        },
+                    )
+                    .await;
+                    let _ = send.finish();
+                    return;
+                };
+
+                let backend = self.backend.lock().ok().and_then(|g| g.clone());
+                let Some(backend) = backend else {
+                    let _ = write_frame(
+                        &mut send,
+                        &RemoteResponse::Error {
+                            code: "not_ready".into(),
+                            message: "Desktop backend not initialized".into(),
+                        },
+                    )
+                    .await;
+                    let _ = send.finish();
+                    return;
+                };
+
+                let resp = match other {
+                    RemoteRequest::Ping => RemoteResponse::Pong {
+                        rev: self.current_rev(),
+                    },
+                    RemoteRequest::GetSyncSnapshot { since_rev } => {
+                        let rev = self.current_rev();
+                        if since_rev == Some(rev) {
+                            RemoteResponse::SnapshotUnchanged { rev }
+                        } else {
+                            let b = Arc::clone(&backend);
+                            let allow = device.allow_remote_launch;
+                            match tokio::task::spawn_blocking(move || b.build_snapshot(allow, rev))
+                                .await
+                            {
+                                Ok(snap) => RemoteResponse::Snapshot(snap),
+                                Err(e) => RemoteResponse::Error {
+                                    code: "snapshot_failed".into(),
+                                    message: e.to_string(),
+                                },
+                            }
+                        }
+                    }
+                    RemoteRequest::GetAccountSecrets => {
+                        RemoteResponse::AccountSecrets(backend.account_secrets())
+                    }
+                    RemoteRequest::GetCoverThumb { game_id } => {
+                        let b = Arc::clone(&backend);
+                        match tokio::task::spawn_blocking(move || b.cover_thumb(&game_id)).await {
+                            Ok(Ok((mime, bytes))) if bytes.len() <= MAX_COVER_BYTES => {
+                                RemoteResponse::CoverThumb {
+                                    mime,
+                                    data_b64: base64::engine::general_purpose::STANDARD
+                                        .encode(bytes),
+                                }
+                            }
+                            Ok(Ok(_)) => RemoteResponse::Error {
+                                code: "cover_too_large".into(),
+                                message: "Cover image exceeds thumbnail size limit".into(),
+                            },
+                            Ok(Err(e)) => RemoteResponse::Error {
+                                code: "cover_missing".into(),
+                                message: e.to_string(),
+                            },
+                            Err(e) => RemoteResponse::Error {
+                                code: "cover_failed".into(),
+                                message: e.to_string(),
+                            },
+                        }
+                    }
+                    req => {
+                        let is_read_only = matches!(
+                            req,
+                            RemoteRequest::CatalogRpc { .. }
+                                | RemoteRequest::CheckStagedModUpdates { .. }
+                                | RemoteRequest::GetFomodInstaller { .. }
+                                | RemoteRequest::GetFomodImage { .. }
+                                | RemoteRequest::GetSavedCollectionDetail { .. }
+                                | RemoteRequest::CheckCollectionIntegrity { .. }
+                        );
+                        match backend
+                            .execute_request(req, device.allow_remote_launch)
+                            .await
+                        {
+                            Ok(data) => {
+                                let rev = if is_read_only {
+                                    self.current_rev()
+                                } else {
+                                    let next = self.bump_rev();
+                                    let _ = self
+                                        .events_tx
+                                        .send(RemoteEvent::SnapshotInvalidated { rev: next });
+                                    next
+                                };
+                                RemoteResponse::Ok { data, rev }
+                            }
+                            Err(e) => RemoteResponse::Error {
+                                code: "rpc_failed".into(),
+                                message: e.to_string(),
+                            },
+                        }
+                    }
+                };
+
+                let _ = write_frame(&mut send, &resp).await;
+                let _ = send.finish();
+            }
         }
-        Ok(())
     }
 
     fn is_authorized(&self, peer_id: &str) -> bool {

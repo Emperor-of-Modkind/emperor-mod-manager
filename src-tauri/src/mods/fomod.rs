@@ -24,6 +24,38 @@ pub struct FomodSelection {
     pub selected: BTreeMap<String, Vec<String>>,
 }
 
+/// Tracks new or invalidated FOMOD items after a mod update so the UI can
+/// prompt only for what changed while keeping carried-over selections.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FomodPendingReview {
+    /// Groups in the new installer that did not exist (or were not visible)
+    /// when the user previously configured the mod.
+    #[serde(default)]
+    pub new_group_ids: Vec<String>,
+    /// Individual plugins added to an existing group.
+    #[serde(default)]
+    pub new_plugin_ids: Vec<String>,
+    /// Existing groups whose previous selection was removed, disabled, or
+    /// violated a stricter group type in the new installer.
+    #[serde(default)]
+    pub invalidated_group_ids: Vec<String>,
+}
+
+impl FomodPendingReview {
+    pub fn is_empty(&self) -> bool {
+        self.new_group_ids.is_empty()
+            && self.new_plugin_ids.is_empty()
+            && self.invalidated_group_ids.is_empty()
+    }
+}
+
+/// Outcome of migrating a saved FOMOD selection onto an updated `FomodModule`.
+#[derive(Debug, Clone)]
+pub struct FomodMigration {
+    pub selection: FomodSelection,
+    pub pending: Option<FomodPendingReview>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct FomodInstallerView {
     pub module_name: String,
@@ -31,6 +63,10 @@ pub struct FomodInstallerView {
     pub selection: FomodSelection,
     /// True when this package needs a C# scripted installer we do not run.
     pub unsupported_scripted: bool,
+    /// Present after a mod update added or invalidated settings that still
+    /// need user review.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_review: Option<FomodPendingReview>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -272,10 +308,38 @@ pub fn load_module(content_root: &Path) -> Result<Option<FomodModule>> {
     Ok(Some(module))
 }
 
+/// Load a FOMOD module from a raw staging directory, unwrapping a single
+/// non-hidden top-level archive folder if `fomod/` sits inside it.
+pub fn load_module_in_staging(staging_dir: &Path) -> Result<Option<FomodModule>> {
+    if !staging_dir.is_dir() {
+        return Ok(None);
+    }
+    if let Some(module) = load_module(staging_dir)? {
+        return Ok(Some(module));
+    }
+    let mut entries: Vec<_> = fs::read_dir(staging_dir)
+        .with_context(|| format!("read staging {}", staging_dir.display()))?
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let name = e.file_name();
+            let s = name.to_string_lossy();
+            s != "__MACOSX" && !s.starts_with('.')
+        })
+        .collect();
+    if entries.len() == 1 {
+        let only = entries.remove(0);
+        if only.file_type().is_ok_and(|t| t.is_dir()) {
+            return load_module(&only.path());
+        }
+    }
+    Ok(None)
+}
+
 /// UI-facing view with absolute image paths and visibility against `selection`.
 pub fn installer_view(
     content_root: &Path,
     stored: Option<&FomodSelection>,
+    pending_review: Option<&FomodPendingReview>,
 ) -> Result<Option<FomodInstallerView>> {
     let Some(module) = load_module(content_root)? else {
         return Ok(None);
@@ -329,6 +393,7 @@ pub fn installer_view(
         steps,
         selection,
         unsupported_scripted: module.unsupported_scripted,
+        pending_review: pending_review.filter(|p| !p.is_empty()).cloned(),
     }))
 }
 
@@ -436,6 +501,409 @@ pub fn effective_selection(
         Some(s) => normalize_selection(module, s),
         None => default_selection(module),
     }
+}
+
+fn norm_fomod_name(raw: &str) -> String {
+    raw.trim().to_ascii_lowercase()
+}
+
+fn push_unique(list: &mut Vec<String>, value: String) {
+    if !list.iter().any(|existing| existing == &value) {
+        list.push(value);
+    }
+}
+
+/// Strip leading `{index}-` from each dot-separated FOMOD id segment so stored
+/// ids can still be matched by slug when the previous `ModuleConfig.xml` is
+/// unavailable.
+fn strip_id_indices(id: &str) -> String {
+    id.split('.')
+        .map(|seg| match seg.split_once('-') {
+            Some((prefix, rest)) if !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_digit()) => {
+                rest
+            }
+            _ => seg,
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn group_is_actionable(group: &FomodGroup, flags: &HashMap<String, String>) -> bool {
+    if group.type_ == FomodGroupType::SelectAll {
+        return false;
+    }
+    let mut usable = 0usize;
+    let mut choosable = 0usize;
+    for p in &group.plugins {
+        let t = resolve_plugin_type(p, flags);
+        if !t.is_disabled() {
+            usable += 1;
+            if !t.is_forced_on() {
+                choosable += 1;
+            }
+        }
+    }
+    if choosable == 0 {
+        return false;
+    }
+    match group.type_ {
+        FomodGroupType::SelectExactlyOne | FomodGroupType::SelectAtLeastOne => usable > 1,
+        FomodGroupType::SelectAny | FomodGroupType::SelectAtMostOne => true,
+        FomodGroupType::SelectAll => false,
+    }
+}
+
+fn raw_selection_violates_group(
+    group: &FomodGroup,
+    mapped_ids: &[String],
+    flags: &HashMap<String, String>,
+) -> bool {
+    let mut usable_count = 0usize;
+    let mut selected_usable: Vec<&str> = Vec::new();
+    for p in &group.plugins {
+        let t = resolve_plugin_type(p, flags);
+        if t.is_disabled() {
+            continue;
+        }
+        usable_count += 1;
+        if t.is_forced_on() || mapped_ids.iter().any(|id| id == &p.id) {
+            selected_usable.push(&p.id);
+        }
+    }
+    match group.type_ {
+        FomodGroupType::SelectExactlyOne => usable_count > 0 && selected_usable.len() != 1,
+        FomodGroupType::SelectAtLeastOne => usable_count > 0 && selected_usable.is_empty(),
+        FomodGroupType::SelectAtMostOne => selected_usable.len() > 1,
+        FomodGroupType::SelectAll | FomodGroupType::SelectAny => false,
+    }
+}
+
+/// True if at least one currently visible step has an actionable new or
+/// invalidated setting under `selection`.
+pub fn pending_has_visible_actionable(
+    module: &FomodModule,
+    selection: &FomodSelection,
+    pending: &FomodPendingReview,
+) -> bool {
+    if pending.is_empty() {
+        return false;
+    }
+    let flags = collect_flags(module, selection);
+    let new_groups: HashSet<&str> = pending.new_group_ids.iter().map(String::as_str).collect();
+    let new_plugins: HashSet<&str> = pending.new_plugin_ids.iter().map(String::as_str).collect();
+    let invalidated: HashSet<&str> = pending
+        .invalidated_group_ids
+        .iter()
+        .map(String::as_str)
+        .collect();
+
+    for step in &module.steps {
+        let visible = step
+            .visible
+            .as_ref()
+            .map(|d| eval_dependency(d, &flags, None))
+            .unwrap_or(true);
+        if !visible {
+            continue;
+        }
+        for group in &step.groups {
+            if !group_is_actionable(group, &flags) {
+                continue;
+            }
+            if new_groups.contains(group.id.as_str()) || invalidated.contains(group.id.as_str()) {
+                return true;
+            }
+            for plugin in &group.plugins {
+                if !new_plugins.contains(plugin.id.as_str()) {
+                    continue;
+                }
+                let t = resolve_plugin_type(plugin, &flags);
+                if !t.is_disabled() && !t.is_forced_on() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Migrate a user's saved FOMOD selection from an older version of a mod onto
+/// `new_module`.
+///
+/// Steps, groups, and plugins are matched by normalized name (with occurrence
+/// disambiguation for duplicates), so reordering or index shifts preserve prior
+/// choices. Returns `pending: None` when no visible actionable setting was
+/// added or invalidated.
+pub fn migrate_selection(
+    old_module: Option<&FomodModule>,
+    old_selection: &FomodSelection,
+    old_pending: Option<&FomodPendingReview>,
+    new_module: &FomodModule,
+) -> FomodMigration {
+    match old_module {
+        Some(old) => migrate_with_old_module(old, old_selection, old_pending, new_module),
+        None => migrate_without_old_module(old_selection, new_module),
+    }
+}
+
+fn migrate_with_old_module(
+    old_module: &FomodModule,
+    old_selection: &FomodSelection,
+    old_pending: Option<&FomodPendingReview>,
+    new_module: &FomodModule,
+) -> FomodMigration {
+    let old_flags = collect_flags(old_module, old_selection);
+    let old_visible_steps: HashSet<&str> = old_module
+        .steps
+        .iter()
+        .filter(|step| {
+            step.visible
+                .as_ref()
+                .map(|d| eval_dependency(d, &old_flags, None))
+                .unwrap_or(true)
+        })
+        .map(|s| s.id.as_str())
+        .collect();
+
+    let old_pending_new_groups: HashSet<&str> = old_pending
+        .map(|p| p.new_group_ids.iter().map(String::as_str).collect())
+        .unwrap_or_default();
+    let old_pending_new_plugins: HashSet<&str> = old_pending
+        .map(|p| p.new_plugin_ids.iter().map(String::as_str).collect())
+        .unwrap_or_default();
+    let old_pending_invalidated: HashSet<&str> = old_pending
+        .map(|p| p.invalidated_group_ids.iter().map(String::as_str).collect())
+        .unwrap_or_default();
+
+    // Index old steps by (normalized_name, occurrence).
+    let mut old_step_counts: HashMap<String, usize> = HashMap::new();
+    let mut old_steps_by_key: HashMap<(String, usize), &FomodStep> = HashMap::new();
+    for step in &old_module.steps {
+        let key = norm_fomod_name(&step.name);
+        let occ = old_step_counts.entry(key.clone()).or_insert(0);
+        old_steps_by_key.insert((key, *occ), step);
+        *occ += 1;
+    }
+
+    let mut raw_selected: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut pending = FomodPendingReview::default();
+
+    struct MatchedGroupCheck<'a> {
+        new_group: &'a FomodGroup,
+        mapped_ids: Vec<String>,
+        dropped_selected: bool,
+    }
+    let mut matched_checks: Vec<MatchedGroupCheck<'_>> = Vec::new();
+
+    let mut new_step_counts: HashMap<String, usize> = HashMap::new();
+    for new_step in &new_module.steps {
+        let step_key = norm_fomod_name(&new_step.name);
+        let step_occ = {
+            let c = new_step_counts.entry(step_key.clone()).or_insert(0);
+            let cur = *c;
+            *c += 1;
+            cur
+        };
+
+        let Some(old_step) = old_steps_by_key.get(&(step_key, step_occ)).copied() else {
+            for new_group in &new_step.groups {
+                push_unique(&mut pending.new_group_ids, new_group.id.clone());
+            }
+            continue;
+        };
+
+        let old_step_was_visible = old_visible_steps.contains(old_step.id.as_str());
+
+        let mut old_group_counts: HashMap<String, usize> = HashMap::new();
+        let mut old_groups_by_key: HashMap<(String, usize), &FomodGroup> = HashMap::new();
+        for g in &old_step.groups {
+            let key = norm_fomod_name(&g.name);
+            let occ = old_group_counts.entry(key.clone()).or_insert(0);
+            old_groups_by_key.insert((key, *occ), g);
+            *occ += 1;
+        }
+
+        let mut new_group_counts: HashMap<String, usize> = HashMap::new();
+        for new_group in &new_step.groups {
+            let group_key = norm_fomod_name(&new_group.name);
+            let group_occ = {
+                let c = new_group_counts.entry(group_key.clone()).or_insert(0);
+                let cur = *c;
+                *c += 1;
+                cur
+            };
+
+            let Some(old_group) = old_groups_by_key.get(&(group_key, group_occ)).copied() else {
+                push_unique(&mut pending.new_group_ids, new_group.id.clone());
+                continue;
+            };
+
+            let mut old_plugin_counts: HashMap<String, usize> = HashMap::new();
+            let mut old_plugins_by_key: HashMap<(String, usize), &FomodPlugin> = HashMap::new();
+            for p in &old_group.plugins {
+                let key = norm_fomod_name(&p.name);
+                let occ = old_plugin_counts.entry(key.clone()).or_insert(0);
+                old_plugins_by_key.insert((key, *occ), p);
+                *occ += 1;
+            }
+
+            let mut old_pid_to_new_pid: HashMap<&str, String> = HashMap::new();
+            let mut new_plugin_counts: HashMap<String, usize> = HashMap::new();
+            for new_plugin in &new_group.plugins {
+                let pkey = norm_fomod_name(&new_plugin.name);
+                let pocc = {
+                    let c = new_plugin_counts.entry(pkey.clone()).or_insert(0);
+                    let cur = *c;
+                    *c += 1;
+                    cur
+                };
+                if let Some(old_plugin) = old_plugins_by_key.get(&(pkey, pocc)).copied() {
+                    old_pid_to_new_pid.insert(old_plugin.id.as_str(), new_plugin.id.clone());
+                    if old_pending_new_plugins.contains(old_plugin.id.as_str()) {
+                        push_unique(&mut pending.new_plugin_ids, new_plugin.id.clone());
+                    }
+                } else {
+                    push_unique(&mut pending.new_plugin_ids, new_plugin.id.clone());
+                }
+            }
+
+            if !old_step_was_visible {
+                // Step was hidden when the user configured v1, so treat it as
+                // unreviewed if it becomes visible now or during reconfiguration.
+                push_unique(&mut pending.new_group_ids, new_group.id.clone());
+                if let Some(old_chosen) = old_selection.selected.get(&old_group.id) {
+                    let mapped: Vec<String> = old_chosen
+                        .iter()
+                        .filter_map(|old_pid| old_pid_to_new_pid.get(old_pid.as_str()).cloned())
+                        .collect();
+                    if !mapped.is_empty() {
+                        raw_selected.insert(new_group.id.clone(), mapped);
+                    }
+                }
+                continue;
+            }
+
+            if old_pending_new_groups.contains(old_group.id.as_str()) {
+                push_unique(&mut pending.new_group_ids, new_group.id.clone());
+            }
+            if old_pending_invalidated.contains(old_group.id.as_str()) {
+                push_unique(&mut pending.invalidated_group_ids, new_group.id.clone());
+            }
+
+            if let Some(old_chosen) = old_selection.selected.get(&old_group.id) {
+                let mut mapped = Vec::new();
+                let mut dropped_selected = false;
+                for old_pid in old_chosen {
+                    if let Some(new_pid) = old_pid_to_new_pid.get(old_pid.as_str()) {
+                        if !mapped.contains(new_pid) {
+                            mapped.push(new_pid.clone());
+                        }
+                    } else {
+                        dropped_selected = true;
+                    }
+                }
+                raw_selected.insert(new_group.id.clone(), mapped.clone());
+                matched_checks.push(MatchedGroupCheck {
+                    new_group,
+                    mapped_ids: mapped,
+                    dropped_selected,
+                });
+            } else {
+                push_unique(&mut pending.new_group_ids, new_group.id.clone());
+            }
+        }
+    }
+
+    let selection = normalize_selection(new_module, &FomodSelection { selected: raw_selected });
+    let new_flags = collect_flags(new_module, &selection);
+
+    for check in matched_checks {
+        let disabled_selected = check.mapped_ids.iter().any(|pid| {
+            check
+                .new_group
+                .plugins
+                .iter()
+                .find(|p| p.id == *pid)
+                .is_some_and(|p| resolve_plugin_type(p, &new_flags).is_disabled())
+        });
+        let violates = raw_selection_violates_group(check.new_group, &check.mapped_ids, &new_flags);
+        if check.dropped_selected || disabled_selected || violates {
+            push_unique(&mut pending.invalidated_group_ids, check.new_group.id.clone());
+        }
+    }
+
+    let pending = pending_has_visible_actionable(new_module, &selection, &pending)
+        .then_some(pending);
+
+    FomodMigration { selection, pending }
+}
+
+fn migrate_without_old_module(
+    old_selection: &FomodSelection,
+    new_module: &FomodModule,
+) -> FomodMigration {
+    // Map stripped group slugs -> stored plugin slugs.
+    let mut old_by_stripped_group: HashMap<String, Vec<String>> = HashMap::new();
+    for (gid, pids) in &old_selection.selected {
+        let stripped_g = strip_id_indices(gid);
+        let stripped_p: Vec<String> = pids.iter().map(|p| strip_id_indices(p)).collect();
+        old_by_stripped_group.entry(stripped_g).or_insert(stripped_p);
+    }
+
+    let mut raw_selected: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut pending = FomodPendingReview::default();
+    let mut matched_checks: Vec<(&FomodGroup, Vec<String>, bool)> = Vec::new();
+
+    for step in &new_module.steps {
+        for group in &step.groups {
+            let stripped_g = strip_id_indices(&group.id);
+            let Some(old_pids) = old_by_stripped_group.get(&stripped_g) else {
+                push_unique(&mut pending.new_group_ids, group.id.clone());
+                continue;
+            };
+            let mut by_stripped_p: HashMap<String, String> = HashMap::new();
+            for p in &group.plugins {
+                by_stripped_p
+                    .entry(strip_id_indices(&p.id))
+                    .or_insert_with(|| p.id.clone());
+            }
+            let mut mapped = Vec::new();
+            let mut dropped = false;
+            for old_p in old_pids {
+                if let Some(new_pid) = by_stripped_p.get(old_p) {
+                    if !mapped.contains(new_pid) {
+                        mapped.push(new_pid.clone());
+                    }
+                } else {
+                    dropped = true;
+                }
+            }
+            raw_selected.insert(group.id.clone(), mapped.clone());
+            matched_checks.push((group, mapped, dropped));
+        }
+    }
+
+    let selection = normalize_selection(new_module, &FomodSelection { selected: raw_selected });
+    let new_flags = collect_flags(new_module, &selection);
+
+    for (group, mapped, dropped) in matched_checks {
+        let disabled_selected = mapped.iter().any(|pid| {
+            group
+                .plugins
+                .iter()
+                .find(|p| p.id == *pid)
+                .is_some_and(|p| resolve_plugin_type(p, &new_flags).is_disabled())
+        });
+        let violates = raw_selection_violates_group(group, &mapped, &new_flags);
+        if dropped || disabled_selected || violates {
+            push_unique(&mut pending.invalidated_group_ids, group.id.clone());
+        }
+    }
+
+    let pending = pending_has_visible_actionable(new_module, &selection, &pending)
+        .then_some(pending);
+
+    FomodMigration { selection, pending }
 }
 
 fn default_group_plugins(group: &FomodGroup) -> Vec<String> {
@@ -2045,7 +2513,7 @@ mod tests {
         fs::write(&logo, b"png").unwrap();
         fs::write(root.join("fomod").join("ModuleConfig.xml"), IMAGE_XML).unwrap();
 
-        let view = installer_view(root, None).unwrap().unwrap();
+        let view = installer_view(root, None, None).unwrap().unwrap();
         let plugins = &view.steps[0].groups[0].plugins;
         assert_eq!(PathBuf::from(plugins[0].image.clone().unwrap()), logo);
         assert!(plugins[1].image.is_none());
@@ -2060,7 +2528,7 @@ mod tests {
         fs::write(&logo, b"png").unwrap();
         fs::write(logo.parent().unwrap().join("ModuleConfig.xml"), IMAGE_XML).unwrap();
 
-        let view = installer_view(root, None).unwrap().unwrap();
+        let view = installer_view(root, None, None).unwrap().unwrap();
         let image = PathBuf::from(
             view.steps[0].groups[0].plugins[0]
                 .image
@@ -2264,5 +2732,392 @@ mod tests {
         fs::create_dir_all(tmp.path().join("Fomod")).unwrap();
         fs::write(tmp.path().join("Fomod").join("script.cs"), b"class Script {}").unwrap();
         assert!(detect_scripted_installer(tmp.path()));
+    }
+
+    #[test]
+    fn migrate_unchanged_or_reordered_fomod_keeps_choices_without_pending() {
+        let v1_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<config>
+  <moduleName>Mod</moduleName>
+  <installSteps order="Explicit">
+    <installStep name="Step A">
+      <optionalFileGroups>
+        <group name="Style" type="SelectExactlyOne">
+          <plugins>
+            <plugin name="Classic"><typeDescriptor><type name="Recommended"/></typeDescriptor></plugin>
+            <plugin name="Alt"><typeDescriptor><type name="Optional"/></typeDescriptor></plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+    <installStep name="Step B">
+      <optionalFileGroups>
+        <group name="Extras" type="SelectAny">
+          <plugins>
+            <plugin name="Fog"><typeDescriptor><type name="Optional"/></typeDescriptor></plugin>
+            <plugin name="Rain"><typeDescriptor><type name="Optional"/></typeDescriptor></plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+  </installSteps>
+</config>"#;
+        // v2 reverses steps and plugins and drops the unselected "Fog" plugin.
+        let v2_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<config>
+  <moduleName>Mod v2</moduleName>
+  <installSteps order="Explicit">
+    <installStep name="Step B">
+      <optionalFileGroups>
+        <group name="Extras" type="SelectAny">
+          <plugins>
+            <plugin name="Rain"><typeDescriptor><type name="Optional"/></typeDescriptor></plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+    <installStep name="Step A">
+      <optionalFileGroups>
+        <group name="Style" type="SelectExactlyOne">
+          <plugins>
+            <plugin name="Alt"><typeDescriptor><type name="Optional"/></typeDescriptor></plugin>
+            <plugin name="Classic"><typeDescriptor><type name="Recommended"/></typeDescriptor></plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+  </installSteps>
+</config>"#;
+
+        let m1 = parse_module_config_bytes(v1_xml.as_bytes()).unwrap();
+        let m2 = parse_module_config_bytes(v2_xml.as_bytes()).unwrap();
+        let mut sel1 = FomodSelection::default();
+        sel1.selected.insert(
+            m1.steps[0].groups[0].id.clone(),
+            vec![m1.steps[0].groups[0].plugins[1].id.clone()], // Alt
+        );
+        sel1.selected.insert(
+            m1.steps[1].groups[0].id.clone(),
+            vec![m1.steps[1].groups[0].plugins[1].id.clone()], // Rain
+        );
+
+        let migrated = migrate_selection(Some(&m1), &sel1, None, &m2);
+        assert!(migrated.pending.is_none(), "expected no pending review: {:?}", migrated.pending);
+        assert_eq!(
+            migrated.selection.selected.get(&m2.steps[0].groups[0].id).unwrap(),
+            &vec![m2.steps[0].groups[0].plugins[0].id.clone()] // Rain
+        );
+        assert_eq!(
+            migrated.selection.selected.get(&m2.steps[1].groups[0].id).unwrap(),
+            &vec![m2.steps[1].groups[0].plugins[0].id.clone()] // Alt
+        );
+    }
+
+    #[test]
+    fn migrate_new_plugin_and_new_step_flags_only_new_items_and_keeps_old_picks() {
+        let v1_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<config>
+  <moduleName>Mod</moduleName>
+  <installSteps order="Explicit">
+    <installStep name="Core">
+      <optionalFileGroups>
+        <group name="Style" type="SelectExactlyOne">
+          <plugins>
+            <plugin name="Classic"><typeDescriptor><type name="Recommended"/></typeDescriptor></plugin>
+            <plugin name="Alt"><typeDescriptor><type name="Optional"/></typeDescriptor></plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+  </installSteps>
+</config>"#;
+        let v2_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<config>
+  <moduleName>Mod v2</moduleName>
+  <installSteps order="Explicit">
+    <installStep name="Core">
+      <optionalFileGroups>
+        <group name="Style" type="SelectExactlyOne">
+          <plugins>
+            <plugin name="Classic"><typeDescriptor><type name="Recommended"/></typeDescriptor></plugin>
+            <plugin name="Alt"><typeDescriptor><type name="Optional"/></typeDescriptor></plugin>
+            <plugin name="Modern"><typeDescriptor><type name="Optional"/></typeDescriptor></plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+    <installStep name="Patches">
+      <optionalFileGroups>
+        <group name="Compat" type="SelectAny">
+          <plugins>
+            <plugin name="DLC Patch"><typeDescriptor><type name="Optional"/></typeDescriptor></plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+  </installSteps>
+</config>"#;
+
+        let m1 = parse_module_config_bytes(v1_xml.as_bytes()).unwrap();
+        let m2 = parse_module_config_bytes(v2_xml.as_bytes()).unwrap();
+        let mut sel1 = FomodSelection::default();
+        sel1.selected.insert(
+            m1.steps[0].groups[0].id.clone(),
+            vec![m1.steps[0].groups[0].plugins[1].id.clone()], // Alt
+        );
+
+        let migrated = migrate_selection(Some(&m1), &sel1, None, &m2);
+        let pending = migrated.pending.expect("should flag new settings");
+        assert_eq!(pending.new_group_ids, vec![m2.steps[1].groups[0].id.clone()]);
+        assert_eq!(
+            pending.new_plugin_ids,
+            vec![m2.steps[0].groups[0].plugins[2].id.clone()] // Modern
+        );
+        assert!(pending.invalidated_group_ids.is_empty());
+        // Old pick "Alt" is preserved.
+        assert_eq!(
+            migrated.selection.selected.get(&m2.steps[0].groups[0].id).unwrap(),
+            &vec![m2.steps[0].groups[0].plugins[1].id.clone()]
+        );
+    }
+
+    #[test]
+    fn migrate_ignores_non_actionable_additions() {
+        let v1_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<config>
+  <moduleName>Mod</moduleName>
+  <installSteps order="Explicit">
+    <installStep name="Core">
+      <optionalFileGroups>
+        <group name="Style" type="SelectExactlyOne">
+          <plugins>
+            <plugin name="Classic"><typeDescriptor><type name="Recommended"/></typeDescriptor></plugin>
+            <plugin name="Alt"><typeDescriptor><type name="Optional"/></typeDescriptor></plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+  </installSteps>
+</config>"#;
+        let v2_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<config>
+  <moduleName>Mod v2</moduleName>
+  <installSteps order="Explicit">
+    <installStep name="Core">
+      <optionalFileGroups>
+        <group name="Style" type="SelectExactlyOne">
+          <plugins>
+            <plugin name="Classic"><typeDescriptor><type name="Recommended"/></typeDescriptor></plugin>
+            <plugin name="Alt"><typeDescriptor><type name="Optional"/></typeDescriptor></plugin>
+            <plugin name="Deprecated"><typeDescriptor><type name="NotUsable"/></typeDescriptor></plugin>
+          </plugins>
+        </group>
+        <group name="Auto Core" type="SelectAll">
+          <plugins>
+            <plugin name="Base Files"><typeDescriptor><type name="Required"/></typeDescriptor></plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+  </installSteps>
+</config>"#;
+
+        let m1 = parse_module_config_bytes(v1_xml.as_bytes()).unwrap();
+        let m2 = parse_module_config_bytes(v2_xml.as_bytes()).unwrap();
+        let mut sel1 = FomodSelection::default();
+        sel1.selected.insert(
+            m1.steps[0].groups[0].id.clone(),
+            vec![m1.steps[0].groups[0].plugins[1].id.clone()],
+        );
+
+        let migrated = migrate_selection(Some(&m1), &sel1, None, &m2);
+        assert!(
+            migrated.pending.is_none(),
+            "NotUsable and SelectAll additions require no user choice"
+        );
+    }
+
+    #[test]
+    fn migrate_invalidates_group_when_selected_plugin_removed() {
+        let v1_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<config>
+  <moduleName>Mod</moduleName>
+  <installSteps order="Explicit">
+    <installStep name="Core">
+      <optionalFileGroups>
+        <group name="Style" type="SelectExactlyOne">
+          <plugins>
+            <plugin name="Classic"><typeDescriptor><type name="Recommended"/></typeDescriptor></plugin>
+            <plugin name="Alt"><typeDescriptor><type name="Optional"/></typeDescriptor></plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+  </installSteps>
+</config>"#;
+        let v2_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<config>
+  <moduleName>Mod v2</moduleName>
+  <installSteps order="Explicit">
+    <installStep name="Core">
+      <optionalFileGroups>
+        <group name="Style" type="SelectExactlyOne">
+          <plugins>
+            <plugin name="Classic"><typeDescriptor><type name="Recommended"/></typeDescriptor></plugin>
+            <plugin name="Alt Renamed"><typeDescriptor><type name="Optional"/></typeDescriptor></plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+  </installSteps>
+</config>"#;
+
+        let m1 = parse_module_config_bytes(v1_xml.as_bytes()).unwrap();
+        let m2 = parse_module_config_bytes(v2_xml.as_bytes()).unwrap();
+        let mut sel1 = FomodSelection::default();
+        sel1.selected.insert(
+            m1.steps[0].groups[0].id.clone(),
+            vec![m1.steps[0].groups[0].plugins[1].id.clone()], // Alt (removed/renamed in v2)
+        );
+
+        let migrated = migrate_selection(Some(&m1), &sel1, None, &m2);
+        let pending = migrated.pending.expect("removed pick should require review");
+        assert_eq!(pending.invalidated_group_ids, vec![m2.steps[0].groups[0].id.clone()]);
+    }
+
+    #[test]
+    fn migrate_back_to_back_updates_preserve_unreviewed_pending() {
+        let v1_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<config>
+  <moduleName>Mod</moduleName>
+  <installSteps order="Explicit">
+    <installStep name="Core">
+      <optionalFileGroups>
+        <group name="Extras" type="SelectAny">
+          <plugins>
+            <plugin name="A"><typeDescriptor><type name="Optional"/></typeDescriptor></plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+  </installSteps>
+</config>"#;
+        let v2_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<config>
+  <moduleName>Mod</moduleName>
+  <installSteps order="Explicit">
+    <installStep name="Core">
+      <optionalFileGroups>
+        <group name="Extras" type="SelectAny">
+          <plugins>
+            <plugin name="A"><typeDescriptor><type name="Optional"/></typeDescriptor></plugin>
+            <plugin name="B"><typeDescriptor><type name="Optional"/></typeDescriptor></plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+  </installSteps>
+</config>"#;
+
+        let m1 = parse_module_config_bytes(v1_xml.as_bytes()).unwrap();
+        let m2 = parse_module_config_bytes(v2_xml.as_bytes()).unwrap();
+        let m3 = parse_module_config_bytes(v2_xml.as_bytes()).unwrap();
+
+        let mut sel1 = FomodSelection::default();
+        sel1.selected.insert(m1.steps[0].groups[0].id.clone(), vec![]);
+
+        let mig_v2 = migrate_selection(Some(&m1), &sel1, None, &m2);
+        assert!(mig_v2.pending.is_some());
+
+        // v3 has same XML as v2, but user hasn't reviewed v2 yet -> pending stays!
+        let mig_v3 = migrate_selection(Some(&m2), &mig_v2.selection, mig_v2.pending.as_ref(), &m3);
+        let pending_v3 = mig_v3.pending.expect("unreviewed v2 pending must persist into v3");
+        assert_eq!(
+            pending_v3.new_plugin_ids,
+            vec![m3.steps[0].groups[0].plugins[1].id.clone()]
+        );
+    }
+
+    #[test]
+    fn migrate_ignores_changes_in_hidden_conditional_steps() {
+        let v1_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<config>
+  <moduleName>Mod</moduleName>
+  <installSteps order="Explicit">
+    <installStep name="Branch">
+      <optionalFileGroups>
+        <group name="Pick" type="SelectExactlyOne">
+          <plugins>
+            <plugin name="A">
+              <conditionFlags><flag name="branch">A</flag></conditionFlags>
+              <typeDescriptor><type name="Recommended"/></typeDescriptor>
+            </plugin>
+            <plugin name="B">
+              <conditionFlags><flag name="branch">B</flag></conditionFlags>
+              <typeDescriptor><type name="Optional"/></typeDescriptor>
+            </plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+    <installStep name="Only B">
+      <visible><flagDependency flag="branch" value="B"/></visible>
+      <optionalFileGroups>
+        <group name="Sub" type="SelectAny">
+          <plugins>
+            <plugin name="B1"><typeDescriptor><type name="Optional"/></typeDescriptor></plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+  </installSteps>
+</config>"#;
+        let v2_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<config>
+  <moduleName>Mod</moduleName>
+  <installSteps order="Explicit">
+    <installStep name="Branch">
+      <optionalFileGroups>
+        <group name="Pick" type="SelectExactlyOne">
+          <plugins>
+            <plugin name="A">
+              <conditionFlags><flag name="branch">A</flag></conditionFlags>
+              <typeDescriptor><type name="Recommended"/></typeDescriptor>
+            </plugin>
+            <plugin name="B">
+              <conditionFlags><flag name="branch">B</flag></conditionFlags>
+              <typeDescriptor><type name="Optional"/></typeDescriptor>
+            </plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+    <installStep name="Only B">
+      <visible><flagDependency flag="branch" value="B"/></visible>
+      <optionalFileGroups>
+        <group name="Sub" type="SelectAny">
+          <plugins>
+            <plugin name="B1"><typeDescriptor><type name="Optional"/></typeDescriptor></plugin>
+            <plugin name="B2"><typeDescriptor><type name="Optional"/></typeDescriptor></plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+  </installSteps>
+</config>"#;
+
+        let m1 = parse_module_config_bytes(v1_xml.as_bytes()).unwrap();
+        let m2 = parse_module_config_bytes(v2_xml.as_bytes()).unwrap();
+        let mut sel1 = default_selection(&m1);
+        sel1.selected.insert(
+            m1.steps[0].groups[0].id.clone(),
+            vec![m1.steps[0].groups[0].plugins[0].id.clone()], // A -> Only B is hidden
+        );
+
+        let migrated = migrate_selection(Some(&m1), &sel1, None, &m2);
+        assert!(
+            migrated.pending.is_none(),
+            "changes in hidden step should not require reconfiguration"
+        );
     }
 }

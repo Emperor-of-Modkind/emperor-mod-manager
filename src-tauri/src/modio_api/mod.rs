@@ -409,12 +409,14 @@ fn detail_from_mod(m: modio::types::mods::Mod) -> ModioModDetail {
     }
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn store_api_key(key: &str) -> Result<()> {
     let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)?;
     entry.set_password(key.trim())?;
     Ok(())
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn load_api_key() -> Result<Option<String>> {
     let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)?;
     match entry.get_password() {
@@ -428,6 +430,7 @@ pub fn load_api_key() -> Result<Option<String>> {
     }
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn clear_api_key() -> Result<()> {
     let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)?;
     match entry.delete_credential() {
