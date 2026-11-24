@@ -29,6 +29,7 @@ export function SocialSettingsSection({
   const [savingMutuals, setSavingMutuals] = useState(false);
   const [savingCacheRelay, setSavingCacheRelay] = useState(false);
   const [savingActiveLoadoutsFeed, setSavingActiveLoadoutsFeed] = useState(false);
+  const [savingPlayingStatus, setSavingPlayingStatus] = useState(false);
   const [privacyModalOpen, setPrivacyModalOpen] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -38,6 +39,7 @@ export function SocialSettingsSection({
   const allowCacheRelay = friendsState?.allow_cache_relay !== false;
   const shareActiveLoadoutsInFeed =
     friendsState?.share_active_loadouts_in_feed !== false;
+  const sharePlayingStatus = friendsState?.share_playing_status !== false;
 
   useEffect(() => {
     setNameInput(friendsState?.display_name ?? "");
@@ -154,6 +156,24 @@ export function SocialSettingsSection({
       onError(String(err));
     } finally {
       setSavingActiveLoadoutsFeed(false);
+    }
+  }
+
+  async function handleToggleSharePlayingStatus(share: boolean) {
+    onError(null);
+    setSavingPlayingStatus(true);
+    try {
+      const next = await api.setSharePlayingStatus(share);
+      onFriendsStateChange(next);
+      onNotice(
+        share
+          ? "Currently playing game status enabled."
+          : "Currently playing game status hidden.",
+      );
+    } catch (err) {
+      onError(String(err));
+    } finally {
+      setSavingPlayingStatus(false);
     }
   }
 
@@ -286,6 +306,21 @@ export function SocialSettingsSection({
         <p className="note">
           When turned off, active loadout changes are hidden from your feed and
           not broadcast to friends&apos; feeds. Saved collection updates still appear.
+        </p>
+      </div>
+
+      <div className="setting-block">
+        <span>Show game I&apos;m playing</span>
+        <SettingsToggle
+          checked={sharePlayingStatus}
+          disabled={savingPlayingStatus}
+          onChange={(checked) => void handleToggleSharePlayingStatus(checked)}
+        >
+          Display the game you are currently playing to connected friends
+        </SettingsToggle>
+        <p className="note">
+          When turned off, friends will only see that you are online, without
+          the game you are playing.
         </p>
       </div>
 

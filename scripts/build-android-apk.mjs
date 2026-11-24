@@ -244,7 +244,12 @@ function ensureRustTargets(opts, env) {
 }
 
 function ensureAndroidInit(env) {
-  if (!fs.existsSync(GEN_ANDROID)) {
+  const appGradle = path.join(GEN_ANDROID, "app", "build.gradle.kts");
+  if (!fs.existsSync(appGradle)) {
+    if (fs.existsSync(GEN_ANDROID)) {
+      log("Removing incomplete `src-tauri/gen/android` directory before re-initializing...");
+      fs.rmSync(GEN_ANDROID, { recursive: true, force: true });
+    }
     log("Initializing Tauri Android project (`src-tauri/gen/android`)...");
     run("npx", ["tauri", "android", "init", "--ci"], env);
   }

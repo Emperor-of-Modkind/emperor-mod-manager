@@ -192,6 +192,18 @@ fn default_share_active_loadouts_in_feed() -> bool {
     true
 }
 
+fn default_share_playing_status() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlayingGameStatus {
+    pub game_id: String,
+    pub game_title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<crate::launch::LaunchMode>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelayProfilePayload {
     pub peer_id: String,
@@ -247,6 +259,10 @@ pub struct PeerProfileSummary {
     /// `viewer_peer_id`, never in `SignedRelayProfile`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub relayed_invites: Vec<SignedFriendInvite>,
+    /// Currently running game launched by this peer, or `None` if idle or hidden.
+    /// Never included in `SignedRelayProfile`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub playing_game: Option<PlayingGameStatus>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -409,6 +425,8 @@ pub struct FriendsStore {
     pub allow_cache_relay: bool,
     #[serde(default = "default_share_active_loadouts_in_feed")]
     pub share_active_loadouts_in_feed: bool,
+    #[serde(default = "default_share_playing_status")]
+    pub share_playing_status: bool,
     #[serde(default)]
     pub appear_offline: bool,
     #[serde(default)]
@@ -446,6 +464,7 @@ impl Default for FriendsStore {
             allow_mutual_connections: default_allow_mutual_connections(),
             allow_cache_relay: default_allow_cache_relay(),
             share_active_loadouts_in_feed: default_share_active_loadouts_in_feed(),
+            share_playing_status: default_share_playing_status(),
             appear_offline: false,
             feed_events: Vec::new(),
             feed_last_read_at: None,
@@ -718,6 +737,8 @@ pub struct FriendsState {
     pub allow_cache_relay: bool,
     #[serde(default = "default_share_active_loadouts_in_feed")]
     pub share_active_loadouts_in_feed: bool,
+    #[serde(default = "default_share_playing_status")]
+    pub share_playing_status: bool,
     pub friends: Vec<FriendRecord>,
     pub pending_requests: Vec<PendingFriendRequest>,
     #[serde(default)]
@@ -2061,6 +2082,9 @@ pub fn load_friends_store(paths: &Paths) -> FriendsStore {
     let migration_now = now_rfc3339();
     for f in &mut store.friends {
         f.online = false;
+        if let Some(ref mut cached) = f.cached_profile {
+            cached.playing_game = None;
+        }
         if f.added_at.is_none() {
             f.added_at = f
                 .last_seen_at
@@ -2375,6 +2399,7 @@ pub fn build_local_profile(
     )
 }
 
+#[allow(dead_code)]
 pub fn build_local_profile_with_since(
     paths: &Paths,
     peer_id: &str,
@@ -2383,6 +2408,28 @@ pub fn build_local_profile_with_since(
     viewer_peer_id: Option<&str>,
     signing_key: Option<&SecretKey>,
     activity_since: Option<&str>,
+) -> PeerProfileSummary {
+    build_local_profile_with_since_and_playing(
+        paths,
+        peer_id,
+        store,
+        known_hashes,
+        viewer_peer_id,
+        signing_key,
+        activity_since,
+        None,
+    )
+}
+
+pub fn build_local_profile_with_since_and_playing(
+    paths: &Paths,
+    peer_id: &str,
+    store: &FriendsStore,
+    known_hashes: Option<&HashMap<String, String>>,
+    viewer_peer_id: Option<&str>,
+    signing_key: Option<&SecretKey>,
+    activity_since: Option<&str>,
+    playing_game: Option<PlayingGameStatus>,
 ) -> PeerProfileSummary {
     let mut collections = Vec::new();
     let mut relay_collections = Vec::new();
@@ -2604,6 +2651,12 @@ pub fn build_local_profile_with_since(
         None => Vec::new(),
     };
 
+    let playing_game = if store.share_playing_status && !store.appear_offline {
+        playing_game
+    } else {
+        None
+    };
+
     PeerProfileSummary {
         peer_id: peer_id.to_string(),
         display_name,
@@ -2615,6 +2668,7 @@ pub fn build_local_profile_with_since(
         signed_relay_profile,
         activity_events: Some(direct_activity_events),
         relayed_invites,
+        playing_game,
     }
 }
 
@@ -2702,6 +2756,7 @@ pub struct P2pService {
     app: Mutex<Option<AppHandle>>,
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     remote_host: OnceCell<Arc<crate::remote::host::RemoteHostService>>,
+    launch_states: OnceCell<Arc<Mutex<HashMap<String, crate::launch::GameLaunchState>>>>,
     incoming_sem: Arc<Semaphore>,
     hello_limiter: Mutex<HelloRateLimiter>,
     profile_limiter: Mutex<PeerProfileRateLimiter>,
@@ -2902,6 +2957,7 @@ impl P2pService {
             app: Mutex::new(None),
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             remote_host: OnceCell::new(),
+            launch_states: OnceCell::new(),
             incoming_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_INCOMING)),
             hello_limiter: Mutex::new(HelloRateLimiter::default()),
             profile_limiter: Mutex::new(PeerProfileRateLimiter::default()),
@@ -2912,6 +2968,31 @@ impl P2pService {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     pub fn set_remote_host(&self, host: Arc<crate::remote::host::RemoteHostService>) {
         let _ = self.remote_host.set(host);
+    }
+
+    pub fn set_launch_states(
+        &self,
+        launch_states: Arc<Mutex<HashMap<String, crate::launch::GameLaunchState>>>,
+    ) {
+        let _ = self.launch_states.set(launch_states);
+    }
+
+    fn current_playing_game(&self) -> Option<PlayingGameStatus> {
+        let states_arc = self.launch_states.get()?;
+        let running = {
+            let map = states_arc.lock().ok()?;
+            map.values()
+                .filter(|s| s.phase == crate::launch::LaunchPhase::Running)
+                .max_by(|a, b| a.started_at.cmp(&b.started_at).then_with(|| a.game_id.cmp(&b.game_id)))
+                .cloned()?
+        };
+        let cfg = load_config(&self.paths).ok()?;
+        let game = cfg.managed_games.iter().find(|g| g.id == running.game_id)?;
+        Some(PlayingGameStatus {
+            game_id: game.id.clone(),
+            game_title: game.title.clone(),
+            mode: Some(running.mode),
+        })
     }
 
     pub fn start(self: &Arc<Self>, app: AppHandle) {
@@ -3283,8 +3364,9 @@ impl P2pService {
                         let signing_key = self.secret_key.get().cloned();
                         let profile = tokio::task::spawn_blocking(move || -> Result<PeerProfileSummary> {
                             let _ = svc.sync_local_activity();
+                            let playing = svc.current_playing_game();
                             let snapshot_store = svc.store.lock().map_err(|e| anyhow!("{e}"))?.clone();
-                            Ok(build_local_profile_with_since(
+                            Ok(build_local_profile_with_since_and_playing(
                                 &svc.paths,
                                 &local_id,
                                 &snapshot_store,
@@ -3292,6 +3374,7 @@ impl P2pService {
                                 Some(&viewer),
                                 signing_key.as_ref(),
                                 sanitized_since.as_deref(),
+                                playing,
                             ))
                         })
                         .await
@@ -3435,6 +3518,7 @@ impl P2pService {
             allow_mutual_connections,
             allow_cache_relay,
             share_active_loadouts_in_feed,
+            share_playing_status,
             mut friends,
             pending_requests,
             queued_invites,
@@ -3471,6 +3555,7 @@ impl P2pService {
                 store.allow_mutual_connections,
                 store.allow_cache_relay,
                 store.share_active_loadouts_in_feed,
+                store.share_playing_status,
                 store.friends.clone(),
                 store.pending_requests.clone(),
                 store.queued_invites.clone(),
@@ -3492,6 +3577,7 @@ impl P2pService {
             allow_mutual_connections,
             allow_cache_relay,
             share_active_loadouts_in_feed,
+            share_playing_status,
             friends,
             pending_requests,
             queued_invites,
@@ -3628,6 +3714,16 @@ impl P2pService {
         {
             let mut store = self.store.lock().map_err(|e| anyhow!("{e}"))?;
             store.share_active_loadouts_in_feed = share;
+            save_friends_store(&self.paths, &store)?;
+        }
+        self.emit_changed();
+        self.get_state()
+    }
+
+    pub fn set_share_playing_status(&self, share: bool) -> Result<FriendsState> {
+        {
+            let mut store = self.store.lock().map_err(|e| anyhow!("{e}"))?;
+            store.share_playing_status = share;
             save_friends_store(&self.paths, &store)?;
         }
         self.emit_changed();
@@ -4611,6 +4707,15 @@ impl P2pService {
             &mut profile.collections,
             &mut profile.friends,
         );
+        profile.playing_game = profile.playing_game.take().and_then(|mut pg| {
+            pg.game_id = sanitize_short_text(&pg.game_id, MAX_COLLECTION_ID_CHARS);
+            pg.game_title = sanitize_short_text(&pg.game_title, MAX_COLLECTION_NAME_CHARS);
+            if pg.game_id.is_empty() || pg.game_title.is_empty() {
+                None
+            } else {
+                Some(pg)
+            }
+        });
         if let Some(ref relay) = profile.signed_relay_profile {
             if let Err(e) = verify_signed_relay_profile(peer_id, relay) {
                 log::warn!("Dropped invalid signed_relay_profile from {peer_id}: {e}");
@@ -4676,12 +4781,17 @@ impl P2pService {
                         || prev.allow_mutual_connections != profile.allow_mutual_connections
                 }
             };
+            let playing_game_changed = match &f.cached_profile {
+                None => profile.playing_game.is_some(),
+                Some(prev) => prev.playing_game != profile.playing_game,
+            };
             changed = !f.online
                 || f.cached_via_peer_name.is_some()
                 || f.display_name != profile.display_name
                 || f.profile_picture != profile.profile_picture
                 || collections_changed
-                || friends_changed;
+                || friends_changed
+                || playing_game_changed;
             f.display_name = profile.display_name.clone();
             f.profile_picture = profile.profile_picture.clone();
             f.cached_profile = Some(profile);
@@ -4789,6 +4899,7 @@ impl P2pService {
                 signed_relay_profile: Some(signed),
                 activity_events: payload.activity_events,
                 relayed_invites: Vec::new(),
+                playing_game: None,
             };
 
             if incoming_activity.is_none() {
@@ -5039,6 +5150,12 @@ impl P2pService {
                         f.online = false;
                         went_offline = true;
                     }
+                    if let Some(ref mut cached) = f.cached_profile {
+                        if cached.playing_game.is_some() {
+                            cached.playing_game = None;
+                            went_offline = true;
+                        }
+                    }
                 }
                 if went_offline {
                     let _ = save_friends_store(&self.paths, &store);
@@ -5176,6 +5293,12 @@ impl P2pService {
                         f.online = false;
                         went_offline = true;
                     }
+                    if let Some(ref mut cached) = f.cached_profile {
+                        if cached.playing_game.is_some() {
+                            cached.playing_game = None;
+                            went_offline = true;
+                        }
+                    }
                 }
                 if went_offline {
                     let _ = save_friends_store(&self.paths, &store);
@@ -5304,6 +5427,7 @@ mod tests {
                     signed_relay_profile: None,
                     activity_events: None,
                     relayed_invites: vec![],
+                    playing_game: None,
                 }),
                 syncing_my_collections: Vec::new(),
                 cached_via_peer_name: None,
@@ -5315,6 +5439,7 @@ mod tests {
             allow_mutual_connections: true,
             allow_cache_relay: true,
             share_active_loadouts_in_feed: true,
+            share_playing_status: true,
             appear_offline: false,
             feed_events: vec![],
             feed_last_read_at: None,
@@ -5611,6 +5736,7 @@ mod tests {
             signed_relay_profile: None,
             activity_events: None,
             relayed_invites: vec![],
+            playing_game: None,
         };
         assert!(svc.apply_fetched_profile(&peer_id, initial).unwrap());
 
@@ -5636,6 +5762,7 @@ mod tests {
             signed_relay_profile: None,
             activity_events: None,
             relayed_invites: vec![],
+            playing_game: None,
         };
         assert!(!svc.apply_fetched_profile(&peer_id, delta_same).unwrap());
         assert_eq!(
@@ -5665,6 +5792,7 @@ mod tests {
             signed_relay_profile: None,
             activity_events: None,
             relayed_invites: vec![],
+            playing_game: None,
         };
         assert!(svc.apply_fetched_profile(&peer_id, updated).unwrap());
         assert_eq!(
@@ -5879,6 +6007,7 @@ mod tests {
             signed_relay_profile: None,
             activity_events: None,
             relayed_invites: vec![],
+            playing_game: None,
         };
         assert!(svc.apply_fetched_profile(&peer_id, wrong_peer).is_err());
 
@@ -5894,6 +6023,7 @@ mod tests {
             signed_relay_profile: None,
             activity_events: None,
             relayed_invites: vec![],
+            playing_game: None,
         };
         assert!(svc.apply_fetched_profile(&peer_id, malicious).unwrap());
         let state = svc.get_state().unwrap();
@@ -5912,6 +6042,7 @@ mod tests {
             signed_relay_profile: None,
             activity_events: None,
             relayed_invites: vec![],
+            playing_game: None,
         };
         let _ = svc.apply_fetched_profile(&peer_id, asset_avatar).unwrap();
         assert!(svc.get_state().unwrap().friends[0].profile_picture.is_none());
@@ -6043,6 +6174,7 @@ mod tests {
             signed_relay_profile: None,
             activity_events: None,
             relayed_invites: vec![],
+            playing_game: None,
         };
         svc.apply_fetched_profile(&peer_id, baseline).unwrap();
         assert!(svc.get_state().unwrap().feed_events.is_empty());
@@ -6069,6 +6201,7 @@ mod tests {
             signed_relay_profile: None,
             activity_events: None,
             relayed_invites: vec![],
+            playing_game: None,
         };
         svc.apply_fetched_profile(&peer_id, delta_same).unwrap();
         assert!(svc.get_state().unwrap().feed_events.is_empty());
@@ -6116,6 +6249,7 @@ mod tests {
             signed_relay_profile: None,
             activity_events: None,
             relayed_invites: vec![],
+            playing_game: None,
         };
         svc.apply_fetched_profile(&peer_id, updated).unwrap();
         let state = svc.get_state().unwrap();
@@ -6180,6 +6314,7 @@ mod tests {
             signed_relay_profile: None,
             activity_events: None,
             relayed_invites: vec![],
+            playing_game: None,
         };
         svc.apply_fetched_profile(&peer_id, renamed).unwrap();
         let state = svc.get_state().unwrap();
@@ -6210,6 +6345,7 @@ mod tests {
             signed_relay_profile: None,
             activity_events: None,
             relayed_invites: vec![],
+            playing_game: None,
         };
         svc.apply_fetched_profile(&peer_id, revoked).unwrap();
         let state = svc.get_state().unwrap();
@@ -6260,6 +6396,7 @@ mod tests {
             signed_relay_profile: None,
             activity_events: None,
             relayed_invites: vec![],
+            playing_game: None,
         };
         reloaded.apply_fetched_profile(&peer_id, readded).unwrap();
         assert_eq!(reloaded.get_state().unwrap().feed_events.len(), 1);
@@ -6389,6 +6526,7 @@ mod tests {
                 signed_relay_profile: None,
                 activity_events: None,
                 relayed_invites: vec![],
+                playing_game: None,
             }),
             syncing_my_collections: Vec::new(),
             cached_via_peer_name: None,
@@ -6516,6 +6654,7 @@ mod tests {
             signed_relay_profile: None,
             activity_events: None,
             relayed_invites: vec![],
+            playing_game: None,
         };
 
         assert!(svc.apply_fetched_profile(&bob_id, profile).unwrap());
@@ -6698,6 +6837,7 @@ mod tests {
                 signed_relay_profile: None,
                 activity_events: None,
                 relayed_invites: vec![],
+                playing_game: None,
             }),
             syncing_my_collections: Vec::new(),
             cached_via_peer_name: None,
@@ -6722,6 +6862,7 @@ mod tests {
                 signed_relay_profile: None,
                 activity_events: None,
                 relayed_invites: vec![],
+                playing_game: None,
             }),
             syncing_my_collections: Vec::new(),
             cached_via_peer_name: None,
@@ -7012,6 +7153,7 @@ mod tests {
                     signed_relay_profile: None,
                     activity_events: None,
                     relayed_invites: vec![],
+                    playing_game: None,
                 }),
                 syncing_my_collections: Vec::new(),
                 cached_via_peer_name: None,
@@ -7163,6 +7305,7 @@ mod tests {
                 signed_relay_profile: Some(carol_relay),
                 activity_events: None,
                 relayed_invites: vec![],
+                playing_game: None,
             }),
             syncing_my_collections: Vec::new(),
             cached_via_peer_name: None,
@@ -7485,6 +7628,7 @@ mod tests {
                 signed_relay_profile: None,
                 activity_events: None,
                 relayed_invites: vec![],
+                playing_game: None,
             }),
             syncing_my_collections: syncing,
             cached_via_peer_name: None,
@@ -7641,6 +7785,7 @@ mod tests {
                 signed_relay_profile: Some(carol_relay),
                 activity_events: None,
                 relayed_invites: vec![],
+                playing_game: None,
             }),
             syncing_my_collections: Vec::new(),
             cached_via_peer_name: None,
@@ -7827,6 +7972,7 @@ mod tests {
                 signed_relay_profile: Some(carol_relay),
                 activity_events: None,
                 relayed_invites: vec![],
+                playing_game: None,
             }),
             syncing_my_collections: Vec::new(),
             cached_via_peer_name: None,
@@ -8171,6 +8317,7 @@ mod tests {
             signed_relay_profile: None,
             activity_events: Some(vec![ev_after_added.clone(), ev_before_added.clone()]),
             relayed_invites: vec![],
+            playing_game: None,
         };
         svc.apply_fetched_profile(&alice_id, profile.clone()).unwrap();
         let state = svc.get_state().unwrap();
@@ -8209,6 +8356,7 @@ mod tests {
             signed_relay_profile: None,
             activity_events: Some(vec![ev_after_coalesced.clone()]),
             relayed_invites: vec![],
+            playing_game: None,
         };
         svc.apply_fetched_profile(&alice_id, profile_coalesced).unwrap();
         let state_coalesced = svc.get_state().unwrap();
@@ -8240,6 +8388,7 @@ mod tests {
             signed_relay_profile: None,
             activity_events: Some(vec![ev_after_coalesced]),
             relayed_invites: vec![],
+            playing_game: None,
         };
         svc.apply_fetched_profile(&alice_id, profile_resync).unwrap();
         assert!(svc.get_state().unwrap().feed_events.is_empty());
@@ -8792,6 +8941,7 @@ mod tests {
                 signed_relay_profile: None,
                 activity_events: None,
                 relayed_invites: Vec::new(),
+                playing_game: None,
             }),
             syncing_my_collections: Vec::new(),
             cached_via_peer_name: None,
@@ -9180,5 +9330,173 @@ mod tests {
             "2026-11-22T11:00:00Z",
         );
         assert!(store_off.local_activity.is_empty());
+    }
+
+    #[test]
+    fn share_playing_status_toggles_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_dir: dir.path().join("cfg"),
+            data_dir: dir.path().join("data"),
+            cache_dir: dir.path().join("cache"),
+        };
+        let svc = P2pService::new(paths.clone());
+        assert!(svc.get_state().unwrap().share_playing_status);
+
+        let off = svc.set_share_playing_status(false).unwrap();
+        assert!(!off.share_playing_status);
+
+        let reloaded = P2pService::new(paths);
+        assert!(!reloaded.get_state().unwrap().share_playing_status);
+        let on = reloaded.set_share_playing_status(true).unwrap();
+        assert!(on.share_playing_status);
+    }
+
+    #[test]
+    fn build_local_profile_respects_share_playing_status_and_appear_offline() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_dir: dir.path().join("cfg"),
+            data_dir: dir.path().join("data"),
+            cache_dir: dir.path().join("cache"),
+        };
+        let mut store = FriendsStore::default();
+        let playing = PlayingGameStatus {
+            game_id: "skyrimse".into(),
+            game_title: "Skyrim Special Edition".into(),
+            mode: Some(crate::launch::LaunchMode::Modded),
+        };
+
+        let visible = build_local_profile_with_since_and_playing(
+            &paths,
+            "self",
+            &store,
+            None,
+            None,
+            None,
+            None,
+            Some(playing.clone()),
+        );
+        assert_eq!(visible.playing_game, Some(playing.clone()));
+
+        store.share_playing_status = false;
+        let hidden_setting = build_local_profile_with_since_and_playing(
+            &paths,
+            "self",
+            &store,
+            None,
+            None,
+            None,
+            None,
+            Some(playing.clone()),
+        );
+        assert_eq!(hidden_setting.playing_game, None);
+
+        store.share_playing_status = true;
+        store.appear_offline = true;
+        let hidden_offline = build_local_profile_with_since_and_playing(
+            &paths,
+            "self",
+            &store,
+            None,
+            None,
+            None,
+            None,
+            Some(playing),
+        );
+        assert_eq!(hidden_offline.playing_game, None);
+    }
+
+    #[test]
+    fn apply_fetched_profile_sanitizes_playing_game_and_cold_load_clears_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_dir: dir.path().join("cfg"),
+            data_dir: dir.path().join("data"),
+            cache_dir: dir.path().join("cache"),
+        };
+        let friend_key = SecretKey::generate();
+        let friend_pid = friend_key.public().to_string();
+        let store = FriendsStore {
+            display_name: "Me".into(),
+            display_name_set: true,
+            friends: vec![FriendRecord {
+                peer_id: friend_pid.clone(),
+                display_name: "Alice".into(),
+                profile_picture: None,
+                addr: EndpointAddr::new(friend_key.public()),
+                status: FriendStatus::Connected,
+                online: false,
+                last_seen_at: None,
+                added_at: None,
+                cached_profile: None,
+                syncing_my_collections: Vec::new(),
+                cached_via_peer_name: None,
+            }],
+            ..Default::default()
+        };
+        save_friends_store(&paths, &store).unwrap();
+        let svc = P2pService::new(paths.clone());
+
+        let profile_playing = PeerProfileSummary {
+            peer_id: friend_pid.clone(),
+            display_name: "Alice".into(),
+            profile_picture: None,
+            updated_at: "2026-11-23T18:00:00Z".into(),
+            collections: Vec::new(),
+            friends: None,
+            allow_mutual_connections: true,
+            signed_relay_profile: None,
+            activity_events: Some(Vec::new()),
+            relayed_invites: Vec::new(),
+            playing_game: Some(PlayingGameStatus {
+                game_id: "cyberpunk2077".into(),
+                game_title: "Cyberpunk\u{202E} 2077".into(),
+                mode: Some(crate::launch::LaunchMode::Modded),
+            }),
+        };
+        assert!(svc.apply_fetched_profile(&friend_pid, profile_playing).unwrap());
+        let state = svc.get_state().unwrap();
+        let pg = state.friends[0]
+            .cached_profile
+            .as_ref()
+            .unwrap()
+            .playing_game
+            .as_ref()
+            .unwrap();
+        assert_eq!(pg.game_title, "Cyberpunk 2077");
+        assert_eq!(pg.mode, Some(crate::launch::LaunchMode::Modded));
+
+        // Same playing_game on next sync reports no change.
+        let profile_same = PeerProfileSummary {
+            peer_id: friend_pid.clone(),
+            display_name: "Alice".into(),
+            profile_picture: None,
+            updated_at: "2026-11-23T18:00:25Z".into(),
+            collections: Vec::new(),
+            friends: None,
+            allow_mutual_connections: true,
+            signed_relay_profile: None,
+            activity_events: Some(Vec::new()),
+            relayed_invites: Vec::new(),
+            playing_game: Some(PlayingGameStatus {
+                game_id: "cyberpunk2077".into(),
+                game_title: "Cyberpunk 2077".into(),
+                mode: Some(crate::launch::LaunchMode::Modded),
+            }),
+        };
+        assert!(!svc.apply_fetched_profile(&friend_pid, profile_same).unwrap());
+
+        // Cold reload clears online and cached playing_game.
+        let reloaded = load_friends_store(&paths);
+        assert!(!reloaded.friends[0].online);
+        assert_eq!(
+            reloaded.friends[0]
+                .cached_profile
+                .as_ref()
+                .unwrap()
+                .playing_game,
+            None
+        );
     }
 }

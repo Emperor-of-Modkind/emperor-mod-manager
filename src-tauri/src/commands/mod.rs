@@ -189,6 +189,12 @@ pub struct AppState {
     pub p2p: Arc<crate::p2p::P2pService>,
     /// Mobile companion remote host service (iroh `emperor-remote/1`).
     pub remote_host: Arc<crate::remote::host::RemoteHostService>,
+    /// Optional Steam Web API key (stored in keyring / encrypted secret store).
+    pub steam_api_key: Mutex<Option<String>>,
+    /// Cached uninstalled launcher library sections from the latest scan.
+    pub library_sections: Mutex<Vec<detection::libraries::LibrarySection>>,
+    /// Active Heroic CLI install jobs keyed by job_id -> cancel flag.
+    pub launcher_install_jobs: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
 }
 
 /// Enough to keep a fast link busy without starving any single transfer.
@@ -316,6 +322,7 @@ impl AppState {
         }
         let api_key = load_key_with_fallback(&paths)?;
         let modio_api_key = load_modio_key_with_fallback(&paths)?;
+        let steam_api_key = load_steam_key_with_fallback(&paths);
         let mut recent = load_recent_downloads(&paths);
         let recent_limit =
             config::clamp_recent_downloads_limit(config.recent_downloads_limit) as usize;
@@ -326,9 +333,11 @@ impl AppState {
             save_recent_downloads(&paths, &recent);
             save_recent_restart_meta(&paths, &recent, &restart_meta, now_unix_secs());
         }
+        let launch_states = Arc::new(Mutex::new(HashMap::new()));
         let remote_host = Arc::new(crate::remote::host::RemoteHostService::new(&paths));
         let p2p = crate::p2p::P2pService::new(paths.clone());
         p2p.set_remote_host(remote_host.clone());
+        p2p.set_launch_states(launch_states.clone());
         Ok(Self {
             paths,
             config: Mutex::new(config),
@@ -370,10 +379,13 @@ impl AppState {
                 .read_timeout(Duration::from_secs(60))
                 .build()
                 .expect("cdn_http client"),
-            launch_states: Arc::new(Mutex::new(HashMap::new())),
+            launch_states,
             close_flags: Arc::new(Mutex::new(HashMap::new())),
             p2p,
             remote_host,
+            steam_api_key: Mutex::new(steam_api_key),
+            library_sections: Mutex::new(Vec::new()),
+            launcher_install_jobs: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -1283,6 +1295,221 @@ fn art_paths(games: &[DetectedGame]) -> Vec<&str> {
                 .chain(game.icon_path.as_deref())
         })
         .collect()
+}
+
+fn load_steam_key_with_fallback(paths: &Paths) -> Option<String> {
+    if let Ok(entry) = keyring::Entry::new(config::KEYRING_SERVICE, config::STEAM_API_KEYRING_USER) {
+        if let Ok(secret) = entry.get_password() {
+            let trimmed = secret.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    let file = paths.config_dir.join("steam_api_key");
+    config::secret_store::load_encrypted_secret(&file)
+        .ok()
+        .flatten()
+}
+
+fn save_steam_key_with_fallback(paths: &Paths, key: &str) -> Result<(), String> {
+    let trimmed = key.trim();
+    if trimmed.is_empty() {
+        return Err("Steam API key cannot be empty".to_string());
+    }
+    let file = paths.config_dir.join("steam_api_key");
+    if let Ok(entry) = keyring::Entry::new(config::KEYRING_SERVICE, config::STEAM_API_KEYRING_USER) {
+        if entry.set_password(trimmed).is_ok() {
+            let _ = std::fs::remove_file(&file);
+            return Ok(());
+        }
+    }
+    config::secret_store::store_encrypted_secret(&file, trimmed).map_err(|e| e.to_string())
+}
+
+fn clear_steam_key_with_fallback(paths: &Paths) {
+    if let Ok(entry) = keyring::Entry::new(config::KEYRING_SERVICE, config::STEAM_API_KEYRING_USER) {
+        let _ = entry.delete_credential();
+    }
+    let file = paths.config_dir.join("steam_api_key");
+    let _ = std::fs::remove_file(&file);
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SteamSyncStatus {
+    pub detected_steam_id: Option<String>,
+    pub steam_id_override: Option<String>,
+    pub effective_steam_id: Option<String>,
+    pub has_api_key: bool,
+    pub sync_enabled: bool,
+}
+
+fn build_steam_sync_status(state: &AppState) -> Result<SteamSyncStatus, String> {
+    let cfg = state.config.lock().map_err(|e| e.to_string())?;
+    let has_api_key = state
+        .steam_api_key
+        .lock()
+        .map_err(|e| e.to_string())?
+        .is_some();
+    let detected = detection::libraries::steam_library::detect_local_steam_id();
+    let override_id = cfg
+        .steam_id_override
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let effective = override_id.clone().or_else(|| detected.clone());
+    Ok(SteamSyncStatus {
+        detected_steam_id: detected,
+        steam_id_override: override_id,
+        effective_steam_id: effective,
+        has_api_key,
+        sync_enabled: cfg.steam_library_sync_enabled,
+    })
+}
+
+#[tauri::command]
+pub async fn scan_launcher_libraries(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    refresh_remote: Option<bool>,
+) -> Result<Vec<detection::libraries::LibrarySection>, String> {
+    let detected = state
+        .detected_games
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clone()
+        .unwrap_or_default();
+    let (managed, steam_id_override, sync_enabled) = {
+        let cfg = state.config.lock().map_err(|e| e.to_string())?;
+        (
+            cfg.managed_games.clone(),
+            cfg.steam_id_override.clone(),
+            cfg.steam_library_sync_enabled,
+        )
+    };
+    let api_key = state
+        .steam_api_key
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clone();
+    let cache_dir = state.paths.cache_dir.clone();
+    let opts = detection::libraries::SteamSyncOptions {
+        steam_id_override,
+        api_key,
+        sync_enabled,
+        refresh_remote: refresh_remote.unwrap_or(false),
+    };
+
+    let mut sections =
+        detection::libraries::scan_all_libraries(&cache_dir, &detected, &managed, opts).await;
+    let covers_dir = state.paths.cache_dir.join("covers");
+    detection::apply_cached_catalog_covers_to_libraries(&mut sections, &covers_dir);
+
+    let cover_paths: Vec<String> = sections
+        .iter()
+        .flat_map(|s| s.games.iter().filter_map(|g| g.cover_path.clone()))
+        .collect();
+    allow_cover_files(&app, cover_paths.iter().map(String::as_str));
+
+    *state
+        .library_sections
+        .lock()
+        .map_err(|e| e.to_string())? = sections.clone();
+
+    Ok(sections)
+}
+
+#[tauri::command]
+pub async fn get_launcher_install_options(
+    state: State<'_, AppState>,
+    source: detection::libraries::LibrarySource,
+    external_id: String,
+) -> Result<crate::launcher_install::LauncherInstallOptions, String> {
+    let game = {
+        let sections = state.library_sections.lock().map_err(|e| e.to_string())?;
+        sections
+            .iter()
+            .filter(|s| s.source == source)
+            .flat_map(|s| s.games.iter())
+            .find(|g| g.external_id == external_id)
+            .cloned()
+            .ok_or_else(|| format!("Library game `{external_id}` not found in cached libraries"))?
+    };
+    blocking(move || Ok(crate::launcher_install::build_install_options(&game))).await
+}
+
+#[tauri::command]
+pub async fn request_launcher_install(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: crate::launcher_install::LauncherInstallRequest,
+) -> Result<crate::launcher_install::LauncherInstallResult, String> {
+    match request.method {
+        crate::launcher_install::InstallMethod::Handoff => {
+            crate::launcher_install::open_launcher_handoff(&app, &request)
+                .map_err(|e| e.to_string())
+        }
+        crate::launcher_install::InstallMethod::HeroicCli => {
+            crate::launcher_install::start_heroic_cli_install(
+                app,
+                state.launcher_install_jobs.clone(),
+                request,
+            )
+            .map_err(|e| e.to_string())
+        }
+    }
+}
+
+#[tauri::command]
+pub fn cancel_launcher_install(
+    state: State<'_, AppState>,
+    job_id: String,
+) -> Result<(), String> {
+    let jobs = state
+        .launcher_install_jobs
+        .lock()
+        .map_err(|e| e.to_string())?;
+    if let Some(flag) = jobs.get(&job_id) {
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_steam_sync_status(state: State<'_, AppState>) -> Result<SteamSyncStatus, String> {
+    build_steam_sync_status(&state)
+}
+
+#[tauri::command]
+pub fn set_steam_sync_config(
+    state: State<'_, AppState>,
+    steam_id_override: Option<String>,
+    api_key: Option<String>,
+    enabled: bool,
+) -> Result<SteamSyncStatus, String> {
+    if let Some(key) = api_key.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+        save_steam_key_with_fallback(&state.paths, key)?;
+        *state.steam_api_key.lock().map_err(|e| e.to_string())? = Some(key.to_string());
+    }
+    {
+        let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
+        cfg.steam_id_override = steam_id_override
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        cfg.steam_library_sync_enabled = enabled;
+        config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())?;
+    }
+    build_steam_sync_status(&state)
+}
+
+#[tauri::command]
+pub fn clear_steam_api_key(state: State<'_, AppState>) -> Result<SteamSyncStatus, String> {
+    clear_steam_key_with_fallback(&state.paths);
+    *state.steam_api_key.lock().map_err(|e| e.to_string())? = None;
+    build_steam_sync_status(&state)
 }
 
 #[derive(Debug, Deserialize)]
@@ -12796,6 +13023,17 @@ pub fn set_share_active_loadouts_in_feed(
     state
         .p2p
         .set_share_active_loadouts_in_feed(share)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn set_share_playing_status(
+    state: State<'_, AppState>,
+    share: bool,
+) -> Result<crate::p2p::FriendsState, String> {
+    state
+        .p2p
+        .set_share_playing_status(share)
         .map_err(|e| e.to_string())
 }
 

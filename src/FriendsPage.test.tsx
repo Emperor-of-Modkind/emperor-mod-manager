@@ -1520,4 +1520,90 @@ describe("FriendsPage", () => {
     });
     host.remove();
   });
+
+  it("shows currently playing game on online friend cards and hides it when offline", async () => {
+    vi.mocked(api.getFriendsState).mockResolvedValue({
+      endpoint_ready: true,
+      peer_id: "peer_self",
+      join_code: "emperor-friend1:self",
+      display_name: "Me",
+      display_name_set: true,
+      friends: [
+        {
+          peer_id: "peer_alice",
+          display_name: "Alice",
+          status: "connected",
+          online: true,
+          cached_profile: {
+            peer_id: "peer_alice",
+            display_name: "Alice",
+            updated_at: "2026-11-23T18:00:00Z",
+            collections: [],
+            playing_game: {
+              game_id: "cyberpunk2077",
+              game_title: "Cyberpunk 2077",
+              mode: "modded",
+            },
+          },
+        },
+        {
+          peer_id: "peer_bob",
+          display_name: "Bob",
+          status: "connected",
+          online: false,
+          last_seen_at: "2026-11-23T17:00:00Z",
+          cached_profile: {
+            peer_id: "peer_bob",
+            display_name: "Bob",
+            updated_at: "2026-11-23T17:00:00Z",
+            collections: [],
+            playing_game: {
+              game_id: "skyrimse",
+              game_title: "Skyrim Special Edition",
+              mode: "unmodded",
+            },
+          },
+        },
+      ],
+      pending_requests: [],
+      local_collections: [],
+      feed_events: [],
+    });
+
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const root: Root = createRoot(host);
+
+    await act(async () => {
+      root.render(
+        <FriendsPage
+          active={true}
+          managed={[]}
+          activeGameId={null}
+          onError={() => {}}
+          onNotice={() => {}}
+          onCollectionSynced={() => {}}
+        />,
+      );
+    });
+    await flush();
+
+    // Switch to the Friends tab.
+    const friendsTabBtn = Array.from(
+      host.querySelectorAll<HTMLButtonElement>("button"),
+    ).find((b) => b.textContent?.includes("Friends"));
+    expect(friendsTabBtn).toBeTruthy();
+    await act(async () => {
+      friendsTabBtn!.click();
+    });
+    await flush();
+
+    expect(host.textContent).toContain("Playing Cyberpunk 2077 (Modded)");
+    expect(host.textContent).not.toContain("Playing Skyrim Special Edition");
+
+    await act(async () => {
+      root.unmount();
+    });
+    host.remove();
+  });
 });

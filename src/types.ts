@@ -994,6 +994,12 @@ export type QueuedFriendInvite = {
   relayed_via_peer_ids?: string[];
 };
 
+export type PlayingGameStatus = {
+  game_id: string;
+  game_title: string;
+  mode?: "modded" | "unmodded" | null;
+};
+
 export type PeerProfileSummary = {
   peer_id: string;
   display_name: string;
@@ -1002,6 +1008,7 @@ export type PeerProfileSummary = {
   collections: FriendShareRef[];
   friends?: SharedFriendRef[] | null;
   allow_mutual_connections?: boolean;
+  playing_game?: PlayingGameStatus | null;
 };
 
 export type FriendStatus = "connected" | "pending_outgoing";
@@ -1084,6 +1091,7 @@ export type FriendsState = {
   allow_mutual_connections?: boolean;
   allow_cache_relay?: boolean;
   share_active_loadouts_in_feed?: boolean;
+  share_playing_status?: boolean;
   friends: FriendRecord[];
   pending_requests: PendingFriendRequest[];
   queued_invites?: QueuedFriendInvite[];
@@ -1539,3 +1547,117 @@ export type RemoteDownloadControl =
   | { action: "restart"; id: string }
   | { action: "remove"; id: string }
   | { action: "clear_recent" };
+
+export type LibrarySource =
+  | "steam"
+  | "heroic_epic"
+  | "heroic_gog"
+  | "heroic_amazon"
+  | "epic_launcher"
+  | "lutris";
+
+export type LibraryDlcOption = {
+  app_name: string;
+  title: string;
+  install_size_bytes?: number | null;
+};
+
+export type LibraryGameMeta = {
+  heroic_runner?: string | null;
+  epic_namespace?: string | null;
+  epic_catalog_item_id?: string | null;
+  epic_app_name?: string | null;
+  lutris_slug?: string | null;
+  lutris_service?: string | null;
+  dlcs: LibraryDlcOption[];
+  languages: string[];
+};
+
+export type LibraryGame = {
+  id: string;
+  title: string;
+  source: LibrarySource;
+  launcher: string;
+  external_id: string;
+  supported: boolean;
+  plugin_id: string | null;
+  nexus_domain: string | null;
+  cover_path: string | null;
+  cover_url: string | null;
+  cover_fallbacks?: string[];
+  install_size_bytes: number | null;
+  platforms: string[];
+  can_cli_install: boolean;
+  metadata: LibraryGameMeta;
+};
+
+export type LibrarySection = {
+  source: LibrarySource;
+  label: string;
+  total_owned: number;
+  games: LibraryGame[];
+  warning: string | null;
+};
+
+export type SteamLibraryFolderInfo = {
+  path: string;
+  free_bytes: number | null;
+};
+
+export type InstallMethod = "handoff" | "heroic_cli";
+
+export type LauncherInstallOptions = {
+  source: LibrarySource;
+  external_id: string;
+  title: string;
+  default_install_dir: string | null;
+  default_dir_free_bytes: number | null;
+  steam_libraries: SteamLibraryFolderInfo[];
+  platforms: string[];
+  dlcs: LibraryDlcOption[];
+  languages: string[];
+  cli_available: boolean;
+  cli_name: string | null;
+  handoff_url: string | null;
+  handoff_note: string;
+};
+
+export type LauncherInstallRequest = {
+  game_id: string;
+  source: LibrarySource;
+  external_id: string;
+  title: string;
+  method: InstallMethod;
+  install_dir?: string | null;
+  platform?: string | null;
+  language?: string | null;
+  dlc_ids: string[];
+  metadata: LibraryGameMeta;
+};
+
+export type LauncherInstallResult = {
+  job_id: string | null;
+  method: InstallMethod;
+  handoff_url: string | null;
+  message: string;
+};
+
+export type LauncherInstallProgress = {
+  job_id: string;
+  game_id: string;
+  title: string;
+  source: LibrarySource;
+  phase: "starting" | "downloading" | "verifying" | "completed" | "failed" | "cancelled";
+  percent: number | null;
+  speed_bps: number | null;
+  message: string | null;
+  error: string | null;
+};
+
+export type SteamSyncStatus = {
+  detected_steam_id: string | null;
+  steam_id_override: string | null;
+  effective_steam_id: string | null;
+  has_api_key: boolean;
+  sync_enabled: boolean;
+};

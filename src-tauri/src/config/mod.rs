@@ -14,6 +14,7 @@ pub const APP_NAME: &str = "emperor-mod-manager";
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const KEYRING_SERVICE: &str = "emperor-mod-manager";
 pub const KEYRING_USER: &str = "nexus-api-key";
+pub const STEAM_API_KEYRING_USER: &str = "steam-api-key";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -163,6 +164,12 @@ pub struct AppConfig {
     /// When true, paired mobile devices may also connect outside the local network via iroh relay.
     #[serde(default = "default_true")]
     pub remote_allow_relay: bool,
+    /// Optional SteamID64 override for Steam library sync (when None, auto-detected from loginusers.vdf).
+    #[serde(default)]
+    pub steam_id_override: Option<String>,
+    /// Whether to fetch owned Steam games remotely via Steam Web API or public profile XML.
+    #[serde(default)]
+    pub steam_library_sync_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -318,6 +325,8 @@ impl Default for AppConfig {
             modio_website_signed_in: false,
             auto_sort_before_deploy: false,
             remote_allow_relay: true,
+            steam_id_override: None,
+            steam_library_sync_enabled: false,
         }
     }
 }

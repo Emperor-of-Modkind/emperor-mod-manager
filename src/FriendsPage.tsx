@@ -66,9 +66,30 @@ import type {
   GamePluginInfo,
   InstalledCollection,
   ManagedGame,
+  PlayingGameStatus,
   SavedCollectionEntry,
   ShareDecodePreview,
 } from "./types";
+
+function getFriendPlayingGame(friend: FriendRecord): PlayingGameStatus | null {
+  if (!friend.online) return null;
+  return friend.cached_profile?.playing_game ?? null;
+}
+
+function formatPlayingGameLabel(playing: PlayingGameStatus): string {
+  const modeSuffix =
+    playing.mode === "modded"
+      ? " (Modded)"
+      : playing.mode === "unmodded"
+        ? " (Unmodded)"
+        : "";
+  return `Playing ${playing.game_title}${modeSuffix}`;
+}
+
+function formatOnlineStatusLabel(friend: FriendRecord): string {
+  const playing = getFriendPlayingGame(friend);
+  return playing ? `Online · ${formatPlayingGameLabel(playing)}` : "Online";
+}
 
 export type FriendsPageProps = {
   active: boolean;
@@ -1304,7 +1325,7 @@ export function FriendsPage({
               title={`Shared by ${selectedFriend.display_name}`}
             >
               {selectedFriend.online
-                ? `${selectedFriend.display_name} · Online`
+                ? `${selectedFriend.display_name} · ${formatOnlineStatusLabel(selectedFriend)}`
                 : `${selectedFriend.display_name} · Offline (Cached)`}
             </span>
           }
@@ -1736,6 +1757,7 @@ export function FriendsPage({
                     state.local_collections,
                   );
                   const activeMatches = getFriendActiveLoadoutMatches(f);
+                  const playingGame = getFriendPlayingGame(f);
                   return (
                     <div key={f.peer_id} className="friends-friend-card">
                       <button
@@ -1768,6 +1790,14 @@ export function FriendsPage({
                           {f.status !== "pending_outgoing" && !f.online && (
                             <div className="muted friends-friend-card-seen">
                               Last seen {formatLastSeen(f.last_seen_at)}
+                            </div>
+                          )}
+                          {playingGame && (
+                            <div
+                              className="friends-friend-card-syncing"
+                              title={formatPlayingGameLabel(playingGame)}
+                            >
+                              {formatPlayingGameLabel(playingGame)}
                             </div>
                           )}
                           {syncingMine.length > 0 && (
@@ -1885,7 +1915,7 @@ export function FriendsPage({
                 {selectedFriend.display_name}.{" "}
                 <span className={`pill ${selectedFriend.online ? "ok" : ""}`}>
                   {selectedFriend.online
-                    ? "Online"
+                    ? formatOnlineStatusLabel(selectedFriend)
                     : selectedFriend.cached_via_peer_name
                       ? `Offline · Cached via ${selectedFriend.cached_via_peer_name} (${formatLastSeen(selectedFriend.last_seen_at)})`
                       : `Offline · Cached (${formatLastSeen(selectedFriend.last_seen_at)})`}
@@ -2049,7 +2079,7 @@ export function FriendsPage({
             grouped by game.{" "}
             <span className={`pill ${selectedFriend.online ? "ok" : ""}`}>
               {selectedFriend.online
-                ? "Online"
+                ? formatOnlineStatusLabel(selectedFriend)
                 : selectedFriend.cached_via_peer_name
                   ? `Offline · Cached via ${selectedFriend.cached_via_peer_name} (${formatLastSeen(selectedFriend.last_seen_at)})`
                   : `Offline · Cached (${formatLastSeen(selectedFriend.last_seen_at)})`}

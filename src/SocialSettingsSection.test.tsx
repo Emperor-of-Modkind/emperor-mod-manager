@@ -13,6 +13,7 @@ vi.mock("./api", () => ({
     setAllowMutualConnections: vi.fn(),
     setAllowCacheRelay: vi.fn(),
     setShareActiveLoadoutsInFeed: vi.fn(),
+    setSharePlayingStatus: vi.fn(),
   },
 }));
 
@@ -270,7 +271,7 @@ describe("SocialSettingsSection", () => {
     const toggles = host.querySelectorAll<HTMLButtonElement>(
       'button[role="switch"]',
     );
-    expect(toggles.length).toBe(3);
+    expect(toggles.length).toBe(4);
     const relayToggle = toggles[1];
     expect(relayToggle.getAttribute("aria-checked")).toBe("true");
 
@@ -321,7 +322,7 @@ describe("SocialSettingsSection", () => {
     const toggles = host.querySelectorAll<HTMLButtonElement>(
       'button[role="switch"]',
     );
-    expect(toggles.length).toBe(3);
+    expect(toggles.length).toBe(4);
     const activeLoadoutFeedToggle = toggles[2];
     expect(activeLoadoutFeedToggle.getAttribute("aria-checked")).toBe("true");
 
@@ -337,6 +338,57 @@ describe("SocialSettingsSection", () => {
     });
     expect(onNotice).toHaveBeenCalledWith(
       "Active loadouts hidden from your feed.",
+    );
+
+    await act(async () => {
+      root.unmount();
+    });
+    host.remove();
+  });
+
+  it("toggles share playing status setting", async () => {
+    const onFriendsStateChange = vi.fn();
+    const onNotice = vi.fn();
+    const onError = vi.fn();
+    vi.mocked(api.setSharePlayingStatus).mockResolvedValue({
+      ...baseState,
+      share_playing_status: false,
+    });
+
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const root: Root = createRoot(host);
+
+    await act(async () => {
+      root.render(
+        <SocialSettingsSection
+          friendsState={baseState}
+          onFriendsStateChange={onFriendsStateChange}
+          onNotice={onNotice}
+          onError={onError}
+        />,
+      );
+    });
+
+    const toggles = host.querySelectorAll<HTMLButtonElement>(
+      'button[role="switch"]',
+    );
+    expect(toggles.length).toBe(4);
+    const playingStatusToggle = toggles[3];
+    expect(playingStatusToggle.getAttribute("aria-checked")).toBe("true");
+
+    await act(async () => {
+      playingStatusToggle.click();
+    });
+    await flush();
+
+    expect(api.setSharePlayingStatus).toHaveBeenCalledWith(false);
+    expect(onFriendsStateChange).toHaveBeenCalledWith({
+      ...baseState,
+      share_playing_status: false,
+    });
+    expect(onNotice).toHaveBeenCalledWith(
+      "Currently playing game status hidden.",
     );
 
     await act(async () => {

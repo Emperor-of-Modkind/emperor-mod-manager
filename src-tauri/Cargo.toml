@@ -1,6 +1,6 @@
 [package]
 name = "emperor-mod-manager"
-version = "0.9.2"
+version = "0.9.3"
 description = "Mod manager for Linux and Windows"
 authors = ["emperor-mod-manager contributors"]
 edition = "2021"
@@ -19,7 +19,7 @@ tauri-plugin-opener = "2"
 tauri-plugin-deep-link = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time", "net", "process"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "gzip"] }
 toml = "0.8"
 thiserror = "2"
@@ -57,11 +57,12 @@ xz2 = "0.1"
 quick-xml = { version = "0.42.0", features = ["encoding", "serialize"] }
 encoding_rs = "0.8.44"
 steam_shortcuts_util = "1.1.8"
-sysinfo = { version = "0.33", default-features = false, features = ["system"] }
+sysinfo = { version = "0.33", default-features = false, features = ["system", "disk"] }
 libloot = "0.29"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 lib_game_detector = { version = "0.0.35", features = ["bundled_sqlite"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
 keyring = { version = "3", default-features = false, features = ["linux-native", "sync-secret-service", "vendored"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
