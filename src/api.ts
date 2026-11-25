@@ -8,6 +8,7 @@ import type {
   BethesdaPluginsState,
   LootSortResult,
   MasterlistStatus,
+  ModConfigFile,
   SavedPluginEntry,
   BrowseMeta,
   BrowseSearchOpts,
@@ -24,6 +25,7 @@ import type {
   CollectionVersionAdvice,
   CollectionVisibility,
   GameLaunchState,
+  GlobalLaunchOptions,
   LaunchCommandSource,
   LaunchEnvVar,
   LaunchPreview,
@@ -642,6 +644,16 @@ export const api = {
     invoke<ModOptionSelection>("set_mod_options", { gameId, modId, selection }),
   listModsWithOptions: (gameId: string) =>
     invoke<string[]>("list_mods_with_options", { gameId }),
+  listModsWithConfigFiles: (gameId: string) =>
+    invoke<string[]>("list_mods_with_config_files", { gameId }),
+  listModConfigFiles: (gameId: string, modId: string) =>
+    invoke<ModConfigFile[]>("list_mod_config_files", { gameId, modId }),
+  saveModConfigFile: (
+    gameId: string,
+    modId: string,
+    relPath: string,
+    content: string,
+  ) => invoke<void>("save_mod_config_file", { gameId, modId, relPath, content }),
   getFomodInstaller: (
     gameId: string,
     modId: string,
@@ -679,6 +691,8 @@ export const api = {
     customEnvVars: LaunchEnvVar[],
     customWrapper: string | null,
     customLaunchArgs: string | null,
+    customRawCommand: string | null,
+    useGlobalLaunchOptions: boolean,
   ) =>
     invoke<LaunchPreview>("set_game_launch_options", {
       gameId,
@@ -686,7 +700,11 @@ export const api = {
       customEnvVars,
       customWrapper,
       customLaunchArgs,
+      customRawCommand,
+      useGlobalLaunchOptions,
     }),
+  setGlobalLaunchOptions: (options: GlobalLaunchOptions) =>
+    invoke<GlobalLaunchOptions>("set_global_launch_options", { options }),
   diagnoseLoad: (gameId: string) =>
     invoke<LoadDiagnosis>("diagnose_load", { gameId }),
   listDownloads: () => invoke<DownloadItem[]>("list_downloads"),
@@ -774,12 +792,16 @@ export const api = {
     peerId: string;
     friendCollectionId: string;
     shareCode: string;
+    memberIds?: string[];
+    existingModIds?: string[];
   }) =>
     invoke<InstalledCollection>("finalize_friend_collection_sync", {
       gameId: args.gameId,
       peerId: args.peerId,
       friendCollectionId: args.friendCollectionId,
       shareCode: args.shareCode,
+      memberIds: args.memberIds ?? null,
+      existingModIds: args.existingModIds ?? null,
     }),
   setFriendCollectionAutoSync: (
     gameId: string,

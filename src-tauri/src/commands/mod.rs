@@ -2166,6 +2166,8 @@ pub fn manage_game(
         custom_env_vars: Vec::new(),
         custom_wrapper: None,
         custom_launch_args: None,
+        custom_raw_command: None,
+        use_global_launch_options: true,
         wine_overrides_dismissed: false,
     };
     let install_exists = Path::new(&install_path).is_dir();
@@ -2926,6 +2928,7 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<serde_json::Value, Str
         "nexus_website_signed_in": cfg.nexus_website_signed_in,
         "modio_website_signed_in": cfg.modio_website_signed_in,
         "auto_sort_before_deploy": cfg.auto_sort_before_deploy,
+        "global_launch_options": cfg.global_launch_options,
         "user": user,
         "config_dir": state.paths.config_dir,
         "data_dir": state.paths.data_dir,
@@ -6400,7 +6403,9 @@ async fn download_and_stage_inner(
             let _ = std::fs::remove_file(&dest);
             if replace_staged_id.is_some() {
                 if let Ok(game) = managed_game(state, game_id) {
-                    let _ = maybe_auto_save_collections(&state.paths, &game);
+                    if maybe_auto_save_collections(&state.paths, &game).unwrap_or(false) {
+                        state.p2p.trigger_local_activity_sync();
+                    }
                 }
             }
             finish_download_success(state, &dl_id);
@@ -7715,7 +7720,9 @@ async fn fetch_and_stage_cdn(
             let _ = std::fs::remove_file(&dest);
             if replace_staged_id.is_some() {
                 if let Ok(game) = managed_game(state, game_id) {
-                    let _ = maybe_auto_save_collections(&state.paths, &game);
+                    if maybe_auto_save_collections(&state.paths, &game).unwrap_or(false) {
+                        state.p2p.trigger_local_activity_sync();
+                    }
                 }
             }
             finish_download_success(state, dl_id);
@@ -7861,7 +7868,9 @@ pub fn import_assist_download(
                 clear_download_job(&state, &dl_id);
                 if ctx.replace_staged_id.is_some() {
                     if let Ok(game) = managed_game(&state, &ctx.game_id) {
-                        let _ = maybe_auto_save_collections(&state.paths, &game);
+                        if maybe_auto_save_collections(&state.paths, &game).unwrap_or(false) {
+                            state.p2p.trigger_local_activity_sync();
+                        }
                     }
                 }
                 let _ = crate::assist::close_assist_intentionally(&app, &state);
@@ -7955,7 +7964,9 @@ pub fn import_assist_download(
                 clear_download_job(&state, &dl_id);
                 if ctx.replace_staged_id.is_some() {
                     if let Ok(game) = managed_game(&state, &ctx.game_id) {
-                        let _ = maybe_auto_save_collections(&state.paths, &game);
+                        if maybe_auto_save_collections(&state.paths, &game).unwrap_or(false) {
+                            state.p2p.trigger_local_activity_sync();
+                        }
                     }
                 }
                 let _ = crate::assist::close_assist_intentionally(&app, &state);
@@ -8065,6 +8076,7 @@ fn prepare_wine_overrides(
                 ),
             },
         };
+        let is_me3_game = games::me3_game_name(&game.plugin_id).is_some();
         let advice = games::advise_wine_overrides(
             Path::new(&game.install_path),
             game.project_name.as_deref(),
@@ -8072,7 +8084,16 @@ fn prepare_wine_overrides(
             &launch_options,
             can_apply,
             steam_note.as_deref(),
-        );
+        )
+        .and_then(|mut adv| {
+            if is_me3_game {
+                adv.needs.retain(|n| !n.dll.eq_ignore_ascii_case("dinput8"));
+                if adv.needs.is_empty() {
+                    return None;
+                }
+            }
+            Some(adv)
+        });
         Ok(PreparedWineOverrides { advice, app_id })
     }
 }
@@ -8556,7 +8577,7 @@ pub async fn update_staged_mod(
                 .ok_or_else(|| "Missing Thunderstore package name".to_string())?;
             let pkg = load_ts_package_detail(&state, &staged.domain, &ns, &name).await?;
             let client = ThunderstoreClient::new().map_err(|e| e.to_string())?;
-            stage_thunderstore_package(
+            let updated = stage_thunderstore_package(
                 &app,
                 &*state,
                 &client,
@@ -8568,7 +8589,13 @@ pub async fn update_staged_mod(
                 None,
                 StagePolicy::KeepNewer,
             )
-            .await
+            .await?;
+            if let Ok(game) = managed_game(&state, &game_id) {
+                if maybe_auto_save_collections(&state.paths, &game).unwrap_or(false) {
+                    state.p2p.trigger_local_activity_sync();
+                }
+            }
+            Ok(updated)
         }
         ModSource::Modio => {
             let modio_game_id = staged
@@ -8578,6 +8605,9 @@ pub async fn update_staged_mod(
                 .modio_mod_id
                 .ok_or_else(|| "Missing mod.io mod id".to_string())?;
             let file_id = update.modio_file_id;
+            let paths = state.paths.clone();
+            let p2p = state.p2p.clone();
+            let game_opt = managed_game(&state, &game_id).ok();
             let staged_all = download_modio_mod(
                 app,
                 state,
@@ -8590,10 +8620,16 @@ pub async fn update_staged_mod(
                 Some(false),
             )
             .await?;
-            staged_all
+            let updated = staged_all
                 .into_iter()
                 .find(|m| m.modio_mod_id == Some(mod_id))
-                .ok_or_else(|| "mod.io update staged nothing".to_string())
+                .ok_or_else(|| "mod.io update staged nothing".to_string())?;
+            if let Some(game) = game_opt {
+                if maybe_auto_save_collections(&paths, &game).unwrap_or(false) {
+                    p2p.trigger_local_activity_sync();
+                }
+            }
+            Ok(updated)
         }
     }
 }
@@ -8643,13 +8679,17 @@ pub async fn set_mod_collections(
 ) -> Result<StagedMod, String> {
     let paths = state.paths.clone();
     let game = managed_game(&state, &game_id)?;
-    blocking(move || {
+    let (updated, auto_saved) = blocking(move || {
         let updated = mods::set_mod_collections(&paths, &game_id, &mod_id, &collection_ids)
             .map_err(|e| e.to_string())?;
-        let _ = maybe_auto_save_collections(&paths, &game);
-        Ok(updated)
+        let auto_saved = maybe_auto_save_collections(&paths, &game).unwrap_or(false);
+        Ok::<_, String>((updated, auto_saved))
     })
-    .await
+    .await?;
+    if auto_saved {
+        state.p2p.trigger_local_activity_sync();
+    }
+    Ok(updated)
 }
 
 fn save_collection_snapshot_inner(
@@ -8708,28 +8748,31 @@ fn save_collection_snapshot_inner(
     .map_err(|e| e.to_string())
 }
 
-fn maybe_auto_save_collections(paths: &Paths, game: &ManagedGame) -> Result<(), String> {
+fn maybe_auto_save_collections(paths: &Paths, game: &ManagedGame) -> Result<bool, String> {
     let store = mods::load_collections(paths, &game.id).map_err(|e| e.to_string())?;
     let auto_ids: Vec<String> = store
         .collections
         .iter()
-        .filter(|c| c.auto_save)
+        .filter(|c| c.auto_save && c.friend_sync.is_none())
         .map(|c| c.id.clone())
         .collect();
     if auto_ids.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     let order = mods::load_loadorder(paths, &game.id).map_err(|e| e.to_string())?;
+    let mut saved_any = false;
     for col in &store.collections {
-        if !col.auto_save {
+        if !col.auto_save || col.friend_sync.is_some() {
             continue;
         }
         let sig = mods::collection_snapshot_signature(&col.id, &order);
         if col.saved_snapshot_hash.as_deref() != Some(sig.as_str()) {
-            let _ = save_collection_snapshot_inner(paths, game, &col.id);
+            if save_collection_snapshot_inner(paths, game, &col.id).is_ok() {
+                saved_any = true;
+            }
         }
     }
-    Ok(())
+    Ok(saved_any)
 }
 
 #[tauri::command]
@@ -10176,8 +10219,12 @@ async fn import_share_code_inner(
             .filter(|id| !before.contains(*id))
             .cloned()
             .collect();
-        let mut final_member_ids =
-            apply_share_manifest_order_and_selections(&state.paths, &game_id, &manifest)?;
+        let mut final_member_ids = apply_share_manifest_order_and_selections(
+            &state.paths,
+            &game_id,
+            &manifest,
+            game.modio_game_id,
+        )?;
         for id in &member_ids {
             if !final_member_ids.contains(id) {
                 final_member_ids.push(id.clone());
@@ -10263,8 +10310,15 @@ pub fn record_emperor_share(
         .as_deref()
         .and_then(|raw| share::decode_share_code(raw).ok());
     if let Some(manifest) = decoded_manifest.as_ref() {
-        let mut final_ids =
-            apply_share_manifest_order_and_selections(&state.paths, &game_id, manifest)?;
+        let fallback_modio_game_id = managed_game(&state, &game_id)
+            .ok()
+            .and_then(|g| g.modio_game_id);
+        let mut final_ids = apply_share_manifest_order_and_selections(
+            &state.paths,
+            &game_id,
+            manifest,
+            fallback_modio_game_id,
+        )?;
         for id in ids {
             if !final_ids.contains(&id) {
                 final_ids.push(id);
@@ -10477,7 +10531,9 @@ pub fn set_mod_enabled(
     }
     mods::set_enabled(&state.paths, &game_id, &mod_id, enabled).map_err(|e| e.to_string())?;
     if let Ok(game) = managed_game(&state, &game_id) {
-        let _ = maybe_auto_save_collections(&state.paths, &game);
+        if maybe_auto_save_collections(&state.paths, &game).unwrap_or(false) {
+            state.p2p.trigger_local_activity_sync();
+        }
     }
     state.remote_host.notify_state_invalidated();
     Ok(())
@@ -10493,7 +10549,9 @@ pub fn set_load_order(
         .map_err(|e| e.to_string())?;
     mods::set_load_order(&state.paths, &game_id, &ordered_ids).map_err(|e| e.to_string())?;
     if let Ok(game) = managed_game(&state, &game_id) {
-        let _ = maybe_auto_save_collections(&state.paths, &game);
+        if maybe_auto_save_collections(&state.paths, &game).unwrap_or(false) {
+            state.p2p.trigger_local_activity_sync();
+        }
     }
     state.remote_host.notify_state_invalidated();
     Ok(())
@@ -10820,7 +10878,9 @@ pub fn set_mod_options(
     mods::set_mod_options(&state.paths, &game_id, &mod_id, normalized.clone())
         .map_err(|e| e.to_string())?;
     if let Ok(game) = managed_game(&state, &game_id) {
-        let _ = maybe_auto_save_collections(&state.paths, &game);
+        if maybe_auto_save_collections(&state.paths, &game).unwrap_or(false) {
+            state.p2p.trigger_local_activity_sync();
+        }
     }
     Ok(normalized)
 }
@@ -10852,6 +10912,204 @@ pub async fn list_mods_with_options(
             .collect())
     })
     .await
+}
+
+const MOD_CONFIG_EXTENSIONS: &[&str] = &["ini", "toml", "cfg", "json", "yaml", "yml"];
+const MOD_CONFIG_SKIP_FILES: &[&str] = &[
+    "manifest.json",
+    "info.json",
+    "mod.json",
+    "package.json",
+    "metadata.json",
+    "meta.ini",
+    "fomod.json",
+];
+const MOD_CONFIG_SKIP_DIRS: &[&str] = &["fomod", ".git", "locale", "locales", "translations"];
+const MOD_CONFIG_MAX_BYTES: u64 = 512 * 1024;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ModConfigFile {
+    pub rel_path: String,
+    pub name: String,
+    pub content: String,
+}
+
+fn is_editable_config_path(rel: &Path, full: &Path) -> bool {
+    if !full.is_file() {
+        return false;
+    }
+    let Ok(meta) = std::fs::metadata(full) else {
+        return false;
+    };
+    if meta.len() > MOD_CONFIG_MAX_BYTES {
+        return false;
+    }
+    for comp in rel.components() {
+        if let std::path::Component::Normal(seg) = comp {
+            if let Some(s) = seg.to_str() {
+                if MOD_CONFIG_SKIP_DIRS
+                    .iter()
+                    .any(|skip| s.eq_ignore_ascii_case(skip))
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    let Some(name) = full.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    if MOD_CONFIG_SKIP_FILES
+        .iter()
+        .any(|skip| name.eq_ignore_ascii_case(skip))
+    {
+        return false;
+    }
+    let Some(ext) = full.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    MOD_CONFIG_EXTENSIONS
+        .iter()
+        .any(|allowed| ext.eq_ignore_ascii_case(allowed))
+}
+
+fn collect_mod_config_paths(staging_root: &Path) -> Vec<PathBuf> {
+    if !staging_root.is_dir() {
+        return Vec::new();
+    }
+    let mut found = Vec::new();
+    for entry in walkdir::WalkDir::new(staging_root)
+        .max_depth(6)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(rel) = path.strip_prefix(staging_root) else {
+            continue;
+        };
+        if is_editable_config_path(rel, path) {
+            found.push(rel.to_path_buf());
+        }
+    }
+    found.sort_by_key(|rel| {
+        let name = rel
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let is_ini = name.ends_with(".ini");
+        let is_settings = name.contains("settings") || name.contains("config");
+        let rank = match (is_ini, is_settings) {
+            (true, true) => 0u8,
+            (true, false) => 1u8,
+            (false, true) => 2u8,
+            (false, false) => 3u8,
+        };
+        (rank, rel.to_string_lossy().to_ascii_lowercase())
+    });
+    found
+}
+
+/// Ids of staged mods that contain editable configuration files (`.ini`, `.toml`, `.cfg`, `.json`, `.yaml`).
+#[tauri::command]
+pub async fn list_mods_with_config_files(
+    state: State<'_, AppState>,
+    game_id: String,
+) -> Result<Vec<String>, String> {
+    let paths = state.paths.clone();
+    blocking(move || {
+        let order = mods::load_loadorder(&paths, &game_id).map_err(|e| e.to_string())?;
+        Ok(order
+            .mods
+            .iter()
+            .filter(|staged| !collect_mod_config_paths(Path::new(&staged.staging_path)).is_empty())
+            .map(|staged| staged.id.clone())
+            .collect())
+    })
+    .await
+}
+
+#[tauri::command]
+pub fn list_mod_config_files(
+    state: State<'_, AppState>,
+    game_id: String,
+    mod_id: String,
+) -> Result<Vec<ModConfigFile>, String> {
+    let order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
+    let staged = order
+        .mods
+        .iter()
+        .find(|m| m.id == mod_id)
+        .ok_or_else(|| "Mod not found".to_string())?;
+    let staging_root = PathBuf::from(&staged.staging_path);
+    let mut out = Vec::new();
+    for rel in collect_mod_config_paths(&staging_root) {
+        let full = staging_root.join(&rel);
+        let Ok(content) = std::fs::read_to_string(&full) else {
+            continue;
+        };
+        let rel_path = rel.to_string_lossy().replace('\\', "/");
+        let name = rel
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&rel_path)
+            .to_string();
+        out.push(ModConfigFile {
+            rel_path,
+            name,
+            content,
+        });
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+pub fn save_mod_config_file(
+    state: State<'_, AppState>,
+    game_id: String,
+    mod_id: String,
+    rel_path: String,
+    content: String,
+) -> Result<(), String> {
+    let order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
+    let staged = order
+        .mods
+        .iter()
+        .find(|m| m.id == mod_id)
+        .ok_or_else(|| "Mod not found".to_string())?;
+    let staging_root = PathBuf::from(&staged.staging_path);
+    let rel = Path::new(&rel_path);
+    if rel.is_absolute()
+        || rel.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err("Invalid config file path".to_string());
+    }
+    let target = staging_root.join(rel);
+    if !is_editable_config_path(rel, &target) {
+        return Err("Target file is not an editable mod config file".to_string());
+    }
+    let canon_root = staging_root
+        .canonicalize()
+        .map_err(|e| format!("Could not resolve mod folder: {e}"))?;
+    let canon_target = target
+        .canonicalize()
+        .map_err(|e| format!("Could not resolve config file: {e}"))?;
+    if !canon_target.starts_with(&canon_root) {
+        return Err("Config file path escapes mod staging folder".to_string());
+    }
+    std::fs::write(&canon_target, content)
+        .map_err(|e| format!("Could not save {}: {e}", rel_path))?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -10914,7 +11172,9 @@ pub fn set_fomod_selection(
     mods::set_fomod_selection(&state.paths, &game_id, &mod_id, normalized.clone())
         .map_err(|e| e.to_string())?;
     if let Ok(game) = managed_game(&state, &game_id) {
-        let _ = maybe_auto_save_collections(&state.paths, &game);
+        if maybe_auto_save_collections(&state.paths, &game).unwrap_or(false) {
+            state.p2p.trigger_local_activity_sync();
+        }
     }
     state.remote_host.notify_state_invalidated();
     Ok(normalized)
@@ -10969,7 +11229,9 @@ pub fn remove_mod(
     }
     mods::remove_mod(&state.paths, &game_id, &mod_id).map_err(|e| e.to_string())?;
     if let Ok(game) = managed_game(&state, &game_id) {
-        let _ = maybe_auto_save_collections(&state.paths, &game);
+        if maybe_auto_save_collections(&state.paths, &game).unwrap_or(false) {
+            state.p2p.trigger_local_activity_sync();
+        }
     }
     Ok(())
 }
@@ -11262,7 +11524,7 @@ pub async fn launch_modded(
         }
     };
 
-    let target = match crate::launch::resolve_launch_target(&game) {
+    let target = match crate::launch::resolve_modded_launch_target(&state.paths, &game) {
         Ok(t) => t,
         Err(e) => {
             let _ = crate::launch::revert_game_deployment(
@@ -11282,75 +11544,42 @@ pub async fn launch_modded(
 
     let steam_app_id = match &target {
         crate::launch::LaunchTarget::Steam { app_id } => Some(app_id.clone()),
-        _ => None,
+        _ => crate::tools::executables::steam_app_id_from_install(&game.install_path),
     };
 
     let mut env_vars = HashMap::new();
     let mut wrapper: Option<String> = None;
     let mut launch_args: Option<String> = None;
-    if game.launch_command_source == config::LaunchCommandSource::Emperor {
-        let preview = build_launch_preview(&state, &game);
-        let mut merged: Vec<config::LaunchEnvVar> = preview.auto_env_vars;
-        for cv in preview.custom_env_vars {
-            if let Some(pos) = merged.iter().position(|v| v.name == cv.name) {
-                merged[pos].value = cv.value;
-            } else {
-                merged.push(cv);
-            }
-        }
-        for v in &merged {
+    if game.launch_command_source != config::LaunchCommandSource::Launcher {
+        let global_opts = state
+            .config
+            .lock()
+            .map(|cfg| cfg.global_launch_options.clone())
+            .unwrap_or_default();
+        let (_, composed) = build_launch_preview_and_composed(&state, &game, &global_opts);
+        for v in &composed.env_vars {
             env_vars.insert(v.name.clone(), v.value.clone());
         }
-        wrapper = game
-            .custom_wrapper
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
-        launch_args = game
-            .custom_launch_args
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
+        if !composed.wrappers.is_empty() {
+            wrapper = Some(composed.wrappers.join(" "));
+        }
+        if !composed.args.is_empty() {
+            launch_args = Some(composed.args.join(" "));
+        }
 
         match &target {
             crate::launch::LaunchTarget::Steam { app_id } => {
                 #[cfg(target_os = "linux")]
                 {
-                    let existing = crate::tools::steam_launch::read_launch_options(app_id)
-                        .unwrap_or(None)
-                        .unwrap_or_default();
-                    let mut parts: Vec<String> = merged
-                        .iter()
-                        .map(|v| {
-                            if v.value.contains(' ') || v.value.contains(';') {
-                                format!("{}=\"{}\"", v.name, v.value)
-                            } else {
-                                format!("{}={}", v.name, v.value)
-                            }
-                        })
-                        .collect();
-                    if let Some(w) = &wrapper {
-                        parts.push(w.clone());
-                    }
-                    let prefix = parts.join(" ");
-                    let base = if existing.trim().is_empty() {
-                        "%command%".to_string()
-                    } else if existing.contains("%command%") {
-                        existing
-                    } else {
-                        format!("{existing} %command%")
-                    };
-                    let mut final_opts = if prefix.is_empty() {
-                        base
-                    } else {
-                        format!("{prefix} {base}")
-                    };
-                    if let Some(a) = &launch_args {
-                        final_opts = format!("{final_opts} {a}");
-                    }
-                    let _ = crate::tools::steam_launch::write_launch_options(app_id, &final_opts);
+                    let backup_path = state.paths.steam_launch_backup_file(&game.id);
+                    let _ = crate::tools::steam_launch::backup_steam_launch_options(
+                        &backup_path,
+                        app_id,
+                    );
+                    let _ = crate::tools::steam_launch::write_launch_options(
+                        app_id,
+                        &composed.effective_command,
+                    );
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
@@ -11358,17 +11587,20 @@ pub async fn launch_modded(
                 }
             }
             crate::launch::LaunchTarget::Heroic { app_name, .. } => {
-                if let Some(heroic) = crate::tools::heroic_launch::resolve_heroic_app(&game.install_path) {
+                if let Some(heroic) =
+                    crate::tools::heroic_launch::resolve_heroic_app(&game.install_path)
+                {
                     let _ = crate::tools::heroic_launch::write_heroic_launch_options(
                         &heroic.config_dir,
                         app_name,
-                        &merged,
+                        &composed.env_vars,
                         wrapper.as_deref(),
                         launch_args.as_deref(),
                     );
                 }
             }
-            crate::launch::LaunchTarget::Executable { .. } => {}
+            crate::launch::LaunchTarget::Executable { .. }
+            | crate::launch::LaunchTarget::Me3 { .. } => {}
         }
     }
 
@@ -11594,14 +11826,21 @@ pub struct LaunchPreview {
     pub source: config::LaunchCommandSource,
     pub launcher_name: String,
     pub auto_env_vars: Vec<config::LaunchEnvVar>,
+    pub global_launch_options: config::GlobalLaunchOptions,
+    pub use_global_launch_options: bool,
     pub custom_env_vars: Vec<config::LaunchEnvVar>,
     pub custom_wrapper: String,
     pub custom_launch_args: String,
+    pub custom_raw_command: String,
     pub launcher_options: Option<String>,
     pub effective_command: String,
 }
 
-fn build_launch_preview(state: &AppState, game: &ManagedGame) -> LaunchPreview {
+fn build_launch_preview_and_composed(
+    state: &AppState,
+    game: &ManagedGame,
+    global_opts: &config::GlobalLaunchOptions,
+) -> (LaunchPreview, crate::launch_options::ComposedLaunchCommand) {
     #[cfg(not(target_os = "linux"))]
     let _ = state;
     #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
@@ -11619,6 +11858,7 @@ fn build_launch_preview(state: &AppState, game: &ManagedGame) -> LaunchPreview {
                     enabled: staged.enabled,
                 })
                 .collect();
+            let is_me3_game = games::me3_game_name(&game.plugin_id).is_some();
             if let Some(advice) = games::advise_wine_overrides(
                 Path::new(&game.install_path),
                 game.project_name.as_deref(),
@@ -11627,7 +11867,12 @@ fn build_launch_preview(state: &AppState, game: &ManagedGame) -> LaunchPreview {
                 false,
                 None,
             ) {
-                let dlls: Vec<&str> = advice.needs.iter().map(|n| n.dll.as_str()).collect();
+                let dlls: Vec<&str> = advice
+                    .needs
+                    .iter()
+                    .map(|n| n.dll.as_str())
+                    .filter(|dll| !(is_me3_game && dll.eq_ignore_ascii_case("dinput8")))
+                    .collect();
                 if !dlls.is_empty() {
                     auto_env_vars.push(config::LaunchEnvVar {
                         name: "WINEDLLOVERRIDES".to_string(),
@@ -11659,15 +11904,15 @@ fn build_launch_preview(state: &AppState, game: &ManagedGame) -> LaunchPreview {
     let custom_env_vars = game.custom_env_vars.clone();
     let custom_wrapper = game.custom_wrapper.clone().unwrap_or_default();
     let custom_launch_args = game.custom_launch_args.clone().unwrap_or_default();
+    let custom_raw_command = game.custom_raw_command.clone().unwrap_or_default();
 
     let launcher_options = if let Some(app_id) =
         crate::tools::executables::steam_app_id_from_install(&game.install_path)
     {
         #[cfg(target_os = "linux")]
         {
-            crate::tools::steam_launch::read_launch_options(&app_id)
-                .ok()
-                .flatten()
+            let backup_path = state.paths.steam_launch_backup_file(&game.id);
+            crate::tools::steam_launch::read_effective_steam_options(&backup_path, &app_id)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -11697,50 +11942,56 @@ fn build_launch_preview(state: &AppState, game: &ManagedGame) -> LaunchPreview {
         None
     };
 
-    let effective_command = if game.launch_command_source == config::LaunchCommandSource::Launcher {
-        launcher_options
-            .clone()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| "%command%".to_string())
+    let has_custom_exe = game
+        .launch_executable
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty());
+    let me3_game = if !has_custom_exe {
+        games::me3_game_name(&game.plugin_id)
     } else {
-        let mut merged = auto_env_vars.clone();
-        for cv in &custom_env_vars {
-            if let Some(pos) = merged.iter().position(|v| v.name == cv.name) {
-                merged[pos].value = cv.value.clone();
-            } else {
-                merged.push(cv.clone());
-            }
-        }
-        let mut parts: Vec<String> = merged
-            .iter()
-            .map(|v| {
-                if v.value.contains(' ') || v.value.contains(';') {
-                    format!("{}=\"{}\"", v.name, v.value)
-                } else {
-                    format!("{}={}", v.name, v.value)
-                }
-            })
-            .collect();
-        if !custom_wrapper.trim().is_empty() {
-            parts.push(custom_wrapper.trim().to_string());
-        }
-        parts.push("%command%".to_string());
-        if !custom_launch_args.trim().is_empty() {
-            parts.push(custom_launch_args.trim().to_string());
-        }
-        parts.join(" ")
+        None
     };
 
-    LaunchPreview {
+    let composed = crate::launch_options::compose_launch_command(
+        &crate::launch_options::LaunchComposeInput {
+            source: game.launch_command_source,
+            launcher_options: launcher_options.as_deref(),
+            auto_env_vars: &auto_env_vars,
+            global: global_opts,
+            use_global: game.use_global_launch_options,
+            custom_env_vars: &custom_env_vars,
+            custom_wrapper: (!custom_wrapper.trim().is_empty()).then_some(custom_wrapper.as_str()),
+            custom_launch_args: (!custom_launch_args.trim().is_empty())
+                .then_some(custom_launch_args.as_str()),
+            custom_raw_command: (!custom_raw_command.trim().is_empty())
+                .then_some(custom_raw_command.as_str()),
+            me3_game,
+        },
+    );
+
+    let preview = LaunchPreview {
         source: game.launch_command_source,
         launcher_name: game.launcher.clone(),
         auto_env_vars,
+        global_launch_options: global_opts.clone(),
+        use_global_launch_options: game.use_global_launch_options,
         custom_env_vars,
         custom_wrapper,
         custom_launch_args,
+        custom_raw_command,
         launcher_options,
-        effective_command,
-    }
+        effective_command: composed.effective_command.clone(),
+    };
+    (preview, composed)
+}
+
+fn build_launch_preview(
+    state: &AppState,
+    game: &ManagedGame,
+    global_opts: &config::GlobalLaunchOptions,
+) -> LaunchPreview {
+    build_launch_preview_and_composed(state, game, global_opts).0
 }
 
 #[tauri::command]
@@ -11748,15 +11999,17 @@ pub fn get_launch_preview(
     state: State<'_, AppState>,
     game_id: String,
 ) -> Result<LaunchPreview, String> {
-    let game = {
+    let (game, global_opts) = {
         let cfg = state.config.lock().map_err(|e| e.to_string())?;
-        cfg.managed_games
+        let game = cfg
+            .managed_games
             .iter()
             .find(|g| g.id == game_id)
             .cloned()
-            .ok_or_else(|| "Managed game not found".to_string())?
+            .ok_or_else(|| "Managed game not found".to_string())?;
+        (game, cfg.global_launch_options.clone())
     };
-    Ok(build_launch_preview(&state, &game))
+    Ok(build_launch_preview(&state, &game, &global_opts))
 }
 
 #[tauri::command]
@@ -11767,8 +12020,10 @@ pub fn set_game_launch_options(
     custom_env_vars: Vec<config::LaunchEnvVar>,
     custom_wrapper: Option<String>,
     custom_launch_args: Option<String>,
+    custom_raw_command: Option<String>,
+    use_global_launch_options: Option<bool>,
 ) -> Result<LaunchPreview, String> {
-    let updated_game = {
+    let (updated_game, global_opts) = {
         let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
         let game = cfg
             .managed_games
@@ -11790,11 +12045,53 @@ pub fn set_game_launch_options(
         game.custom_launch_args = custom_launch_args
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
+        game.custom_raw_command = custom_raw_command
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        if let Some(use_global) = use_global_launch_options {
+            game.use_global_launch_options = use_global;
+        }
         let cloned = game.clone();
+        let global_opts = cfg.global_launch_options.clone();
         config::save_config(&state.paths, &cfg).map_err(|e| format!("{e:#}"))?;
-        cloned
+        (cloned, global_opts)
     };
-    Ok(build_launch_preview(&state, &updated_game))
+    Ok(build_launch_preview(&state, &updated_game, &global_opts))
+}
+
+#[tauri::command]
+pub fn set_global_launch_options(
+    state: State<'_, AppState>,
+    options: config::GlobalLaunchOptions,
+) -> Result<config::GlobalLaunchOptions, String> {
+    let cleaned = config::GlobalLaunchOptions {
+        enabled: options.enabled,
+        env_vars: options
+            .env_vars
+            .into_iter()
+            .filter(|v| !v.name.trim().is_empty())
+            .map(|v| config::LaunchEnvVar {
+                name: v.name.trim().to_string(),
+                value: v.value,
+            })
+            .collect(),
+        wrapper: options
+            .wrapper
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        launch_args: options
+            .launch_args
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        raw_command: options
+            .raw_command
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+    };
+    let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
+    cfg.global_launch_options = cleaned.clone();
+    config::save_config(&state.paths, &cfg).map_err(|e| format!("{e:#}"))?;
+    Ok(cleaned)
 }
 
 #[tauri::command]
@@ -12847,64 +13144,168 @@ fn friend_collection_local_id(peer_id: &str, collection_id: &str) -> String {
     format!("friend:{peer_id}:{collection_id}")
 }
 
-fn match_manifest_entry_to_staged<'a>(
+fn match_manifest_entry_to_staged_exact<'a>(
     order: &'a mods::LoadOrder,
     entry: &share::ShareModEntry,
+    fallback_modio_game_id: Option<u32>,
 ) -> Option<&'a mods::StagedMod> {
     match entry.s {
         ShareModSource::Nexus => {
             let mid = entry.mod_id.unwrap_or(0);
             let fid = entry.file_id.unwrap_or(0);
+            if mid == 0 || fid == 0 {
+                return None;
+            }
             mods::find_nexus_file(order, mid, fid)
-                .or_else(|| {
-                    order
-                        .mods
-                        .iter()
-                        .find(|m| m.source == ModSource::Nexus && m.nexus_mod_id == mid && m.enabled)
-                })
-                .or_else(|| {
-                    order
-                        .mods
-                        .iter()
-                        .find(|m| m.source == ModSource::Nexus && m.nexus_mod_id == mid)
-                })
         }
         ShareModSource::Thunderstore => {
-            let ns = entry.namespace.as_deref()?;
-            let name = entry.name.as_deref()?;
+            let ns = entry.namespace.as_deref().filter(|s| !s.is_empty())?;
+            let name = entry.name.as_deref().filter(|s| !s.is_empty())?;
             mods::find_thunderstore_package_version(order, ns, name, entry.version.as_deref())
-                .or_else(|| {
-                    mods::find_all_thunderstore_packages(order, ns, name)
-                        .into_iter()
-                        .find(|m| m.enabled)
-                })
-                .or_else(|| mods::find_thunderstore_package(order, ns, name))
         }
         ShareModSource::Modio => {
-            let gid = entry.game_id.unwrap_or(0);
+            let gid = entry.game_id.or(fallback_modio_game_id).unwrap_or(0);
             let mid = entry.mod_id.unwrap_or(0);
+            if gid == 0 || mid == 0 {
+                return None;
+            }
             mods::find_modio_file(order, gid, mid, entry.file_id, entry.version.as_deref())
-                .or_else(|| {
-                    mods::find_all_modio_mods(order, gid, mid)
-                        .into_iter()
-                        .find(|m| m.enabled)
-                })
-                .or_else(|| mods::find_modio_mod(order, gid, mid))
         }
     }
+}
+
+fn is_valid_manifest_entry(
+    entry: &share::ShareModEntry,
+    fallback_modio_game_id: Option<u32>,
+) -> bool {
+    match entry.s {
+        ShareModSource::Nexus => entry.mod_id.unwrap_or(0) > 0 && entry.file_id.unwrap_or(0) > 0,
+        ShareModSource::Thunderstore => {
+            entry.namespace.as_deref().is_some_and(|s| !s.is_empty())
+                && entry.name.as_deref().is_some_and(|s| !s.is_empty())
+        }
+        ShareModSource::Modio => {
+            entry.game_id.or(fallback_modio_game_id).unwrap_or(0) > 0
+                && entry.mod_id.unwrap_or(0) > 0
+        }
+    }
+}
+
+/// Returns `true` when the locally installed synced collection `col` and `order`
+/// accurately match the author's `manifest` (exact versions/file IDs, intact staging
+/// dirs, membership, enabled state, FOMOD/options, relative load order, and no stale
+/// extra members).
+fn friend_collection_matches_manifest(
+    order: &mods::LoadOrder,
+    col: &InstalledCollection,
+    manifest: &share::ShareManifest,
+    fallback_modio_game_id: Option<u32>,
+) -> bool {
+    let fallback_gid = fallback_modio_game_id.or(manifest.game.modio_game_id);
+    if let Some(expected_name) = manifest
+        .name
+        .as_deref()
+        .map(|n| crate::p2p::sanitize_short_text(n, 128))
+        .filter(|n| !n.is_empty())
+    {
+        if col.name != expected_name {
+            return false;
+        }
+    }
+
+    let pos_by_id: HashMap<&str, usize> = order
+        .mods
+        .iter()
+        .enumerate()
+        .map(|(idx, m)| (m.id.as_str(), idx))
+        .collect();
+    let mod_by_id: HashMap<&str, &mods::StagedMod> = order
+        .mods
+        .iter()
+        .map(|m| (m.id.as_str(), m))
+        .collect();
+
+    let mut matched_ids: HashSet<&str> = HashSet::new();
+    let mut prev_pos: Option<usize> = None;
+
+    for entry in &manifest.mods {
+        if !is_valid_manifest_entry(entry, fallback_gid) {
+            continue;
+        }
+        let Some(staged) = match_manifest_entry_to_staged_exact(order, entry, fallback_gid) else {
+            return false;
+        };
+        if !matched_ids.insert(staged.id.as_str()) {
+            continue;
+        }
+        if mods::check_staged_mod_integrity(staged).is_some() {
+            return false;
+        }
+        if !staged.collection_ids.iter().any(|id| id == &col.id) {
+            return false;
+        }
+        if staged.enabled != entry.enabled.unwrap_or(true) {
+            return false;
+        }
+        if let Some(ref fomod) = entry.fomod {
+            if staged.fomod_selection.as_ref() != Some(fomod) {
+                return false;
+            }
+        }
+        if let Some(ref opts) = entry.options {
+            if staged.option_selection.as_ref() != Some(opts) {
+                return false;
+            }
+        }
+        let Some(&pos) = pos_by_id.get(staged.id.as_str()) else {
+            return false;
+        };
+        if let Some(prev) = prev_pos {
+            if pos < prev {
+                return false;
+            }
+        }
+        prev_pos = Some(pos);
+    }
+
+    // Expand expected membership to include transitive dependencies of matched mods
+    // (e.g. Thunderstore dependencies installed alongside a manifest entry).
+    let mut expected_ids: HashSet<&str> = matched_ids.clone();
+    let mut stack: Vec<&str> = matched_ids.into_iter().collect();
+    while let Some(id) = stack.pop() {
+        if let Some(m) = mod_by_id.get(id) {
+            for dep in &m.depends_on {
+                if expected_ids.insert(dep.as_str()) {
+                    stack.push(dep.as_str());
+                }
+            }
+        }
+    }
+
+    // Any mod still attached to this synced collection that isn't in expected_ids is stale.
+    for m in &order.mods {
+        if m.collection_ids.iter().any(|id| id == &col.id) && !expected_ids.contains(m.id.as_str()) {
+            return false;
+        }
+    }
+
+    true
 }
 
 fn apply_share_manifest_order_and_selections(
     paths: &Paths,
     game_id: &str,
     manifest: &share::ShareManifest,
+    fallback_modio_game_id: Option<u32>,
 ) -> Result<Vec<String>, String> {
     let order = mods::load_loadorder(paths, game_id).map_err(|e| e.to_string())?;
     let mut selections = Vec::new();
     let mut member_ids = Vec::new();
     let mut seen = HashSet::new();
     for entry in &manifest.mods {
-        if let Some(staged) = match_manifest_entry_to_staged(&order, entry) {
+        if let Some(staged) =
+            mods::match_share_mod_entry(&order, entry, fallback_modio_game_id)
+        {
             if seen.insert(staged.id.clone()) {
                 member_ids.push(staged.id.clone());
                 selections.push(mods::SyncedModSelection {
@@ -13165,6 +13566,11 @@ pub async fn join_or_sync_friend_collection(
         .map(|n| crate::p2p::sanitize_short_text(n, 128))
         .filter(|n| !n.is_empty());
 
+    let before = snapshot_mod_ids(&state.paths, &game_id)?;
+    let fallback_modio_game_id = managed_game(&state, &game_id)
+        .ok()
+        .and_then(|g| g.modio_game_id);
+
     let mut result = import_share_code_inner(
         app,
         state.clone(),
@@ -13178,7 +13584,20 @@ pub async fn join_or_sync_friend_collection(
     .await?;
 
     if result.needs_assist.is_empty() {
-        let recorded = record_synced_friend_collection(
+        let new_ids: Vec<String> = result
+            .member_ids
+            .iter()
+            .filter(|id| !before.contains(*id))
+            .cloned()
+            .collect();
+        let prev_synced_hash = mods::list_installed_collections(&state.paths, &game_id)
+            .ok()
+            .and_then(|cols| {
+                cols.into_iter()
+                    .find(|c| c.id == local_col_id)
+                    .and_then(|c| c.friend_sync.map(|s| s.last_synced_hash))
+            });
+        let mut recorded = record_synced_friend_collection(
             &state.paths,
             &game_id,
             &local_col_id,
@@ -13188,9 +13607,40 @@ pub async fn join_or_sync_friend_collection(
             share_code.clone(),
             share_hash.clone(),
             &manifest,
+            fallback_modio_game_id,
+            &result.member_ids,
+            &new_ids,
         )?;
+        if !result.warnings.is_empty() {
+            if let Ok(post_order) = mods::load_loadorder(&state.paths, &game_id) {
+                if !friend_collection_matches_manifest(
+                    &post_order,
+                    &recorded,
+                    &manifest,
+                    fallback_modio_game_id,
+                ) {
+                    let fallback_hash = prev_synced_hash.unwrap_or_default();
+                    if let Ok(updated_col) =
+                        mods::mutate_collections(&state.paths, &game_id, |store| {
+                            let Some(c) =
+                                store.collections.iter_mut().find(|c| c.id == local_col_id)
+                            else {
+                                anyhow::bail!("collection not found");
+                            };
+                            if let Some(ref mut fs) = c.friend_sync {
+                                fs.last_synced_hash = fallback_hash.clone();
+                            }
+                            Ok(c.clone())
+                        })
+                    {
+                        recorded = updated_col;
+                    }
+                }
+            }
+        }
         result.member_ids = recorded.mod_ids.clone();
         result.collection = Some(recorded);
+        state.p2p.notify_peer_sync_state(peer_id);
     }
 
     Ok(FriendSyncResult {
@@ -13216,8 +13666,21 @@ fn record_synced_friend_collection(
     share_code: String,
     share_hash: String,
     manifest: &share::ShareManifest,
+    fallback_modio_game_id: Option<u32>,
+    extra_member_ids: &[String],
+    new_mod_ids: &[String],
 ) -> Result<InstalledCollection, String> {
-    let ordered_ids = apply_share_manifest_order_and_selections(paths, game_id, manifest)?;
+    let mut ordered_ids = apply_share_manifest_order_and_selections(
+        paths,
+        game_id,
+        manifest,
+        fallback_modio_game_id,
+    )?;
+    for id in extra_member_ids {
+        if !ordered_ids.contains(id) {
+            ordered_ids.push(id.clone());
+        }
+    }
     let existing_auto_sync = mods::list_installed_collections(paths, game_id)
         .ok()
         .and_then(|cols| {
@@ -13250,7 +13713,7 @@ fn record_synced_friend_collection(
         }),
         ..Default::default()
     };
-    mods::sync_installed_collection(paths, game_id, col, &[]).map_err(|e| e.to_string())
+    mods::sync_installed_collection(paths, game_id, col, new_mod_ids).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -13260,6 +13723,8 @@ pub fn finalize_friend_collection_sync(
     peer_id: String,
     friend_collection_id: String,
     share_code: String,
+    member_ids: Option<Vec<String>>,
+    existing_mod_ids: Option<Vec<String>>,
 ) -> Result<InstalledCollection, String> {
     let peer_id = peer_id
         .trim()
@@ -13275,6 +13740,31 @@ pub fn finalize_friend_collection_sync(
         .map(|s| crate::p2p::sanitize_short_text(s, 128))
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "Friend Collection".into());
+    let fallback_modio_game_id = managed_game(&state, &game_id)
+        .ok()
+        .and_then(|g| g.modio_game_id);
+    let extra_member_ids = member_ids.unwrap_or_default();
+    let new_mod_ids: Vec<String> = if let Some(existing) = existing_mod_ids {
+        let existing_set: HashSet<String> = existing.into_iter().collect();
+        let order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
+        let mut ids: Vec<String> = manifest
+            .mods
+            .iter()
+            .filter_map(|entry| {
+                mods::match_share_mod_entry(&order, entry, fallback_modio_game_id)
+                    .map(|m| m.id.clone())
+            })
+            .filter(|id| !existing_set.contains(id))
+            .collect();
+        for id in &extra_member_ids {
+            if !existing_set.contains(id) && !ids.contains(id) {
+                ids.push(id.clone());
+            }
+        }
+        ids
+    } else {
+        Vec::new()
+    };
     let installed = record_synced_friend_collection(
         &state.paths,
         &game_id,
@@ -13285,6 +13775,9 @@ pub fn finalize_friend_collection_sync(
         share_code,
         share_hash,
         &manifest,
+        fallback_modio_game_id,
+        &extra_member_ids,
+        &new_mod_ids,
     )?;
     state.p2p.notify_peer_sync_state(peer_id);
     Ok(installed)
@@ -13308,10 +13801,14 @@ pub fn get_friend_collection_sync_states(
 ) -> Result<Vec<FriendCollectionSyncStatus>, String> {
     let installed = mods::list_installed_collections(&state.paths, &game_id)
         .map_err(|e| e.to_string())?;
+    let order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
+    let fallback_modio_game_id = managed_game(&state, &game_id)
+        .ok()
+        .and_then(|g| g.modio_game_id);
     let friends_state = state.p2p.get_state().map_err(|e| e.to_string())?;
     let mut out = Vec::new();
     for col in installed {
-        let Some(sync) = col.friend_sync else {
+        let Some(sync) = col.friend_sync.clone() else {
             continue;
         };
         let friend = friends_state
@@ -13328,8 +13825,24 @@ pub fn get_friend_collection_sync_states(
         let latest_hash = remote_col
             .map(|c| c.share_hash.clone())
             .unwrap_or_else(|| sync.last_synced_hash.clone());
-        let has_update = remote_col
-            .is_some_and(|c| c.share_hash != sync.last_synced_hash && !c.share_code.is_empty());
+        let has_update = remote_col.is_some_and(|c| {
+            if c.share_code.is_empty() {
+                return false;
+            }
+            if c.share_hash != sync.last_synced_hash {
+                return true;
+            }
+            share::decode_share_code(&c.share_code)
+                .map(|manifest| {
+                    !friend_collection_matches_manifest(
+                        &order,
+                        &col,
+                        &manifest,
+                        fallback_modio_game_id,
+                    )
+                })
+                .unwrap_or(false)
+        });
         out.push(FriendCollectionSyncStatus {
             collection_id: col.id,
             peer_id: sync.friend_peer_id,
@@ -13831,6 +14344,8 @@ mod recent_download_restart_meta_tests {
             custom_env_vars: Vec::new(),
             custom_wrapper: None,
             custom_launch_args: None,
+            custom_raw_command: None,
+            use_global_launch_options: true,
             wine_overrides_dismissed: false,
         };
         let initial_order = mods::LoadOrder {
@@ -13891,5 +14406,319 @@ mod recent_download_restart_meta_tests {
         assert_eq!(empty_saved.entry.mod_count, 0);
         let decoded_empty = share::decode_share_code(&empty_saved.entry.code).unwrap();
         assert!(decoded_empty.mods.is_empty());
+    }
+
+    #[test]
+    fn record_synced_friend_collection_preserves_extra_member_ids_and_new_mod_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_dir: dir.path().join("cfg"),
+            data_dir: dir.path().join("data"),
+            cache_dir: dir.path().join("cache"),
+        };
+        let game_id = "lc_sync_deps";
+
+        let make_ts = |id: &str, ns: &str, name: &str, order: u32| crate::mods::StagedMod {
+            id: id.into(),
+            name: name.into(),
+            domain: "lethal-company".into(),
+            source: crate::mods::ModSource::Thunderstore,
+            ts_namespace: Some(ns.into()),
+            ts_name: Some(name.into()),
+            version: Some("1.0.0".into()),
+            staging_path: dir.path().join(id).to_string_lossy().into(),
+            enabled: true,
+            order,
+            independent: true,
+            ..Default::default()
+        };
+
+        std::fs::create_dir_all(paths.game_data_dir(game_id)).unwrap();
+        std::fs::write(
+            paths.loadorder_file(game_id),
+            serde_json::to_string(&crate::mods::LoadOrder {
+                mods: vec![
+                    make_ts("ts_Author_Root", "Author", "Root", 0),
+                    make_ts("ts_Author_Dep1", "Author", "Dep1", 1),
+                    make_ts("ts_Author_Dep2", "Author", "Dep2", 2),
+                ],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let manifest = crate::share::ShareManifest {
+            v: 1,
+            name: Some("TS Pack".into()),
+            game: crate::share::ShareGameHint {
+                plugin_id: Some("lethal-company".into()),
+                thunderstore_community: Some("lethal-company".into()),
+                title: Some("Lethal Company".into()),
+                ..Default::default()
+            },
+            game_versions: None,
+            mods: vec![crate::share::ShareModEntry {
+                s: crate::share::ShareModSource::Thunderstore,
+                domain: None,
+                mod_id: None,
+                file_id: None,
+                community: Some("lethal-company".into()),
+                namespace: Some("Author".into()),
+                name: Some("Root".into()),
+                game_id: None,
+                display_name: Some("Root".into()),
+                version: Some("1.0.0".into()),
+                fomod: None,
+                options: None,
+                enabled: None,
+            }],
+        };
+        let share_code = crate::share::encode_share_manifest(&manifest).unwrap();
+        let share_hash = crate::share::share_hash(&share_code);
+        let extra_members = vec![
+            "ts_Author_Root".to_string(),
+            "ts_Author_Dep1".to_string(),
+            "ts_Author_Dep2".to_string(),
+        ];
+        let new_ids = vec![
+            "ts_Author_Dep1".to_string(),
+            "ts_Author_Dep2".to_string(),
+        ];
+
+        let col = super::record_synced_friend_collection(
+            &paths,
+            game_id,
+            "friend:peer1:saved:ts1",
+            "peer1",
+            "saved:ts1",
+            "TS Pack".into(),
+            share_code,
+            share_hash,
+            &manifest,
+            None,
+            &extra_members,
+            &new_ids,
+        )
+        .unwrap();
+
+        assert_eq!(
+            col.mod_ids,
+            vec!["ts_Author_Root", "ts_Author_Dep1", "ts_Author_Dep2"]
+        );
+        let order = crate::mods::load_loadorder(&paths, game_id).unwrap();
+        let root = order.mods.iter().find(|m| m.id == "ts_Author_Root").unwrap();
+        let dep1 = order.mods.iter().find(|m| m.id == "ts_Author_Dep1").unwrap();
+        let dep2 = order.mods.iter().find(|m| m.id == "ts_Author_Dep2").unwrap();
+        assert!(root.independent);
+        assert!(!dep1.independent);
+        assert!(!dep2.independent);
+        for m in [root, dep1, dep2] {
+            assert!(m.collection_ids.iter().any(|id| id == "friend:peer1:saved:ts1"));
+        }
+    }
+
+    #[test]
+    fn friend_collection_matches_manifest_detects_exact_match_and_drift() {
+        use super::friend_collection_matches_manifest;
+        use crate::mods::{self, InstalledCollection};
+        use crate::share;
+
+        let dir = tempfile::tempdir().unwrap();
+        let make_dir = |name: &str| {
+            let p = dir.path().join(name);
+            std::fs::create_dir_all(&p).unwrap();
+            std::fs::write(p.join("mod.esp"), b"data").unwrap();
+            p.to_string_lossy().to_string()
+        };
+        let col_id = "friend:peer1:saved:coop";
+        let make_col = |name: &str| InstalledCollection {
+            id: col_id.into(),
+            name: name.into(),
+            ..Default::default()
+        };
+        let make_manifest = |mods: Vec<share::ShareModEntry>| share::ShareManifest {
+            v: 1,
+            name: Some("Coop Pack".into()),
+            game: share::ShareGameHint {
+                plugin_id: Some("skyrimse".into()),
+                nexus_domain: Some("skyrimspecialedition".into()),
+                thunderstore_community: None,
+                modio_game_id: None,
+                title: Some("Skyrim SE".into()),
+                ..Default::default()
+            },
+            game_versions: None,
+            mods,
+        };
+        let entry_a = share::ShareModEntry {
+            s: share::ShareModSource::Nexus,
+            domain: Some("skyrimspecialedition".into()),
+            mod_id: Some(10),
+            file_id: Some(100),
+            community: None,
+            namespace: None,
+            name: None,
+            game_id: None,
+            display_name: Some("Mod A".into()),
+            version: Some("1.0".into()),
+            fomod: None,
+            options: None,
+            enabled: Some(true),
+        };
+        let entry_b = share::ShareModEntry {
+            s: share::ShareModSource::Nexus,
+            domain: Some("skyrimspecialedition".into()),
+            mod_id: Some(20),
+            file_id: Some(200),
+            community: None,
+            namespace: None,
+            name: None,
+            game_id: None,
+            display_name: Some("Mod B".into()),
+            version: Some("1.0".into()),
+            fomod: None,
+            options: None,
+            enabled: Some(false),
+        };
+        let manifest = make_manifest(vec![entry_a.clone(), entry_b.clone()]);
+        let col = make_col("Coop Pack");
+
+        let mod_a = mods::StagedMod {
+            id: "10_100".into(),
+            name: "Mod A".into(),
+            source: mods::ModSource::Nexus,
+            domain: "skyrimspecialedition".into(),
+            nexus_mod_id: 10,
+            nexus_file_id: 100,
+            staging_path: make_dir("a"),
+            staged_file_count: Some(1),
+            enabled: true,
+            order: 1,
+            collection_ids: vec![col_id.into()],
+            ..Default::default()
+        };
+        let mod_b = mods::StagedMod {
+            id: "20_200".into(),
+            name: "Mod B".into(),
+            source: mods::ModSource::Nexus,
+            domain: "skyrimspecialedition".into(),
+            nexus_mod_id: 20,
+            nexus_file_id: 200,
+            staging_path: make_dir("b"),
+            staged_file_count: Some(1),
+            enabled: false,
+            order: 2,
+            collection_ids: vec![col_id.into()],
+            ..Default::default()
+        };
+
+        // 1. Exact match -> true
+        let exact_order = mods::LoadOrder {
+            mods: vec![mod_a.clone(), mod_b.clone()],
+        };
+        assert!(friend_collection_matches_manifest(&exact_order, &col, &manifest, None));
+
+        // 2. Wrong file_id -> false
+        let mut wrong_ver = mod_a.clone();
+        wrong_ver.nexus_file_id = 999;
+        assert!(!friend_collection_matches_manifest(
+            &mods::LoadOrder {
+                mods: vec![wrong_ver, mod_b.clone()],
+            },
+            &col,
+            &manifest,
+            None,
+        ));
+
+        // 3. Missing mod -> false
+        assert!(!friend_collection_matches_manifest(
+            &mods::LoadOrder {
+                mods: vec![mod_a.clone()],
+            },
+            &col,
+            &manifest,
+            None,
+        ));
+
+        // 4. Wrong enabled state -> false
+        let mut wrong_enabled = mod_b.clone();
+        wrong_enabled.enabled = true;
+        assert!(!friend_collection_matches_manifest(
+            &mods::LoadOrder {
+                mods: vec![mod_a.clone(), wrong_enabled],
+            },
+            &col,
+            &manifest,
+            None,
+        ));
+
+        // 5. Wrong load order -> false
+        assert!(!friend_collection_matches_manifest(
+            &mods::LoadOrder {
+                mods: vec![mod_b.clone(), mod_a.clone()],
+            },
+            &col,
+            &manifest,
+            None,
+        ));
+
+        // 6. Extra stale member still attached to col -> false
+        let stale = mods::StagedMod {
+            id: "30_300".into(),
+            name: "Removed Mod".into(),
+            source: mods::ModSource::Nexus,
+            domain: "skyrimspecialedition".into(),
+            nexus_mod_id: 30,
+            nexus_file_id: 300,
+            staging_path: make_dir("c"),
+            staged_file_count: Some(1),
+            enabled: true,
+            order: 3,
+            collection_ids: vec![col_id.into()],
+            ..Default::default()
+        };
+        assert!(!friend_collection_matches_manifest(
+            &mods::LoadOrder {
+                mods: vec![mod_a.clone(), mod_b.clone(), stale],
+            },
+            &col,
+            &manifest,
+            None,
+        ));
+
+        // 7. Transitive dependency in depends_on is allowed (not treated as stale) -> true
+        let mut mod_a_with_dep = mod_a.clone();
+        mod_a_with_dep.depends_on = vec!["dep_1".into()];
+        let dep_mod = mods::StagedMod {
+            id: "dep_1".into(),
+            name: "Dep".into(),
+            source: mods::ModSource::Thunderstore,
+            staging_path: make_dir("dep"),
+            staged_file_count: Some(1),
+            enabled: true,
+            order: 3,
+            collection_ids: vec![col_id.into()],
+            ..Default::default()
+        };
+        assert!(friend_collection_matches_manifest(
+            &mods::LoadOrder {
+                mods: vec![mod_a_with_dep, mod_b.clone(), dep_mod],
+            },
+            &col,
+            &manifest,
+            None,
+        ));
+
+        // 8. Damaged staging directory -> false
+        let mut damaged = mod_a.clone();
+        damaged.staging_path = dir.path().join("does_not_exist").to_string_lossy().into();
+        assert!(!friend_collection_matches_manifest(
+            &mods::LoadOrder {
+                mods: vec![damaged, mod_b],
+            },
+            &col,
+            &manifest,
+            None,
+        ));
     }
 }

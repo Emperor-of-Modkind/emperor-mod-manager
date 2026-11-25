@@ -2,7 +2,7 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { DesktopSnapshot, MobileConnectionState } from "./types";
+import type { DesktopSnapshot, ManagedGame, MobileConnectionState } from "./types";
 
 const invoked: string[] = [];
 let mockConnState: MobileConnectionState = {
@@ -661,5 +661,108 @@ describe("MobileApp", () => {
       });
       window.dispatchEvent(new Event("resize"));
     }
+  });
+
+  it("hides Save Changes and Auto-save options for sync-joined collections in MobileCollectionsView", async () => {
+    const { MobileCollectionsView } = await import("./MobileCollectionsView");
+    container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+
+    const activeGame = {
+      id: "skyrimse",
+      plugin_id: "skyrimse",
+      title: "Skyrim Special Edition",
+      nexus_domain: "skyrimspecialedition",
+      install_path: "/games/Skyrim",
+      launcher: "steam",
+    } as ManagedGame;
+
+    const regularCol = {
+      id: "col-own",
+      source: "emperor",
+      kind: "share",
+      name: "My Own Pack",
+      mod_ids: ["m1"],
+      installed_at: "2026-11-23T20:00:00Z",
+      auto_save: true,
+    } as DesktopSnapshot["installed_collections_by_game"][string][number];
+
+    const syncedCol = {
+      id: "col-friend",
+      source: "emperor",
+      kind: "share",
+      name: "Friend's Co-op Pack",
+      mod_ids: ["m2"],
+      installed_at: "2026-11-23T20:00:00Z",
+      auto_save: true,
+      friend_sync: {
+        friend_peer_id: "peer-friend-1",
+        friend_collection_id: "fc1",
+        last_synced_hash: "abc",
+        last_synced_at: "2026-11-23T21:00:00Z",
+        auto_sync: true,
+      },
+    } as DesktopSnapshot["installed_collections_by_game"][string][number];
+
+    await act(async () => {
+      root!.render(
+        <MobileCollectionsView
+          activeGame={activeGame}
+          installedCollections={[regularCol, syncedCol]}
+          savedCollections={[]}
+          mods={[]}
+          updatesByModId={{}}
+          online={true}
+          onRefresh={async () => {}}
+          onToggleCollection={async () => {}}
+          onToggleMod={async () => {}}
+          onCheckUpdates={async () => {}}
+          onUpdateAll={async () => {}}
+          onImportShareCode={async () => {}}
+          onNotify={() => {}}
+        />,
+      );
+    });
+    await flush();
+
+    // List view: own pack shows Auto-save, synced pack shows Synced (never Auto-save)
+    const cards = Array.from(
+      container.querySelectorAll<HTMLButtonElement>(".mobile-collection-card-main"),
+    );
+    expect(cards).toHaveLength(2);
+    expect(cards[0].textContent).toContain("My Own Pack");
+    expect(cards[0].textContent).toContain("Auto-save");
+    expect(cards[1].textContent).toContain("Friend's Co-op Pack");
+    expect(cards[1].textContent).toContain("Synced");
+    expect(cards[1].textContent).not.toContain("Auto-save");
+
+    // Open synced collection detail: Save Changes and Auto-save toggle must be absent
+    await act(async () => {
+      cards[1].click();
+    });
+    await flush();
+    expect(container.textContent).toContain("Friend's Co-op Pack");
+    expect(container.textContent).toContain("Synced");
+    expect(container.textContent).not.toContain("Save Changes");
+    expect(container.textContent).not.toContain("Auto-save changes to this collection");
+
+    // Go back and open own collection detail: both options must be present
+    const backBtn = container.querySelector<HTMLButtonElement>(".mobile-back-btn");
+    expect(backBtn).not.toBeNull();
+    await act(async () => {
+      backBtn!.click();
+    });
+    await flush();
+
+    const cardsAgain = Array.from(
+      container.querySelectorAll<HTMLButtonElement>(".mobile-collection-card-main"),
+    );
+    await act(async () => {
+      cardsAgain[0].click();
+    });
+    await flush();
+    expect(container.textContent).toContain("Save Changes");
+    expect(container.textContent).toContain("Auto-save changes to this collection");
   });
 });

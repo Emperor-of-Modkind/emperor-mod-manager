@@ -324,6 +324,7 @@ fn findings_for(kind: LogKind, text: &str, mods: &ModIndex<'_>) -> Vec<LoadFindi
         LogKind::ReFramework => excerpt_finding(text, "REFramework reported an error."),
         LogKind::Ue4ss => excerpt_finding(text, "UE4SS reported an error."),
         LogKind::Ds2Lighting => excerpt_finding(text, "Lighting Engine reported an error."),
+        LogKind::Me3 => excerpt_finding(text, "Mod Engine 3 (me3) reported an error."),
         LogKind::CrLoader => excerpt_finding(text, "crloader reported an error."),
         LogKind::Player => excerpt_finding(text, "Unity Player.log reported an error."),
         LogKind::Console => excerpt_finding(text, "Project Zomboid console.txt reported an error."),

@@ -129,6 +129,7 @@ export function useStagedModDrag({
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const rowRefs = useRef(new Map<string, HTMLElement>());
   const listRef = useRef<HTMLUListElement | null>(null);
+  const disabledListRef = useRef<HTMLUListElement | null>(null);
   const visibleModsRef = useRef(visibleMods);
   const onCommitRef = useRef(onCommit);
   const previewRef = useRef<number | null>(null);
@@ -136,6 +137,10 @@ export function useStagedModDrag({
   visibleModsRef.current = visibleMods;
   onCommitRef.current = onCommit;
   previewRef.current = previewGroupIndex;
+
+  const activeListFor = useCallback((enabled: boolean) => {
+    return enabled ? listRef.current : (disabledListRef.current ?? listRef.current);
+  }, []);
 
   const clearTimer = useCallback(() => {
     if (timerRef.current != null) {
@@ -150,9 +155,11 @@ export function useStagedModDrag({
   }, []);
 
   const clearListDragStyle = useCallback(() => {
-    if (listRef.current) {
-      listRef.current.style.touchAction = "";
-      listRef.current.style.userSelect = "";
+    for (const el of [listRef.current, disabledListRef.current]) {
+      if (el) {
+        el.style.touchAction = "";
+        el.style.userSelect = "";
+      }
     }
   }, []);
 
@@ -165,38 +172,42 @@ export function useStagedModDrag({
     setLift(null);
   }, [clearListDragStyle, clearTimer]);
 
-  const activateDrag = useCallback((session: DragSession, target: HTMLElement) => {
-    const row = target.closest("li");
-    if (!(row instanceof HTMLElement)) return;
-    const rect = row.getBoundingClientRect();
-    session.activated = true;
-    session.offsetY = session.startY - rect.top;
-    // Capture on the list so the row can unmount into a placeholder + floating clone.
-    const captureEl = listRef.current ?? target;
-    if (listRef.current) {
-      listRef.current.style.touchAction = "none";
-      listRef.current.style.userSelect = "none";
-    }
-    try {
-      captureEl.setPointerCapture(session.pointerId);
-    } catch {
-      /* already released */
-    }
-    setDraggingId(session.modId);
-    setPreviewGroupIndex(session.startGroupIndex);
-    previewRef.current = session.startGroupIndex;
-    setLift({
-      x: rect.left,
-      y: rect.top,
-      width: rect.width,
-      height: rect.height,
-    });
-    setSuppressClick(true);
-  }, []);
+  const activateDrag = useCallback(
+    (session: DragSession, target: HTMLElement) => {
+      const row = target.closest("li");
+      if (!(row instanceof HTMLElement)) return;
+      const rect = row.getBoundingClientRect();
+      session.activated = true;
+      session.offsetY = session.startY - rect.top;
+      // Capture on the list so the row can unmount into a placeholder + floating clone.
+      const activeList = activeListFor(session.enabled);
+      const captureEl = activeList ?? target;
+      if (activeList) {
+        activeList.style.touchAction = "none";
+        activeList.style.userSelect = "none";
+      }
+      try {
+        captureEl.setPointerCapture(session.pointerId);
+      } catch {
+        /* already released */
+      }
+      setDraggingId(session.modId);
+      setPreviewGroupIndex(session.startGroupIndex);
+      previewRef.current = session.startGroupIndex;
+      setLift({
+        x: rect.left,
+        y: rect.top,
+        width: rect.width,
+        height: rect.height,
+      });
+      setSuppressClick(true);
+    },
+    [activeListFor],
+  );
 
   const indexFromPointerY = useCallback(
     (pointerY: number, modId: string, enabled: boolean) => {
-      const list = listRef.current;
+      const list = activeListFor(enabled);
       const display = previewVisibleMods(
         visibleModsRef.current,
         modId,
@@ -205,9 +216,15 @@ export function useStagedModDrag({
       if (!list) {
         return display.filter((m) => m.enabled === enabled && m.id !== modId).length;
       }
+      const splitList =
+        disabledListRef.current != null ||
+        (enabled && listRef.current != null && display.some((m) => !m.enabled));
+      const scopedDisplay = splitList
+        ? display.filter((m) => m.enabled === enabled)
+        : display;
       const rect = list.getBoundingClientRect();
       return stagedDropGroupIndex(
-        display,
+        scopedDisplay,
         modId,
         enabled,
         pointerY,
@@ -215,7 +232,7 @@ export function useStagedModDrag({
         rect.height,
       );
     },
-    [],
+    [activeListFor],
   );
 
   const onPointerMove = useCallback(
@@ -250,7 +267,7 @@ export function useStagedModDrag({
         setPreviewGroupIndex(nextIndex);
       }
 
-      const scrollParent = findScrollParent(listRef.current);
+      const scrollParent = findScrollParent(activeListFor(session.enabled));
       if (scrollParent) {
         const bounds = scrollParent.getBoundingClientRect();
         if (event.clientY < bounds.top + EDGE_SCROLL_PX) {
@@ -260,7 +277,7 @@ export function useStagedModDrag({
         }
       }
     },
-    [clearTimer, indexFromPointerY],
+    [activeListFor, clearTimer, indexFromPointerY],
   );
 
   const onPointerUp = useCallback(
@@ -358,10 +375,23 @@ export function useStagedModDrag({
     [visibleMods, draggingId, previewGroupIndex],
   );
 
+  const enabledDisplayMods = useMemo(
+    () => displayMods.filter((m) => m.enabled),
+    [displayMods],
+  );
+
+  const disabledDisplayMods = useMemo(
+    () => displayMods.filter((m) => !m.enabled),
+    [displayMods],
+  );
+
   return {
     listRef,
+    disabledListRef,
     setRowRef,
     displayMods,
+    enabledDisplayMods,
+    disabledDisplayMods,
     draggingId,
     previewGroupIndex,
     lift,

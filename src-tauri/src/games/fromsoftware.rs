@@ -1,8 +1,8 @@
 //! Shared deploy logic for FromSoftware titles (Dark Souls trilogy + Elden Ring).
 //!
 //! Legacy Mod Engine titles (DS1 / Remastered / DS2) merge into `<Game>/mod/` and
-//! update `modengine.ini`. Elden Ring and Dark Souls 3 keep `<Game>/mods/<ModName>/`
-//! and write `emperor.me3` + `config_emperor.toml` for me3 / Mod Engine 2.
+//! update `modengine.ini`. Modern titles (Elden Ring, Nightreign, AC6, DS3) keep
+//! `<Game>/mods/<ModName>/` and autoconfigure `emperor.me3` for Mod Engine 3 (`me3`).
 
 use std::path::{Component, Path, PathBuf};
 
@@ -16,6 +16,7 @@ use super::{
 /// Top-level FromSoft asset / overlay folders that must not be peeled as archive wrappers.
 pub const FROMSOFT_ROOT_DIRS: &[&str] = &[
     "action",
+    "asset",
     "chr",
     "cutscene",
     "event",
@@ -68,6 +69,42 @@ const ROOT_INJECTOR_FILES: &[&str] = &[
     "dxgi.dll",
     "d3d11.dll",
     "d3d12.dll",
+];
+
+/// Graphics proxy DLLs that may still sit next to the game exe on modern ME3 titles (e.g. ReShade).
+const GRAPHICS_PROXY_FILES: &[&str] = &["dxgi.dll", "d3d11.dll", "d3d12.dll"];
+
+/// FromSoft game asset override directories recognized as ME3 `[[packages]]` content.
+const FROMSOFT_ASSET_DIRS: &[&str] = &[
+    "action",
+    "asset",
+    "chr",
+    "cutscene",
+    "event",
+    "expression",
+    "facegen",
+    "font",
+    "lang",
+    "layout",
+    "map",
+    "material",
+    "menu",
+    "movie",
+    "msg",
+    "mtd",
+    "other",
+    "param",
+    "parts",
+    "script",
+    "sd",
+    "sfx",
+    "shader",
+    "sound",
+    "tex_override",
+];
+
+const FROMSOFT_ASSET_EXTENSIONS: &[&str] = &[
+    "dcx", "bnd", "tpf", "flver", "msb", "emevd", "luabnd", "bdt", "bhd",
 ];
 
 /// Docs / previews that Lighting Engine and similar packs ship but the game never loads.
@@ -124,14 +161,6 @@ pub fn legacy_modengine_present(install_path: &Path) -> bool {
     find_file_ci(&resolve_game_root(install_path), "dinput8.dll").is_some()
 }
 
-/// True when deploy wrote me3 / ME2 launch helpers into the game root.
-pub fn modern_launch_helpers_present(install_path: &Path) -> bool {
-    let root = resolve_game_root(install_path);
-    root.join("launch_emperor_me3.bat").is_file()
-        || root.join("launch_emperor_me3.sh").is_file()
-        || root.join("launch_emperor_me2.bat").is_file()
-}
-
 fn has_known_exe(dir: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return false;
@@ -163,6 +192,170 @@ fn is_root_injector(name: &str) -> bool {
     ROOT_INJECTOR_FILES
         .iter()
         .any(|file| name.eq_ignore_ascii_case(file))
+}
+
+fn is_graphics_proxy(name: &str) -> bool {
+    GRAPHICS_PROXY_FILES
+        .iter()
+        .any(|file| name.eq_ignore_ascii_case(file))
+}
+
+/// True when a staged mod is a graphics proxy pack (e.g. ERSS-FG with `D3D12.dll` + `ERSS-FG.dll`
+/// + `ERSS2/`, OptiScaler, ReShade) that must deploy intact to `Game/` rather than `Game/mods/<Mod>/`.
+pub fn looks_like_modern_graphics_proxy_pack(content_root: &Path) -> bool {
+    if dir_has_graphics_proxy(content_root) {
+        return true;
+    }
+    let Ok(entries) = std::fs::read_dir(content_root) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() && dir_has_graphics_proxy(&path) {
+            return true;
+        }
+    }
+    false
+}
+
+fn dir_has_graphics_proxy(dir: &Path) -> bool {
+    GRAPHICS_PROXY_FILES
+        .iter()
+        .any(|name| find_file_ci(dir, name).is_some())
+}
+
+/// Subdirectory names inside a mod folder that hold helper/SDK dependency DLLs, not mod plugins.
+const NATIVE_DEPENDENCY_DIRS: &[&str] = &[
+    "bin", "lib", "libs", "deps", "redist", "x64", "x86", "runtime", "runtimes",
+];
+
+fn is_non_mod_native_dll(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if is_root_injector(&lower) {
+        return true;
+    }
+    matches!(
+        lower.as_str(),
+        "me3_mod_host.dll"
+            | "modengine2.dll"
+            | "modengine.dll"
+            | "steam_api64.dll"
+            | "steam_api.dll"
+            | "_winhttp.dll"
+            | "winhttp.dll"
+            | "dxcompiler.dll"
+            | "dxil.dll"
+    ) || lower.starts_with("oo2core_")
+        || lower.starts_with("vcruntime")
+        || lower.starts_with("msvcp")
+        || lower.starts_with("concrt")
+        || lower.starts_with("ucrtbase")
+        || lower.starts_with("api-ms-win-")
+        || lower.starts_with("amd_fidelityfx_")
+        || lower.starts_with("ffx_")
+        || lower.starts_with("libxess")
+        || lower.starts_with("xess")
+        || lower.starts_with("nvngx_")
+        || lower.starts_with("sl.")
+        || lower.starts_with("d3dcompiler_")
+        || lower.starts_with("vulkan-")
+        || lower.starts_with("openvr_")
+        || lower.starts_with("openxr_")
+        || lower.starts_with("xinput")
+        || lower.starts_with("d3dx")
+        || lower.starts_with("physx")
+        || lower.starts_with("bink2")
+        || lower.starts_with("fmod")
+        || lower.starts_with("wwise")
+        || lower.starts_with("sdl2")
+        || lower.starts_with("sdl3")
+}
+
+/// True when a staged pack is Elden Mod Loader (`dinput8.dll` + `mod_loader_config.ini`),
+/// which is superseded by Mod Engine 3 (`me3`) on modern FromSoft titles.
+pub fn looks_like_elden_mod_loader(content_root: &Path) -> bool {
+    if dir_has_elden_mod_loader_markers(content_root) {
+        return true;
+    }
+    let Ok(entries) = std::fs::read_dir(content_root) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() && dir_has_elden_mod_loader_markers(&path) {
+            return true;
+        }
+    }
+    false
+}
+
+fn dir_has_elden_mod_loader_markers(dir: &Path) -> bool {
+    let has_loader_file =
+        find_file_ci(dir, "mod_loader_config.ini").is_some() || find_file_ci(dir, "dinput8.dll").is_some();
+    if !has_loader_file {
+        return false;
+    }
+    if mod_folder_has_assets(dir) {
+        return false;
+    }
+    // Only treat the pack as standalone Elden Mod Loader when it has NO real mod DLLs.
+    // Bundles (like "Elden Ring Ultrawide Fix") that ship dinput8.dll + mods/*.dll should
+    // skip only the loader files while deploying their real DLL mods.
+    let has_other_mod_dll = WalkDir::new(dir)
+        .max_depth(3)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .any(|e| {
+            e.file_type().is_file()
+                && e.file_name().to_str().is_some_and(|n| {
+                    n.to_ascii_lowercase().ends_with(".dll") && !is_non_mod_native_dll(n)
+                })
+        });
+    !has_other_mod_dll
+}
+
+/// Collect top-level mod DLL filenames from an Elden-Mod-Loader-style flat DLL mod pack
+/// (either `<root>/*.dll` or `<root>/mods/*.dll`), when the pack has no FromSoft assets,
+/// is not a graphics proxy pack, and is not a Seamless Co-op pack.
+pub fn flat_modern_dll_mod_files(content_root: &Path) -> Vec<String> {
+    if looks_like_elden_mod_loader(content_root)
+        || looks_like_modern_graphics_proxy_pack(content_root)
+        || mod_folder_has_assets(content_root)
+        || find_child_dir_ci(content_root, "SeamlessCoop").is_some()
+    {
+        return Vec::new();
+    }
+    let search_dir = find_child_dir_ci(content_root, "mods")
+        .or_else(|| find_child_dir_ci(content_root, "mod"))
+        .unwrap_or_else(|| content_root.to_path_buf());
+    if mod_folder_has_assets(&search_dir) {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(&search_dir) else {
+        return Vec::new();
+    };
+    let mut dlls = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name.to_ascii_lowercase().ends_with(".dll") && !is_non_mod_native_dll(name) {
+            dlls.push(name.to_string());
+        }
+    }
+    dlls.sort();
+    dlls
+}
+
+/// True when a staged pack is a flat Elden-Mod-Loader-style DLL mod (`mods/<Mod>.dll` +
+/// `mods/<Mod>/config.ini`) that must deploy directly under `Game/mods/` so its hardcoded
+/// `mods/<Mod>/config.ini` path resolves.
+pub fn looks_like_modern_flat_dll_mod(content_root: &Path) -> bool {
+    !flat_modern_dll_mod_files(content_root).is_empty()
 }
 
 /// Drop a leading `mod`/`mods` segment, and a nested one immediately after a wrap folder.
@@ -217,7 +410,101 @@ fn resolve_legacy_deploy(install_path: &Path, relative: &Path) -> PathBuf {
 }
 
 fn resolve_modern_deploy(install_path: &Path, relative: &Path) -> PathBuf {
-    resolve_overlay_deploy(install_path, relative, "mods")
+    let root = resolve_game_root(install_path);
+    let normalized = normalize_relative(relative);
+    let components = path_components(&normalized);
+    if components.is_empty() {
+        return root.join("mods");
+    }
+
+    let leaf = components[components.len() - 1].as_str();
+    if is_graphics_proxy(leaf) {
+        return root.join(
+            normalized
+                .file_name()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(leaf)),
+        );
+    }
+
+    let stripped = strip_mod_overlay_segments(&normalized);
+    if stripped.as_os_str().is_empty() {
+        return root.join("mods");
+    }
+    root.join("mods").join(stripped)
+}
+
+fn resolve_modern_deploy_ctx(
+    install_path: &Path,
+    relative: &Path,
+    ctx: &DeployContext<'_>,
+) -> PathBuf {
+    if let Some(content) = ctx.content_root {
+        if looks_like_modern_graphics_proxy_pack(content) {
+            let root = resolve_game_root(install_path);
+            let normalized = normalize_relative(relative);
+            let comps = path_components(&normalized);
+            // `deploy_tree` prepends the wrap folder name because `prefers_mod_folder()` is true;
+            // drop that synthetic leading segment so the pack's files land directly under `Game/`.
+            let unwrapped: PathBuf = if comps.len() > 1 {
+                comps.into_iter().skip(1).collect()
+            } else {
+                normalized
+            };
+            let stripped = strip_leading_game_segment(&unwrapped);
+            if stripped.as_os_str().is_empty() {
+                return root;
+            }
+            return root.join(stripped);
+        }
+        if looks_like_modern_flat_dll_mod(content) {
+            let root = resolve_game_root(install_path);
+            let normalized = normalize_relative(relative);
+            let comps = path_components(&normalized);
+            // Drop the synthetic wrap folder name and any leading `mods/`/`mod/` segment
+            // so `mods/CameraFix.dll` and `mods/CameraFix/config.ini` land directly under `Game/mods/`.
+            let unwrapped: PathBuf = if comps.len() > 1 {
+                comps.into_iter().skip(1).collect()
+            } else {
+                normalized
+            };
+            let stripped = strip_mod_overlay_segments(&unwrapped);
+            if stripped.as_os_str().is_empty() {
+                return root.join("mods");
+            }
+            return root.join("mods").join(stripped);
+        }
+    }
+    resolve_modern_deploy(install_path, relative)
+}
+
+fn should_deploy_modern_file(relative: &Path, ctx: &DeployContext<'_>) -> bool {
+    if let Some(content) = ctx.content_root {
+        if looks_like_elden_mod_loader(content) {
+            return false;
+        }
+    }
+    if let Some(leaf) = relative.file_name().and_then(|n| n.to_str()) {
+        if leaf.eq_ignore_ascii_case("dinput8.dll")
+            || leaf.eq_ignore_ascii_case("modengine.ini")
+            || leaf.eq_ignore_ascii_case("mod_loader_config.ini")
+            || leaf.eq_ignore_ascii_case("anti_cheat_toggler_config.ini")
+            || leaf.eq_ignore_ascii_case("_winhttp.dll")
+            || leaf.eq_ignore_ascii_case("toggle_anti_cheat.exe")
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn modern_staging_deploy_warnings(content_root: &Path, mod_name: &str) -> Vec<String> {
+    if looks_like_elden_mod_loader(content_root) {
+        return vec![format!(
+            "{mod_name} (Elden Mod Loader) is superseded by Mod Engine 3 (me3); skipped deploying dinput8.dll. All DLL mods are loaded natively via me3 [[natives]]."
+        )];
+    }
+    Vec::new()
 }
 
 /// Lighting Engine / Seamless Co-op style packs must land next to the exe, not in `mod/`.
@@ -364,16 +651,27 @@ fn missing_modengine_message(plugin_id: &str) -> String {
 }
 
 fn modern_preflight_warnings(install_path: &Path) -> Vec<String> {
-    if modern_launch_helpers_present(install_path) {
-        return vec![
-            "Launch with launch_emperor_me3 or launch_emperor_me2 in the Game folder (not the vanilla Steam shortcut) so mods/ load."
+    let root = resolve_game_root(install_path);
+    let mut warnings = Vec::new();
+    if find_file_ci(&root, "dinput8.dll").is_some() {
+        warnings.push(
+            "Found dinput8.dll (Elden Mod Loader / legacy Mod Engine) in the Game folder. Remove it if the game crashes or DLL mods fail to load under Mod Engine 3 (me3)."
                 .into(),
-        ];
+        );
     }
-    vec![
-        "Launch via me3 (`me3 launch --profile emperor.me3` from the Game folder) or Mod Engine 2 with config_emperor.toml — starting the game normally ignores mods/."
-            .into(),
-    ]
+    if let Some(ini_path) = empty_er_seamless_cooppassword(&root) {
+        warnings.push(format!(
+            "Seamless Co-op cooppassword is empty in {} — set a password before launching or Seamless Co-op will refuse to start.",
+            ini_path.display()
+        ));
+    }
+    if !root.join("emperor.me3").is_file() {
+        warnings.push(
+            "Mod Engine 3 profile (emperor.me3) was not found in the Game folder. Deploy again before launching."
+                .into(),
+        );
+    }
+    warnings
 }
 
 /// Ensure Mod Engine loads the `mod/` overlay (`useModOverrideDirectory` + path).
@@ -439,18 +737,82 @@ fn escape_toml_basic(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// True when a deployed mod folder contains FromSoft asset overrides for `[[packages]]`.
+pub fn mod_folder_has_assets(mod_dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(mod_dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if path.is_dir() {
+            if FROMSOFT_ASSET_DIRS
+                .iter()
+                .any(|dir| name.eq_ignore_ascii_case(dir))
+            {
+                return true;
+            }
+        } else if path.is_file() {
+            if name.eq_ignore_ascii_case("regulation.bin") {
+                return true;
+            }
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                if FROMSOFT_ASSET_EXTENSIONS
+                    .iter()
+                    .any(|allowed| ext.eq_ignore_ascii_case(allowed))
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn path_has_dependency_dir(rel_within_mod: &Path) -> bool {
+    let Some(parent) = rel_within_mod.parent() else {
+        return false;
+    };
+    parent.components().any(|c| match c {
+        Component::Normal(seg) => seg.to_str().is_some_and(|s| {
+            NATIVE_DEPENDENCY_DIRS
+                .iter()
+                .any(|dep| s.eq_ignore_ascii_case(dep))
+        }),
+        _ => false,
+    })
+}
+
 fn collect_native_dlls(game_root: &Path, enabled_mod_folders: &[String]) -> Vec<String> {
-    let mut natives = Vec::new();
+    let mut natives: Vec<String> = Vec::new();
     for folder in enabled_mod_folders {
         let trimmed = folder.trim();
         if trimmed.is_empty() {
+            continue;
+        }
+        // Flat DLL mods deploy directly under `Game/mods/<Mod>.dll` and pass their DLL filename.
+        if trimmed.to_ascii_lowercase().ends_with(".dll") {
+            let direct = game_root.join("mods").join(trimmed);
+            if direct.is_file() && !is_non_mod_native_dll(trimmed) {
+                let rel_str = format!("mods/{}", trimmed.replace('\\', "/"));
+                if !natives.iter().any(|existing| existing.eq_ignore_ascii_case(&rel_str)) {
+                    natives.push(rel_str);
+                }
+            }
             continue;
         }
         let mod_dir = game_root.join("mods").join(trimmed);
         if !mod_dir.is_dir() {
             continue;
         }
-        for entry in WalkDir::new(&mod_dir).into_iter().filter_map(|e| e.ok()) {
+        let mut candidates: Vec<(usize, String)> = Vec::new();
+        for entry in WalkDir::new(&mod_dir)
+            .max_depth(2)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
             let path = entry.path();
             if !path.is_file() {
                 continue;
@@ -461,7 +823,13 @@ fn collect_native_dlls(game_root: &Path, enabled_mod_folders: &[String]) -> Vec<
             if !name.to_ascii_lowercase().ends_with(".dll") {
                 continue;
             }
-            if is_root_injector(name) {
+            if is_non_mod_native_dll(name) {
+                continue;
+            }
+            let Ok(rel_in_mod) = path.strip_prefix(&mod_dir) else {
+                continue;
+            };
+            if path_has_dependency_dir(rel_in_mod) {
                 continue;
             }
             let Ok(rel) = path.strip_prefix(game_root) else {
@@ -469,75 +837,68 @@ fn collect_native_dlls(game_root: &Path, enabled_mod_folders: &[String]) -> Vec<
             };
             let rel_str = normalize_relative(rel).to_string_lossy().replace('\\', "/");
             if !rel_str.is_empty() {
-                natives.push(rel_str);
+                candidates.push((entry.depth(), rel_str));
+            }
+        }
+        // Only register entry-point DLLs at the shallowest depth inside this mod folder
+        // (e.g. ERSS-FG.dll at depth 1 ignores nested helper/SDK DLLs, while SeamlessCoop/ersc.dll
+        // at depth 2 is picked when no depth-1 DLL exists).
+        let Some(min_depth) = candidates.iter().map(|(d, _)| *d).min() else {
+            continue;
+        };
+        let mut mod_dlls: Vec<String> = candidates
+            .into_iter()
+            .filter(|(d, _)| *d == min_depth)
+            .map(|(_, path)| path)
+            .collect();
+        // Sort deterministically within each mod folder while preserving user load order across mods.
+        mod_dlls.sort();
+        for dll in mod_dlls {
+            if !natives.iter().any(|existing| existing == &dll) {
+                natives.push(dll);
             }
         }
     }
-    natives.sort();
-    natives.dedup();
     natives
 }
 
-/// Write a me3 profile listing enabled mod packages and native DLLs.
+/// Write a me3 profile listing enabled asset packages and native DLLs in load order.
 pub fn write_me3_profile(
     game_root: &Path,
     me3_game: &str,
     enabled_mod_folders: &[String],
 ) -> Result<()> {
-    let mut body = String::from("profileVersion = \"v1\"\n\n[[supports]]\ngame = \"");
+    let mut body = String::from(
+        "# Auto-generated by Emperor Mod Manager.\nprofileVersion = \"v1\"\n\n[[supports]]\ngame = \"",
+    );
     body.push_str(&escape_toml_basic(me3_game));
     body.push_str("\"\n");
 
+    let mut seen_packages: Vec<String> = Vec::new();
     for folder in enabled_mod_folders {
         let trimmed = folder.trim();
-        if trimmed.is_empty() {
+        if trimmed.is_empty() || seen_packages.iter().any(|p| p == trimmed) {
             continue;
         }
+        let mod_dir = game_root.join("mods").join(trimmed);
+        if !mod_folder_has_assets(&mod_dir) {
+            continue;
+        }
+        seen_packages.push(trimmed.to_string());
         body.push_str("\n[[packages]]\nid = \"");
         body.push_str(&escape_toml_basic(trimmed));
-        body.push_str("\"\npath = 'mods/");
-        body.push_str(&trimmed.replace('\'', ""));
-        body.push_str("'\n");
+        body.push_str("\"\npath = \"mods/");
+        body.push_str(&escape_toml_basic(trimmed));
+        body.push_str("\"\n");
     }
 
     for native in collect_native_dlls(game_root, enabled_mod_folders) {
-        body.push_str("\n[[natives]]\npath = '");
-        body.push_str(&native.replace('\'', ""));
-        body.push_str("'\n");
+        body.push_str("\n[[natives]]\npath = \"");
+        body.push_str(&escape_toml_basic(&native));
+        body.push_str("\"\n");
     }
 
     let path = game_root.join("emperor.me3");
-    std::fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
-    Ok(())
-}
-
-/// Write a Mod Engine 2 config pointing at each enabled `mods/<Name>` folder.
-pub fn write_me2_config(game_root: &Path, enabled_mod_folders: &[String]) -> Result<()> {
-    let mut body = String::from(
-        "# Generated by Emperor Mod Manager. Point Mod Engine 2 at this file.\n\
-         [modengine]\n\
-         debug = false\n\n\
-         [extension.mod_loader]\n\
-         enabled = true\n\
-         loose_params = false\n\
-         mods = [\n",
-    );
-    for folder in enabled_mod_folders {
-        let trimmed = folder.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let abs = game_root.join("mods").join(trimmed);
-        let path = abs.to_string_lossy().replace('\\', "\\\\");
-        body.push_str("  { enabled = true, name = \"");
-        body.push_str(&escape_toml_basic(trimmed));
-        body.push_str("\", path = \"");
-        body.push_str(&path);
-        body.push_str("\" },\n");
-    }
-    body.push_str("]\n");
-
-    let path = game_root.join("config_emperor.toml");
     std::fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
@@ -1216,6 +1577,59 @@ fn prepare_fromsoft_runtime<'a>(
     })
 }
 
+fn ini_has_empty_cooppassword(ini: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(ini) else {
+        return false;
+    };
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with(';') || trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed.to_ascii_lowercase().starts_with("cooppassword") {
+            if let Some((_, val)) = trimmed.split_once('=') {
+                return val.trim().is_empty();
+            }
+            return true;
+        }
+    }
+    false
+}
+
+/// Find an Elden Ring Seamless Co-op `ersc_settings.ini` whose `cooppassword` is empty.
+pub fn empty_er_seamless_cooppassword(game_root: &Path) -> Option<PathBuf> {
+    if let Some(sc_dir) = find_child_dir_ci(game_root, "SeamlessCoop") {
+        if let Some(ini) = find_file_ci(&sc_dir, "ersc_settings.ini") {
+            if ini_has_empty_cooppassword(&ini) {
+                return Some(ini);
+            }
+        }
+    }
+    let mods_dir = game_root.join("mods");
+    let Ok(entries) = std::fs::read_dir(&mods_dir) else {
+        return None;
+    };
+    for entry in entries.flatten() {
+        let mod_dir = entry.path();
+        if !mod_dir.is_dir() {
+            continue;
+        }
+        if let Some(sc_dir) = find_child_dir_ci(&mod_dir, "SeamlessCoop") {
+            if let Some(ini) = find_file_ci(&sc_dir, "ersc_settings.ini") {
+                if ini_has_empty_cooppassword(&ini) {
+                    return Some(ini);
+                }
+            }
+        }
+        if let Some(ini) = find_file_ci(&mod_dir, "ersc_settings.ini") {
+            if ini_has_empty_cooppassword(&ini) {
+                return Some(ini);
+            }
+        }
+    }
+    None
+}
+
 fn modern_after_deploy(
     install_path: &Path,
     me3_game: &str,
@@ -1223,8 +1637,91 @@ fn modern_after_deploy(
 ) -> Result<Vec<String>> {
     let root = resolve_game_root(install_path);
     write_me3_profile(&root, me3_game, enabled_mod_folders)?;
-    write_me2_config(&root, enabled_mod_folders)?;
-    Ok(Vec::new())
+    let mut warnings = Vec::new();
+    if let Some(ini_path) = empty_er_seamless_cooppassword(&root) {
+        warnings.push(format!(
+            "Seamless Co-op cooppassword is empty in {} — set the same password as your co-op partners before launching.",
+            ini_path.display()
+        ));
+    }
+    Ok(warnings)
+}
+
+fn modern_on_revert(install_path: &Path) -> Result<()> {
+    let root = resolve_game_root(install_path);
+    for name in [
+        "emperor.me3",
+        "config_emperor.toml",
+        "launch_emperor_me3.sh",
+        "launch_emperor_me3.bat",
+        "launch_emperor_me2.bat",
+    ] {
+        let path = root.join(name);
+        if path.is_file() {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    Ok(())
+}
+
+fn modern_log_sources(install_path: &Path) -> Vec<super::LogSource> {
+    let root = resolve_game_root(install_path);
+    let mut sources = vec![super::LogSource {
+        label: "Mod Engine 3 (me3)".into(),
+        kind: super::LogKind::Me3,
+        path: root.join("emperor_me3.log"),
+    }];
+
+    // Also include the newest me3 host log if present in me3's standard data directory.
+    let me3_logs_dir = me3_standard_logs_dir();
+    if let Some(dir) = me3_logs_dir.filter(|d| d.is_dir()) {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            let mut logs: Vec<PathBuf> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.is_file()
+                        && p.extension()
+                            .and_then(|e| e.to_str())
+                            .is_some_and(|e| e.eq_ignore_ascii_case("log"))
+                })
+                .collect();
+            logs.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
+            if let Some(newest) = logs.pop() {
+                sources.push(super::LogSource {
+                    label: "me3 host log".into(),
+                    kind: super::LogKind::Me3,
+                    path: newest,
+                });
+            }
+        }
+    }
+
+    sources
+}
+
+fn me3_standard_logs_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .map(|d| d.join("garyttierney").join("me3").join("data").join("logs"))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let base = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .map(|h| h.join(".local").join("share"))
+            })?;
+        let direct = base.join("me3").join("logs");
+        if direct.is_dir() {
+            return Some(direct);
+        }
+        Some(base.join("garyttierney").join("me3").join("logs"))
+    }
 }
 
 macro_rules! fromsoft_legacy_plugin {
@@ -1351,6 +1848,45 @@ macro_rules! fromsoft_modern_plugin {
                 Ok(resolve_modern_deploy(install_path, relative))
             }
 
+            fn resolve_deploy_root_ctx(
+                &self,
+                install_path: &Path,
+                relative: &Path,
+                ctx: &DeployContext<'_>,
+            ) -> Result<PathBuf> {
+                Ok(resolve_modern_deploy_ctx(install_path, relative, ctx))
+            }
+
+            fn should_deploy_file_ctx(&self, relative: &Path, ctx: &DeployContext<'_>) -> bool {
+                should_deploy_modern_file(relative, ctx)
+            }
+
+            fn allows_empty_deploy(&self, content_root: &Path) -> bool {
+                looks_like_elden_mod_loader(content_root)
+            }
+
+            fn staging_deploy_warnings(&self, content_root: &Path, mod_name: &str) -> Vec<String> {
+                modern_staging_deploy_warnings(content_root, mod_name)
+            }
+
+            fn load_order_entries(&self, content_root: &Path, staged_name: &str) -> Vec<String> {
+                if looks_like_elden_mod_loader(content_root)
+                    || looks_like_modern_graphics_proxy_pack(content_root)
+                {
+                    return Vec::new();
+                }
+                let flat_dlls = flat_modern_dll_mod_files(content_root);
+                if !flat_dlls.is_empty() {
+                    return flat_dlls;
+                }
+                let name = self.wrap_mod_folder_name(content_root, staged_name);
+                if name.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![name]
+                }
+            }
+
             fn prunable_dirs(&self, install_path: &Path) -> Vec<PathBuf> {
                 vec![resolve_game_root(install_path).join("mods")]
             }
@@ -1359,12 +1895,20 @@ macro_rules! fromsoft_modern_plugin {
                 modern_preflight_warnings(install_path)
             }
 
+            fn load_log_sources(&self, install_path: &Path) -> Vec<super::LogSource> {
+                modern_log_sources(install_path)
+            }
+
             fn after_deploy(
                 &self,
                 install_path: &Path,
                 enabled_mod_folders: &[String],
             ) -> Result<Vec<String>> {
                 modern_after_deploy(install_path, $me3_game, enabled_mod_folders)
+            }
+
+            fn on_revert(&self, install_path: &Path) -> Result<()> {
+                modern_on_revert(install_path)
             }
 
             fn prepare_runtime<'a>(
@@ -1620,9 +2164,9 @@ mod tests {
         assert_eq!(dest, game.join("dxgi.dll"));
 
         let dest = EldenRingPlugin
-            .resolve_deploy_root(&install, Path::new("SomeMod/modengine.ini"))
+            .resolve_deploy_root(&install, Path::new("SomeMod/dxgi.dll"))
             .unwrap();
-        assert_eq!(dest, game.join("modengine.ini"));
+        assert_eq!(dest, game.join("dxgi.dll"));
     }
 
     #[test]
@@ -1905,7 +2449,7 @@ mod tests {
     }
 
     #[test]
-    fn writes_me3_and_me2_configs() {
+    fn writes_me3_profile_with_assets_and_natives() {
         let tmp = tempfile::tempdir().unwrap();
         let mod_a = tmp.path().join("mods").join("CoolMod");
         std::fs::create_dir_all(mod_a.join("parts")).unwrap();
@@ -1913,17 +2457,325 @@ mod tests {
         std::fs::write(mod_a.join("dinput8.dll"), b"x").unwrap();
 
         write_me3_profile(tmp.path(), "eldenring", &["CoolMod".into()]).unwrap();
-        write_me2_config(tmp.path(), &["CoolMod".into()]).unwrap();
 
         let me3 = std::fs::read_to_string(tmp.path().join("emperor.me3")).unwrap();
         assert!(me3.contains("game = \"eldenring\""));
-        assert!(me3.contains("path = 'mods/CoolMod'"));
-        assert!(me3.contains("path = 'mods/CoolMod/helper.dll'"));
+        assert!(me3.contains("path = \"mods/CoolMod\""));
+        assert!(me3.contains("path = \"mods/CoolMod/helper.dll\""));
         assert!(!me3.contains("dinput8.dll"));
+    }
 
-        let me2 = std::fs::read_to_string(tmp.path().join("config_emperor.toml")).unwrap();
-        assert!(me2.contains("name = \"CoolMod\""));
-        assert!(me2.contains("mods/CoolMod"));
+    #[test]
+    fn me3_profile_separates_packages_and_natives_in_load_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        // 1. Pure DLL mod (Zeta) — listed FIRST in user load order
+        let zeta = tmp.path().join("mods").join("ZetaFps");
+        std::fs::create_dir_all(&zeta).unwrap();
+        std::fs::write(zeta.join("UnlockTheFps.dll"), b"x").unwrap();
+        std::fs::write(zeta.join("vcruntime140.dll"), b"rt").unwrap();
+        std::fs::write(zeta.join("steam_api64.dll"), b"steam").unwrap();
+
+        // 2. Seamless Co-op — pure native DLL inside SeamlessCoop/
+        let sc = tmp.path().join("mods").join("Seamless Co-op");
+        std::fs::create_dir_all(sc.join("SeamlessCoop")).unwrap();
+        std::fs::write(sc.join("SeamlessCoop").join("ersc.dll"), b"x").unwrap();
+        std::fs::write(sc.join("ersc_launcher.exe"), b"x").unwrap();
+
+        // 3. Asset + DLL hybrid mod with apostrophe in name
+        let hybrid = tmp.path().join("mods").join("Malenia's Overhaul");
+        std::fs::create_dir_all(hybrid.join("asset")).unwrap();
+        std::fs::write(hybrid.join("regulation.bin"), b"x").unwrap();
+        std::fs::write(hybrid.join("AlphaHook.dll"), b"x").unwrap();
+        std::fs::write(hybrid.join("me3_mod_host.dll"), b"x").unwrap();
+
+        let order = vec![
+            "ZetaFps".to_string(),
+            "Seamless Co-op".to_string(),
+            "Malenia's Overhaul".to_string(),
+        ];
+        write_me3_profile(tmp.path(), "eldenring", &order).unwrap();
+        let me3 = std::fs::read_to_string(tmp.path().join("emperor.me3")).unwrap();
+
+        // Only the hybrid mod has FromSoft assets, so only it gets [[packages]].
+        assert!(!me3.contains("id = \"ZetaFps\""));
+        assert!(!me3.contains("id = \"Seamless Co-op\""));
+        assert!(me3.contains("id = \"Malenia's Overhaul\""));
+        assert!(me3.contains("path = \"mods/Malenia's Overhaul\""));
+
+        // Non-mod runtime/host DLLs are excluded.
+        assert!(!me3.contains("vcruntime140.dll"));
+        assert!(!me3.contains("steam_api64.dll"));
+        assert!(!me3.contains("me3_mod_host.dll"));
+
+        // Native DLLs preserve user load order (Zeta -> Seamless -> Alpha), not alphabetical.
+        let pos_zeta = me3.find("mods/ZetaFps/UnlockTheFps.dll").unwrap();
+        let pos_sc = me3.find("mods/Seamless Co-op/SeamlessCoop/ersc.dll").unwrap();
+        let pos_alpha = me3.find("mods/Malenia's Overhaul/AlphaHook.dll").unwrap();
+        assert!(pos_zeta < pos_sc && pos_sc < pos_alpha);
+    }
+
+    #[test]
+    fn me3_profile_ignores_nested_sdk_and_dependency_dlls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let erss = tmp.path().join("mods").join("ERSS-FG-v4.13.0-Release");
+        std::fs::create_dir_all(erss.join("ERSS2").join("bin")).unwrap();
+        std::fs::write(erss.join("ERSS-FG.dll"), b"mod").unwrap();
+        std::fs::write(
+            erss.join("ERSS2").join("bin").join("nvngx_dlss.dll"),
+            b"sdk",
+        )
+        .unwrap();
+        std::fs::write(
+            erss.join("ERSS2")
+                .join("bin")
+                .join("amd_fidelityfx_framegeneration_dx12.dll"),
+            b"sdk",
+        )
+        .unwrap();
+        std::fs::write(
+            erss.join("ERSS2").join("bin").join("sl.interposer.dll"),
+            b"sdk",
+        )
+        .unwrap();
+        // Even a non-SDK helper DLL in a deeper folder is skipped when depth-1 entry DLL exists.
+        std::fs::create_dir_all(erss.join("helper")).unwrap();
+        std::fs::write(erss.join("helper").join("internal_dep.dll"), b"dep").unwrap();
+
+        let sc = tmp.path().join("mods").join("Seamless Co-op (Elden Ring)");
+        std::fs::create_dir_all(sc.join("SeamlessCoop")).unwrap();
+        std::fs::write(sc.join("SeamlessCoop").join("ersc.dll"), b"sc").unwrap();
+
+        write_me3_profile(
+            tmp.path(),
+            "eldenring",
+            &[
+                "Seamless Co-op (Elden Ring)".into(),
+                "ERSS-FG-v4.13.0-Release".into(),
+            ],
+        )
+        .unwrap();
+
+        let me3 = std::fs::read_to_string(tmp.path().join("emperor.me3")).unwrap();
+        assert!(me3.contains("mods/Seamless Co-op (Elden Ring)/SeamlessCoop/ersc.dll"));
+        assert!(me3.contains("mods/ERSS-FG-v4.13.0-Release/ERSS-FG.dll"));
+        assert!(!me3.contains("nvngx_dlss.dll"));
+        assert!(!me3.contains("amd_fidelityfx"));
+        assert!(!me3.contains("sl.interposer.dll"));
+        assert!(!me3.contains("internal_dep.dll"));
+    }
+
+    #[test]
+    fn graphics_proxy_pack_deploys_to_game_root_and_skips_me3_natives() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install = tmp.path().join("ELDEN RING");
+        let game = install.join("Game");
+        std::fs::create_dir_all(&game).unwrap();
+
+        let erss = tmp.path().join("ERSS-FG-v4.13.0-Release");
+        std::fs::create_dir_all(erss.join("ERSS2").join("bin")).unwrap();
+        std::fs::write(erss.join("D3D12.dll"), b"proxy").unwrap();
+        std::fs::write(erss.join("ERSS-FG.dll"), b"mod").unwrap();
+        std::fs::write(erss.join("ERSS2").join("ERSS-FG.toml"), b"cfg").unwrap();
+        std::fs::write(erss.join("ERSS2").join("bin").join("libxess.dll"), b"sdk").unwrap();
+
+        assert!(looks_like_modern_graphics_proxy_pack(&erss));
+        assert!(EldenRingPlugin
+            .load_order_entries(&erss, "ERSS-FG-v4.13.0-Release")
+            .is_empty());
+
+        let ctx = DeployContext {
+            project_name: None,
+            content_root: Some(&erss),
+            source_dir: None,
+        };
+        assert_eq!(
+            EldenRingPlugin
+                .resolve_deploy_root_ctx(
+                    &install,
+                    Path::new("ERSS-FG-v4.13.0-Release/D3D12.dll"),
+                    &ctx
+                )
+                .unwrap(),
+            game.join("D3D12.dll")
+        );
+        assert_eq!(
+            EldenRingPlugin
+                .resolve_deploy_root_ctx(
+                    &install,
+                    Path::new("ERSS-FG-v4.13.0-Release/ERSS-FG.dll"),
+                    &ctx
+                )
+                .unwrap(),
+            game.join("ERSS-FG.dll")
+        );
+        assert_eq!(
+            EldenRingPlugin
+                .resolve_deploy_root_ctx(
+                    &install,
+                    Path::new("ERSS-FG-v4.13.0-Release/ERSS2/bin/libxess.dll"),
+                    &ctx
+                )
+                .unwrap(),
+            game.join("ERSS2").join("bin").join("libxess.dll")
+        );
+    }
+
+    #[test]
+    fn flat_dll_mods_and_eml_bundles_deploy_directly_under_mods() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install = tmp.path().join("ELDEN RING");
+        let game = install.join("Game");
+        std::fs::create_dir_all(&game).unwrap();
+
+        // 1. Individual techiew mod: Fix the camera -> mods/CameraFix.dll + mods/CameraFix/config.ini
+        let cam = tmp.path().join("Fix the camera");
+        std::fs::create_dir_all(cam.join("mods").join("CameraFix")).unwrap();
+        std::fs::write(cam.join("mods").join("CameraFix.dll"), b"dll").unwrap();
+        std::fs::write(cam.join("mods").join("CameraFix").join("config.ini"), b"ini").unwrap();
+
+        assert!(looks_like_modern_flat_dll_mod(&cam));
+        assert_eq!(
+            EldenRingPlugin.load_order_entries(&cam, "Fix the camera"),
+            vec!["CameraFix.dll".to_string()]
+        );
+        let cam_ctx = DeployContext {
+            project_name: None,
+            content_root: Some(&cam),
+            source_dir: None,
+        };
+        assert_eq!(
+            EldenRingPlugin
+                .resolve_deploy_root_ctx(
+                    &install,
+                    Path::new("Fix the camera/mods/CameraFix.dll"),
+                    &cam_ctx
+                )
+                .unwrap(),
+            game.join("mods").join("CameraFix.dll")
+        );
+        assert_eq!(
+            EldenRingPlugin
+                .resolve_deploy_root_ctx(
+                    &install,
+                    Path::new("Fix the camera/mods/CameraFix/config.ini"),
+                    &cam_ctx
+                )
+                .unwrap(),
+            game.join("mods").join("CameraFix").join("config.ini")
+        );
+
+        // 2. Bundle pack (like Elden Ring Ultrawide Fix) that includes dinput8.dll + mod_loader_config.ini
+        // alongside real DLL mods under mods/.
+        let uw = tmp.path().join("Elden Ring Ultrawide Fix");
+        std::fs::create_dir_all(uw.join("mods").join("UltrawideFix")).unwrap();
+        std::fs::write(uw.join("dinput8.dll"), b"eml").unwrap();
+        std::fs::write(uw.join("mod_loader_config.ini"), b"cfg").unwrap();
+        std::fs::write(uw.join("anti_cheat_toggler_config.ini"), b"eac").unwrap();
+        std::fs::write(uw.join("_winhttp.dll"), b"eac").unwrap();
+        std::fs::write(uw.join("mods").join("UltrawideFix.dll"), b"uw").unwrap();
+        std::fs::write(uw.join("mods").join("CameraFix.dll"), b"cam").unwrap();
+
+        // Must NOT be skipped as standalone Elden Mod Loader!
+        assert!(!looks_like_elden_mod_loader(&uw));
+        assert!(looks_like_modern_flat_dll_mod(&uw));
+        let uw_ctx = DeployContext {
+            project_name: None,
+            content_root: Some(&uw),
+            source_dir: None,
+        };
+        // Loader files are skipped, real DLLs are deployed.
+        assert!(!EldenRingPlugin.should_deploy_file_ctx(Path::new("dinput8.dll"), &uw_ctx));
+        assert!(!EldenRingPlugin.should_deploy_file_ctx(Path::new("mod_loader_config.ini"), &uw_ctx));
+        assert!(!EldenRingPlugin.should_deploy_file_ctx(Path::new("anti_cheat_toggler_config.ini"), &uw_ctx));
+        assert!(!EldenRingPlugin.should_deploy_file_ctx(Path::new("_winhttp.dll"), &uw_ctx));
+        assert!(EldenRingPlugin.should_deploy_file_ctx(Path::new("mods/UltrawideFix.dll"), &uw_ctx));
+        assert_eq!(
+            EldenRingPlugin.load_order_entries(&uw, "Elden Ring Ultrawide Fix"),
+            vec!["CameraFix.dll".to_string(), "UltrawideFix.dll".to_string()]
+        );
+
+        // Deployed flat DLLs are registered in emperor.me3 and deduplicated across mods.
+        std::fs::create_dir_all(game.join("mods")).unwrap();
+        std::fs::write(game.join("mods").join("CameraFix.dll"), b"dll").unwrap();
+        std::fs::write(game.join("mods").join("UltrawideFix.dll"), b"uw").unwrap();
+        write_me3_profile(
+            &game,
+            "eldenring",
+            &[
+                "CameraFix.dll".into(),
+                "CameraFix.dll".into(),
+                "UltrawideFix.dll".into(),
+            ],
+        )
+        .unwrap();
+        let me3 = std::fs::read_to_string(game.join("emperor.me3")).unwrap();
+        assert_eq!(me3.matches("mods/CameraFix.dll").count(), 1);
+        assert_eq!(me3.matches("mods/UltrawideFix.dll").count(), 1);
+        assert!(!me3.contains("[[packages]]"));
+    }
+
+    #[test]
+    fn elden_mod_loader_is_skipped_with_warning_for_modern_fromsoft() {
+        let tmp = tempfile::tempdir().unwrap();
+        let eml = tmp.path().join("EldenModLoader");
+        std::fs::create_dir_all(&eml).unwrap();
+        std::fs::write(eml.join("dinput8.dll"), b"x").unwrap();
+        std::fs::write(eml.join("mod_loader_config.ini"), b"[modloader]").unwrap();
+
+        assert!(looks_like_elden_mod_loader(&eml));
+        let ctx = DeployContext {
+            project_name: None,
+            content_root: Some(&eml),
+            source_dir: None,
+        };
+        assert!(!EldenRingPlugin.should_deploy_file_ctx(Path::new("dinput8.dll"), &ctx));
+        assert!(!EldenRingPlugin.should_deploy_file_ctx(Path::new("mod_loader_config.ini"), &ctx));
+        assert!(EldenRingPlugin.allows_empty_deploy(&eml));
+        assert!(EldenRingPlugin
+            .load_order_entries(&eml, "Elden Mod Loader")
+            .is_empty());
+        let warnings = EldenRingPlugin.staging_deploy_warnings(&eml, "Elden Mod Loader");
+        assert!(warnings.iter().any(|w| w.contains("superseded by Mod Engine 3")));
+    }
+
+    #[test]
+    fn er_seamless_coop_empty_password_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sc = tmp
+            .path()
+            .join("mods")
+            .join("SeamlessCoop")
+            .join("SeamlessCoop");
+        std::fs::create_dir_all(&sc).unwrap();
+        std::fs::write(sc.join("ersc_settings.ini"), "[PASSWORD]\ncooppassword = \n").unwrap();
+
+        assert!(empty_er_seamless_cooppassword(tmp.path()).is_some());
+        let warnings = EldenRingPlugin
+            .after_deploy(tmp.path(), &["SeamlessCoop".into()])
+            .unwrap();
+        assert!(warnings.iter().any(|w| w.contains("cooppassword is empty")));
+
+        std::fs::write(
+            sc.join("ersc_settings.ini"),
+            "[PASSWORD]\ncooppassword = tarnished\n",
+        )
+        .unwrap();
+        assert!(empty_er_seamless_cooppassword(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn modern_on_revert_removes_generated_me3_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let game = tmp.path().join("Game");
+        std::fs::create_dir_all(&game).unwrap();
+        std::fs::write(game.join("emperor.me3"), b"profile").unwrap();
+        std::fs::write(game.join("launch_emperor_me3.sh"), b"sh").unwrap();
+        std::fs::write(game.join("launch_emperor_me3.bat"), b"bat").unwrap();
+
+        EldenRingPlugin.on_revert(tmp.path()).unwrap();
+        assert!(!game.join("emperor.me3").exists());
+        assert!(!game.join("launch_emperor_me3.sh").exists());
+        assert!(!game.join("launch_emperor_me3.bat").exists());
     }
 
     #[test]
@@ -1952,14 +2804,17 @@ mod tests {
     }
 
     #[test]
-    fn modern_preflight_reminds_about_launcher() {
+    fn modern_preflight_checks_profile_and_dinput8() {
         let tmp = tempfile::tempdir().unwrap();
         let warnings = EldenRingPlugin.preflight_warnings(tmp.path());
         assert!(warnings.iter().any(|w| w.contains("emperor.me3")));
 
-        std::fs::write(tmp.path().join("launch_emperor_me3.sh"), b"#!/bin/sh\n").unwrap();
-        let soft = EldenRingPlugin.preflight_warnings(tmp.path());
-        assert!(soft.iter().any(|w| w.contains("launch_emperor_me3")));
+        std::fs::write(tmp.path().join("emperor.me3"), b"profileVersion = \"v1\"\n").unwrap();
+        assert!(EldenRingPlugin.preflight_warnings(tmp.path()).is_empty());
+
+        std::fs::write(tmp.path().join("dinput8.dll"), b"x").unwrap();
+        let conflict = EldenRingPlugin.preflight_warnings(tmp.path());
+        assert!(conflict.iter().any(|w| w.contains("dinput8.dll")));
     }
 
     #[test]

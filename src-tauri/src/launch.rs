@@ -84,9 +84,24 @@ pub struct LaunchResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaunchTarget {
-    Steam { app_id: String },
-    Heroic { runner: String, app_name: String },
-    Executable { path: PathBuf },
+    Steam {
+        app_id: String,
+    },
+    Heroic {
+        runner: String,
+        app_name: String,
+    },
+    Executable {
+        path: PathBuf,
+    },
+    Me3 {
+        binary: PathBuf,
+        windows_binaries_dir: Option<PathBuf>,
+        game: String,
+        profile: PathBuf,
+        cwd: PathBuf,
+        log_file: PathBuf,
+    },
 }
 
 pub fn now_unix_secs() -> u64 {
@@ -94,6 +109,35 @@ pub fn now_unix_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// Resolve the modded launch target, preferring Mod Engine 3 (`me3`) for modern FromSoft titles
+/// when no custom launch executable is configured and `emperor.me3` + `me3` are available.
+pub fn resolve_modded_launch_target(paths: &Paths, game: &ManagedGame) -> Result<LaunchTarget> {
+    let has_custom = game
+        .launch_executable
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty());
+    if !has_custom {
+        if let Some(me3_game) = games::me3_game_name(&game.plugin_id) {
+            let game_root = games::fromsoft_resolve_game_root(Path::new(&game.install_path));
+            let profile = game_root.join("emperor.me3");
+            if profile.is_file() {
+                if let Some(me3) = games::resolve_me3_installation(paths) {
+                    return Ok(LaunchTarget::Me3 {
+                        binary: me3.binary,
+                        windows_binaries_dir: me3.windows_binaries_dir,
+                        game: me3_game.to_string(),
+                        profile,
+                        cwd: game_root.clone(),
+                        log_file: game_root.join("emperor_me3.log"),
+                    });
+                }
+            }
+        }
+    }
+    resolve_launch_target(game)
 }
 
 pub fn resolve_launch_target(game: &ManagedGame) -> Result<LaunchTarget> {
@@ -179,11 +223,20 @@ pub fn launch_target(
             let is_win_exe = false;
 
             if let Some(w) = wrapper.map(str::trim).filter(|s| !s.is_empty()) {
-                program = std::ffi::OsString::from(w);
-                if is_win_exe {
-                    argv.push("wine".to_string());
+                let mut w_tokens = w.split_whitespace();
+                if let Some(first_w) = w_tokens.next() {
+                    program = std::ffi::OsString::from(first_w);
+                    for rest in w_tokens {
+                        argv.push(rest.to_string());
+                    }
+                    if is_win_exe {
+                        argv.push("wine".to_string());
+                    }
+                    argv.push(path.to_string_lossy().into_owned());
+                } else if is_win_exe {
+                    program = std::ffi::OsString::from("wine");
+                    argv.push(path.to_string_lossy().into_owned());
                 }
-                argv.push(path.to_string_lossy().into_owned());
             } else if is_win_exe {
                 program = std::ffi::OsString::from("wine");
                 argv.push(path.to_string_lossy().into_owned());
@@ -201,6 +254,59 @@ pub fn launch_target(
                 .envs(env_vars)
                 .spawn()
                 .with_context(|| format!("launching {}", path.display()))?;
+            Ok(Some(child.id()))
+        }
+        LaunchTarget::Me3 {
+            binary,
+            windows_binaries_dir,
+            game,
+            profile,
+            cwd,
+            log_file,
+        } => {
+            let mut argv: Vec<String> = Vec::new();
+            let program = if let Some(w) = wrapper.map(str::trim).filter(|s| !s.is_empty()) {
+                let mut w_tokens = w.split_whitespace();
+                if let Some(first_w) = w_tokens.next() {
+                    for rest in w_tokens {
+                        argv.push(rest.to_string());
+                    }
+                    argv.push(binary.to_string_lossy().into_owned());
+                    std::ffi::OsString::from(first_w)
+                } else {
+                    binary.as_os_str().to_os_string()
+                }
+            } else {
+                binary.as_os_str().to_os_string()
+            };
+
+            if let Some(win_dir) = windows_binaries_dir {
+                argv.push("--windows-binaries-dir".to_string());
+                argv.push(win_dir.to_string_lossy().into_owned());
+            }
+            argv.push("launch".to_string());
+            argv.push("--game".to_string());
+            argv.push(game.clone());
+            argv.push("--profile".to_string());
+            argv.push(profile.to_string_lossy().into_owned());
+
+            if let Some(extra) = extra_args.map(str::trim).filter(|s| !s.is_empty()) {
+                for tok in extra.split_whitespace() {
+                    argv.push(tok.to_string());
+                }
+            }
+
+            let mut cmd = Command::new(&program);
+            cmd.args(&argv).current_dir(cwd).envs(env_vars);
+            if let Ok(file) = std::fs::File::create(log_file) {
+                if let Ok(err_file) = file.try_clone() {
+                    cmd.stdout(std::process::Stdio::from(file))
+                        .stderr(std::process::Stdio::from(err_file));
+                }
+            }
+            let child = cmd
+                .spawn()
+                .with_context(|| format!("launching me3 ({})", binary.display()))?;
             Ok(Some(child.id()))
         }
     }
@@ -574,6 +680,11 @@ pub fn revert_game_deployment(
     if let Some(plugin) = games::plugin_by_id(plugin_id) {
         mods::prune_empty_loader_dirs(plugin, install);
         plugin.on_revert(install)?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let backup = paths.steam_launch_backup_file(game_id);
+        let _ = crate::tools::steam_launch::restore_steam_launch_options(&backup);
     }
     Ok(())
 }
@@ -1018,6 +1129,75 @@ mod tests {
             None,
             false,
         ));
+    }
+
+    #[test]
+    fn resolve_modded_launch_target_uses_me3_for_elden_ring() {
+        let tmp = tempdir().unwrap();
+        let paths = Paths {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+            cache_dir: tmp.path().join("cache"),
+        };
+        let bin_dir = paths.me3_install_dir().join("bin");
+        let win_dir = bin_dir.join("win64");
+        fs::create_dir_all(&win_dir).unwrap();
+        fs::write(bin_dir.join("me3"), b"x").unwrap();
+        fs::write(win_dir.join("me3_mod_host.dll"), b"dll").unwrap();
+
+        let install = tmp.path().join("ELDEN RING");
+        let game_dir = install.join("Game");
+        fs::create_dir_all(&game_dir).unwrap();
+        fs::write(game_dir.join("eldenring.exe"), b"x").unwrap();
+        fs::write(game_dir.join("emperor.me3"), b"profileVersion = \"v1\"\n").unwrap();
+
+        let mut game = ManagedGame {
+            id: "er-1".into(),
+            title: "ELDEN RING".into(),
+            nexus_domain: "eldenring".into(),
+            install_path: install.to_string_lossy().into_owned(),
+            launcher: "Steam".into(),
+            plugin_id: "eldenring".into(),
+            cover_path: None,
+            cover_url: None,
+            project_name: None,
+            thunderstore_community: None,
+            modio_game_id: None,
+            tool_overrides: None,
+            game_version: None,
+            ignored_requirements: Vec::new(),
+            launch_executable: None,
+            launch_command_source: crate::config::LaunchCommandSource::Emperor,
+            custom_env_vars: Vec::new(),
+            custom_wrapper: None,
+            custom_launch_args: None,
+            custom_raw_command: None,
+            use_global_launch_options: true,
+            wine_overrides_dismissed: false,
+        };
+
+        let target = resolve_modded_launch_target(&paths, &game).unwrap();
+        assert_eq!(
+            target,
+            LaunchTarget::Me3 {
+                binary: bin_dir.join("me3"),
+                windows_binaries_dir: Some(win_dir),
+                game: "eldenring".into(),
+                profile: game_dir.join("emperor.me3"),
+                cwd: game_dir.clone(),
+                log_file: game_dir.join("emperor_me3.log"),
+            }
+        );
+
+        // Explicit custom launch_executable still overrides me3.
+        game.launch_executable = Some("Game/eldenring.exe".into());
+        let custom = resolve_modded_launch_target(&paths, &game).unwrap();
+        assert_eq!(
+            custom,
+            LaunchTarget::Executable {
+                path: game_dir.join("eldenring.exe"),
+            }
+        );
     }
 
     #[test]

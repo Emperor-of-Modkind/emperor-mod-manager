@@ -305,6 +305,11 @@ describe("FriendsPage", () => {
       friendCollectionId: "active:skyrim",
     });
     expect(onCollectionSynced).toHaveBeenCalledTimes(1);
+    expect(onCollectionSynced).toHaveBeenCalledWith(
+      "skyrim",
+      expect.objectContaining({ collection_id: "col_1" }),
+      { peerId: "peer_alice", friendCollectionId: "active:skyrim" },
+    );
 
     await act(async () => {
       saveBtn!.click();

@@ -621,6 +621,14 @@ function BrowseVirtualListInner<T,>({
     const observer = new ResizeObserver(publish);
     observer.observe(scroll);
     if (list.parentElement) observer.observe(list.parentElement);
+    const contentRoot = scroll.firstElementChild;
+    if (
+      contentRoot &&
+      contentRoot !== scroll &&
+      contentRoot !== list.parentElement
+    ) {
+      observer.observe(contentRoot);
+    }
     return () => observer.disconnect();
   }, [active, items.length, scrollRef]);
 

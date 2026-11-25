@@ -250,4 +250,118 @@ describe("MoveModCollectionDialog", () => {
 
     expect(onSave).toHaveBeenCalledWith(["col-synced", "col-local"]);
   });
+
+  it("allows removing a mod from its only installed collection to keep it standalone", async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    const collections = [makeCollection("col-a", "Essentials", ["1_2"])];
+
+    mount(
+      <MoveModCollectionDialog
+        mod={makeMod(["col-a"])}
+        collections={collections}
+        busy={false}
+        onSave={onSave}
+        onClose={vi.fn()}
+      />,
+    );
+
+    const checkboxes = Array.from(
+      document.body.querySelectorAll<HTMLInputElement>('input[type="checkbox"]'),
+    );
+    expect(checkboxes).toHaveLength(1);
+    expect(checkboxes[0].checked).toBe(true);
+
+    const saveBtn = Array.from(document.body.querySelectorAll("button")).find(
+      (b) => b.textContent === "Save",
+    )!;
+    expect(saveBtn.disabled).toBe(true);
+
+    act(() => {
+      checkboxes[0].click();
+    });
+    expect(checkboxes[0].checked).toBe(false);
+    expect(saveBtn.disabled).toBe(false);
+
+    await act(async () => {
+      saveBtn.click();
+    });
+
+    expect(onSave).toHaveBeenCalledTimes(1);
+    expect(onSave).toHaveBeenCalledWith([]);
+  });
+
+  it("allows adding a standalone mod to the only installed collection", async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    const collections = [makeCollection("col-a", "Essentials", [])];
+
+    mount(
+      <MoveModCollectionDialog
+        mod={makeMod([])}
+        collections={collections}
+        busy={false}
+        onSave={onSave}
+        onClose={vi.fn()}
+      />,
+    );
+
+    const checkboxes = Array.from(
+      document.body.querySelectorAll<HTMLInputElement>('input[type="checkbox"]'),
+    );
+    expect(checkboxes).toHaveLength(1);
+    expect(checkboxes[0].checked).toBe(false);
+
+    const saveBtn = Array.from(document.body.querySelectorAll("button")).find(
+      (b) => b.textContent === "Save",
+    )!;
+    expect(saveBtn.disabled).toBe(true);
+
+    act(() => {
+      checkboxes[0].click();
+    });
+    expect(checkboxes[0].checked).toBe(true);
+    expect(saveBtn.disabled).toBe(false);
+
+    await act(async () => {
+      saveBtn.click();
+    });
+
+    expect(onSave).toHaveBeenCalledTimes(1);
+    expect(onSave).toHaveBeenCalledWith(["col-a"]);
+  });
+
+  it("locks a single synced collection so membership cannot be changed", () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    const collections = [
+      makeCollection("col-synced", "Friend Pack", ["1_2"], true),
+    ];
+
+    mount(
+      <MoveModCollectionDialog
+        mod={makeMod(["col-synced"])}
+        collections={collections}
+        busy={false}
+        onSave={onSave}
+        onClose={vi.fn()}
+      />,
+    );
+
+    const checkboxes = Array.from(
+      document.body.querySelectorAll<HTMLInputElement>('input[type="checkbox"]'),
+    );
+    const saveBtn = Array.from(document.body.querySelectorAll("button")).find(
+      (b) => b.textContent === "Save",
+    )!;
+
+    expect(checkboxes).toHaveLength(1);
+    expect(checkboxes[0].disabled).toBe(true);
+    expect(checkboxes[0].checked).toBe(true);
+    expect(saveBtn.disabled).toBe(true);
+
+    act(() => {
+      checkboxes[0].click();
+    });
+    expect(checkboxes[0].checked).toBe(true);
+    expect(saveBtn.disabled).toBe(true);
+    expect(onSave).not.toHaveBeenCalled();
+  });
 });

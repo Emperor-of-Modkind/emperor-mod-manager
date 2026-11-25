@@ -19,6 +19,7 @@ import {
   faArrowUp,
   faBars,
   faCaretDown,
+  faChevronRight,
   faCopy,
   faDownload,
   faEye,
@@ -27,6 +28,7 @@ import {
   faFilter,
   faFloppyDisk,
   faGear,
+  faSliders,
   faLink,
   faLock,
   faMagnifyingGlass,
@@ -167,6 +169,7 @@ import {
   startFomodPass,
   type FomodPass,
 } from "./fomodQueue";
+import { ModConfigDialog } from "./ModConfigDialog";
 import { ModOptionsDialog } from "./ModOptionsDialog";
 import { MoveModCollectionDialog } from "./MoveModCollectionDialog";
 import { QuickInstallDialog } from "./QuickInstallDialog";
@@ -268,10 +271,12 @@ import type {
   AppInstallVia,
   AppUpdateStatus,
   GameLaunchState,
+  GlobalLaunchOptions,
   LaunchCommandSource,
   LaunchEnvVar,
   LaunchPreview,
 } from "./types";
+import { composeLiveLaunchCommand } from "./launchPreview";
 import {
   formatCollectionGameVersions,
   groupSavedCollectionsByGame,
@@ -1933,6 +1938,10 @@ export default function App() {
   );
   const [modsWithOptions, setModsWithOptions] = useState<Set<string>>(new Set());
   const [modOptionsFor, setModOptionsFor] = useState<StagedMod | null>(null);
+  const [modsWithConfigFiles, setModsWithConfigFiles] = useState<Set<string>>(
+    new Set(),
+  );
+  const [modConfigFor, setModConfigFor] = useState<StagedMod | null>(null);
   const [fomodNeedingIds, setFomodNeedingIds] = useState<string[]>([]);
   const [fomodDialog, setFomodDialog] = useState<{
     mod: StagedMod;
@@ -1951,6 +1960,7 @@ export default function App() {
     useState<CatalogSourceFilter>("all");
   const [modsSort, setModsSort] = useState<ModsSort>("loadOrder");
   const [modsCollectionFilter, setModsCollectionFilter] = useState("");
+  const [disabledModsExpanded, setDisabledModsExpanded] = useState(false);
   const [collectionIntegrityById, setCollectionIntegrityById] = useState<
     Record<string, CollectionIntegrityReport>
   >({});
@@ -2101,6 +2111,15 @@ export default function App() {
   const [newEnvValue, setNewEnvValue] = useState("");
   const [wrapperDraft, setWrapperDraft] = useState("");
   const [argsDraft, setArgsDraft] = useState("");
+  const [rawCommandDraft, setRawCommandDraft] = useState("");
+  const [useGlobalLaunchDraft, setUseGlobalLaunchDraft] = useState(true);
+  const [globalLaunchEnabled, setGlobalLaunchEnabled] = useState(false);
+  const [globalLaunchEnvVars, setGlobalLaunchEnvVars] = useState<LaunchEnvVar[]>([]);
+  const [globalLaunchWrapper, setGlobalLaunchWrapper] = useState("");
+  const [globalLaunchArgs, setGlobalLaunchArgs] = useState("");
+  const [globalLaunchRaw, setGlobalLaunchRaw] = useState("");
+  const [newGlobalEnvName, setNewGlobalEnvName] = useState("");
+  const [newGlobalEnvValue, setNewGlobalEnvValue] = useState("");
   const [gameInfo, setGameInfo] = useState<GameInfo | null>(null);
   const [modDetail, setModDetail] = useState<ModDetail | null>(null);
   const [modDetailLoading, setModDetailLoading] = useState(false);
@@ -2150,7 +2169,6 @@ export default function App() {
   const [tsCommunityEdit, setTsCommunityEdit] = useState("");
   const assistQueueRef = useRef<AssistQueueState | null>(null);
   const activeBatchRef = useRef<ActiveDownloadBatch | null>(null);
-  activeBatchRef.current = activeBatch;
   const assistHostRef = useRef<HTMLDivElement | null>(null);
   const sidebarAssistHostRef = useRef<HTMLDivElement | null>(null);
   const assistActiveRef = useRef(false);
@@ -2538,6 +2556,10 @@ export default function App() {
       setModOptionsFor(null);
       return true;
     }
+    if (modConfigFor) {
+      setModConfigFor(null);
+      return true;
+    }
     if (loadDiagnosis) {
       setLoadDiagnosis(null);
       return true;
@@ -2758,6 +2780,13 @@ export default function App() {
     visibleMods,
     onCommit: commitModDrag,
   });
+
+  useEffect(() => {
+    setDisabledModsExpanded(false);
+  }, [activeGame?.id]);
+
+  const showDisabledModsExpanded =
+    disabledModsExpanded || Boolean(deferredModsQuery.trim());
 
   const stagedUpdateCount = useMemo(
     () =>
@@ -3007,6 +3036,13 @@ export default function App() {
         setModsWithOptions(new Set(withOptions));
       } catch (e) {
         console.warn("list_mods_with_options failed", e);
+      }
+      try {
+        const withConfigs = await api.listModsWithConfigFiles(gameId);
+        if (activeGameRef.current?.id !== gameId) return null;
+        setModsWithConfigFiles(new Set(withConfigs));
+      } catch (e) {
+        console.warn("list_mods_with_config_files failed", e);
       }
       let needing: string[] = [];
       try {
@@ -3784,6 +3820,16 @@ export default function App() {
         if (!force && navTtlRef.current.isFresh(ttlKey, 15 * 60_000)) return;
         navTtlRef.current.mark(ttlKey);
         void refreshModUpdates(gameId);
+        void api
+          .refreshFriends()
+          .catch(() => {})
+          .finally(() => {
+            if (cancelled) return;
+            void runAutoSyncPassRef.current?.({
+              gameIds: [gameId],
+              forceRetry: true,
+            });
+          });
       };
       poll(false);
       const id = window.setInterval(() => poll(true), 15 * 60 * 1000);
@@ -4486,6 +4532,75 @@ export default function App() {
     setAssistQueue(next);
   }, []);
 
+  const setActiveBatchState = useCallback((next: ActiveDownloadBatch | null) => {
+    activeBatchRef.current = next;
+    setActiveBatch(next);
+  }, []);
+
+  const finalizeActiveBatch = useCallback(
+    async (
+      batch: ActiveDownloadBatch,
+      fallbackGameId: string,
+      reportErrors: boolean,
+    ) => {
+      const targetGameId =
+        batch.gameId || fallbackGameId || activeGameRef.current?.id || "";
+      if (!targetGameId) return;
+      if (batch.collection) {
+        try {
+          await api.recordNexusCollection({
+            gameId: targetGameId,
+            slug: batch.collection.slug,
+            name: batch.collection.name,
+            revision: batch.collection.revision,
+            files: batch.collection.files,
+            existingModIds: batch.collection.existingModIds,
+          });
+          if (activeGameRef.current?.id === targetGameId) {
+            await refreshCollections(targetGameId);
+          }
+        } catch (e) {
+          if (reportErrors && !String(e).includes("No staged mods matched")) {
+            setError(String(e));
+          }
+        }
+      }
+      if (batch.emperorShare) {
+        try {
+          if (batch.emperorShare.friendSync && batch.emperorShare.code) {
+            await api.finalizeFriendCollectionSync({
+              gameId: targetGameId,
+              peerId: batch.emperorShare.friendSync.peerId,
+              friendCollectionId:
+                batch.emperorShare.friendSync.friendCollectionId,
+              shareCode: batch.emperorShare.code,
+              memberIds: batch.emperorShare.memberIds,
+              existingModIds: batch.emperorShare.existingModIds,
+            });
+          } else {
+            await api.recordEmperorShare({
+              gameId: targetGameId,
+              collectionId: batch.emperorShare.collectionId,
+              name: batch.emperorShare.name,
+              code: batch.emperorShare.code,
+              files: batch.emperorShare.files,
+              memberIds: batch.emperorShare.memberIds,
+              existingModIds: batch.emperorShare.existingModIds,
+            });
+          }
+          if (activeGameRef.current?.id === targetGameId) {
+            await refreshCollections(targetGameId);
+          }
+        } catch (e) {
+          if (reportErrors && !String(e).includes("No staged mods matched")) {
+            setError(String(e));
+          }
+        }
+      }
+    },
+    [refreshCollections],
+  );
+
   const finishAssistQueue = useCallback(async () => {
     const q = assistQueueRef.current;
     setAssistQueueState(null);
@@ -4493,79 +4608,58 @@ export default function App() {
     setAssistHint(null);
     setAssistLoginBanner(false);
     setBusy(null);
+
+    const pendingBatch: ActiveDownloadBatch | null =
+      q && !q.cancelled
+        ? {
+            id: q.batchId,
+            label: q.label,
+            gameId: q.entries[0]?.gameId ?? activeGameRef.current?.id,
+            collection: q.collection,
+            emperorShare: q.emperorShare,
+          }
+        : null;
+
+    // Publish activeBatchRef synchronously BEFORE awaiting listDownloads() so
+    // any download-finished event arriving in flight cannot miss the batch.
+    if (pendingBatch) {
+      setActiveBatchState(pendingBatch);
+    } else if (q?.cancelled && activeBatchRef.current?.id === q.batchId) {
+      setActiveBatchState(null);
+    }
+
     const list = await api.listDownloads();
     setDownloads(list);
-    if (q && !q.cancelled) {
+
+    let shouldFinalizeNow = false;
+    if (pendingBatch) {
       const stillActive = list.some(
         (d) =>
-          d.batch_id === q.batchId &&
+          d.batch_id === pendingBatch.id &&
           (d.status === "downloading" ||
-              d.status === "extracting" ||
-              d.status === "paused"),
+            d.status === "extracting" ||
+            d.status === "paused"),
       );
-      if (stillActive) {
-        setActiveBatch({
-          id: q.batchId,
-          label: q.label,
-          collection: q.collection,
-          emperorShare: q.emperorShare,
-        });
-      } else {
-        setActiveBatch((prev) => (prev?.id === q.batchId ? null : prev));
+      if (!stillActive) {
+        if (activeBatchRef.current?.id === pendingBatch.id) {
+          setActiveBatchState(null);
+          shouldFinalizeNow = true;
+        }
       }
-    } else if (q?.cancelled) {
-      setActiveBatch((prev) => (prev?.id === q.batchId ? null : prev));
     }
+
     const game = activeGameRef.current;
     if (game) {
       await refreshMods(game.id);
       await refreshCollections(game.id);
     }
     if (!q) return;
-    if (q.collection && !q.cancelled) {
-      try {
-        await api.recordNexusCollection({
-          gameId: q.entries[0]?.gameId ?? game?.id ?? "",
-          slug: q.collection.slug,
-          name: q.collection.name,
-          revision: q.collection.revision,
-          files: q.collection.files,
-          existingModIds: q.collection.existingModIds,
-        });
-        if (game) await refreshCollections(game.id);
-      } catch (e) {
-        if (!String(e).includes("No staged mods matched")) {
-          setError(String(e));
-        }
-      }
-    }
-    if (q.emperorShare && !q.cancelled) {
-      try {
-        const targetGameId = q.entries[0]?.gameId ?? game?.id ?? "";
-        if (q.emperorShare.friendSync && q.emperorShare.code) {
-          await api.finalizeFriendCollectionSync({
-            gameId: targetGameId,
-            peerId: q.emperorShare.friendSync.peerId,
-            friendCollectionId: q.emperorShare.friendSync.friendCollectionId,
-            shareCode: q.emperorShare.code,
-          });
-        } else {
-          await api.recordEmperorShare({
-            gameId: targetGameId,
-            collectionId: q.emperorShare.collectionId,
-            name: q.emperorShare.name,
-            code: q.emperorShare.code,
-            files: q.emperorShare.files,
-            memberIds: q.emperorShare.memberIds,
-            existingModIds: q.emperorShare.existingModIds,
-          });
-        }
-        if (game) await refreshCollections(game.id);
-      } catch (e) {
-        if (!String(e).includes("No staged mods matched")) {
-          setError(String(e));
-        }
-      }
+    if (shouldFinalizeNow && pendingBatch) {
+      await finalizeActiveBatch(
+        pendingBatch,
+        q.entries[0]?.gameId ?? game?.id ?? "",
+        true,
+      );
     }
     if (q.cancelled) {
       setError(`Download queue cancelled after ${q.completed}/${q.entries.length} mods.`);
@@ -4584,7 +4678,13 @@ export default function App() {
     } else if (q.completed > 0) {
       setError(null);
     }
-  }, [refreshMods, refreshCollections, setAssistQueueState]);
+  }, [
+    finalizeActiveBatch,
+    refreshMods,
+    refreshCollections,
+    setActiveBatchState,
+    setAssistQueueState,
+  ]);
 
   const openAssistAtHead = useCallback(
     async (q: AssistQueueState) => {
@@ -4729,9 +4829,9 @@ export default function App() {
     } catch (e) {
       setError(String(e));
     }
-    setActiveBatch(null);
+    setActiveBatchState(null);
     await refreshDownloads();
-  }, [refreshDownloads]);
+  }, [refreshDownloads, setActiveBatchState]);
 
   const cancelOneDownload = useCallback(
     async (id: string) => {
@@ -4911,12 +5011,12 @@ export default function App() {
         collection,
         emperorShare,
       };
-      setActiveBatch(null);
+      setActiveBatchState(null);
       setAssistQueueState(q);
       setError(null);
       await openAssistAtHead(q);
     },
-    [openAssistAtHead, setAssistQueueState],
+    [openAssistAtHead, setActiveBatchState, setAssistQueueState],
   );
 
   useEffect(() => {
@@ -5124,53 +5224,18 @@ export default function App() {
             (d) =>
               d.batch_id === batch.id &&
               (d.status === "downloading" ||
-              d.status === "extracting" ||
-              d.status === "paused"),
+                d.status === "extracting" ||
+                d.status === "paused"),
           );
           if (!still) {
-            if (batch.collection) {
-              try {
-                await api.recordNexusCollection({
-                  gameId:
-                    event.payload.game_id ?? activeGameRef.current?.id ?? "",
-                  slug: batch.collection.slug,
-                  name: batch.collection.name,
-                  revision: batch.collection.revision,
-                  files: batch.collection.files,
-                  existingModIds: batch.collection.existingModIds,
-                });
-              } catch {
-                /* ignore incomplete match */
-              }
-            }
-            if (batch.emperorShare) {
-              try {
-                const targetGameId =
-                  event.payload.game_id ?? activeGameRef.current?.id ?? "";
-                if (batch.emperorShare.friendSync && batch.emperorShare.code) {
-                  await api.finalizeFriendCollectionSync({
-                    gameId: targetGameId,
-                    peerId: batch.emperorShare.friendSync.peerId,
-                    friendCollectionId:
-                      batch.emperorShare.friendSync.friendCollectionId,
-                    shareCode: batch.emperorShare.code,
-                  });
-                } else {
-                  await api.recordEmperorShare({
-                    gameId: targetGameId,
-                    collectionId: batch.emperorShare.collectionId,
-                    name: batch.emperorShare.name,
-                    code: batch.emperorShare.code,
-                    files: batch.emperorShare.files,
-                    memberIds: batch.emperorShare.memberIds,
-                    existingModIds: batch.emperorShare.existingModIds,
-                  });
-                }
-              } catch {
-                /* ignore incomplete match */
-              }
-            }
-            setActiveBatch(null);
+            // Claim and clear synchronously before awaiting so concurrent
+            // download-finished events cannot double-finalize the batch.
+            setActiveBatchState(null);
+            await finalizeActiveBatch(
+              batch,
+              event.payload.game_id ?? activeGameRef.current?.id ?? "",
+              false,
+            );
           }
         }
         const gameId = event.payload.game_id ?? activeGameRef.current?.id;
@@ -5226,10 +5291,17 @@ export default function App() {
             (d) =>
               d.batch_id === batch.id &&
               (d.status === "downloading" ||
-              d.status === "extracting" ||
-              d.status === "paused"),
+                d.status === "extracting" ||
+                d.status === "paused"),
           );
-          if (!still) setActiveBatch(null);
+          if (!still) {
+            setActiveBatchState(null);
+            await finalizeActiveBatch(
+              batch,
+              activeGameRef.current?.id ?? "",
+              false,
+            );
+          }
         }
         const label = event.payload.label ?? "Download";
         const err = event.payload.error ?? "unknown error";
@@ -5267,10 +5339,17 @@ export default function App() {
             (d) =>
               d.batch_id === batch.id &&
               (d.status === "downloading" ||
-              d.status === "extracting" ||
-              d.status === "paused"),
+                d.status === "extracting" ||
+                d.status === "paused"),
           );
-          if (!still) setActiveBatch(null);
+          if (!still) {
+            setActiveBatchState(null);
+            await finalizeActiveBatch(
+              batch,
+              activeGameRef.current?.id ?? "",
+              false,
+            );
+          }
         }
         if (!hasActiveDownloads(list)) {
           setBusy(null);
@@ -5371,7 +5450,7 @@ export default function App() {
       unlistenProgress.then((f) => f());
       unlistenStarted.then((f) => f());
     };
-  }, [advanceAssistAfterFailure, advanceAssistAfterStart, refreshDownloads, refreshMods, refreshCollections, refreshModUpdates, refreshMissingRequirements, restartOneDownload, syncAssistHost]);
+  }, [advanceAssistAfterFailure, advanceAssistAfterStart, finalizeActiveBatch, refreshDownloads, refreshMods, refreshCollections, refreshModUpdates, refreshMissingRequirements, restartOneDownload, setActiveBatchState, syncAssistHost]);
 
   async function withBusy<T>(label: string, fn: () => Promise<T>): Promise<T | undefined> {
     setBusy(label);
@@ -7269,7 +7348,15 @@ export default function App() {
     friendSync?: { peerId: string; friendCollectionId: string } | null,
   ) {
     if (result.needs_assist.length > 0) {
-      const existingModIds = mods.map((m) => m.id);
+      let existingModIds = mods.map((m) => m.id);
+      if (gameId !== activeGameRef.current?.id) {
+        try {
+          const targetMods = await api.listMods(gameId);
+          existingModIds = targetMods.map((m) => m.id);
+        } catch {
+          existingModIds = [];
+        }
+      }
       const entries = result.needs_assist.map((f) =>
         createQueueEntry(
           gameId,
@@ -7420,83 +7507,150 @@ export default function App() {
     }
   }
 
-  const runAutoSyncPass = useCallback(async () => {
-    const currentActive = activeGameRef.current;
-    if (currentActive) {
-      await refreshFriendSyncStates(currentActive.id);
-    }
-    for (const game of managedRef.current) {
-      let states: FriendCollectionSyncStatus[] = [];
-      try {
-        states = await api.getFriendCollectionSyncStates(game.id);
-      } catch {
-        continue;
+  const runAutoSyncPass = useCallback(
+    async (opts?: {
+      gameIds?: string[];
+      forceRetry?: boolean;
+      silent?: boolean;
+    }) => {
+      const summary = {
+        syncedNames: [] as string[],
+        pendingManualNames: [] as string[],
+        conflictNames: [] as string[],
+        assistNames: [] as string[],
+        failedNames: [] as string[],
+      };
+      const currentActive = activeGameRef.current;
+      if (currentActive) {
+        await refreshFriendSyncStates(currentActive.id);
       }
-      for (const st of states) {
-        if (!st.auto_sync || !st.has_update) continue;
-        const key = `${game.id}:${st.collection_id}`;
-        if (autoSyncInFlightRef.current.has(key)) continue;
-        autoSyncInFlightRef.current.add(key);
+      const targetGames = opts?.gameIds
+        ? managedRef.current.filter((g) => opts.gameIds!.includes(g.id))
+        : managedRef.current;
+      for (const game of targetGames) {
+        let states: FriendCollectionSyncStatus[] = [];
         try {
-          const plan = await api.planCollectionResolution(game.id, {
-            kind: "friend_sync",
-            peerId: st.peer_id,
-            friendCollectionId: st.friend_collection_id,
-          });
-          if (plan.conflicts.length > 0) {
-            if (autoSyncNotifiedHashRef.current.get(key) !== st.latest_hash) {
-              autoSyncNotifiedHashRef.current.set(key, st.latest_hash);
-              setNotice({
-                kind: "warn",
-                message: `${plan.targetCollectionName} has an update with ${plan.conflicts.length} version conflict${plan.conflicts.length === 1 ? "" : "s"}. Click Sync on the game page to resolve.`,
-              });
+          states = await api.getFriendCollectionSyncStates(game.id);
+        } catch {
+          continue;
+        }
+        let installedCols: InstalledCollection[] | null = null;
+        for (const st of states) {
+          if (!st.has_update) continue;
+          const key = `${game.id}:${st.collection_id}`;
+          if (!st.auto_sync) {
+            if (!installedCols) {
+              installedCols = await api
+                .listInstalledCollections(game.id)
+                .catch(() => []);
             }
+            const colName =
+              installedCols.find((c) => c.id === st.collection_id)?.name ??
+              "Synced collection";
+            summary.pendingManualNames.push(colName);
             continue;
           }
-          const res = await api.joinOrSyncFriendCollection({
-            gameId: game.id,
-            peerId: st.peer_id,
-            friendCollectionId: st.friend_collection_id,
-          });
-          if (res.needs_assist.length === 0) {
-            if (activeGameRef.current?.id === game.id) {
-              await refreshMods(game.id);
-              await refreshCollections(game.id);
-              await refreshFriendSyncStates(game.id);
-              await refreshDownloads();
-            }
-            setNotice({
-              kind: "ok",
-              message: `Auto-synced ${res.name} to latest settings.`,
-            });
-          } else if (
-            autoSyncNotifiedHashRef.current.get(key) !== st.latest_hash
+          if (autoSyncInFlightRef.current.has(key)) continue;
+          if (
+            !opts?.forceRetry &&
+            autoSyncNotifiedHashRef.current.get(key) === st.latest_hash
           ) {
-            autoSyncNotifiedHashRef.current.set(key, st.latest_hash);
-            setNotice({
-              kind: "warn",
-              message: `${res.name} has an update that requires manual Nexus download assist. Click Sync on the game page to download.`,
-            });
+            continue;
           }
-        } catch (e) {
-          if (autoSyncNotifiedHashRef.current.get(key) !== st.latest_hash) {
-            autoSyncNotifiedHashRef.current.set(key, st.latest_hash);
-            setNotice({
-              kind: "warn",
-              message: `Auto-sync failed for collection: ${String(e)}`,
+          autoSyncInFlightRef.current.add(key);
+          try {
+            const plan = await api.planCollectionResolution(game.id, {
+              kind: "friend_sync",
+              peerId: st.peer_id,
+              friendCollectionId: st.friend_collection_id,
             });
+            if (plan.conflicts.length > 0) {
+              summary.conflictNames.push(plan.targetCollectionName);
+              if (
+                !opts?.silent &&
+                (opts?.forceRetry ||
+                  autoSyncNotifiedHashRef.current.get(key) !== st.latest_hash)
+              ) {
+                autoSyncNotifiedHashRef.current.set(key, st.latest_hash);
+                setNotice({
+                  kind: "warn",
+                  message: `${plan.targetCollectionName} has an update with ${plan.conflicts.length} version conflict${plan.conflicts.length === 1 ? "" : "s"}. Click Sync on the game page to resolve.`,
+                });
+              } else {
+                autoSyncNotifiedHashRef.current.set(key, st.latest_hash);
+              }
+              continue;
+            }
+            const res = await api.joinOrSyncFriendCollection({
+              gameId: game.id,
+              peerId: st.peer_id,
+              friendCollectionId: st.friend_collection_id,
+            });
+            if (res.needs_assist.length === 0) {
+              autoSyncNotifiedHashRef.current.delete(key);
+              summary.syncedNames.push(res.name);
+              if (activeGameRef.current?.id === game.id) {
+                await refreshMods(game.id);
+                await refreshCollections(game.id);
+                await refreshFriendSyncStates(game.id);
+                await refreshDownloads();
+              }
+              if (!opts?.silent) {
+                setNotice({
+                  kind: res.warnings.length > 0 ? "warn" : "ok",
+                  message:
+                    res.warnings.length > 0
+                      ? `Auto-synced ${res.name} with ${res.warnings.length} warning${res.warnings.length === 1 ? "" : "s"}.`
+                      : `Auto-synced ${res.name} to latest settings.`,
+                  details: res.warnings.length > 0 ? res.warnings : undefined,
+                });
+              }
+            } else {
+              summary.assistNames.push(res.name);
+              if (
+                !opts?.silent &&
+                (opts?.forceRetry ||
+                  autoSyncNotifiedHashRef.current.get(key) !== st.latest_hash)
+              ) {
+                setNotice({
+                  kind: "warn",
+                  message: `${res.name} has an update that requires manual Nexus download assist. Click Sync on the game page to download.`,
+                });
+              }
+              autoSyncNotifiedHashRef.current.set(key, st.latest_hash);
+            }
+          } catch (e) {
+            summary.failedNames.push(st.collection_id);
+            if (
+              !opts?.silent &&
+              (opts?.forceRetry ||
+                autoSyncNotifiedHashRef.current.get(key) !== st.latest_hash)
+            ) {
+              setNotice({
+                kind: "warn",
+                message: `Auto-sync failed for collection: ${String(e)}`,
+              });
+            }
+            autoSyncNotifiedHashRef.current.set(key, st.latest_hash);
+          } finally {
+            autoSyncInFlightRef.current.delete(key);
           }
-        } finally {
-          autoSyncInFlightRef.current.delete(key);
         }
       }
-    }
-  }, [
-    refreshCollections,
-    refreshDownloads,
-    refreshFriendSyncStates,
-    refreshMods,
-  ]);
+      if (activeGameRef.current) {
+        await refreshFriendSyncStates(activeGameRef.current.id);
+      }
+      return summary;
+    },
+    [
+      refreshCollections,
+      refreshDownloads,
+      refreshFriendSyncStates,
+      refreshMods,
+    ],
+  );
+  const runAutoSyncPassRef = useRef<typeof runAutoSyncPass | null>(null);
+  runAutoSyncPassRef.current = runAutoSyncPass;
 
   async function toggleInstalledCollectionAutoSync(
     c: InstalledCollection,
@@ -7516,7 +7670,7 @@ export default function App() {
   }
 
   async function saveCollectionChanges(c: InstalledCollection) {
-    if (!activeGame) return;
+    if (!activeGame || c.friend_sync) return;
     setSavingCollectionIds((prev) => ({ ...prev, [c.id]: true }));
     setError(null);
     try {
@@ -7542,7 +7696,7 @@ export default function App() {
     c: InstalledCollection,
     autoSave: boolean,
   ) {
-    if (!activeGame || savingCollectionIds[c.id]) return;
+    if (!activeGame || c.friend_sync || savingCollectionIds[c.id]) return;
     setSavingCollectionIds((prev) => ({ ...prev, [c.id]: true }));
     setError(null);
     try {
@@ -7577,6 +7731,7 @@ export default function App() {
   }, [runAutoSyncPass]);
 
   useEffect(() => {
+    let wasChecking = false;
     const unlisten = listen<boolean>("friends-checking", (event) => {
       const checking = Boolean(event.payload);
       if (checkingFriendUpdatesTimerRef.current != null) {
@@ -7584,12 +7739,17 @@ export default function App() {
         checkingFriendUpdatesTimerRef.current = null;
       }
       if (checking) {
+        wasChecking = true;
         checkingFriendUpdatesTimerRef.current = window.setTimeout(() => {
           checkingFriendUpdatesTimerRef.current = null;
           setCheckingFriendUpdates(true);
         }, MOD_UPDATE_CHECK_TOAST_DELAY_MS);
       } else {
         setCheckingFriendUpdates(false);
+        if (wasChecking) {
+          wasChecking = false;
+          void runAutoSyncPass();
+        }
       }
     });
     return () => {
@@ -7599,7 +7759,7 @@ export default function App() {
       }
       void unlisten.then((f) => f());
     };
-  }, []);
+  }, [runAutoSyncPass]);
 
   useEffect(() => {
     if (managed.length > 0) {
@@ -8451,15 +8611,50 @@ export default function App() {
   async function checkStagedModUpdatesNow() {
     if (!activeGame) return;
     const gameId = activeGame.id;
-    const updates = await refreshModUpdates(gameId);
+    const [updates] = await Promise.all([
+      refreshModUpdates(gameId),
+      api.refreshFriends().catch(() => null),
+    ]);
+    const syncSummary = await runAutoSyncPass({
+      gameIds: [gameId],
+      forceRetry: true,
+      silent: true,
+    });
     if (updates == null) return;
-    const count = updates.length;
+    const count = updates.filter(
+      (u) => !syncedCollectionNameByModId.has(u.staged_id),
+    ).length;
+    const parts: string[] = [];
+    if (count > 0) {
+      parts.push(`${count} mod update${count === 1 ? "" : "s"} available`);
+    }
+    if (syncSummary.syncedNames.length > 0) {
+      parts.push(`synced ${syncSummary.syncedNames.join(", ")}`);
+    }
+    const attentionCount =
+      syncSummary.pendingManualNames.length +
+      syncSummary.conflictNames.length +
+      syncSummary.assistNames.length;
+    if (attentionCount > 0) {
+      parts.push(
+        `${attentionCount} synced collection${attentionCount === 1 ? "" : "s"} need${attentionCount === 1 ? "s" : ""} manual sync`,
+      );
+    }
+    if (syncSummary.failedNames.length > 0) {
+      parts.push(
+        `${syncSummary.failedNames.length} synced collection${syncSummary.failedNames.length === 1 ? "" : "s"} failed to sync`,
+      );
+    }
+    const hasWarn =
+      syncSummary.conflictNames.length > 0 ||
+      syncSummary.assistNames.length > 0 ||
+      syncSummary.failedNames.length > 0;
     setNotice({
-      kind: "ok",
+      kind: hasWarn ? "warn" : "ok",
       message:
-        count === 0
+        parts.length === 0
           ? "No updates available."
-          : `${count} update${count === 1 ? "" : "s"} available.`,
+          : `${parts.join(" · ")}.`,
     });
   }
 
@@ -9168,6 +9363,16 @@ export default function App() {
   }
 
   useEffect(() => {
+    const g = settings?.global_launch_options;
+    if (!g) return;
+    setGlobalLaunchEnabled(Boolean(g.enabled));
+    setGlobalLaunchEnvVars(g.env_vars ?? []);
+    setGlobalLaunchWrapper(g.wrapper ?? "");
+    setGlobalLaunchArgs(g.launch_args ?? "");
+    setGlobalLaunchRaw(g.raw_command ?? "");
+  }, [settings?.global_launch_options]);
+
+  useEffect(() => {
     if (gameModal !== "launch" || !libraryDetail) return;
     let active = true;
     const gameId = libraryDetail.game.id;
@@ -9180,6 +9385,8 @@ export default function App() {
         setLaunchPreview(preview);
         setWrapperDraft(preview.custom_wrapper);
         setArgsDraft(preview.custom_launch_args);
+        setRawCommandDraft(preview.custom_raw_command);
+        setUseGlobalLaunchDraft(preview.use_global_launch_options);
       })
       .catch((e) => {
         if (active) setError(String(e));
@@ -9189,11 +9396,39 @@ export default function App() {
     };
   }, [gameModal, libraryDetail?.game.id]);
 
+  async function saveGlobalLaunchOptions(next: GlobalLaunchOptions) {
+    try {
+      const saved = await api.setGlobalLaunchOptions({
+        enabled: next.enabled,
+        env_vars: next.env_vars,
+        wrapper: next.wrapper?.trim() || null,
+        launch_args: next.launch_args?.trim() || null,
+        raw_command: next.raw_command?.trim() || null,
+      });
+      setGlobalLaunchEnabled(saved.enabled);
+      setGlobalLaunchEnvVars(saved.env_vars ?? []);
+      setGlobalLaunchWrapper(saved.wrapper ?? "");
+      setGlobalLaunchArgs(saved.launch_args ?? "");
+      setGlobalLaunchRaw(saved.raw_command ?? "");
+      setSettings((prev) =>
+        prev ? { ...prev, global_launch_options: saved } : prev,
+      );
+      setLaunchPreview((prev) =>
+        prev ? { ...prev, global_launch_options: saved } : prev,
+      );
+      setNotice({ kind: "ok", message: "Saved global launch commands." });
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
   async function saveLaunchOptions(
     nextSource: LaunchCommandSource,
     nextCustomVars: LaunchEnvVar[],
     nextWrapper: string,
     nextArgs: string,
+    nextRawCommand: string,
+    nextUseGlobal: boolean,
   ) {
     if (!libraryDetail) return;
     const game = libraryDetail.game;
@@ -9204,10 +9439,14 @@ export default function App() {
         nextCustomVars,
         nextWrapper.trim() || null,
         nextArgs.trim() || null,
+        nextRawCommand.trim() || null,
+        nextUseGlobal,
       );
       setLaunchPreview(updated);
       setWrapperDraft(updated.custom_wrapper);
       setArgsDraft(updated.custom_launch_args);
+      setRawCommandDraft(updated.custom_raw_command);
+      setUseGlobalLaunchDraft(updated.use_global_launch_options);
       setManaged((prev) =>
         prev.map((g) =>
           g.id === game.id
@@ -9217,6 +9456,8 @@ export default function App() {
                 custom_env_vars: updated.custom_env_vars,
                 custom_wrapper: updated.custom_wrapper || null,
                 custom_launch_args: updated.custom_launch_args || null,
+                custom_raw_command: updated.custom_raw_command || null,
+                use_global_launch_options: updated.use_global_launch_options,
               }
             : g,
         ),
@@ -9231,6 +9472,8 @@ export default function App() {
                 custom_env_vars: updated.custom_env_vars,
                 custom_wrapper: updated.custom_wrapper || null,
                 custom_launch_args: updated.custom_launch_args || null,
+                custom_raw_command: updated.custom_raw_command || null,
+                use_global_launch_options: updated.use_global_launch_options,
               },
             }
           : prev,
@@ -9241,15 +9484,26 @@ export default function App() {
   }
 
   async function setGameLaunchCommandSource(next: LaunchCommandSource) {
-    if (!activeGame) return;
-    const currentVars = launchPreview?.custom_env_vars ?? activeGame.custom_env_vars ?? [];
-    await saveLaunchOptions(next, currentVars, wrapperDraft, argsDraft);
+    if (!libraryDetail) return;
+    const currentVars =
+      launchPreview?.custom_env_vars ?? libraryDetail.game.custom_env_vars ?? [];
+    await saveLaunchOptions(
+      next,
+      currentVars,
+      wrapperDraft,
+      argsDraft,
+      rawCommandDraft,
+      useGlobalLaunchDraft,
+    );
+    const launcherLabel = shortLauncher(libraryDetail.game.launcher);
     setNotice({
       kind: "ok",
       message:
         next === "emperor"
-          ? "Using Emperor launch commands (WINEDLLOVERRIDES & tool overrides)."
-          : "Using game launcher's own launch commands.",
+          ? "Using Emperor launch commands only."
+          : next === "merged"
+            ? `Merging ${launcherLabel} + Emperor launch commands.`
+            : `Using ${launcherLabel} launch commands only.`,
     });
   }
 
@@ -10264,7 +10518,7 @@ export default function App() {
                             cardActiveUsers.length > 0
                               ? formatSyncersSummary(cardActiveUsers, "Active for")
                               : null,
-                            savedStatusLabel,
+                            !c.friend_sync ? savedStatusLabel : null,
                             installedLabel,
                           ]
                             .filter(Boolean)
@@ -10822,24 +11076,8 @@ export default function App() {
                       <ul className="list mods">
                         <li className="empty">No mods match your search/filters.</li>
                       </ul>
-                    ) : (
-                    <BrowseVirtualList
-                      items={modDrag.displayMods}
-                      scrollRef={libraryDetailScrollRef}
-                      active={tab === "library"}
-                      staggerEnter={!modDrag.isDragging}
-                      staggerKey={activeGame?.id}
-                      listRef={modDrag.listRef}
-                      listClassName={
-                        modDrag.isDragging ? "mods mod-list-dragging" : "mods"
-                      }
-                      estimateSize={estimateStagedModRowHeight()}
-                      getKey={(m) => m.id}
-                      onRowPointerDown={(m, event) => {
-                        if (syncedCollectionNameByModId.has(m.id)) return;
-                        modDrag.onDragPointerDown(m.id, event);
-                      }}
-                      rowClassName={(m) =>
+                    ) : (() => {
+                      const stagedModRowClassName = (m: StagedMod) =>
                         [
                           m.enabled
                             ? "list-row-poster"
@@ -10850,9 +11088,15 @@ export default function App() {
                           modDrag.draggingId === m.id ? "mod-drag-placeholder" : "",
                         ]
                           .filter(Boolean)
-                          .join(" ")
-                      }
-                      renderItem={(m) => {
+                          .join(" ");
+                      const handleStagedModPointerDown = (
+                        m: StagedMod,
+                        event: Parameters<typeof modDrag.onDragPointerDown>[1],
+                      ) => {
+                        if (syncedCollectionNameByModId.has(m.id)) return;
+                        modDrag.onDragPointerDown(m.id, event);
+                      };
+                      const renderStagedModItem = (m: StagedMod) => {
                         const syncedCollectionName =
                           syncedCollectionNameByModId.get(m.id) ?? null;
                         const idx = modIndexById.get(m.id) ?? -1;
@@ -10993,6 +11237,17 @@ export default function App() {
                                     : "Update"}
                                 </button>
                               )}
+                              {modsWithConfigFiles.has(m.id) && (
+                                <button
+                                  type="button"
+                                  className="icon-btn"
+                                  onClick={() => setModConfigFor(m)}
+                                  aria-label={`Configure ${m.name}`}
+                                  title="Edit mod configuration files"
+                                >
+                                  <FontAwesomeIcon icon={faSliders} />
+                                </button>
+                              )}
                               {modsWithOptions.has(m.id) && (
                                 <button
                                   type="button"
@@ -11009,7 +11264,7 @@ export default function App() {
                                   <FontAwesomeIcon icon={faGear} />
                                 </button>
                               )}
-                              {installedCollections.length > 1 && (() => {
+                              {installedCollections.length > 0 && (() => {
                                 const canMoveModCollections =
                                   installedCollections.some((c) => !c.friend_sync);
                                 return (
@@ -11018,10 +11273,10 @@ export default function App() {
                                     className="icon-btn"
                                     disabled={!canMoveModCollections}
                                     onClick={() => setMoveCollectionMod(m)}
-                                    aria-label={`Move ${m.name} between collections`}
+                                    aria-label={`Manage collections for ${m.name}`}
                                     title={
                                       canMoveModCollections
-                                        ? "Move between collections"
+                                        ? "Manage collections"
                                         : "Synced collection membership cannot be changed"
                                     }
                                   >
@@ -11121,9 +11376,106 @@ export default function App() {
                           );
                         }
                         return rowBody;
-                      }}
-                    />
-                    )}
+                      };
+
+                      const listClassName = modDrag.isDragging
+                        ? "mods mod-list-dragging"
+                        : "mods";
+                      const rowEstimate = estimateStagedModRowHeight();
+
+                      if (modsStatusFilter === "disabled") {
+                        return (
+                          <BrowseVirtualList
+                            items={modDrag.disabledDisplayMods}
+                            scrollRef={libraryDetailScrollRef}
+                            active={tab === "library"}
+                            staggerEnter={!modDrag.isDragging}
+                            staggerKey={activeGame?.id}
+                            listRef={modDrag.disabledListRef}
+                            listClassName={listClassName}
+                            estimateSize={rowEstimate}
+                            getKey={(m) => m.id}
+                            onRowPointerDown={handleStagedModPointerDown}
+                            rowClassName={stagedModRowClassName}
+                            renderItem={renderStagedModItem}
+                          />
+                        );
+                      }
+
+                      return (
+                        <>
+                          {modDrag.enabledDisplayMods.length > 0 && (
+                            <BrowseVirtualList
+                              items={modDrag.enabledDisplayMods}
+                              scrollRef={libraryDetailScrollRef}
+                              active={tab === "library"}
+                              staggerEnter={!modDrag.isDragging}
+                              staggerKey={activeGame?.id}
+                              listRef={modDrag.listRef}
+                              listClassName={listClassName}
+                              estimateSize={rowEstimate}
+                              getKey={(m) => m.id}
+                              onRowPointerDown={handleStagedModPointerDown}
+                              rowClassName={stagedModRowClassName}
+                              renderItem={renderStagedModItem}
+                            />
+                          )}
+                          {modDrag.disabledDisplayMods.length > 0 && (
+                            <section
+                              className={
+                                modDrag.enabledDisplayMods.length > 0
+                                  ? "staged-disabled-section"
+                                  : "staged-disabled-section staged-disabled-section-solo"
+                              }
+                              data-expanded={
+                                showDisabledModsExpanded ? "true" : "false"
+                              }
+                            >
+                              <button
+                                type="button"
+                                className="staged-disabled-toggle"
+                                aria-expanded={showDisabledModsExpanded}
+                                onClick={() =>
+                                  setDisabledModsExpanded((open) => !open)
+                                }
+                              >
+                                <FontAwesomeIcon
+                                  icon={faChevronRight}
+                                  className="staged-disabled-chevron"
+                                  aria-hidden="true"
+                                />
+                                <span className="staged-disabled-title">
+                                  Disabled
+                                </span>
+                                <span className="pill muted">
+                                  {modDrag.disabledDisplayMods.length}
+                                </span>
+                              </button>
+                              <Collapse
+                                show={showDisabledModsExpanded}
+                                className="staged-disabled-body"
+                              >
+                                <BrowseVirtualList
+                                  items={modDrag.disabledDisplayMods}
+                                  scrollRef={libraryDetailScrollRef}
+                                  active={
+                                    tab === "library" && showDisabledModsExpanded
+                                  }
+                                  staggerEnter={false}
+                                  listRef={modDrag.disabledListRef}
+                                  listClassName={listClassName}
+                                  estimateSize={rowEstimate}
+                                  getKey={(m) => m.id}
+                                  onRowPointerDown={handleStagedModPointerDown}
+                                  rowClassName={stagedModRowClassName}
+                                  renderItem={renderStagedModItem}
+                                />
+                              </Collapse>
+                            </section>
+                          )}
+                        </>
+                      );
+                    })()}
                       </div>
                     ) : (
                       <StagedModsSkeleton />
@@ -11697,6 +12049,9 @@ export default function App() {
                   friendSync ?? null,
                 );
               }}
+              onFriendsRefreshed={() =>
+                void runAutoSyncPass({ forceRetry: true })
+              }
               resolveCollectionConflicts={resolveCollectionConflicts}
               onOpenMod={(hit, targetGameId) =>
                 void openCollectionMod(hit, "friends", targetGameId)
@@ -13742,6 +14097,195 @@ export default function App() {
                 manager” links.
               </p>
             </SettingsSection>
+            <SettingsSection title="Launch commands">
+              <SettingsToggle
+                checked={globalLaunchEnabled}
+                onChange={(checked) => {
+                  setGlobalLaunchEnabled(checked);
+                  void saveGlobalLaunchOptions({
+                    enabled: checked,
+                    env_vars: globalLaunchEnvVars,
+                    wrapper: globalLaunchWrapper,
+                    launch_args: globalLaunchArgs,
+                    raw_command: globalLaunchRaw,
+                  });
+                }}
+              >
+                Enable global add-on launch commands for all games
+              </SettingsToggle>
+              <p className="note">
+                {settings?.platform_linux ? (
+                  <>
+                    Combined with each game{"'"}s detected required launch commands (such
+                    as <code>WINEDLLOVERRIDES</code>) whenever Emperor or Merged launch
+                    commands are selected. Individual games can opt out in their Launch
+                    settings.
+                  </>
+                ) : (
+                  <>
+                    Combined with each game{"'"}s launch commands whenever Emperor or
+                    Merged launch commands are selected (applies to direct executable,
+                    Mod Engine 3, and Heroic launches). Individual games can opt out in
+                    their Launch settings.
+                  </>
+                )}
+              </p>
+              <div className="setting-block">
+                <span>Additional launch command</span>
+                <div className="launch-wrapper-row">
+                  <input
+                    type="text"
+                    placeholder={
+                      settings?.platform_linux
+                        ? "e.g. MANGOHUD=1 gamemoderun %command% -dx12"
+                        : "e.g. %command% -dx12"
+                    }
+                    value={globalLaunchRaw}
+                    onChange={(e) => setGlobalLaunchRaw(e.target.value)}
+                  />
+                </div>
+              </div>
+              <div className="setting-block">
+                <span>Wrapper &amp; Arguments</span>
+                <div className="launch-wrapper-row">
+                  <input
+                    type="text"
+                    placeholder={
+                      settings?.platform_linux
+                        ? "Wrapper (e.g. gamemoderun)"
+                        : "Wrapper (optional)"
+                    }
+                    value={globalLaunchWrapper}
+                    onChange={(e) => setGlobalLaunchWrapper(e.target.value)}
+                  />
+                  <input
+                    type="text"
+                    placeholder="Arguments (e.g. --launcher-skip)"
+                    value={globalLaunchArgs}
+                    onChange={(e) => setGlobalLaunchArgs(e.target.value)}
+                  />
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void saveGlobalLaunchOptions({
+                        enabled: globalLaunchEnabled,
+                        env_vars: globalLaunchEnvVars,
+                        wrapper: globalLaunchWrapper,
+                        launch_args: globalLaunchArgs,
+                        raw_command: globalLaunchRaw,
+                      })
+                    }
+                  >
+                    Save
+                  </button>
+                </div>
+              </div>
+              <div className="setting-block">
+                <span>Global Environment Variables</span>
+                <div className="launch-env-list">
+                  {globalLaunchEnvVars.map((v, idx) => (
+                    <div className="launch-env-row" key={`global-env-${v.name}-${idx}`}>
+                      <code className="launch-env-name">{v.name}</code>
+                      <span className="launch-env-eq">=</span>
+                      <code className="launch-env-val">{v.value}</code>
+                      <button
+                        type="button"
+                        className="icon-btn"
+                        title="Copy"
+                        onClick={() =>
+                          void navigator.clipboard?.writeText(`${v.name}=${v.value}`)
+                        }
+                      >
+                        <FontAwesomeIcon icon={faCopy} />
+                      </button>
+                      <button
+                        type="button"
+                        className="icon-btn danger"
+                        title="Remove variable"
+                        onClick={() => {
+                          const nextVars = globalLaunchEnvVars.filter((_, i) => i !== idx);
+                          setGlobalLaunchEnvVars(nextVars);
+                          void saveGlobalLaunchOptions({
+                            enabled: globalLaunchEnabled,
+                            env_vars: nextVars,
+                            wrapper: globalLaunchWrapper,
+                            launch_args: globalLaunchArgs,
+                            raw_command: globalLaunchRaw,
+                          });
+                        }}
+                      >
+                        <FontAwesomeIcon icon={faTrashCan} />
+                      </button>
+                    </div>
+                  ))}
+                  {globalLaunchEnvVars.length === 0 && (
+                    <p className="note">No global environment variables configured.</p>
+                  )}
+                </div>
+                <div className="launch-env-add">
+                  <input
+                    type="text"
+                    placeholder="NAME"
+                    value={newGlobalEnvName}
+                    onChange={(e) => setNewGlobalEnvName(e.target.value)}
+                  />
+                  <span className="launch-env-eq">=</span>
+                  <input
+                    type="text"
+                    placeholder="VALUE"
+                    value={newGlobalEnvValue}
+                    onChange={(e) => setNewGlobalEnvValue(e.target.value)}
+                  />
+                  <button
+                    type="button"
+                    className="accent"
+                    aria-label="Add global environment variable"
+                    disabled={!newGlobalEnvName.trim()}
+                    onClick={() => {
+                      const name = newGlobalEnvName.trim();
+                      if (!name) return;
+                      const nextVars = globalLaunchEnvVars.filter((v) => v.name !== name);
+                      nextVars.push({ name, value: newGlobalEnvValue.trim() });
+                      setNewGlobalEnvName("");
+                      setNewGlobalEnvValue("");
+                      setGlobalLaunchEnvVars(nextVars);
+                      void saveGlobalLaunchOptions({
+                        enabled: globalLaunchEnabled,
+                        env_vars: nextVars,
+                        wrapper: globalLaunchWrapper,
+                        launch_args: globalLaunchArgs,
+                        raw_command: globalLaunchRaw,
+                      });
+                    }}
+                  >
+                    <FontAwesomeIcon icon={faPlus} />
+                  </button>
+                </div>
+              </div>
+              <div className="setting-block">
+                <span>Global add-on preview</span>
+                <pre className="launch-preview-code">
+                  <code>
+                    {composeLiveLaunchCommand({
+                      source: "emperor",
+                      autoEnvVars: [],
+                      globalOptions: {
+                        enabled: true,
+                        env_vars: globalLaunchEnvVars,
+                        wrapper: globalLaunchWrapper || null,
+                        launch_args: globalLaunchArgs || null,
+                        raw_command: globalLaunchRaw || null,
+                      },
+                      useGlobal: true,
+                      customEnvVars: [],
+                      customWrapper: "",
+                      customLaunchArgs: "",
+                      customRawCommand: "",
+                    })}
+                  </code>
+                </pre>
+              </div>
+            </SettingsSection>
             <SettingsSection title="Content">
               <SettingsToggle
                 checked={settings?.adult_content ?? true}
@@ -14880,187 +15424,331 @@ export default function App() {
             </div>
           }
         >
-          <div className="launch-settings-modal">
-            <div className="setting-block">
-              <span>Launch commands</span>
-              <p className="note">
-                Choose whether Emperor applies required mod overrides (such as{" "}
-                <code>WINEDLLOVERRIDES</code> for Proton/Wine proxy DLLs) and
-                custom options when launching modded, or defers to{" "}
-                {shortLauncher(libraryDetail.game.launcher)}
-                {"'"}s own launch options.
-              </p>
-              <div className="actions">
-                <button
-                  type="button"
-                  className={
-                    (libraryDetail.game.launch_command_source ?? "emperor") === "emperor"
-                      ? "accent"
-                      : ""
-                  }
-                  onClick={() => void setGameLaunchCommandSource("emperor")}
-                >
-                  Emperor launch commands
-                </button>
-                <button
-                  type="button"
-                  className={
-                    libraryDetail.game.launch_command_source === "launcher"
-                      ? "accent"
-                      : ""
-                  }
-                  onClick={() => void setGameLaunchCommandSource("launcher")}
-                >
-                  {shortLauncher(libraryDetail.game.launcher)} launch commands
-                </button>
-              </div>
-            </div>
+          {(() => {
+            const currentSource: LaunchCommandSource =
+              libraryDetail.game.launch_command_source ?? "emperor";
+            const launcherLabel = shortLauncher(libraryDetail.game.launcher);
+            const activeGlobalOpts =
+              launchPreview?.global_launch_options ??
+              settings?.global_launch_options ?? {
+                enabled: false,
+                env_vars: [],
+              };
+            const effectiveCommandToken = (() => {
+              const eff = launchPreview?.effective_command ?? "";
+              const me3Match = eff.match(/me3 launch --game \S+ --profile emperor\.me3/);
+              return me3Match ? me3Match[0] : "%command%";
+            })();
+            const liveEffectiveCommand = composeLiveLaunchCommand({
+              source: currentSource,
+              launcherOptions: launchPreview?.launcher_options ?? null,
+              autoEnvVars: launchPreview?.auto_env_vars ?? [],
+              globalOptions: activeGlobalOpts,
+              useGlobal: useGlobalLaunchDraft,
+              customEnvVars:
+                launchPreview?.custom_env_vars ?? libraryDetail.game.custom_env_vars ?? [],
+              customWrapper: wrapperDraft,
+              customLaunchArgs: argsDraft,
+              customRawCommand: rawCommandDraft,
+              commandToken: effectiveCommandToken,
+            });
+            const currentCustomVars =
+              launchPreview?.custom_env_vars ?? libraryDetail.game.custom_env_vars ?? [];
 
-            {launchPreview && (
-              <>
+            return (
+              <div className="launch-settings-modal">
                 <div className="setting-block">
-                  <span>Wrapper &amp; Arguments</span>
-                  <div className="launch-wrapper-row">
-                    <input
-                      type="text"
-                      placeholder="Wrapper (e.g. gamemoderun)"
-                      value={wrapperDraft}
-                      onChange={(e) => setWrapperDraft(e.target.value)}
-                    />
-                    <input
-                      type="text"
-                      placeholder="Arguments (e.g. --launcher-skip)"
-                      value={argsDraft}
-                      onChange={(e) => setArgsDraft(e.target.value)}
-                    />
+                  <span>Launch commands</span>
+                  <p className="note">
+                    {settings?.platform_linux
+                      ? `Choose whether to use ${launcherLabel}'s launch options only, merge ${launcherLabel} + Emperor launch commands, or apply Emperor launch commands only (your original ${launcherLabel} options are restored when the game exits).`
+                      : `Choose whether to use ${launcherLabel}'s launch options only, merge ${launcherLabel} + Emperor launch commands, or apply Emperor launch commands only. On Windows, Emperor launch commands apply to direct executable, Mod Engine 3, and Heroic launches.`}
+                  </p>
+                  <div className="actions">
                     <button
                       type="button"
-                      onClick={() =>
-                        void saveLaunchOptions(
-                          libraryDetail.game.launch_command_source ?? "emperor",
-                          launchPreview.custom_env_vars,
-                          wrapperDraft,
-                          argsDraft,
-                        )
-                      }
+                      className={currentSource === "launcher" ? "accent" : ""}
+                      onClick={() => void setGameLaunchCommandSource("launcher")}
                     >
-                      Save
+                      {launcherLabel} only
+                    </button>
+                    <button
+                      type="button"
+                      className={currentSource === "merged" ? "accent" : ""}
+                      onClick={() => void setGameLaunchCommandSource("merged")}
+                    >
+                      {launcherLabel} + Emperor
+                    </button>
+                    <button
+                      type="button"
+                      className={currentSource === "emperor" ? "accent" : ""}
+                      onClick={() => void setGameLaunchCommandSource("emperor")}
+                    >
+                      Emperor only
                     </button>
                   </div>
                 </div>
 
                 <div className="setting-block">
-                  <span>Environment Variables</span>
-                  <div className="launch-env-list">
-                    {launchPreview.auto_env_vars.map((v) => (
-                      <div className="launch-env-row" key={`auto-${v.name}`}>
-                        <code className="launch-env-name">{v.name}</code>
-                        <span className="launch-env-eq">=</span>
-                        <code className="launch-env-val">{v.value}</code>
-                        <span className="launch-env-badge">Auto</span>
+                  <div className="launch-preview-header">
+                    <span>Applied launch options preview</span>
+                    <button
+                      type="button"
+                      className="icon-btn"
+                      title="Copy applied launch options"
+                      onClick={() =>
+                        void navigator.clipboard?.writeText(liveEffectiveCommand)
+                      }
+                    >
+                      <FontAwesomeIcon icon={faCopy} />
+                    </button>
+                  </div>
+                  <pre className="launch-preview-code">
+                    <code>{liveEffectiveCommand}</code>
+                  </pre>
+                </div>
+
+                {currentSource === "launcher" ? (
+                  <p className="note">
+                    Emperor, global add-on, and per-game overrides are bypassed
+                    while {launcherLabel} only is selected.
+                  </p>
+                ) : (
+                  <>
+                    <div className="setting-block">
+                      <SettingsToggle
+                        checked={useGlobalLaunchDraft}
+                        onChange={(checked) => {
+                          setUseGlobalLaunchDraft(checked);
+                          void saveLaunchOptions(
+                            currentSource,
+                            currentCustomVars,
+                            wrapperDraft,
+                            argsDraft,
+                            rawCommandDraft,
+                            checked,
+                          );
+                        }}
+                      >
+                        Include global add-on launch commands
+                      </SettingsToggle>
+                      <p className="note">
+                        {activeGlobalOpts.enabled
+                          ? "Global add-on launch commands are enabled in Settings and will be combined with this game's detected required commands."
+                          : "Global add-on launch commands are currently disabled in Settings → Launch commands."}
+                      </p>
+                    </div>
+
+                    <div className="setting-block">
+                      <span>Additional launch command</span>
+                      <p className="note">
+                        Combined on top of Emperor{"'"}s detected required commands (e.g.{" "}
+                        <code>
+                          {settings?.platform_linux
+                            ? "MANGOHUD=1 %command% -dx12"
+                            : "%command% -dx12"}
+                        </code>
+                        ).
+                      </p>
+                      <div className="launch-wrapper-row">
+                        <input
+                          type="text"
+                          placeholder={
+                            settings?.platform_linux
+                              ? "e.g. MANGOHUD=1 gamemoderun %command% -dx12"
+                              : "e.g. %command% -dx12"
+                          }
+                          value={rawCommandDraft}
+                          onChange={(e) => setRawCommandDraft(e.target.value)}
+                        />
+                      </div>
+                    </div>
+
+                    <div className="setting-block">
+                      <span>Wrapper &amp; Arguments</span>
+                      <div className="launch-wrapper-row">
+                        <input
+                          type="text"
+                          placeholder={
+                            settings?.platform_linux
+                              ? "Wrapper (e.g. gamemoderun)"
+                              : "Wrapper (optional)"
+                          }
+                          value={wrapperDraft}
+                          onChange={(e) => setWrapperDraft(e.target.value)}
+                        />
+                        <input
+                          type="text"
+                          placeholder="Arguments (e.g. --launcher-skip)"
+                          value={argsDraft}
+                          onChange={(e) => setArgsDraft(e.target.value)}
+                        />
                         <button
                           type="button"
-                          className="icon-btn"
-                          title="Copy"
                           onClick={() =>
-                            void navigator.clipboard?.writeText(`${v.name}=${v.value}`)
+                            void saveLaunchOptions(
+                              currentSource,
+                              currentCustomVars,
+                              wrapperDraft,
+                              argsDraft,
+                              rawCommandDraft,
+                              useGlobalLaunchDraft,
+                            )
                           }
                         >
-                          <FontAwesomeIcon icon={faCopy} />
+                          Save
                         </button>
                       </div>
-                    ))}
-                    {launchPreview.custom_env_vars.map((v, idx) => (
-                      <div className="launch-env-row" key={`custom-${v.name}-${idx}`}>
-                        <code className="launch-env-name">{v.name}</code>
+                    </div>
+
+                    <div className="setting-block">
+                      <span>Environment Variables</span>
+                      <div className="launch-env-list">
+                        {(launchPreview?.auto_env_vars ?? []).map((v) => (
+                          <div className="launch-env-row" key={`auto-${v.name}`}>
+                            <code className="launch-env-name">{v.name}</code>
+                            <span className="launch-env-eq">=</span>
+                            <code className="launch-env-val">{v.value}</code>
+                            <span className="launch-env-badge">Auto</span>
+                            <button
+                              type="button"
+                              className="icon-btn"
+                              title="Copy"
+                              onClick={() =>
+                                void navigator.clipboard?.writeText(
+                                  `${v.name}=${v.value}`,
+                                )
+                              }
+                            >
+                              <FontAwesomeIcon icon={faCopy} />
+                            </button>
+                          </div>
+                        ))}
+                        {activeGlobalOpts.enabled &&
+                          useGlobalLaunchDraft &&
+                          (activeGlobalOpts.env_vars ?? []).map((v, idx) => (
+                            <div
+                              className="launch-env-row"
+                              key={`global-${v.name}-${idx}`}
+                            >
+                              <code className="launch-env-name">{v.name}</code>
+                              <span className="launch-env-eq">=</span>
+                              <code className="launch-env-val">{v.value}</code>
+                              <span className="launch-env-badge">Global</span>
+                              <button
+                                type="button"
+                                className="icon-btn"
+                                title="Copy"
+                                onClick={() =>
+                                  void navigator.clipboard?.writeText(
+                                    `${v.name}=${v.value}`,
+                                  )
+                                }
+                              >
+                                <FontAwesomeIcon icon={faCopy} />
+                              </button>
+                            </div>
+                          ))}
+                        {currentCustomVars.map((v, idx) => (
+                          <div
+                            className="launch-env-row"
+                            key={`custom-${v.name}-${idx}`}
+                          >
+                            <code className="launch-env-name">{v.name}</code>
+                            <span className="launch-env-eq">=</span>
+                            <code className="launch-env-val">{v.value}</code>
+                            <button
+                              type="button"
+                              className="icon-btn"
+                              title="Copy"
+                              onClick={() =>
+                                void navigator.clipboard?.writeText(
+                                  `${v.name}=${v.value}`,
+                                )
+                              }
+                            >
+                              <FontAwesomeIcon icon={faCopy} />
+                            </button>
+                            <button
+                              type="button"
+                              className="icon-btn danger"
+                              title="Remove variable"
+                              onClick={() => {
+                                const next = currentCustomVars.filter(
+                                  (_, i) => i !== idx,
+                                );
+                                void saveLaunchOptions(
+                                  currentSource,
+                                  next,
+                                  wrapperDraft,
+                                  argsDraft,
+                                  rawCommandDraft,
+                                  useGlobalLaunchDraft,
+                                );
+                              }}
+                            >
+                              <FontAwesomeIcon icon={faTrashCan} />
+                            </button>
+                          </div>
+                        ))}
+                        {(launchPreview?.auto_env_vars ?? []).length === 0 &&
+                          (!activeGlobalOpts.enabled ||
+                            !useGlobalLaunchDraft ||
+                            (activeGlobalOpts.env_vars ?? []).length === 0) &&
+                          currentCustomVars.length === 0 && (
+                            <p className="note">
+                              No environment variables configured.
+                            </p>
+                          )}
+                      </div>
+
+                      <div className="launch-env-add">
+                        <input
+                          type="text"
+                          placeholder="NAME"
+                          value={newEnvName}
+                          onChange={(e) => setNewEnvName(e.target.value)}
+                        />
                         <span className="launch-env-eq">=</span>
-                        <code className="launch-env-val">{v.value}</code>
+                        <input
+                          type="text"
+                          placeholder="VALUE"
+                          value={newEnvValue}
+                          onChange={(e) => setNewEnvValue(e.target.value)}
+                        />
                         <button
                           type="button"
-                          className="icon-btn"
-                          title="Copy"
-                          onClick={() =>
-                            void navigator.clipboard?.writeText(`${v.name}=${v.value}`)
-                          }
-                        >
-                          <FontAwesomeIcon icon={faCopy} />
-                        </button>
-                        <button
-                          type="button"
-                          className="icon-btn danger"
-                          title="Remove variable"
+                          className="accent"
+                          aria-label="Add environment variable"
+                          disabled={!newEnvName.trim()}
                           onClick={() => {
-                            const next = launchPreview.custom_env_vars.filter(
-                              (_, i) => i !== idx,
+                            const name = newEnvName.trim();
+                            if (!name) return;
+                            const next = currentCustomVars.filter(
+                              (v) => v.name !== name,
                             );
+                            next.push({ name, value: newEnvValue.trim() });
+                            setNewEnvName("");
+                            setNewEnvValue("");
                             void saveLaunchOptions(
-                              libraryDetail.game.launch_command_source ?? "emperor",
+                              currentSource,
                               next,
                               wrapperDraft,
                               argsDraft,
+                              rawCommandDraft,
+                              useGlobalLaunchDraft,
                             );
                           }}
                         >
-                          <FontAwesomeIcon icon={faTrashCan} />
+                          <FontAwesomeIcon icon={faPlus} />
                         </button>
                       </div>
-                    ))}
-                    {launchPreview.auto_env_vars.length === 0 &&
-                      launchPreview.custom_env_vars.length === 0 && (
-                        <p className="note">No environment variables configured.</p>
-                      )}
-                  </div>
-
-                  <div className="launch-env-add">
-                    <input
-                      type="text"
-                      placeholder="NAME"
-                      value={newEnvName}
-                      onChange={(e) => setNewEnvName(e.target.value)}
-                    />
-                    <span className="launch-env-eq">=</span>
-                    <input
-                      type="text"
-                      placeholder="VALUE"
-                      value={newEnvValue}
-                      onChange={(e) => setNewEnvValue(e.target.value)}
-                    />
-                    <button
-                      type="button"
-                      className="accent"
-                      aria-label="Add environment variable"
-                      disabled={!newEnvName.trim()}
-                      onClick={() => {
-                        const name = newEnvName.trim();
-                        if (!name) return;
-                        const next = launchPreview.custom_env_vars.filter(
-                          (v) => v.name !== name,
-                        );
-                        next.push({ name, value: newEnvValue.trim() });
-                        setNewEnvName("");
-                        setNewEnvValue("");
-                        void saveLaunchOptions(
-                          libraryDetail.game.launch_command_source ?? "emperor",
-                          next,
-                          wrapperDraft,
-                          argsDraft,
-                        );
-                      }}
-                    >
-                      <FontAwesomeIcon icon={faPlus} />
-                    </button>
-                  </div>
-                </div>
-
-                <div className="setting-block">
-                  <span>Applied launch options preview</span>
-                  <pre className="launch-preview-code">
-                    <code>{launchPreview.effective_command}</code>
-                  </pre>
-                </div>
-              </>
-            )}
-          </div>
+                    </div>
+                  </>
+                )}
+              </div>
+            );
+          })()}
         </Modal>
       )}
       {unmanageTarget && (
@@ -15202,6 +15890,19 @@ export default function App() {
           }}
         />
       )}
+      {modConfigFor && activeGame && (
+        <ModConfigDialog
+          gameId={activeGame.id}
+          mod={modConfigFor}
+          onClose={() => setModConfigFor(null)}
+          onSaved={(fileName) => {
+            setNotice({
+              kind: "ok",
+              message: `Saved ${fileName} for ${modConfigFor.name}. Launch modded to apply changes.`,
+            });
+          }}
+        />
+      )}
       {modOptionsFor && activeGame && (
         <ModOptionsDialog
           gameId={activeGame.id}
@@ -15221,7 +15922,7 @@ export default function App() {
           }}
         />
       )}
-      {moveCollectionMod && activeGame && installedCollections.length > 1 && (
+      {moveCollectionMod && activeGame && installedCollections.length > 0 && (
         <MoveModCollectionDialog
           mod={moveCollectionMod}
           collections={installedCollections}

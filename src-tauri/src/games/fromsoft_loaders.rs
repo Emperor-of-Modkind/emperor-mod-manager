@@ -1,4 +1,4 @@
-//! Auto-install FromSoftware loaders (legacy Mod Engine, Mod Engine 2, me3) on deploy.
+//! Auto-install FromSoftware loaders (legacy Mod Engine, Mod Engine 3 / me3) on deploy.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -35,8 +35,25 @@ pub enum EnsureLoadersOutcome {
     },
 }
 
-const ME2_REPO: &str = "soulsmods/ModEngine2";
 const ME3_REPO: &str = "garyttierney/me3";
+
+/// Resolved Mod Engine 3 (`me3`) executable and portable Windows host binaries directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Me3Installation {
+    pub binary: PathBuf,
+    pub windows_binaries_dir: Option<PathBuf>,
+}
+
+/// Official `me3 --game` identifier for modern FromSoftware plugins.
+pub fn me3_game_name(plugin_id: &str) -> Option<&'static str> {
+    match plugin_id {
+        "eldenring" => Some("eldenring"),
+        "eldenringnightreign" => Some("nightreign"),
+        "armoredcore6firesofrubicon" => Some("armoredcore6"),
+        "darksouls3" => Some("darksouls3"),
+        _ => None,
+    }
+}
 
 /// DS2 Mod Engine binaries mirrored from a public mod pack (no Nexus download required).
 const DS2_ME_RAW_BASE: &str = "https://raw.githubusercontent.com/vawser/Vestiges-DS2/master";
@@ -95,7 +112,7 @@ pub async fn ensure_fromsoft_loaders(
         match ensure_modern_loaders(paths, plugin_id, install_path).await {
             Ok(extra) => EnsureLoadersOutcome::Done(extra),
             Err(e) => EnsureLoadersOutcome::Done(vec![format!(
-                "Could not auto-install me3 / Mod Engine 2: {e:#}"
+                "Could not auto-install Mod Engine 3 (me3): {e:#}"
             )]),
         }
     }
@@ -354,85 +371,87 @@ async fn ensure_modern_loaders(
     let mut warnings = Vec::new();
     let game_root = resolve_game_root(install_path);
 
-    match ensure_modengine2(paths).await {
-        Ok(true) => warnings.push(format!(
-            "Installed Mod Engine 2 into {}.",
-            paths.modengine2_install_dir().display()
-        )),
-        Ok(false) => {}
-        Err(e) => warnings.push(format!("Mod Engine 2 install skipped: {e:#}")),
-    }
-
     match ensure_me3(paths).await {
         Ok(true) => warnings.push(format!(
-            "Installed me3 into {}.",
+            "Installed Mod Engine 3 (me3) into {}.",
             paths.me3_install_dir().display()
         )),
         Ok(false) => {}
-        Err(e) => warnings.push(format!("me3 install skipped: {e:#}")),
+        Err(e) => warnings.push(format!("Mod Engine 3 (me3) install skipped: {e:#}")),
     }
 
     write_modern_launch_helpers(paths, plugin_id, &game_root)?;
     Ok(warnings)
 }
 
-async fn ensure_modengine2(paths: &Paths) -> Result<bool> {
-    let dest = paths.modengine2_install_dir();
-    if find_me2_launcher(&dest).is_some() {
-        return Ok(false);
+/// Resolve Emperor's managed `me3` installation, falling back to `me3` on `PATH`.
+pub fn resolve_me3_installation(paths: &Paths) -> Option<Me3Installation> {
+    let dest = paths.me3_install_dir();
+    if let Some(binary) = me3_binary(&dest) {
+        let windows_binaries_dir = find_me3_windows_binaries_dir(&dest);
+        return Some(Me3Installation {
+            binary,
+            windows_binaries_dir,
+        });
     }
-    let release = github_release::fetch_latest_release(ME2_REPO)
-        .await?
-        .ok_or_else(|| anyhow!("no Mod Engine 2 releases found"))?;
-    let asset = pick_me2_asset(&release).ok_or_else(|| anyhow!("no win64 zip on ME2 release"))?;
-    let bytes = github_release::download_bytes(&asset.browser_download_url).await?;
-    tool_install::extract_archive(&bytes, &asset.name, &dest)?;
-    tool_install::normalize_install_root(&dest)?;
-    if find_me2_launcher(&dest).is_none() {
-        return Err(anyhow!(
-            "Mod Engine 2 archive extracted but modengine2_launcher.exe was not found"
-        ));
+    if me3_on_path() {
+        return Some(Me3Installation {
+            binary: PathBuf::from("me3"),
+            windows_binaries_dir: None,
+        });
     }
-    Ok(true)
+    None
 }
 
 async fn ensure_me3(paths: &Paths) -> Result<bool> {
     let dest = paths.me3_install_dir();
-    if me3_binary(&dest).is_some() || me3_on_path() {
-        return Ok(false);
+    if let Some(bin) = me3_binary(&dest) {
+        let has_win_bins = find_me3_windows_binaries_dir(&dest).is_some();
+        if has_win_bins {
+            ensure_executable(&bin);
+            return Ok(false);
+        }
     }
-    let release = github_release::fetch_latest_release(ME3_REPO)
-        .await?
-        .ok_or_else(|| anyhow!("no me3 releases found"))?;
+    let release = match github_release::fetch_latest_release(ME3_REPO).await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            if me3_binary(&dest).is_some() || me3_on_path() {
+                return Ok(false);
+            }
+            return Err(anyhow!("no me3 releases found"));
+        }
+        Err(e) => {
+            if me3_binary(&dest).is_some() || me3_on_path() {
+                return Ok(false);
+            }
+            return Err(e);
+        }
+    };
     let asset = pick_me3_asset(&release, std::env::consts::OS)
         .ok_or_else(|| anyhow!("no me3 portable asset for this OS"))?;
     let bytes = github_release::download_bytes(&asset.browser_download_url).await?;
     tool_install::extract_archive(&bytes, &asset.name, &dest)?;
     tool_install::normalize_install_root(&dest)?;
-    // Some archives nest bin/me3
-    if me3_binary(&dest).is_none() {
-        return Err(anyhow!(
-            "me3 archive extracted but me3 binary was not found"
-        ));
-    }
+    let bin = me3_binary(&dest)
+        .ok_or_else(|| anyhow!("me3 archive extracted but me3 binary was not found"))?;
+    ensure_executable(&bin);
     Ok(true)
 }
 
-pub fn pick_me2_asset(release: &GhRelease) -> Option<&GhAsset> {
-    release
-        .assets
-        .iter()
-        .find(|a| {
-            let n = a.name.to_ascii_lowercase();
-            n.contains("win64") && n.ends_with(".zip")
-        })
-        .or_else(|| {
-            release
-                .assets
-                .iter()
-                .find(|a| a.name.to_ascii_lowercase().ends_with(".zip"))
-        })
+#[cfg(unix)]
+fn ensure_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = std::fs::metadata(path) {
+        let mut perms = meta.permissions();
+        if perms.mode() & 0o111 == 0 {
+            perms.set_mode(perms.mode() | 0o755);
+            let _ = std::fs::set_permissions(path, perms);
+        }
+    }
 }
+
+#[cfg(not(unix))]
+fn ensure_executable(_path: &Path) {}
 
 pub fn pick_me3_asset<'a>(release: &'a GhRelease, os: &str) -> Option<&'a GhAsset> {
     match os {
@@ -448,8 +467,10 @@ pub fn pick_me3_asset<'a>(release: &'a GhRelease, os: &str) -> Option<&'a GhAsse
     }
 }
 
-fn find_me2_launcher(dir: &Path) -> Option<PathBuf> {
-    find_named_file(dir, "modengine2_launcher.exe")
+fn find_me3_windows_binaries_dir(dir: &Path) -> Option<PathBuf> {
+    find_named_file(dir, "me3_mod_host.dll")
+        .or_else(|| find_named_file(dir, "me3-launcher.exe"))
+        .and_then(|p| p.parent().map(Path::to_path_buf))
 }
 
 fn me3_binary(dir: &Path) -> Option<PathBuf> {
@@ -473,29 +494,32 @@ fn me3_on_path() -> bool {
         .unwrap_or(false)
 }
 
-fn me2_game_type(plugin_id: &str) -> &'static str {
-    match plugin_id {
-        "darksouls3" => "ds3",
-        "armoredcore6firesofrubicon" => "ac6",
-        "eldenringnightreign" => "nr",
-        _ => "er",
-    }
-}
-
 pub fn write_modern_launch_helpers(paths: &Paths, plugin_id: &str, game_root: &Path) -> Result<()> {
     std::fs::create_dir_all(game_root)?;
-    let me3_bin = me3_binary(&paths.me3_install_dir())
-        .map(|p| p.display().to_string())
+    let me3 = resolve_me3_installation(paths);
+    let me3_bin = me3
+        .as_ref()
+        .map(|m| m.binary.display().to_string())
         .unwrap_or_else(|| "me3".into());
+    let win_bins = me3.as_ref().and_then(|m| m.windows_binaries_dir.as_ref());
+    let me3_game = me3_game_name(plugin_id).unwrap_or("eldenring");
     let profile = game_root.join("emperor.me3");
-    let me2_launcher = find_me2_launcher(&paths.modengine2_install_dir());
-    let config = game_root.join("config_emperor.toml");
 
     // Shell helper (Linux / Git Bash).
+    let sh_win_bins = win_bins
+        .map(|dir| {
+            format!(
+                " --windows-binaries-dir \"{}\"",
+                sh_double_quote_escape(&dir.display().to_string())
+            )
+        })
+        .unwrap_or_default();
     let sh = format!(
-        "#!/bin/sh\ncd \"$(dirname \"$0\")\" || exit 1\nexec \"{me3}\" launch --profile \"{profile}\"\n",
-        me3 = shell_escape(&me3_bin),
-        profile = shell_escape(&profile.display().to_string()),
+        "#!/bin/sh\ncd \"$(dirname \"$0\")\" || exit 1\nexec \"{me3}\"{win_bins} launch --game {game} --profile \"{profile}\"\n",
+        me3 = sh_double_quote_escape(&me3_bin),
+        win_bins = sh_win_bins,
+        game = me3_game,
+        profile = sh_double_quote_escape(&profile.display().to_string()),
     );
     let sh_path = game_root.join("launch_emperor_me3.sh");
     std::fs::write(&sh_path, sh)?;
@@ -508,28 +532,31 @@ pub fn write_modern_launch_helpers(paths: &Paths, plugin_id: &str, game_root: &P
     }
 
     // Windows batch for me3.
+    let bat_win_bins = win_bins
+        .map(|dir| {
+            format!(
+                " --windows-binaries-dir \"{}\"",
+                dir.display().to_string().replace('/', "\\")
+            )
+        })
+        .unwrap_or_default();
     let bat_me3 = format!(
-        "@echo off\r\ncd /d \"%~dp0\"\r\n\"{me3}\" launch --profile \"{profile}\"\r\n",
+        "@echo off\r\ncd /d \"%~dp0\"\r\n\"{me3}\"{win_bins} launch --game {game} --profile \"{profile}\"\r\n",
         me3 = me3_bin.replace('/', "\\"),
+        win_bins = bat_win_bins,
+        game = me3_game,
         profile = profile.display().to_string().replace('/', "\\"),
     );
     std::fs::write(game_root.join("launch_emperor_me3.bat"), bat_me3)?;
 
-    if let Some(launcher) = me2_launcher {
-        let bat_me2 = format!(
-            "@echo off\r\ncd /d \"%~dp0\"\r\n\"{launcher}\" -t {game} -c \"{config}\"\r\n",
-            launcher = launcher.display().to_string().replace('/', "\\"),
-            game = me2_game_type(plugin_id),
-            config = config.display().to_string().replace('/', "\\"),
-        );
-        std::fs::write(game_root.join("launch_emperor_me2.bat"), bat_me2)?;
-    }
-
     Ok(())
 }
 
-fn shell_escape(s: &str) -> String {
-    s.replace('\'', "'\\''")
+fn sh_double_quote_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('$', "\\$")
+        .replace('`', "\\`")
 }
 
 fn find_named_file(root: &Path, name: &str) -> Option<PathBuf> {
@@ -564,26 +591,34 @@ mod tests {
     }
 
     #[test]
-    fn picks_me2_win64_zip() {
-        let release = GhRelease {
-            tag_name: "release-2.1.0".into(),
-            prerelease: false,
-            html_url: None,
-            assets: vec![
-                GhAsset {
-                    name: "notes.txt".into(),
-                    browser_download_url: "https://example/notes".into(),
-                },
-                GhAsset {
-                    name: "ModEngine-2.1.0.0-win64.zip".into(),
-                    browser_download_url: "https://example/me2.zip".into(),
-                },
-            ],
-        };
+    fn maps_modern_plugins_to_me3_game_names() {
+        assert_eq!(me3_game_name("eldenring"), Some("eldenring"));
+        assert_eq!(me3_game_name("eldenringnightreign"), Some("nightreign"));
         assert_eq!(
-            pick_me2_asset(&release).map(|a| a.name.as_str()),
-            Some("ModEngine-2.1.0.0-win64.zip")
+            me3_game_name("armoredcore6firesofrubicon"),
+            Some("armoredcore6")
         );
+        assert_eq!(me3_game_name("darksouls3"), Some("darksouls3"));
+        assert_eq!(me3_game_name("darksouls2"), None);
+    }
+
+    #[test]
+    fn resolve_me3_installation_finds_binary_and_windows_binaries_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+            cache_dir: tmp.path().join("cache"),
+        };
+        let bin_dir = paths.me3_install_dir().join("bin");
+        let win_dir = bin_dir.join("win64");
+        std::fs::create_dir_all(&win_dir).unwrap();
+        std::fs::write(bin_dir.join("me3"), b"x").unwrap();
+        std::fs::write(win_dir.join("me3_mod_host.dll"), b"dll").unwrap();
+
+        let resolved = resolve_me3_installation(&paths).expect("me3 resolved");
+        assert_eq!(resolved.binary, bin_dir.join("me3"));
+        assert_eq!(resolved.windows_binaries_dir, Some(win_dir));
     }
 
     #[test]
@@ -728,20 +763,24 @@ mod tests {
             data_dir: tmp.path().join("data"),
             cache_dir: tmp.path().join("cache"),
         };
-        std::fs::create_dir_all(paths.me3_install_dir()).unwrap();
-        std::fs::write(paths.me3_install_dir().join("me3"), b"x").unwrap();
-        let me2 = paths.modengine2_install_dir();
-        std::fs::create_dir_all(&me2).unwrap();
-        std::fs::write(me2.join("modengine2_launcher.exe"), b"x").unwrap();
+        let bin_dir = paths.me3_install_dir().join("bin");
+        let win_dir = bin_dir.join("win64");
+        std::fs::create_dir_all(&win_dir).unwrap();
+        std::fs::write(bin_dir.join("me3"), b"x").unwrap();
+        std::fs::write(win_dir.join("me3_mod_host.dll"), b"dll").unwrap();
 
         let game = tmp.path().join("Game");
         std::fs::create_dir_all(&game).unwrap();
         write_modern_launch_helpers(&paths, "eldenring", &game).unwrap();
+
         let sh = std::fs::read_to_string(game.join("launch_emperor_me3.sh")).unwrap();
-        assert!(sh.contains("launch --profile"));
-        assert!(game.join("launch_emperor_me3.bat").is_file());
-        let me2_bat = std::fs::read_to_string(game.join("launch_emperor_me2.bat")).unwrap();
-        assert!(me2_bat.contains("-t er"));
-        assert!(me2_bat.contains("config_emperor.toml"));
+        assert!(sh.contains("--windows-binaries-dir"));
+        assert!(sh.contains("launch --game eldenring --profile"));
+        assert!(sh.contains("emperor.me3"));
+
+        let bat = std::fs::read_to_string(game.join("launch_emperor_me3.bat")).unwrap();
+        assert!(bat.contains("--windows-binaries-dir"));
+        assert!(bat.contains("launch --game eldenring --profile"));
+        assert!(!game.join("launch_emperor_me2.bat").exists());
     }
 }

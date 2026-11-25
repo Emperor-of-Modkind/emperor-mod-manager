@@ -306,6 +306,8 @@ impl RemoteBackend for TauriDesktopBackend {
                     Ok(Some(serde_json::to_value(res)?))
                 }
                 RemoteRequest::CheckStagedModUpdates { game_id } => {
+                    let p2p = state.p2p.clone();
+                    let _ = p2p.refresh_all_friends().await;
                     let updates = crate::commands::check_staged_mod_updates(state, game_id)
                         .await
                         .map_err(|e| anyhow!(e))?;

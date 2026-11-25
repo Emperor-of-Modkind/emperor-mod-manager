@@ -54,6 +54,7 @@ export type AssistQueueState = {
 export type ActiveDownloadBatch = {
   id: string;
   label: string | null;
+  gameId?: string;
   collection?: AssistQueueState["collection"];
   emperorShare?: AssistQueueState["emperorShare"];
 };

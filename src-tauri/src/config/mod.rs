@@ -170,6 +170,9 @@ pub struct AppConfig {
     /// Whether to fetch owned Steam games remotely via Steam Web API or public profile XML.
     #[serde(default)]
     pub steam_library_sync_enabled: bool,
+    /// Global add-on launch options combined with detected required commands for games using Emperor launch commands.
+    #[serde(default)]
+    pub global_launch_options: GlobalLaunchOptions,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -327,6 +330,7 @@ impl Default for AppConfig {
             remote_allow_relay: true,
             steam_id_override: None,
             steam_library_sync_enabled: false,
+            global_launch_options: GlobalLaunchOptions::default(),
         }
     }
 }
@@ -337,11 +341,22 @@ pub struct LaunchEnvVar {
     pub value: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct GlobalLaunchOptions {
+    pub enabled: bool,
+    pub env_vars: Vec<LaunchEnvVar>,
+    pub wrapper: Option<String>,
+    pub launch_args: Option<String>,
+    pub raw_command: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum LaunchCommandSource {
     #[default]
     Emperor,
+    Merged,
     Launcher,
 }
 
@@ -393,6 +408,12 @@ pub struct ManagedGame {
     /// Optional extra launch arguments (e.g. "--launcher-skip").
     #[serde(default)]
     pub custom_launch_args: Option<String>,
+    /// Optional freeform additional launch command combined on top of Emperor commands.
+    #[serde(default)]
+    pub custom_raw_command: Option<String>,
+    /// Whether global add-on launch commands are included for this game.
+    #[serde(default = "default_true")]
+    pub use_global_launch_options: bool,
     /// Whether the user dismissed the inline Proton launch options notice for this game.
     #[serde(default)]
     pub wine_overrides_dismissed: bool,
@@ -544,6 +565,11 @@ impl Paths {
         self.game_data_dir(game_id).join("last-launch-deployed.json")
     }
 
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn steam_launch_backup_file(&self, game_id: &str) -> PathBuf {
+        self.game_data_dir(game_id).join("steam-launch-backup.json")
+    }
+
     pub fn logs_dir(&self) -> PathBuf {
         self.data_dir.join("logs")
     }
@@ -587,10 +613,6 @@ impl Paths {
         self.tools_dir()
             .join("fromsoft-modengine-legacy")
             .join(plugin_id)
-    }
-
-    pub fn modengine2_install_dir(&self) -> PathBuf {
-        self.tools_dir().join("modengine2")
     }
 
     pub fn me3_install_dir(&self) -> PathBuf {
@@ -777,5 +799,41 @@ plugin_id = "ue"
         let serialized = toml::to_string_pretty(&cfg).unwrap();
         let reloaded: AppConfig = toml::from_str(&serialized).unwrap();
         assert!(reloaded.managed_games[0].wine_overrides_dismissed);
+    }
+
+    #[test]
+    fn launch_options_defaults_and_roundtrip() {
+        let raw = r#"
+[[managed_games]]
+id = "g1"
+title = "Game"
+nexus_domain = "game"
+install_path = "/games/game"
+launcher = "Steam"
+plugin_id = "ue"
+"#;
+        let mut cfg: AppConfig = toml::from_str(raw).unwrap();
+        assert!(!cfg.global_launch_options.enabled);
+        assert!(cfg.global_launch_options.env_vars.is_empty());
+        assert_eq!(cfg.managed_games[0].launch_command_source, LaunchCommandSource::Emperor);
+        assert!(cfg.managed_games[0].use_global_launch_options);
+        assert_eq!(cfg.managed_games[0].custom_raw_command, None);
+
+        cfg.global_launch_options.enabled = true;
+        cfg.global_launch_options.wrapper = Some("gamemoderun".into());
+        cfg.global_launch_options.raw_command = Some("MANGOHUD=1 %command%".into());
+        cfg.managed_games[0].launch_command_source = LaunchCommandSource::Merged;
+        cfg.managed_games[0].use_global_launch_options = false;
+        cfg.managed_games[0].custom_raw_command = Some("PROTON_LOG=1 %command% -dx12".into());
+
+        let serialized = toml::to_string_pretty(&cfg).unwrap();
+        let reloaded: AppConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(reloaded.global_launch_options, cfg.global_launch_options);
+        assert_eq!(reloaded.managed_games[0].launch_command_source, LaunchCommandSource::Merged);
+        assert!(!reloaded.managed_games[0].use_global_launch_options);
+        assert_eq!(
+            reloaded.managed_games[0].custom_raw_command.as_deref(),
+            Some("PROTON_LOG=1 %command% -dx12")
+        );
     }
 }

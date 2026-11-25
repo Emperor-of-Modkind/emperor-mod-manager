@@ -46,7 +46,7 @@ export function MoveModCollectionDialog({
   return (
     <Modal
       className="modal-move-collection"
-      title="Move between collections"
+      title="Manage collections"
       subtitle={mod.name}
       onClose={onClose}
       footer={
@@ -71,8 +71,9 @@ export function MoveModCollectionDialog({
       }
     >
       <p className="note">
-        Choose which installed collections include this mod. Uncheck all to keep
-        it as a standalone mod.
+        {collections.length === 1
+          ? "Choose whether this mod belongs to the installed collection. Uncheck it to keep it as a standalone mod."
+          : "Choose which installed collections include this mod. Uncheck all to keep it as a standalone mod."}
       </p>
       <div className="move-collection-list" role="group" aria-label="Installed collections">
         {collections.map((col) => {

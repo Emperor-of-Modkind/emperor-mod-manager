@@ -100,10 +100,13 @@ pub use firstlight::FirstLightPlugin;
 pub use folder_mods::{
     BarotraumaPlugin, DarkestDungeonPlugin, DwarfFortressPlugin, VintageStoryPlugin,
 };
-pub use fromsoft_loaders::install_legacy_from_archive;
+pub use fromsoft_loaders::{
+    install_legacy_from_archive, me3_game_name, resolve_me3_installation,
+};
 pub use fromsoftware::{
-    ArmoredCore6Plugin, DarkSouls2Plugin, DarkSouls3Plugin, DarkSoulsPlugin,
-    DarkSoulsRemasteredPlugin, EldenRingNightreignPlugin, EldenRingPlugin, SekiroPlugin,
+    resolve_game_root as fromsoft_resolve_game_root, ArmoredCore6Plugin, DarkSouls2Plugin,
+    DarkSouls3Plugin, DarkSoulsPlugin, DarkSoulsRemasteredPlugin, EldenRingNightreignPlugin,
+    EldenRingPlugin, SekiroPlugin,
 };
 pub use ghostoftsushima::GhostOfTsushimaPlugin;
 pub use hades::{Hades2Plugin, HadesPlugin};
@@ -440,6 +443,7 @@ pub enum LogKind {
     /// Binary minidump. Mentioned, never parsed.
     CrashDump,
     Ds2Lighting,
+    Me3,
     CrLoader,
     Player,
     Console,

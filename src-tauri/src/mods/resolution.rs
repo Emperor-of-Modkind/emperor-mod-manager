@@ -255,13 +255,22 @@ fn find_same_identity_rows<'a>(order: &'a LoadOrder, spec: &IncomingModSpec) -> 
     }
 }
 
-fn is_exclusive_to_target(staged: &StagedMod, target_collection_id: Option<&str>) -> bool {
+fn is_exclusive_to_target(
+    staged: &StagedMod,
+    target_collection_id: Option<&str>,
+    is_synced_target: bool,
+) -> bool {
     let Some(target_id) = target_collection_id else {
         return false;
     };
-    !staged.independent
-        && !staged.collection_ids.is_empty()
-        && staged.collection_ids.iter().all(|id| id == target_id)
+    let exclusive_membership = !staged.collection_ids.is_empty()
+        && staged.collection_ids.iter().all(|id| id == target_id);
+    if !exclusive_membership {
+        return false;
+    }
+    // Synced friend collections manage their exclusive member mods directly (even if
+    // earlier joins erroneously left `independent = true` on downloaded members).
+    is_synced_target || !staged.independent
 }
 
 fn other_collections_for_mod(
@@ -387,7 +396,7 @@ pub fn plan_collection_conflicts(
             // Even if an exact match is already staged (e.g. currently disabled), check
             // whether a *different* enabled version of the same mod is active.
             if let Some(active_other) = other_versions.iter().copied().find(|m| {
-                m.enabled && !is_exclusive_to_target(m, target_collection_id)
+                m.enabled && !is_exclusive_to_target(m, target_collection_id, is_synced_target)
             }) {
                 let conflicting_cols =
                     other_collections_for_mod(active_other, order, collections, target_collection_id);
@@ -413,7 +422,7 @@ pub fn plan_collection_conflicts(
         // treat this as a clean self-update rather than a user conflict.
         if other_versions
             .iter()
-            .all(|m| is_exclusive_to_target(m, target_collection_id))
+            .all(|m| is_exclusive_to_target(m, target_collection_id, is_synced_target))
         {
             plan.auto_update_count += 1;
             continue;
@@ -425,7 +434,9 @@ pub fn plan_collection_conflicts(
         let enabled_others: Vec<&StagedMod> = other_versions
             .iter()
             .copied()
-            .filter(|m| m.enabled && !is_exclusive_to_target(m, target_collection_id))
+            .filter(|m| {
+                m.enabled && !is_exclusive_to_target(m, target_collection_id, is_synced_target)
+            })
             .collect();
 
         if enabled_others.is_empty() {
@@ -567,9 +578,10 @@ pub fn resolve_mod_execution(
     }
 
     // Automatic self-update when existing version belongs exclusively to target collection.
+    let is_synced_target = target_collection_id.is_some_and(|id| id.starts_with("friend:"));
     if other_versions
         .iter()
-        .all(|m| is_exclusive_to_target(m, target_collection_id))
+        .all(|m| is_exclusive_to_target(m, target_collection_id, is_synced_target))
     {
         return ModExecutionPlan::ReplaceStaged {
             replace_id: other_versions[0].id.clone(),
@@ -917,5 +929,106 @@ mod tests {
         let plan = plan_collection_conflicts(&order, &cols, None, "New", true, &incoming);
         assert!(plan.conflicts.is_empty());
         assert_eq!(plan.install_count, 1);
+    }
+
+    #[test]
+    fn synced_collection_exclusive_mod_with_legacy_independent_flag_auto_updates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staging_synced = make_staged_dir(&tmp.path().join("synced_v1"));
+        let staging_indep = make_staged_dir(&tmp.path().join("indep_v1"));
+        let order = LoadOrder {
+            mods: vec![
+                StagedMod {
+                    id: "100_1".into(),
+                    name: "SyncedMod".into(),
+                    source: ModSource::Nexus,
+                    nexus_mod_id: 100,
+                    nexus_file_id: 1,
+                    version: Some("1.0".into()),
+                    domain: "skyrimspecialedition".into(),
+                    staging_path: staging_synced,
+                    staged_file_count: Some(1),
+                    enabled: true,
+                    // Legacy synced joins erroneously left independent=true.
+                    independent: true,
+                    collection_ids: vec!["friend:peer1:col1".into()],
+                    ..Default::default()
+                },
+                StagedMod {
+                    id: "200_1".into(),
+                    name: "IndependentMod".into(),
+                    source: ModSource::Nexus,
+                    nexus_mod_id: 200,
+                    nexus_file_id: 1,
+                    version: Some("1.0".into()),
+                    domain: "skyrimspecialedition".into(),
+                    staging_path: staging_indep,
+                    staged_file_count: Some(1),
+                    enabled: true,
+                    independent: true,
+                    collection_ids: vec![],
+                    ..Default::default()
+                },
+            ],
+        };
+        let cols = InstalledCollections {
+            collections: vec![InstalledCollection {
+                id: "friend:peer1:col1".into(),
+                name: "Friends Co-op".into(),
+                mod_ids: vec!["100_1".into()],
+                friend_sync: Some(FriendSyncMetadata {
+                    friend_peer_id: "peer1".into(),
+                    friend_collection_id: "col1".into(),
+                    last_synced_hash: "h1".into(),
+                    last_synced_at: String::new(),
+                    auto_sync: true,
+                }),
+                ..Default::default()
+            }],
+        };
+        let incoming = vec![
+            IncomingModSpec::Nexus {
+                domain: "skyrimspecialedition".into(),
+                mod_id: 100,
+                file_id: 2,
+                name: "SyncedMod".into(),
+                version: Some("2.0".into()),
+                file_name: None,
+            },
+            IncomingModSpec::Nexus {
+                domain: "skyrimspecialedition".into(),
+                mod_id: 200,
+                file_id: 2,
+                name: "IndependentMod".into(),
+                version: Some("2.0".into()),
+                file_name: None,
+            },
+        ];
+
+        let plan = plan_collection_conflicts(
+            &order,
+            &cols,
+            Some("friend:peer1:col1"),
+            "Friends Co-op",
+            true,
+            &incoming,
+        );
+        // Mod 100 belongs exclusively to friend:peer1:col1 -> auto-updates cleanly.
+        assert_eq!(plan.auto_update_count, 1);
+        // Mod 200 is genuinely independent (not in friend:peer1:col1) -> still conflicts.
+        assert_eq!(plan.conflicts.len(), 1);
+        assert_eq!(plan.conflicts[0].existing_mod_id, "200_1");
+        assert_eq!(
+            resolve_mod_execution(
+                &order,
+                Some("friend:peer1:col1"),
+                &incoming,
+                &incoming[0],
+                None
+            ),
+            ModExecutionPlan::ReplaceStaged {
+                replace_id: "100_1".into()
+            }
+        );
     }
 }

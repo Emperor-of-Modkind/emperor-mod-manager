@@ -166,6 +166,7 @@ vi.mock("@tauri-apps/api/core", () => {
       case "resolve_catalog_covers":
       case "list_installed_collections":
       case "list_mods_with_options":
+      case "list_mods_with_config_files":
       case "list_mods_needing_fomod":
       case "check_staged_mod_updates":
         return Promise.resolve([]);

@@ -193,6 +193,7 @@ export function MobileCollectionsView({
               <p className="muted">
                 {colMods.length} mods · {activeGame.title}
                 {installedSelected.revision ? ` · Rev ${installedSelected.revision}` : ""}
+                {installedSelected.friend_sync ? " · Synced" : ""}
               </p>
             </div>
             <SettingsToggle
@@ -248,40 +249,44 @@ export function MobileCollectionsView({
             >
               <FontAwesomeIcon icon={faShieldHalved} /> Check Integrity
             </button>
-            <button
-              type="button"
-              className="secondary"
-              disabled={!online || busyAction !== null}
-              onClick={() =>
-                void runAction("save", async () => {
-                  await api.mobileSaveCollectionChanges(activeGame.id, installedSelected.id);
-                  await onRefresh();
-                  onNotify("info", `Saved changes to ${installedSelected.name}`);
-                })
-              }
-            >
-              <FontAwesomeIcon icon={faFloppyDisk} /> Save Changes
-            </button>
+            {!installedSelected.friend_sync ? (
+              <button
+                type="button"
+                className="secondary"
+                disabled={!online || busyAction !== null}
+                onClick={() =>
+                  void runAction("save", async () => {
+                    await api.mobileSaveCollectionChanges(activeGame.id, installedSelected.id);
+                    await onRefresh();
+                    onNotify("info", `Saved changes to ${installedSelected.name}`);
+                  })
+                }
+              >
+                <FontAwesomeIcon icon={faFloppyDisk} /> Save Changes
+              </button>
+            ) : null}
           </div>
 
-          <div className="mobile-detail-toggles">
-            <SettingsToggle
-              checked={Boolean(installedSelected.auto_save)}
-              disabled={!online || busyAction !== null}
-              onChange={(checked) =>
-                void runAction("autosave", async () => {
-                  await api.mobileSetCollectionAutoSave(
-                    activeGame.id,
-                    installedSelected.id,
-                    checked,
-                  );
-                  await onRefresh();
-                })
-              }
-            >
-              Auto-save changes to this collection
-            </SettingsToggle>
-          </div>
+          {!installedSelected.friend_sync ? (
+            <div className="mobile-detail-toggles">
+              <SettingsToggle
+                checked={Boolean(installedSelected.auto_save)}
+                disabled={!online || busyAction !== null}
+                onChange={(checked) =>
+                  void runAction("autosave", async () => {
+                    await api.mobileSetCollectionAutoSave(
+                      activeGame.id,
+                      installedSelected.id,
+                      checked,
+                    );
+                    await onRefresh();
+                  })
+                }
+              >
+                Auto-save changes to this collection
+              </SettingsToggle>
+            </div>
+          ) : null}
 
           {integrity ? (
             <div className="mobile-integrity-box">
@@ -538,7 +543,7 @@ export function MobileCollectionsView({
                     <span className="muted">
                       {colMods.length} mods
                       {col.revision ? ` · Rev ${col.revision}` : ""}
-                      {col.auto_save ? " · Auto-save" : ""}
+                      {col.friend_sync ? " · Synced" : col.auto_save ? " · Auto-save" : ""}
                     </span>
                   </button>
                   <SettingsToggle

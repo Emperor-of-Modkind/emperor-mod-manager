@@ -17,6 +17,8 @@ mod github_release;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod launch;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
+mod launch_options;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod launcher_install;
 #[cfg(any(
     target_os = "linux",
@@ -389,6 +391,9 @@ pub fn run() {
             commands::get_mod_options,
             commands::set_mod_options,
             commands::list_mods_with_options,
+            commands::list_mods_with_config_files,
+            commands::list_mod_config_files,
+            commands::save_mod_config_file,
             commands::get_fomod_installer,
             commands::set_fomod_selection,
             commands::list_mods_needing_fomod,
@@ -403,6 +408,7 @@ pub fn run() {
             commands::set_launch_command_source,
             commands::get_launch_preview,
             commands::set_game_launch_options,
+            commands::set_global_launch_options,
             commands::diagnose_load,
             commands::list_downloads,
             commands::clear_recent_downloads,

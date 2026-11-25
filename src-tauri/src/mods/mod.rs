@@ -1142,6 +1142,54 @@ pub fn find_all_nexus_mod<'a>(
         .collect()
 }
 
+pub fn match_share_mod_entry<'a>(
+    order: &'a LoadOrder,
+    entry: &crate::share::ShareModEntry,
+    fallback_modio_game_id: Option<u32>,
+) -> Option<&'a StagedMod> {
+    match entry.s {
+        crate::share::ShareModSource::Nexus => {
+            let mid = entry.mod_id.unwrap_or(0);
+            let fid = entry.file_id.unwrap_or(0);
+            find_nexus_file(order, mid, fid)
+                .or_else(|| {
+                    order
+                        .mods
+                        .iter()
+                        .find(|m| m.source == ModSource::Nexus && m.nexus_mod_id == mid && m.enabled)
+                })
+                .or_else(|| {
+                    order
+                        .mods
+                        .iter()
+                        .find(|m| m.source == ModSource::Nexus && m.nexus_mod_id == mid)
+                })
+        }
+        crate::share::ShareModSource::Thunderstore => {
+            let ns = entry.namespace.as_deref()?;
+            let name = entry.name.as_deref()?;
+            find_thunderstore_package_version(order, ns, name, entry.version.as_deref())
+                .or_else(|| {
+                    find_all_thunderstore_packages(order, ns, name)
+                        .into_iter()
+                        .find(|m| m.enabled)
+                })
+                .or_else(|| find_thunderstore_package(order, ns, name))
+        }
+        crate::share::ShareModSource::Modio => {
+            let gid = entry.game_id.or(fallback_modio_game_id).unwrap_or(0);
+            let mid = entry.mod_id.unwrap_or(0);
+            find_modio_file(order, gid, mid, entry.file_id, entry.version.as_deref())
+                .or_else(|| {
+                    find_all_modio_mods(order, gid, mid)
+                        .into_iter()
+                        .find(|m| m.enabled)
+                })
+                .or_else(|| find_modio_mod(order, gid, mid))
+        }
+    }
+}
+
 pub fn merge_mod_meta(
     paths: &Paths,
     game_id: &str,
@@ -1230,7 +1278,9 @@ fn record_installed_collection_inner(
             if collection.game_versions.is_none() && existing.revision == collection.revision {
                 collection.game_versions = existing.game_versions.clone();
             }
-            if !collection.auto_save {
+            if collection.friend_sync.is_some() {
+                collection.auto_save = false;
+            } else if !collection.auto_save {
                 collection.auto_save = existing.auto_save;
             }
             if !replace_members {
@@ -1244,6 +1294,9 @@ fn record_installed_collection_inner(
             collection.has_unsaved_changes = false;
             *existing = collection.clone();
         } else {
+            if collection.friend_sync.is_some() {
+                collection.auto_save = false;
+            }
             collection.saved_snapshot_hash = Some(snapshot_sig);
             collection.has_unsaved_changes = false;
             store.collections.push(collection.clone());
@@ -1415,12 +1468,13 @@ pub fn list_installed_collections(
     let mut ordered_mods: Vec<&StagedMod> = order.mods.iter().collect();
     ordered_mods.sort_by_key(|m| m.order);
 
-    with_game_collections(game_id, || {
+    let (collections, missing_links) = with_game_collections(game_id, || -> Result<_> {
         let mut store = read_collections(paths, game_id)?;
         if store.collections.is_empty() {
-            return Ok(store.collections);
+            return Ok((store.collections, Vec::new()));
         }
         let mut dirty = false;
+        let mut missing_links: Vec<(String, String)> = Vec::new();
         for col in &mut store.collections {
             let mut seen = HashSet::new();
             let before_len = col.mod_ids.len();
@@ -1434,18 +1488,68 @@ pub fn list_installed_collections(
                     dirty = true;
                 }
             }
+            if col.friend_sync.is_some() {
+                if let Some(code) = col.profile_code.as_deref() {
+                    if let Ok(manifest) = crate::share::decode_share_code(code) {
+                        if col.mod_ids.len() < manifest.mods.len() {
+                            for entry in &manifest.mods {
+                                if let Some(staged) = match_share_mod_entry(&order, entry, None) {
+                                    if seen.insert(staged.id.clone()) {
+                                        col.mod_ids.push(staged.id.clone());
+                                        dirty = true;
+                                    }
+                                    if !staged.collection_ids.iter().any(|id| id == &col.id) {
+                                        missing_links.push((col.id.clone(), staged.id.clone()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             let sig = collection_snapshot_signature(&col.id, &order);
             if col.saved_snapshot_hash.is_none() {
                 col.saved_snapshot_hash = Some(sig.clone());
                 dirty = true;
             }
-            col.has_unsaved_changes = col.saved_snapshot_hash.as_deref() != Some(sig.as_str());
+            if col.friend_sync.is_some() {
+                if col.auto_save {
+                    col.auto_save = false;
+                    dirty = true;
+                }
+                col.has_unsaved_changes = false;
+            } else {
+                col.has_unsaved_changes = col.saved_snapshot_hash.as_deref() != Some(sig.as_str());
+            }
         }
         if dirty {
             write_collections(paths, game_id, &store)?;
         }
-        Ok(store.collections)
-    })
+        Ok((store.collections, missing_links))
+    })?;
+
+    if !missing_links.is_empty() {
+        let _ = with_game_order(game_id, || {
+            let mut order = read_loadorder(paths, game_id)?;
+            collapse_load_order(paths, game_id, &mut order)?;
+            let mut order_dirty = false;
+            for (col_id, mod_id) in &missing_links {
+                if let Some(m) = order.mods.iter_mut().find(|m| &m.id == mod_id) {
+                    let before = m.collection_ids.len();
+                    push_unique(&mut m.collection_ids, col_id.clone());
+                    if m.collection_ids.len() != before {
+                        order_dirty = true;
+                    }
+                }
+            }
+            if order_dirty {
+                write_loadorder(paths, game_id, &order)?;
+            }
+            Ok::<(), anyhow::Error>(())
+        });
+    }
+
+    Ok(collections)
 }
 
 pub fn set_collection_auto_save(
@@ -8006,6 +8110,71 @@ mod tests {
     }
 
     #[test]
+    fn friend_sync_collections_disallow_auto_save_and_clear_unsaved_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_dir: dir.path().join("cfg"),
+            data_dir: dir.path().join("data"),
+            cache_dir: dir.path().join("cache"),
+        };
+        let game_id = "skyrim_sync_autosave";
+        let staged = |id: &str, order: u32| StagedMod {
+            id: id.into(),
+            name: id.into(),
+            staging_path: dir.path().join(id).to_string_lossy().into_owned(),
+            enabled: true,
+            order,
+            collection_ids: vec!["friend-col".into()],
+            ..Default::default()
+        };
+        save_loadorder(
+            &paths,
+            game_id,
+            &LoadOrder {
+                mods: vec![staged("m1", 1), staged("m2", 2)],
+            },
+        )
+        .unwrap();
+        save_collections(
+            &paths,
+            game_id,
+            &InstalledCollections {
+                collections: vec![InstalledCollection {
+                    id: "friend-col".into(),
+                    source: CollectionSource::Emperor,
+                    kind: CollectionKind::Share,
+                    name: "Friend Pack".into(),
+                    mod_ids: vec!["m1".into(), "m2".into()],
+                    auto_save: true,
+                    friend_sync: Some(FriendSyncMetadata {
+                        friend_peer_id: "peer-1".into(),
+                        friend_collection_id: "fc-1".into(),
+                        last_synced_hash: "h1".into(),
+                        last_synced_at: "2026-11-23T21:00:00Z".into(),
+                        auto_sync: true,
+                    }),
+                    ..Default::default()
+                }],
+            },
+        )
+        .unwrap();
+
+        // Listing normalizes persisted auto_save = true -> false and never reports unsaved changes.
+        let cols = list_installed_collections(&paths, game_id).unwrap();
+        assert!(!cols[0].auto_save);
+        assert!(!cols[0].has_unsaved_changes);
+
+        // Reordering mods must not mark a friend_sync collection as having unsaved changes.
+        set_load_order(&paths, game_id, &["m2".into(), "m1".into()]).unwrap();
+        let cols_after = list_installed_collections(&paths, game_id).unwrap();
+        assert!(!cols_after[0].has_unsaved_changes);
+        assert!(!cols_after[0].auto_save);
+
+        // Toggling auto_save on a friend_sync collection must fail.
+        assert!(set_collection_auto_save(&paths, game_id, "friend-col", true).is_err());
+    }
+
+    #[test]
     fn apply_collection_order_and_selections_respects_enabled_flag() {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths {
@@ -8273,5 +8442,142 @@ mod tests {
         assert_eq!(order.mods.len(), 2);
         assert!(find_thunderstore_package_version(&order, "Owner", "Pkg", Some("1.0.0")).is_some());
         assert!(find_thunderstore_package_version(&order, "Owner", "Pkg", Some("2.0.0")).is_some());
+    }
+
+    #[test]
+    fn list_installed_collections_self_heals_friend_sync_missing_members_from_profile_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_dir: dir.path().join("cfg"),
+            data_dir: dir.path().join("data"),
+            cache_dir: dir.path().join("cache"),
+        };
+        let game_id = "skyrim_heal";
+        let col_id = "friend:peer1:saved:c1";
+
+        let make_nexus = |id: &str, mod_id: u64, file_id: u64, cols: Vec<String>, order: u32| StagedMod {
+            id: id.into(),
+            name: id.into(),
+            domain: "skyrimspecialedition".into(),
+            nexus_mod_id: mod_id,
+            nexus_file_id: file_id,
+            source: ModSource::Nexus,
+            staging_path: dir.path().join(id).to_string_lossy().into(),
+            enabled: true,
+            order,
+            collection_ids: cols,
+            independent: true,
+            ..Default::default()
+        };
+
+        write_loadorder(
+            &paths,
+            game_id,
+            &LoadOrder {
+                mods: vec![
+                    make_nexus("m1", 10, 100, vec![col_id.into()], 0),
+                    make_nexus("m2", 20, 200, vec![], 1),
+                    make_nexus("m3", 30, 300, vec![], 2),
+                ],
+            },
+        )
+        .unwrap();
+
+        let manifest = crate::share::ShareManifest {
+            v: 1,
+            name: Some("Friend Pack".into()),
+            game: crate::share::ShareGameHint {
+                plugin_id: Some("skyrimse".into()),
+                nexus_domain: Some("skyrimspecialedition".into()),
+                title: Some("Skyrim SE".into()),
+                ..Default::default()
+            },
+            game_versions: None,
+            mods: vec![
+                crate::share::ShareModEntry {
+                    s: crate::share::ShareModSource::Nexus,
+                    domain: Some("skyrimspecialedition".into()),
+                    mod_id: Some(10),
+                    file_id: Some(100),
+                    community: None,
+                    namespace: None,
+                    name: None,
+                    game_id: None,
+                    display_name: Some("m1".into()),
+                    version: None,
+                    fomod: None,
+                    options: None,
+                    enabled: None,
+                },
+                crate::share::ShareModEntry {
+                    s: crate::share::ShareModSource::Nexus,
+                    domain: Some("skyrimspecialedition".into()),
+                    mod_id: Some(20),
+                    file_id: Some(200),
+                    community: None,
+                    namespace: None,
+                    name: None,
+                    game_id: None,
+                    display_name: Some("m2".into()),
+                    version: None,
+                    fomod: None,
+                    options: None,
+                    enabled: None,
+                },
+                crate::share::ShareModEntry {
+                    s: crate::share::ShareModSource::Nexus,
+                    domain: Some("skyrimspecialedition".into()),
+                    mod_id: Some(30),
+                    file_id: Some(300),
+                    community: None,
+                    namespace: None,
+                    name: None,
+                    game_id: None,
+                    display_name: Some("m3".into()),
+                    version: None,
+                    fomod: None,
+                    options: None,
+                    enabled: None,
+                },
+            ],
+        };
+        let share_code = crate::share::encode_share_manifest(&manifest).unwrap();
+
+        write_collections(
+            &paths,
+            game_id,
+            &InstalledCollections {
+                collections: vec![InstalledCollection {
+                    id: col_id.into(),
+                    source: CollectionSource::Emperor,
+                    kind: CollectionKind::Share,
+                    name: "Friend Pack".into(),
+                    profile_code: Some(share_code),
+                    mod_ids: vec!["m1".into()],
+                    friend_sync: Some(FriendSyncMetadata {
+                        friend_peer_id: "peer1".into(),
+                        friend_collection_id: "saved:c1".into(),
+                        last_synced_hash: "hash1".into(),
+                        last_synced_at: "2026-01-01T00:00:00Z".into(),
+                        auto_sync: true,
+                    }),
+                    ..Default::default()
+                }],
+            },
+        )
+        .unwrap();
+
+        let cols = list_installed_collections(&paths, game_id).unwrap();
+        assert_eq!(cols.len(), 1);
+        assert_eq!(cols[0].mod_ids, vec!["m1", "m2", "m3"]);
+
+        let order = load_loadorder(&paths, game_id).unwrap();
+        for id in ["m1", "m2", "m3"] {
+            let m = order.mods.iter().find(|m| m.id == id).unwrap();
+            assert!(
+                m.collection_ids.iter().any(|c| c == col_id),
+                "expected {id} to have collection_id {col_id}"
+            );
+        }
     }
 }

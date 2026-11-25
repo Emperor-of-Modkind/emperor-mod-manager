@@ -120,6 +120,7 @@ export type FriendsPageProps = {
     result: FriendSyncResult,
     friendSync?: { peerId: string; friendCollectionId: string },
   ) => Promise<void> | void;
+  onFriendsRefreshed?: () => Promise<void> | void;
   resolveCollectionConflicts?: (
     gameId: string,
     source: CollectionPlanSource,
@@ -300,6 +301,7 @@ export function FriendsPage({
   onInstallCollection,
   onSaveCollection,
   onCollectionSynced,
+  onFriendsRefreshed,
   resolveCollectionConflicts,
   onOpenMod,
   pendingJoinCode,
@@ -344,6 +346,12 @@ export function FriendsPage({
   >(null);
   const [installedByGame, setInstalledByGame] = useState<
     Record<string, InstalledCollection[]>
+  >({});
+  const [syncStatesByGame, setSyncStatesByGame] = useState<
+    Record<string, Record<string, boolean>>
+  >({});
+  const [targetSyncStates, setTargetSyncStates] = useState<
+    Record<string, boolean>
   >({});
   const [rowBusyKey, setRowBusyKey] = useState<string | null>(null);
   const [targetGameId, setTargetGameId] = useState<string>("");
@@ -663,24 +671,37 @@ export function FriendsPage({
   useEffect(() => {
     if (!selectedFriend || !managedGroupIdsKey) {
       setInstalledByGame({});
+      setSyncStatesByGame({});
       return;
     }
     const managedIds = managedGroupIdsKey.split(",");
     let cancelled = false;
     void Promise.allSettled(
-      managedIds.map(async (gid) => ({
-        gid,
-        cols: await api.listInstalledCollections(gid),
-      })),
+      managedIds.map(async (gid) => {
+        const [cols, syncStates] = await Promise.all([
+          api.listInstalledCollections(gid),
+          api.getFriendCollectionSyncStates
+            ? api.getFriendCollectionSyncStates(gid).catch(() => [])
+            : Promise.resolve([]),
+        ]);
+        const hasUpdateMap: Record<string, boolean> = {};
+        for (const st of syncStates ?? []) {
+          hasUpdateMap[st.collection_id] = st.has_update;
+        }
+        return { gid, cols, hasUpdateMap };
+      }),
     ).then((results) => {
       if (cancelled) return;
       const next: Record<string, InstalledCollection[]> = {};
+      const nextSync: Record<string, Record<string, boolean>> = {};
       for (const r of results) {
         if (r.status === "fulfilled") {
           next[r.value.gid] = r.value.cols;
+          nextSync[r.value.gid] = r.value.hasUpdateMap;
         }
       }
       setInstalledByGame(next);
+      setSyncStatesByGame(nextSync);
     });
     return () => {
       cancelled = true;
@@ -719,17 +740,24 @@ export function FriendsPage({
   useEffect(() => {
     if (!targetGameId) {
       setInstalledForTarget([]);
+      setTargetSyncStates({});
       return;
     }
     let cancelled = false;
-    void api
-      .listInstalledCollections(targetGameId)
-      .then((cols) => {
-        if (!cancelled) setInstalledForTarget(cols);
-      })
-      .catch(() => {
-        if (!cancelled) setInstalledForTarget([]);
-      });
+    void Promise.all([
+      api.listInstalledCollections(targetGameId).catch(() => []),
+      api.getFriendCollectionSyncStates
+        ? api.getFriendCollectionSyncStates(targetGameId).catch(() => [])
+        : Promise.resolve([]),
+    ]).then(([cols, syncStates]) => {
+      if (cancelled) return;
+      setInstalledForTarget(cols);
+      const map: Record<string, boolean> = {};
+      for (const st of syncStates ?? []) {
+        map[st.collection_id] = st.has_update;
+      }
+      setTargetSyncStates(map);
+    });
     return () => {
       cancelled = true;
     };
@@ -749,7 +777,8 @@ export function FriendsPage({
   const hasUpdate = Boolean(
     linkedInstalled &&
       selectedCol &&
-      linkedInstalled.friend_sync?.last_synced_hash !== selectedCol.share_hash,
+      (targetSyncStates[linkedInstalled.id] ??
+        linkedInstalled.friend_sync?.last_synced_hash !== selectedCol.share_hash),
   );
 
   async function handleCopyJoinCode() {
@@ -875,6 +904,7 @@ export function FriendsPage({
     try {
       const next = await api.refreshFriends();
       setState(next);
+      await onFriendsRefreshed?.();
     } catch (err) {
       onError(String(err));
     } finally {
@@ -2128,7 +2158,10 @@ export function FriendsPage({
                   ) ?? null;
                 const rowHasUpdate = Boolean(
                   linked &&
-                    linked.friend_sync?.last_synced_hash !== col.share_hash,
+                    ((group.managed
+                      ? syncStatesByGame[group.managed.id]?.[linked.id]
+                      : undefined) ??
+                      linked.friend_sync?.last_synced_hash !== col.share_hash),
                 );
                 const rowActiveMatch =
                   col.kind === "active_loadout"
@@ -2263,14 +2296,31 @@ export function FriendsPage({
                                 friendCollectionId: col.id,
                                 ...(resolutions ? { resolutions } : {}),
                               });
-                              await onCollectionSynced(group.managed.id, res);
-                              const updated =
-                                await api.listInstalledCollections(
-                                  group.managed.id,
-                                );
+                              await onCollectionSynced(group.managed.id, res, {
+                                peerId: selectedFriend.peer_id,
+                                friendCollectionId: col.id,
+                              });
+                              const [updated, syncStates] = await Promise.all([
+                                api.listInstalledCollections(group.managed.id),
+                                api.getFriendCollectionSyncStates
+                                  ? api
+                                      .getFriendCollectionSyncStates(
+                                        group.managed.id,
+                                      )
+                                      .catch(() => [])
+                                  : Promise.resolve([]),
+                              ]);
                               setInstalledByGame((prev) => ({
                                 ...prev,
                                 [group.managed!.id]: updated,
+                              }));
+                              const syncMap: Record<string, boolean> = {};
+                              for (const st of syncStates ?? []) {
+                                syncMap[st.collection_id] = st.has_update;
+                              }
+                              setSyncStatesByGame((prev) => ({
+                                ...prev,
+                                [group.managed!.id]: syncMap,
                               }));
                             } catch (err) {
                               onError(String(err));

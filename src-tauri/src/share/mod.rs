@@ -1006,6 +1006,8 @@ mod tests {
             custom_env_vars: Vec::new(),
             custom_wrapper: None,
             custom_launch_args: None,
+            custom_raw_command: None,
+            use_global_launch_options: true,
             wine_overrides_dismissed: false,
         };
         let order = LoadOrder {
@@ -1084,6 +1086,8 @@ mod tests {
             custom_env_vars: Vec::new(),
             custom_wrapper: None,
             custom_launch_args: None,
+            custom_raw_command: None,
+            use_global_launch_options: true,
             wine_overrides_dismissed: false,
         };
         let hint = sample_manifest().game;
@@ -1112,6 +1116,8 @@ mod tests {
             custom_env_vars: Vec::new(),
             custom_wrapper: None,
             custom_launch_args: None,
+            custom_raw_command: None,
+            use_global_launch_options: true,
             wine_overrides_dismissed: false,
         };
         let hint = ShareGameHint {
@@ -1154,6 +1160,8 @@ mod tests {
             custom_env_vars: Vec::new(),
             custom_wrapper: None,
             custom_launch_args: None,
+            custom_raw_command: None,
+            use_global_launch_options: true,
             wine_overrides_dismissed: false,
         };
         let manifest = sample_manifest();
@@ -1212,6 +1220,8 @@ mod tests {
             custom_env_vars: Vec::new(),
             custom_wrapper: None,
             custom_launch_args: None,
+            custom_raw_command: None,
+            use_global_launch_options: true,
             wine_overrides_dismissed: false,
         };
         let mut selected = std::collections::BTreeMap::new();
@@ -1324,6 +1334,8 @@ mod tests {
             custom_env_vars: Vec::new(),
             custom_wrapper: None,
             custom_launch_args: None,
+            custom_raw_command: None,
+            use_global_launch_options: true,
             wine_overrides_dismissed: false,
         };
         let mut order = LoadOrder {

@@ -85,11 +85,13 @@ export type ManagedGame = {
   ignored_requirements?: IgnoredRequirement[];
   /** Optional relative or absolute executable override for launching non-Steam games. */
   launch_executable?: string | null;
-  /** Whether Emperor applies its own launch commands (WINEDLLOVERRIDES, tool env) or defers to the launcher. */
+  /** Whether Emperor applies its own launch commands, merges with the launcher, or defers to the launcher. */
   launch_command_source?: LaunchCommandSource;
   custom_env_vars?: LaunchEnvVar[];
   custom_wrapper?: string | null;
   custom_launch_args?: string | null;
+  custom_raw_command?: string | null;
+  use_global_launch_options?: boolean;
   wine_overrides_dismissed?: boolean;
 };
 
@@ -1207,20 +1209,31 @@ export type DeployResult = {
 
 export type LaunchMode = "modded" | "unmodded";
 
-export type LaunchCommandSource = "emperor" | "launcher";
+export type LaunchCommandSource = "emperor" | "merged" | "launcher";
 
 export type LaunchEnvVar = {
   name: string;
   value: string;
 };
 
+export type GlobalLaunchOptions = {
+  enabled: boolean;
+  env_vars: LaunchEnvVar[];
+  wrapper?: string | null;
+  launch_args?: string | null;
+  raw_command?: string | null;
+};
+
 export type LaunchPreview = {
   source: LaunchCommandSource;
   launcher_name: string;
   auto_env_vars: LaunchEnvVar[];
+  global_launch_options: GlobalLaunchOptions;
+  use_global_launch_options: boolean;
   custom_env_vars: LaunchEnvVar[];
   custom_wrapper: string;
   custom_launch_args: string;
+  custom_raw_command: string;
   launcher_options?: string | null;
   effective_command: string;
 };
@@ -1336,6 +1349,7 @@ export type Settings = {
   adult_content: boolean;
   game_version_warnings: boolean;
   auto_sort_before_deploy?: boolean;
+  global_launch_options?: GlobalLaunchOptions;
   autoclick_free_download: boolean;
   last_active_game_id: string | null;
   theme?: ThemePreference;
@@ -1660,4 +1674,10 @@ export type SteamSyncStatus = {
   effective_steam_id: string | null;
   has_api_key: boolean;
   sync_enabled: boolean;
+};
+
+export type ModConfigFile = {
+  rel_path: string;
+  name: string;
+  content: string;
 };

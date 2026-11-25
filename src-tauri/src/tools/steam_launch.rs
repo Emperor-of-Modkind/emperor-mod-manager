@@ -7,6 +7,7 @@ use std::{
 
 use anyhow::{anyhow, Context, Result};
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 
 const EMM_BEGIN: &str = "EMM_TOOLS_BEGIN";
 const EMM_END: &str = "EMM_TOOLS_END";
@@ -331,6 +332,75 @@ fn find_matching_brace(content: &str, open_idx: usize) -> Option<usize> {
     None
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SteamLaunchBackup {
+    pub app_id: String,
+    pub original_options: Option<String>,
+}
+
+/// Read an existing backup file if present.
+pub fn read_steam_launch_backup(backup_path: &Path) -> Option<SteamLaunchBackup> {
+    let raw = fs::read_to_string(backup_path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// Snapshot Steam's original `LaunchOptions` before Emperor temporarily modifies them.
+/// Idempotent: if a backup already exists for this game, preserves and returns it.
+pub fn backup_steam_launch_options_value(
+    backup_path: &Path,
+    app_id: &str,
+    current_options: Option<String>,
+) -> Result<Option<String>> {
+    if let Some(existing) = read_steam_launch_backup(backup_path) {
+        if existing.app_id == app_id {
+            return Ok(existing.original_options);
+        }
+    }
+    if let Some(parent) = backup_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let backup = SteamLaunchBackup {
+        app_id: app_id.to_string(),
+        original_options: current_options.clone(),
+    };
+    fs::write(backup_path, serde_json::to_string_pretty(&backup)?)
+        .with_context(|| format!("writing {}", backup_path.display()))?;
+    Ok(current_options)
+}
+
+/// Snapshot Steam's current `LaunchOptions` for `app_id` from `localconfig.vdf`.
+pub fn backup_steam_launch_options(backup_path: &Path, app_id: &str) -> Result<Option<String>> {
+    if let Some(existing) = read_steam_launch_backup(backup_path) {
+        if existing.app_id == app_id {
+            return Ok(existing.original_options);
+        }
+    }
+    let current = read_launch_options(app_id).unwrap_or(None);
+    backup_steam_launch_options_value(backup_path, app_id, current)
+}
+
+/// Return the user's true Steam `LaunchOptions` — preferring the saved backup if a modded
+/// launch is currently active so previews never double-count temporary Emperor options.
+pub fn read_effective_steam_options(backup_path: &Path, app_id: &str) -> Option<String> {
+    if let Some(existing) = read_steam_launch_backup(backup_path) {
+        if existing.app_id == app_id {
+            return existing.original_options;
+        }
+    }
+    read_launch_options(app_id).ok().flatten()
+}
+
+/// Restore backed-up Steam `LaunchOptions` (if any) and delete the backup file.
+pub fn restore_steam_launch_options(backup_path: &Path) -> Result<()> {
+    let Some(backup) = read_steam_launch_backup(backup_path) else {
+        return Ok(());
+    };
+    let restore_val = backup.original_options.as_deref().unwrap_or("");
+    let _ = write_launch_options(&backup.app_id, restore_val);
+    let _ = fs::remove_file(backup_path);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -438,6 +508,42 @@ mod tests {
         assert_eq!(
             escape_vdf_string(r#"WINEDLLOVERRIDES="dinput8=n,b""#),
             r#"WINEDLLOVERRIDES=\"dinput8=n,b\""#
+        );
+    }
+
+    #[test]
+    fn steam_backup_is_idempotent_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let backup_path = dir.path().join("steam-launch-backup.json");
+
+        let first = backup_steam_launch_options_value(
+            &backup_path,
+            "1091500",
+            Some("PROTON_ENABLE_WAYLAND=1 %command%".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            first.as_deref(),
+            Some("PROTON_ENABLE_WAYLAND=1 %command%")
+        );
+
+        // Second backup attempt must NOT overwrite the original snapshot.
+        let second = backup_steam_launch_options_value(
+            &backup_path,
+            "1091500",
+            Some("WINEDLLOVERRIDES=winmm=n,b %command%".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            second.as_deref(),
+            Some("PROTON_ENABLE_WAYLAND=1 %command%")
+        );
+
+        let loaded = read_steam_launch_backup(&backup_path).unwrap();
+        assert_eq!(loaded.app_id, "1091500");
+        assert_eq!(
+            loaded.original_options.as_deref(),
+            Some("PROTON_ENABLE_WAYLAND=1 %command%")
         );
     }
 }
