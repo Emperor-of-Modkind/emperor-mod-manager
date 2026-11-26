@@ -4,11 +4,17 @@
 //! not from the mod root. Mods live in the user `Zomboid/mods` folder, and the
 //! game only loads ids listed in `mods/default.txt`.
 
+use std::future::Future;
 use std::path::{Component, Path, PathBuf};
+use std::pin::Pin;
 
 use anyhow::{Context, Result};
 
-use super::{content_folder_wrap_name, normalize_relative, GamePlugin, GamePluginInfo};
+use super::{
+    content_folder_wrap_name, normalize_relative, GamePlugin, GamePluginInfo,
+    PluginToolActionResult, PluginToolStatus,
+};
+use crate::config::Paths;
 
 #[cfg(any(not(windows), test))]
 const STEAM_APP_ID: &str = "108600";
@@ -94,7 +100,7 @@ impl GamePlugin for ProjectZomboidPlugin {
         let mods = mods_dir(install_path);
         std::fs::create_dir_all(&mods).with_context(|| format!("create {}", mods.display()))?;
         write_default_list(&mods, enabled_mod_folders)?;
-        Ok(Vec::new())
+        super::projectzomboid_pz3d::repair_after_deploy(install_path)
     }
 
     fn load_log_sources(&self, install_path: &Path) -> Vec<super::LogSource> {
@@ -107,9 +113,54 @@ impl GamePlugin for ProjectZomboidPlugin {
             path: user.join("console.txt"),
         }]
     }
+
+    fn has_plugin_tools(&self) -> bool {
+        true
+    }
+
+    fn plugin_tools_status(&self, paths: &Paths, install_path: &Path) -> Vec<PluginToolStatus> {
+        super::projectzomboid_pz3d::tools_status(paths, install_path)
+    }
+
+    fn check_plugin_tool_updates<'a>(
+        &'a self,
+        paths: &'a Paths,
+        install_path: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<PluginToolStatus>>> + Send + 'a>> {
+        Box::pin(super::projectzomboid_pz3d::check_tool_updates(
+            paths,
+            install_path,
+        ))
+    }
+
+    fn install_plugin_tool<'a>(
+        &'a self,
+        paths: &'a Paths,
+        install_path: &'a Path,
+        tool_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<PluginToolActionResult>> + Send + 'a>> {
+        Box::pin(super::projectzomboid_pz3d::install_tool(
+            paths,
+            install_path,
+            tool_id,
+        ))
+    }
+
+    fn uninstall_plugin_tool<'a>(
+        &'a self,
+        paths: &'a Paths,
+        install_path: &'a Path,
+        tool_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<PluginToolActionResult>> + Send + 'a>> {
+        Box::pin(super::projectzomboid_pz3d::uninstall_tool(
+            paths,
+            install_path,
+            tool_id,
+        ))
+    }
 }
 
-fn is_windows_build(install_path: &Path) -> bool {
+pub(super) fn is_windows_build(install_path: &Path) -> bool {
     install_path.join("ProjectZomboid64.exe").is_file()
         || install_path.join("ProjectZomboid32.exe").is_file()
 }
@@ -122,7 +173,7 @@ fn native_home() -> Option<PathBuf> {
     from_env.or_else(|| directories::UserDirs::new().map(|dirs| dirs.home_dir().to_path_buf()))
 }
 
-fn zomboid_user_dir(install_path: &Path) -> Option<PathBuf> {
+pub(super) fn zomboid_user_dir(install_path: &Path) -> Option<PathBuf> {
     if is_windows_build(install_path) {
         return windows_build_user_dir(install_path);
     }
@@ -141,7 +192,7 @@ fn windows_build_user_dir(install_path: &Path) -> Option<PathBuf> {
         .map(|user| user.join("Zomboid"))
 }
 
-fn mods_dir(install_path: &Path) -> PathBuf {
+pub(super) fn mods_dir(install_path: &Path) -> PathBuf {
     zomboid_user_dir(install_path)
         .map(|dir| dir.join("mods"))
         .unwrap_or_else(|| install_path.join("mods"))
@@ -435,6 +486,50 @@ fn write_default_list(mods_root: &Path, enabled_ids: &[String]) -> Result<()> {
     };
     std::fs::write(&sidecar_path, sidecar)
         .with_context(|| format!("write {}", sidecar_path.display()))?;
+    Ok(())
+}
+
+/// Add or remove mod IDs in `Zomboid/mods/default.txt` without touching Emperor's
+/// `.emperor-mods.txt` sidecar, so optional plugin-managed tools survive normal
+/// mod deploys and reverts.
+pub(super) fn update_default_list_entries(
+    mods_root: &Path,
+    add_ids: &[&str],
+    remove_ids: &[&str],
+) -> Result<()> {
+    std::fs::create_dir_all(mods_root)
+        .with_context(|| format!("create {}", mods_root.display()))?;
+    let list_path = mods_root.join("default.txt");
+    let existing = std::fs::read_to_string(&list_path).unwrap_or_default();
+    let maps_inner = find_block_inner(&existing, "maps").unwrap_or("\n");
+    let mut kept: Vec<ModEntry> = find_block_inner(&existing, "mods")
+        .map(|inner| inner.lines().filter_map(parse_mod_entry).collect())
+        .unwrap_or_default();
+
+    kept.retain(|entry| {
+        !remove_ids
+            .iter()
+            .any(|id| entry.canonical.eq_ignore_ascii_case(&canonical_mod_id(id)))
+    });
+
+    for id in add_ids {
+        let canonical = canonical_mod_id(id);
+        if canonical.is_empty() {
+            continue;
+        }
+        if !kept
+            .iter()
+            .any(|entry| entry.canonical.eq_ignore_ascii_case(&canonical))
+        {
+            kept.push(ModEntry {
+                canonical: canonical.clone(),
+                token: canonical,
+            });
+        }
+    }
+
+    let body = render_default_txt(&kept, maps_inner);
+    std::fs::write(&list_path, body).with_context(|| format!("write {}", list_path.display()))?;
     Ok(())
 }
 

@@ -51,6 +51,8 @@ mod system_theme;
 mod thunderstore;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod tools;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+mod tray;
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use commands::AppState;
@@ -245,12 +247,7 @@ pub fn run() {
     #[cfg(desktop)]
     {
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            use tauri::Manager;
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.unminimize();
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
+            tray::show_main_window(app);
         }));
     }
     builder
@@ -258,6 +255,8 @@ pub fn run() {
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(state)
+        .manage(tray::TrayState::new())
+        .on_window_event(tray::handle_window_event)
         .register_uri_scheme_protocol("nxm", |ctx, request| {
             let uri = request.uri().to_string();
             assist::handle_nxm_uri_scheme(ctx.app_handle(), &uri);
@@ -299,6 +298,7 @@ pub fn run() {
             commands::set_adult_content,
             commands::set_game_version_warnings,
             commands::set_auto_sort_before_deploy,
+            commands::set_background_settings,
             commands::set_theme,
             commands::set_theme_style,
             commands::set_accent_color,
@@ -443,6 +443,9 @@ pub fn run() {
             tools::get_game_tools,
             tools::set_game_tools,
             tools::sync_game_tools,
+            tools::check_game_plugin_tool_updates,
+            tools::install_game_plugin_tool,
+            tools::uninstall_game_plugin_tool,
             commands::get_friends_state,
             commands::set_p2p_display_name,
             commands::set_p2p_profile_picture,
@@ -480,9 +483,22 @@ pub fn run() {
             commands::sync_desktop_banners,
         ])
         .setup(|app| {
+            let cli_args: Vec<String> = std::env::args().skip(1).collect();
             {
                 use tauri::Manager;
                 let st = app.state::<AppState>();
+                let bg_settings = st
+                    .config
+                    .lock()
+                    .map(|c| c.background)
+                    .unwrap_or_default();
+                let tray_available = tray::init_tray(app.handle(), bg_settings);
+                if tray::should_start_minimized(&cli_args, bg_settings, tray_available) {
+                    tray::sync_tray_visibility(app.handle(), true);
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.hide();
+                    }
+                }
                 st.remote_host.attach_backend(std::sync::Arc::new(
                     remote::desktop_backend::TauriDesktopBackend::new(app.handle().clone()),
                 ));
@@ -510,15 +526,16 @@ pub fn run() {
                     if s.starts_with("nxm://") {
                         assist::emit_nxm_url(&handle, &s);
                     } else if s.starts_with("emperor://") {
+                        tray::show_main_window(&handle);
                         deep_link::emit_emperor_url(&handle, &s);
                     }
                 }
             });
-            for arg in std::env::args().skip(1) {
+            for arg in &cli_args {
                 if arg.starts_with("nxm://") {
-                    assist::emit_nxm_url(app.handle(), &arg);
+                    assist::emit_nxm_url(app.handle(), arg);
                 } else if arg.starts_with("emperor://") {
-                    deep_link::emit_emperor_url(app.handle(), &arg);
+                    deep_link::emit_emperor_url(app.handle(), arg);
                 }
             }
             Ok(())

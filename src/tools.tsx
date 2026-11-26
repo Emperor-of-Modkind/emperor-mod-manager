@@ -14,6 +14,7 @@ import type {
   LsfgVkGlobal,
   LsfgVkProfile,
   ManagedGame,
+  PluginToolStatus,
   ToolsStatusResponse,
   ToolGameState,
   ToolStatus,
@@ -696,6 +697,10 @@ export const GameToolsPanel = memo(function GameToolsPanel({
     cached?.overrides ?? defaultOverrides(),
   );
   const [busy, setBusy] = useState(false);
+  const [pluginToolBusy, setPluginToolBusy] = useState<string | null>(null);
+  const [checkingPluginUpdates, setCheckingPluginUpdates] = useState(false);
+  const [pluginNotice, setPluginNotice] = useState<string | null>(null);
+  const [pluginWarnings, setPluginWarnings] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
   const reqIdRef = useRef(0);
 
@@ -763,6 +768,63 @@ export const GameToolsPanel = memo(function GameToolsPanel({
     } as Partial<GameToolOverrides>);
   }
 
+  async function checkPluginToolUpdates() {
+    setCheckingPluginUpdates(true);
+    setError(null);
+    setPluginNotice(null);
+    setPluginWarnings([]);
+    try {
+      const updated = await api.checkGamePluginToolUpdates(game.id);
+      setData((prev) => {
+        if (!prev) return prev;
+        const next = { ...prev, plugin_tools: updated };
+        gameToolsCache.set(game.id, next);
+        return next;
+      });
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setCheckingPluginUpdates(false);
+    }
+  }
+
+  async function installPluginTool(tool: PluginToolStatus) {
+    setPluginToolBusy(tool.id);
+    setError(null);
+    setPluginNotice(null);
+    setPluginWarnings([]);
+    try {
+      const res = await api.installGamePluginTool(game.id, tool.id);
+      setPluginNotice(res.message);
+      setPluginWarnings(res.warnings ?? []);
+      await load(true);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setPluginToolBusy(null);
+    }
+  }
+
+  async function uninstallPluginTool(tool: PluginToolStatus) {
+    if (!window.confirm(`Uninstall ${tool.name}?`)) {
+      return;
+    }
+    setPluginToolBusy(tool.id);
+    setError(null);
+    setPluginNotice(null);
+    setPluginWarnings([]);
+    try {
+      const res = await api.uninstallGamePluginTool(game.id, tool.id);
+      setPluginNotice(res.message);
+      setPluginWarnings(res.warnings ?? []);
+      await load(true);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setPluginToolBusy(null);
+    }
+  }
+
   if (!data && error) {
     return (
       <div className="detail-body game-tools">
@@ -774,81 +836,174 @@ export const GameToolsPanel = memo(function GameToolsPanel({
     return <ToolsSkeleton />;
   }
 
+  const pluginTools = data.plugin_tools ?? [];
+  const showLinuxTools = data.platform_linux !== false;
+
   return (
     <div className="detail-body game-tools results-fill">
       {error && <p className="error-banner">{error}</p>}
-      <div className="panel">
-        <h3>Executables</h3>
-        <p className="muted">Matched against lsfg-vk profiles and AutoHDR-VK per-exe overrides.</p>
-        <ul>
-          {(data?.executables ?? []).map((exe) => (
-            <li key={exe}>{exe}</li>
-          ))}
-          {(data?.executables ?? []).length === 0 && (
-            <li className="muted">No .exe files detected</li>
-          )}
-        </ul>
-        {data?.steam_app_id && (
-          <p className="muted">Steam App ID: {data.steam_app_id}</p>
-        )}
-        {data?.launch_options && (
-          <p className="muted launch-options-preview">Launch options: {data.launch_options}</p>
-        )}
-        <button type="button" onClick={() => void load(true)} disabled={busy}>
-          Refresh detection
-        </button>
-        <button
-          type="button"
-          onClick={() => void api.syncGameTools(game.id).then(() => load(true))}
-          disabled={busy}
-        >
-          Re-sync Steam launch options
-        </button>
-      </div>
+      {pluginNotice && <p className="status-banner">{pluginNotice}</p>}
+      {pluginWarnings.map((warning) => (
+        <p key={warning} className="warn-banner">
+          {warning}
+        </p>
+      ))}
 
-      <div className="panel tool-toggle-panel">
-        <h3>lsfg-vk</h3>
-        <label className="checkbox">
-          <input
-            type="checkbox"
-            checked={overrides.lsfg_vk?.enabled ?? false}
-            onChange={(e) => toggleTool("lsfg_vk", e.target.checked)}
-            disabled={busy}
-          />
-          Enable for this game
-        </label>
-        <label className="checkbox">
-          <input
-            type="checkbox"
-            checked={overrides.lsfg_vk?.use_global_settings ?? true}
-            onChange={(e) => toggleGlobal("lsfg_vk", e.target.checked)}
-            disabled={busy || !overrides.lsfg_vk?.enabled}
-          />
-          Use global settings
-        </label>
-      </div>
+      {pluginTools.length > 0 &&
+        pluginTools.map((tool) => {
+          const badge = !tool.installed
+            ? { label: "Not installed", kind: "muted" }
+            : tool.update_available
+              ? { label: "Update available", kind: "warn" }
+              : { label: "Installed", kind: "ok" };
+          const isToolBusy = pluginToolBusy === tool.id;
+          const anyPluginBusy = pluginToolBusy !== null || checkingPluginUpdates;
+          return (
+            <article key={tool.id} className="panel tool-card">
+              <div className="tool-card-head">
+                <h3>{tool.name}</h3>
+                <span className={`tool-status-badge tool-status-badge-${badge.kind}`}>
+                  {badge.label}
+                </span>
+              </div>
+              <div className="tool-card-body">
+                <p className="muted">{tool.description}</p>
+                {tool.installed_version && (
+                  <p>
+                    <strong>Installed:</strong> {tool.installed_version}
+                  </p>
+                )}
+                {tool.latest_version && (
+                  <p>
+                    <strong>Latest:</strong> {tool.latest_version}
+                  </p>
+                )}
+                {tool.status_detail && <p className="muted">{tool.status_detail}</p>}
+                {(tool.notes ?? []).map((note) => (
+                  <p key={note} className="muted">
+                    {note}
+                  </p>
+                ))}
+                {tool.homepage_url && (
+                  <p className="muted">
+                    <a href={tool.homepage_url} target="_blank" rel="noreferrer">
+                      {tool.homepage_url.replace(/^https?:\/\//, "")}
+                    </a>
+                  </p>
+                )}
+              </div>
+              <div className="tool-card-actions">
+                <button
+                  type="button"
+                  onClick={() => void checkPluginToolUpdates()}
+                  disabled={anyPluginBusy}
+                >
+                  {checkingPluginUpdates ? "Checking…" : "Check updates"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void installPluginTool(tool)}
+                  disabled={anyPluginBusy}
+                >
+                  {isToolBusy
+                    ? "Working…"
+                    : tool.update_available
+                      ? "Update"
+                      : tool.installed
+                        ? "Reinstall"
+                        : "Install"}
+                </button>
+                {tool.installed && tool.can_uninstall && (
+                  <button
+                    type="button"
+                    className="danger"
+                    onClick={() => void uninstallPluginTool(tool)}
+                    disabled={anyPluginBusy}
+                  >
+                    Uninstall
+                  </button>
+                )}
+              </div>
+            </article>
+          );
+        })}
 
-      <div className="panel tool-toggle-panel">
-        <h3>AutoHDR-VK</h3>
-        <label className="checkbox">
-          <input
-            type="checkbox"
-            checked={overrides.autohdr_vk?.enabled ?? false}
-            onChange={(e) => toggleTool("autohdr_vk", e.target.checked)}
-            disabled={busy}
-          />
-          Enable for this game
-        </label>
-        <label className="checkbox">
-          <input
-            type="checkbox"
-            checked={overrides.autohdr_vk?.use_global_settings ?? true}
-            onChange={(e) => toggleGlobal("autohdr_vk", e.target.checked)}
-            disabled={busy || !overrides.autohdr_vk?.enabled}
-          />
-          Use global settings
-        </label>
-      </div>
+      {showLinuxTools && (
+        <>
+          <div className="panel">
+            <h3>Executables</h3>
+            <p className="muted">Matched against lsfg-vk profiles and AutoHDR-VK per-exe overrides.</p>
+            <ul>
+              {(data?.executables ?? []).map((exe) => (
+                <li key={exe}>{exe}</li>
+              ))}
+              {(data?.executables ?? []).length === 0 && (
+                <li className="muted">No .exe files detected</li>
+              )}
+            </ul>
+            {data?.steam_app_id && (
+              <p className="muted">Steam App ID: {data.steam_app_id}</p>
+            )}
+            {data?.launch_options && (
+              <p className="muted launch-options-preview">Launch options: {data.launch_options}</p>
+            )}
+            <button type="button" onClick={() => void load(true)} disabled={busy}>
+              Refresh detection
+            </button>
+            <button
+              type="button"
+              onClick={() => void api.syncGameTools(game.id).then(() => load(true))}
+              disabled={busy}
+            >
+              Re-sync Steam launch options
+            </button>
+          </div>
+
+          <div className="panel tool-toggle-panel">
+            <h3>lsfg-vk</h3>
+            <label className="checkbox">
+              <input
+                type="checkbox"
+                checked={overrides.lsfg_vk?.enabled ?? false}
+                onChange={(e) => toggleTool("lsfg_vk", e.target.checked)}
+                disabled={busy}
+              />
+              Enable for this game
+            </label>
+            <label className="checkbox">
+              <input
+                type="checkbox"
+                checked={overrides.lsfg_vk?.use_global_settings ?? true}
+                onChange={(e) => toggleGlobal("lsfg_vk", e.target.checked)}
+                disabled={busy || !overrides.lsfg_vk?.enabled}
+              />
+              Use global settings
+            </label>
+          </div>
+
+          <div className="panel tool-toggle-panel">
+            <h3>AutoHDR-VK</h3>
+            <label className="checkbox">
+              <input
+                type="checkbox"
+                checked={overrides.autohdr_vk?.enabled ?? false}
+                onChange={(e) => toggleTool("autohdr_vk", e.target.checked)}
+                disabled={busy}
+              />
+              Enable for this game
+            </label>
+            <label className="checkbox">
+              <input
+                type="checkbox"
+                checked={overrides.autohdr_vk?.use_global_settings ?? true}
+                onChange={(e) => toggleGlobal("autohdr_vk", e.target.checked)}
+                disabled={busy || !overrides.autohdr_vk?.enabled}
+              />
+              Use global settings
+            </label>
+          </div>
+        </>
+      )}
     </div>
   );
 });

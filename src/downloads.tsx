@@ -84,6 +84,8 @@ export function createQueueEntry(
 
 function statusLabel(status: string): string {
   switch (status) {
+    case "queued":
+      return "Queued";
     case "downloading":
       return "Downloading";
     case "extracting":
@@ -165,6 +167,7 @@ type DownloadsWorkspaceProps = {
   onSkip: () => void;
   onCancel: () => void;
   onCancelRemaining: () => void;
+  onCancelBatch?: (batchId: string) => void;
   onCancelDownload: (id: string) => void;
   onRestartDownload: (id: string) => void;
   onRetryAssistOpening: () => void;
@@ -192,6 +195,7 @@ export const DownloadsWorkspace = memo(function DownloadsWorkspace(
     onSkip,
     onCancel,
     onCancelRemaining,
+    onCancelBatch,
     onCancelDownload,
     onRestartDownload,
     onRetryAssistOpening,
@@ -244,16 +248,44 @@ export const DownloadsWorkspace = memo(function DownloadsWorkspace(
       ),
     [downloads],
   );
+  const queuedDownloads = useMemo(() => {
+    const queued = downloads.filter((d) => d.status === "queued");
+    // Backend stores newest-first; reverse so the Queue pane shows FIFO execution order.
+    queued.reverse();
+    return queued;
+  }, [downloads]);
   const recentDownloads = useMemo(
     () =>
       downloads.filter(
         (d) =>
+          d.status !== "queued" &&
           d.status !== "downloading" &&
           d.status !== "extracting" &&
           d.status !== "paused",
       ),
     [downloads],
   );
+  const backendBatch = useMemo(() => {
+    if (queue) return null;
+    const anchor =
+      activeDownloads.find((d) => d.batch_id) ??
+      queuedDownloads.find((d) => d.batch_id);
+    if (!anchor?.batch_id) return null;
+    const id = anchor.batch_id;
+    const members = downloads.filter((d) => d.batch_id === id);
+    const completed = members.filter(
+      (d) => d.status === "done" || d.status === "staged",
+    ).length;
+    const remaining = members.filter(
+      (d) =>
+        d.status === "queued" ||
+        d.status === "downloading" ||
+        d.status === "extracting" ||
+        d.status === "paused",
+    ).length;
+    const label = members.find((d) => d.batch_label)?.batch_label ?? null;
+    return { id, label, completed, total: members.length, remaining };
+  }, [queue, activeDownloads, queuedDownloads, downloads]);
   const visibleRecent = useMemo(
     () => recentDownloads.slice(0, recentLimit),
     [recentDownloads, recentLimit],
@@ -262,10 +294,24 @@ export const DownloadsWorkspace = memo(function DownloadsWorkspace(
     () => pending.slice(0, queueLimit),
     [pending, queueLimit],
   );
+  const visibleQueued = useMemo(
+    () => queuedDownloads.slice(0, Math.max(0, queueLimit - visiblePending.length)),
+    [queuedDownloads, queueLimit, visiblePending.length],
+  );
+  const totalQueuedOverflow =
+    pending.length + queuedDownloads.length - visiblePending.length - visibleQueued.length;
   const showCancelRemaining =
     !queue &&
     !!activeBatch &&
-    activeDownloads.some((d) => d.batch_id === activeBatch.id);
+    (activeDownloads.some((d) => d.batch_id === activeBatch.id) ||
+      queuedDownloads.some((d) => d.batch_id === activeBatch.id));
+  const showCancelBackendBatch =
+    !queue &&
+    !showCancelRemaining &&
+    !!backendBatch &&
+    backendBatch.remaining > 0 &&
+    (backendBatch.total > 1 || queuedDownloads.some((d) => d.batch_id === backendBatch.id)) &&
+    typeof onCancelBatch === "function";
 
   return (
     <section className="panel downloads-workspace">
@@ -279,6 +325,10 @@ export const DownloadsWorkspace = memo(function DownloadsWorkspace(
           ) : showCancelRemaining && activeBatch?.label ? (
             <p className="downloads-subtitle">
               {activeBatch.label} — finishing remaining downloads
+            </p>
+          ) : backendBatch?.label && backendBatch.remaining > 0 ? (
+            <p className="downloads-subtitle">
+              {backendBatch.label} — {backendBatch.completed}/{backendBatch.total} complete
             </p>
           ) : null}
         </div>
@@ -300,6 +350,14 @@ export const DownloadsWorkspace = memo(function DownloadsWorkspace(
           ) : null}
           {showCancelRemaining ? (
             <button type="button" className="danger" onClick={onCancelRemaining}>
+              Cancel remaining downloads
+            </button>
+          ) : showCancelBackendBatch && backendBatch ? (
+            <button
+              type="button"
+              className="danger"
+              onClick={() => onCancelBatch!(backendBatch.id)}
+            >
               Cancel remaining downloads
             </button>
           ) : null}
@@ -546,18 +604,36 @@ export const DownloadsWorkspace = memo(function DownloadsWorkspace(
                   </div>
                 </li>
               ))}
-              {!current && pending.length === 0 && (
+              {visibleQueued.map((d, i) => (
+                <li key={d.id} className="downloads-queue-item">
+                  <div>
+                    <strong>{d.label}</strong>
+                    <small>
+                      Queued · #{visiblePending.length + i + 1}
+                      {d.batch_label ? ` · ${d.batch_label}` : ""}
+                    </small>
+                  </div>
+                  <button
+                    type="button"
+                    className="danger downloads-cancel-one"
+                    onClick={() => onCancelDownload(d.id)}
+                  >
+                    Cancel
+                  </button>
+                </li>
+              ))}
+              {!current && pending.length === 0 && queuedDownloads.length === 0 && (
                 <li className="empty">Queue is empty.</li>
               )}
             </ul>
-            {pending.length > visiblePending.length && (
+            {totalQueuedOverflow > 0 && (
               <div className="list-load-more">
                 <button
                   type="button"
                   className="linkish"
                   onClick={() => setQueueLimit((n) => n + QUEUE_PAGE_SIZE)}
                 >
-                  Show more ({pending.length - visiblePending.length} remaining)
+                  Show more ({totalQueuedOverflow} remaining)
                 </button>
               </div>
             )}

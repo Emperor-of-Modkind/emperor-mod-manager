@@ -49,6 +49,7 @@ mod mysummercar;
 mod nomanssky;
 mod paradox;
 mod projectzomboid;
+mod projectzomboid_pz3d;
 mod rage_engine;
 mod re_engine;
 mod rimworld;
@@ -221,6 +222,47 @@ pub struct GamePluginInfo {
     pub display_name: &'static str,
     pub nexus_domain: &'static str,
     pub match_names: &'static [&'static str],
+}
+
+/// Plugin metadata returned by `list_plugins`, including whether the plugin
+/// exposes optional game-specific tools in the Tools modal.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct GamePluginSummary {
+    #[serde(flatten)]
+    pub info: GamePluginInfo,
+    pub has_tools: bool,
+}
+
+/// Status of an optional game-specific tool provided by a `GamePlugin`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginToolStatus {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    #[serde(default)]
+    pub homepage_url: Option<String>,
+    pub installed: bool,
+    #[serde(default)]
+    pub installed_version: Option<String>,
+    #[serde(default)]
+    pub latest_version: Option<String>,
+    #[serde(default)]
+    pub update_available: bool,
+    #[serde(default)]
+    pub status_detail: Option<String>,
+    #[serde(default)]
+    pub notes: Vec<String>,
+    #[serde(default)]
+    pub can_uninstall: bool,
+}
+
+/// Result of installing or uninstalling a plugin-provided tool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginToolActionResult {
+    pub tool: PluginToolStatus,
+    pub message: String,
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 pub trait GamePlugin: Send + Sync {
@@ -423,6 +465,47 @@ pub trait GamePlugin: Send + Sync {
     /// diagnosis can say the loader never ran.
     fn load_log_sources(&self, _install_path: &Path) -> Vec<LogSource> {
         Vec::new()
+    }
+
+    /// Whether this plugin provides optional game-specific tools for the Tools modal.
+    fn has_plugin_tools(&self) -> bool {
+        false
+    }
+
+    /// Fast, offline status of this plugin's optional tools for `install_path`.
+    fn plugin_tools_status(&self, _paths: &Paths, _install_path: &Path) -> Vec<PluginToolStatus> {
+        Vec::new()
+    }
+
+    /// Check remote sources for newer versions of this plugin's optional tools.
+    fn check_plugin_tool_updates<'a>(
+        &'a self,
+        _paths: &'a Paths,
+        _install_path: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<PluginToolStatus>>> + Send + 'a>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    /// Install or update one of this plugin's optional tools.
+    fn install_plugin_tool<'a>(
+        &'a self,
+        _paths: &'a Paths,
+        _install_path: &'a Path,
+        tool_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<PluginToolActionResult>> + Send + 'a>> {
+        let id = tool_id.to_string();
+        Box::pin(async move { Err(anyhow::anyhow!("unknown plugin tool: {id}")) })
+    }
+
+    /// Uninstall one of this plugin's optional tools.
+    fn uninstall_plugin_tool<'a>(
+        &'a self,
+        _paths: &'a Paths,
+        _install_path: &'a Path,
+        tool_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<PluginToolActionResult>> + Send + 'a>> {
+        let id = tool_id.to_string();
+        Box::pin(async move { Err(anyhow::anyhow!("unknown plugin tool: {id}")) })
     }
 }
 
@@ -732,8 +815,14 @@ pub fn match_plugin(title: &str, install_path: Option<&str>) -> Option<GamePlugi
     None
 }
 
-pub fn list_plugins() -> Vec<GamePluginInfo> {
-    all_plugins().into_iter().map(|p| p.info()).collect()
+pub fn list_plugins() -> Vec<GamePluginSummary> {
+    all_plugins()
+        .into_iter()
+        .map(|p| GamePluginSummary {
+            info: p.info(),
+            has_tools: p.has_plugin_tools(),
+        })
+        .collect()
 }
 
 /// Turn archive-originated `\` separators into normal path components.

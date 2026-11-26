@@ -4873,6 +4873,24 @@ button.path-link:focus-visible:not(:disabled):not(.nav) {
   border-color: var(--accent);
 }
 
+.downloads-queue-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.65rem;
+}
+
+.downloads-queue-item > div {
+  min-width: 0;
+  flex: 1;
+}
+
+.downloads-queue-item strong,
+.downloads-queue-item small {
+  display: block;
+  overflow-wrap: break-word;
+}
+
 .downloads-active-item {
   flex-direction: column;
   align-items: stretch;
@@ -5201,6 +5219,39 @@ button.path-link:focus-visible:not(:disabled):not(.nav) {
   min-height: 0;
   overflow-x: hidden;
   overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.detail-scroll-content {
+  min-width: 0;
+}
+
+.detail-scroll-content > .detail-hero {
+  margin-top: 0.25rem;
+}
+
+@media (max-height: 900px) {
+  .detail-scroll-content > .detail-hero {
+    grid-template-columns: 104px minmax(0, 1fr);
+    gap: 1rem;
+    margin: 0.25rem 0 0.85rem;
+  }
+
+  .detail-scroll-content .detail-collections-box {
+    min-height: 5.5rem;
+    padding: 0.45rem 0.65rem;
+    gap: 0.35rem;
+  }
+
+  .detail-scroll-content .installed-collection-card {
+    min-height: 4.25rem;
+    padding: 0.5rem 0.65rem;
+    gap: 0.35rem;
+  }
+
+  .detail-scroll-content .mods-toolbar {
+    margin-bottom: 0.6rem;
+  }
 }
 
 .panel .page-scroll,
@@ -6731,6 +6782,15 @@ li.list-row-poster > .list-poster.skeleton,
 .mobile-devices-actions,
 .mobile-devices-option {
   margin: 0.75rem 0;
+}
+
+.background-tray-suboptions {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  margin-top: 0.5rem;
+  padding-left: 1.5rem;
+  border-left: 2px solid var(--border);
 }
 
 .paired-devices-list {

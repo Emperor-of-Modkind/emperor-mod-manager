@@ -8,6 +8,7 @@ url="https://github.com/LewisTansley/emperor-mod-manager"
 license=('AGPL-3.0-or-later')
 depends=('webkit2gtk-4.1' 'gtk3' 'hicolor-icon-theme')
 optdepends=('gnome-keyring: store the Nexus/mod.io API keys in the Secret Service keyring'
+            'libayatana-appindicator: system tray icon support for running in the background'
             'wine: Darktide dtkit-patch when no native patcher is present')
 provides=('emperor-mod-manager')
 conflicts=('emperor-mod-manager')

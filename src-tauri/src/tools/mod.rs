@@ -20,7 +20,11 @@ use manifest::ToolsManifest;
 use serde::Serialize;
 use tauri::State;
 
-use crate::{commands::AppState, config::GameToolOverrides};
+use crate::{
+    commands::AppState,
+    config::GameToolOverrides,
+    games::{self, PluginToolActionResult, PluginToolStatus},
+};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolStatus {
@@ -43,10 +47,12 @@ pub struct ToolsStatusResponse {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct GameToolsResponse {
+    pub platform_linux: bool,
     pub overrides: GameToolOverrides,
     pub executables: Vec<String>,
     pub steam_app_id: Option<String>,
     pub launch_options: Option<String>,
+    pub plugin_tools: Vec<PluginToolStatus>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -359,11 +365,18 @@ pub fn get_game_tools(
         .and_then(|id| steam_launch::read_launch_options(id).ok().flatten());
     #[cfg(not(target_os = "linux"))]
     let launch_options = None;
+    let plugin_tools = games::plugin_by_id(&game.plugin_id)
+        .map(|plugin| {
+            plugin.plugin_tools_status(&state.paths, std::path::Path::new(&game.install_path))
+        })
+        .unwrap_or_default();
     Ok(GameToolsResponse {
+        platform_linux: cfg!(target_os = "linux"),
         overrides,
         executables,
         steam_app_id,
         launch_options,
+        plugin_tools,
     })
 }
 
@@ -420,4 +433,57 @@ pub fn sync_game_tools(
         sync::sync_game_tools(&state.paths, &game).map_err(|e| e.to_string())?;
     }
     get_game_tools(state, game_id)
+}
+
+fn managed_game_plugin_and_install(
+    state: &AppState,
+    game_id: &str,
+) -> Result<(&'static dyn games::GamePlugin, std::path::PathBuf), String> {
+    let cfg = state.config.lock().map_err(|e| e.to_string())?;
+    let game = cfg
+        .managed_games
+        .iter()
+        .find(|g| g.id == game_id)
+        .ok_or_else(|| format!("game not found: {game_id}"))?;
+    let plugin = games::plugin_by_id(&game.plugin_id)
+        .ok_or_else(|| format!("unknown game plugin: {}", game.plugin_id))?;
+    Ok((plugin, std::path::PathBuf::from(&game.install_path)))
+}
+
+#[tauri::command]
+pub async fn check_game_plugin_tool_updates(
+    state: State<'_, AppState>,
+    game_id: String,
+) -> Result<Vec<PluginToolStatus>, String> {
+    let (plugin, install_path) = managed_game_plugin_and_install(&state, &game_id)?;
+    plugin
+        .check_plugin_tool_updates(&state.paths, &install_path)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+pub async fn install_game_plugin_tool(
+    state: State<'_, AppState>,
+    game_id: String,
+    tool_id: String,
+) -> Result<PluginToolActionResult, String> {
+    let (plugin, install_path) = managed_game_plugin_and_install(&state, &game_id)?;
+    plugin
+        .install_plugin_tool(&state.paths, &install_path, &tool_id)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+pub async fn uninstall_game_plugin_tool(
+    state: State<'_, AppState>,
+    game_id: String,
+    tool_id: String,
+) -> Result<PluginToolActionResult, String> {
+    let (plugin, install_path) = managed_game_plugin_and_install(&state, &game_id)?;
+    plugin
+        .uninstall_plugin_tool(&state.paths, &install_path, &tool_id)
+        .await
+        .map_err(|e| format!("{e:#}"))
 }

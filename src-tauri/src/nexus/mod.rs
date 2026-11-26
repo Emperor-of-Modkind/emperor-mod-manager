@@ -1383,6 +1383,10 @@ pub async fn stream_url_to_file_with_policy(
     speed_samples.push_back((started, downloaded));
     stall_samples.push_back((started, downloaded));
 
+    if let Some(cb) = on_progress {
+        cb(downloaded, total, 0);
+    }
+
     while let Some(chunk) = stream.next().await {
         if control
             .map(|c| c.cancel.load(Ordering::SeqCst))

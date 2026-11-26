@@ -203,7 +203,7 @@ pub struct FriendSyncMetadata {
     pub friend_collection_id: String,
     pub last_synced_hash: String,
     pub last_synced_at: String,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub auto_sync: bool,
 }
 
@@ -543,6 +543,15 @@ fn is_main_category(name: Option<&str>) -> bool {
     category_key(name).contains("main")
 }
 
+fn is_historical_category(name: Option<&str>) -> bool {
+    let key = category_key(name);
+    key.is_empty()
+        || matches!(
+            key.as_str(),
+            "old_version" | "old version" | "archived" | "removed" | "deleted"
+        )
+}
+
 fn nexus_file_is_newer(candidate: &NexusFileMeta, baseline: &NexusFileMeta) -> bool {
     match (candidate.uploaded_timestamp, baseline.uploaded_timestamp) {
         (Some(ta), Some(tb)) if ta != tb => ta > tb,
@@ -577,7 +586,7 @@ fn file_variant_key(name: &str) -> String {
     out.trim().to_string()
 }
 
-/// `v1.2`, `1.2.3`, and `1-0-7`. A bare number stays, so loader majors are kept.
+/// `v1.2`, `1.2.3`, `1-0-7`, `1.10.6a`, and `1.10.6-rc1`. A bare number stays, so loader majors are kept.
 fn skip_version_token(chars: &[char], start: usize) -> Option<usize> {
     let mut i = start;
     let mut saw_v = false;
@@ -603,7 +612,35 @@ fn skip_version_token(chars: &[char], start: usize) -> Option<usize> {
         groups += 1;
         i = j;
     }
-    (saw_v || groups >= 2).then_some(i)
+    if !(saw_v || groups >= 2) {
+        return None;
+    }
+    // Consume a single trailing letter hotfix suffix (e.g. `1.10.6a`).
+    if chars.get(i).is_some_and(|c| c.is_ascii_alphabetic())
+        && !chars.get(i + 1).is_some_and(|c| c.is_ascii_alphanumeric())
+    {
+        i += 1;
+    } else if matches!(chars.get(i), Some('-' | '.')) {
+        // Consume common prerelease / hotfix tags (e.g. `1.10.6-rc1`, `1.10.6-beta2`).
+        let mut j = i + 1;
+        let tag_start = j;
+        while chars.get(j).is_some_and(|c| c.is_ascii_alphabetic()) {
+            j += 1;
+        }
+        let tag: String = chars[tag_start..j].iter().collect();
+        if matches!(
+            tag.as_str(),
+            "rc" | "beta" | "alpha" | "pre" | "dev" | "hotfix" | "rev"
+        ) {
+            while chars.get(j).is_some_and(|c| c.is_ascii_digit()) {
+                j += 1;
+            }
+            if !chars.get(j).is_some_and(|c| c.is_ascii_alphanumeric()) {
+                i = j;
+            }
+        }
+    }
+    Some(i)
 }
 
 fn same_file_variant(staged: &NexusFileMeta, other: &NexusFileMeta) -> bool {
@@ -612,15 +649,77 @@ fn same_file_variant(staged: &NexusFileMeta, other: &NexusFileMeta) -> bool {
     staged_key.is_empty() || other_key.is_empty() || staged_key == other_key
 }
 
-fn newest_nexus_file<'a, F>(files: &'a [NexusFileMeta], pred: F) -> Option<&'a NexusFileMeta>
+fn is_word_prefix(prefix: &str, full: &str) -> bool {
+    if prefix.is_empty() || full.is_empty() {
+        return false;
+    }
+    full == prefix
+        || full
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with(' '))
+}
+
+fn related_file_variant(staged: &NexusFileMeta, other: &NexusFileMeta) -> bool {
+    let staged_key = file_variant_key(&staged.name);
+    let other_key = file_variant_key(&other.name);
+    if staged_key.is_empty() || other_key.is_empty() {
+        return true;
+    }
+    is_word_prefix(&staged_key, &other_key) || is_word_prefix(&other_key, &staged_key)
+}
+
+fn normalized_version_key(version: Option<&str>) -> Option<Vec<u64>> {
+    let mut parts = parse_version_parts(version?)?;
+    while parts.len() > 1 && parts.last() == Some(&0) {
+        parts.pop();
+    }
+    Some(parts)
+}
+
+fn is_valid_nexus_update(
+    staged_file_id: u64,
+    effective_staged_version: Option<&str>,
+    staged: Option<&NexusFileMeta>,
+    candidate: &NexusFileMeta,
+) -> bool {
+    if candidate.file_id == staged_file_id {
+        return false;
+    }
+    // A newer upload of an older version is a different file in the same
+    // category, not an update of the one that is installed.
+    match version_against_staged(effective_staged_version, candidate.version.as_deref()) {
+        VersionOrder::Newer => true,
+        VersionOrder::Older => false,
+        VersionOrder::UseUpload => match staged {
+            Some(s) => nexus_file_is_newer(candidate, s),
+            None => true,
+        },
+    }
+}
+
+fn compare_nexus_candidates(a: &NexusFileMeta, b: &NexusFileMeta) -> std::cmp::Ordering {
+    normalized_version_key(a.version.as_deref())
+        .cmp(&normalized_version_key(b.version.as_deref()))
+        .then_with(|| a.uploaded_timestamp.cmp(&b.uploaded_timestamp))
+        .then_with(|| a.file_id.cmp(&b.file_id))
+}
+
+fn best_nexus_update<'a, F>(
+    files: &'a [NexusFileMeta],
+    staged_file_id: u64,
+    effective_staged_version: Option<&str>,
+    staged: Option<&NexusFileMeta>,
+    pred: F,
+) -> Option<&'a NexusFileMeta>
 where
     F: Fn(&NexusFileMeta) -> bool,
 {
-    files.iter().filter(|f| pred(f)).max_by(|a, b| {
-        a.uploaded_timestamp
-            .cmp(&b.uploaded_timestamp)
-            .then_with(|| a.file_id.cmp(&b.file_id))
-    })
+    files
+        .iter()
+        .filter(|f| {
+            pred(f) && is_valid_nexus_update(staged_file_id, effective_staged_version, staged, f)
+        })
+        .max_by(|a, b| compare_nexus_candidates(a, b))
 }
 
 /// Pick a newer Nexus file that should replace the staged file, if any.
@@ -633,36 +732,79 @@ pub fn nexus_update_candidate<'a>(
         return None;
     }
     let staged = files.iter().find(|f| f.file_id == staged_file_id);
-    let candidate = if let Some(staged) = staged {
-        let cat = category_key(staged.category_name.as_deref());
-        // A different title in the same category is another main file, not a
-        // newer upload of the one that is installed. Don't fall through to
-        // whichever file happens to be primary.
-        newest_nexus_file(files, |f| {
-            category_key(f.category_name.as_deref()) == cat && same_file_variant(staged, f)
-        })
-    } else {
-        newest_nexus_file(files, |f| f.is_primary)
-            .or_else(|| newest_nexus_file(files, |f| is_main_category(f.category_name.as_deref())))
-            .or_else(|| newest_nexus_file(files, |_| true))
-    }?;
+    let effective_staged_version = staged_version
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| staged.and_then(|s| s.version.as_deref()));
 
-    if candidate.file_id == staged_file_id {
-        return None;
-    }
-
-    // A newer upload of an older version is a different file in the same
-    // category, not an update of the one that is installed.
-    match version_against_staged(staged_version, candidate.version.as_deref()) {
-        VersionOrder::Newer => Some(candidate),
-        VersionOrder::Older => None,
-        VersionOrder::UseUpload => {
-            let upload_newer = match staged {
-                Some(s) => nexus_file_is_newer(candidate, s),
-                None => true,
-            };
-            upload_newer.then_some(candidate)
+    if let Some(staged) = staged {
+        if is_historical_category(staged.category_name.as_deref()) {
+            // Authors commonly move superseded releases to OLD_VERSION or ARCHIVED
+            // (often with category_name: None in the REST API) when publishing a new
+            // version. Look for the active replacement rather than staying inside the
+            // historical category.
+            best_nexus_update(files, staged_file_id, effective_staged_version, Some(staged), |f| {
+                is_main_category(f.category_name.as_deref()) && same_file_variant(staged, f)
+            })
+            .or_else(|| {
+                best_nexus_update(
+                    files,
+                    staged_file_id,
+                    effective_staged_version,
+                    Some(staged),
+                    |f| {
+                        !is_historical_category(f.category_name.as_deref())
+                            && same_file_variant(staged, f)
+                    },
+                )
+            })
+            .or_else(|| {
+                best_nexus_update(
+                    files,
+                    staged_file_id,
+                    effective_staged_version,
+                    Some(staged),
+                    |f| {
+                        is_main_category(f.category_name.as_deref())
+                            && related_file_variant(staged, f)
+                    },
+                )
+            })
+            .or_else(|| {
+                best_nexus_update(
+                    files,
+                    staged_file_id,
+                    effective_staged_version,
+                    Some(staged),
+                    |f| {
+                        !is_historical_category(f.category_name.as_deref())
+                            && related_file_variant(staged, f)
+                    },
+                )
+            })
+        } else {
+            let cat = category_key(staged.category_name.as_deref());
+            // A different title in the same category is another main file, not a
+            // newer upload of the one that is installed. Don't fall through to
+            // whichever file happens to be primary.
+            best_nexus_update(files, staged_file_id, effective_staged_version, Some(staged), |f| {
+                category_key(f.category_name.as_deref()) == cat && same_file_variant(staged, f)
+            })
         }
+    } else {
+        best_nexus_update(files, staged_file_id, effective_staged_version, None, |f| {
+            !is_historical_category(f.category_name.as_deref()) && f.is_primary
+        })
+        .or_else(|| {
+            best_nexus_update(files, staged_file_id, effective_staged_version, None, |f| {
+                is_main_category(f.category_name.as_deref())
+            })
+        })
+        .or_else(|| {
+            best_nexus_update(files, staged_file_id, effective_staged_version, None, |f| {
+                !is_historical_category(f.category_name.as_deref())
+            })
+        })
     }
 }
 
@@ -6389,6 +6531,10 @@ mod tests {
         assert_eq!(file_variant_key("BepInEx 1.2"), "bepinex");
         assert_eq!(file_variant_key("Cool Mod v1.2.3"), "cool mod");
         assert_eq!(file_variant_key("Pack 1-0-7"), "pack");
+        assert_eq!(file_variant_key("TweakXL 1.10.6a"), "tweakxl");
+        assert_eq!(file_variant_key("Codeware 1.14.0-rc1"), "codeware");
+        assert_eq!(file_variant_key("Codeware 1.14.0-beta2"), "codeware");
+        assert_eq!(file_variant_key("BepInEx 5"), "bepinex 5");
         assert_eq!(file_variant_key("MelonLoader"), "melonloader");
         assert_eq!(file_variant_key(""), "");
     }
@@ -6412,6 +6558,85 @@ mod tests {
         let c = nexus_update_candidate(10, Some("1.0.0"), &files).unwrap();
         assert_eq!(c.file_id, 20);
         assert_eq!(c.version.as_deref(), Some("1.2.0"));
+    }
+
+    #[test]
+    fn nexus_old_version_or_archived_staged_updates_to_main() {
+        let mut archived_null = named(nexus_file(10, "1.10.6", "OLD_VERSION", 100, false), "TweakXL");
+        archived_null.category_name = None;
+
+        for old in [
+            named(nexus_file(10, "1.10.6", "OLD_VERSION", 100, false), "TweakXL"),
+            named(nexus_file(10, "1.10.6", "ARCHIVED", 100, false), "TweakXL"),
+            archived_null,
+        ] {
+            let files = vec![
+                old,
+                named(nexus_file(20, "1.11.0", "MAIN", 200, true), "TweakXL"),
+                named(nexus_file(15, "1.10.7", "OLD_VERSION", 150, false), "TweakXL"),
+            ];
+            let c = nexus_update_candidate(10, Some("1.10.6"), &files).unwrap();
+            assert_eq!(c.file_id, 20);
+            assert_eq!(c.version.as_deref(), Some("1.11.0"));
+        }
+    }
+
+    #[test]
+    fn nexus_renamed_old_version_matches_main_by_prefix() {
+        let files = vec![
+            named(
+                nexus_file(10, "1.13.0", "OLD_VERSION", 100, false),
+                "Codeware (for Patch 2.13)",
+            ),
+            named(nexus_file(20, "1.14.0", "MAIN", 200, true), "Codeware"),
+        ];
+        let c = nexus_update_candidate(10, Some("1.13.0"), &files).unwrap();
+        assert_eq!(c.file_id, 20);
+        assert_eq!(c.version.as_deref(), Some("1.14.0"));
+    }
+
+    #[test]
+    fn nexus_old_version_multi_variant_and_retired_optional_do_not_cross_update() {
+        let multi_variant = vec![
+            named(nexus_file(10, "1.0.0", "OLD_VERSION", 100, false), "BepInEx"),
+            named(nexus_file(20, "1.2.0", "MAIN", 200, false), "BepInEx 1.2"),
+            named(nexus_file(30, "3.0.0", "MAIN", 400, true), "MelonLoader"),
+        ];
+        let c = nexus_update_candidate(10, Some("1.0.0"), &multi_variant).unwrap();
+        assert_eq!(c.file_id, 20);
+
+        let retired_optional = vec![
+            named(
+                nexus_file(10, "1.0.0", "OLD_VERSION", 100, false),
+                "Optional 4K Textures",
+            ),
+            named(
+                nexus_file(20, "2.0.0", "MAIN", 200, true),
+                "Cyberpunk Overhaul",
+            ),
+        ];
+        assert!(nexus_update_candidate(10, Some("1.0.0"), &retired_optional).is_none());
+    }
+
+    #[test]
+    fn nexus_newer_backport_upload_does_not_shadow_higher_version() {
+        let files = vec![
+            named(nexus_file(10, "1.10.8", "OLD_VERSION", 100, false), "TweakXL"),
+            named(nexus_file(20, "1.11.0", "MAIN", 200, true), "TweakXL"),
+            named(nexus_file(30, "1.10.7", "MAIN", 300, false), "TweakXL"),
+        ];
+        let c = nexus_update_candidate(10, Some("1.10.8"), &files).unwrap();
+        assert_eq!(c.file_id, 20);
+        assert_eq!(c.version.as_deref(), Some("1.11.0"));
+    }
+
+    #[test]
+    fn nexus_missing_staged_ignores_historical_files() {
+        let files = vec![
+            named(nexus_file(20, "2.0.0", "OLD_VERSION", 200, false), "TweakXL"),
+            named(nexus_file(30, "3.0.0", "ARCHIVED", 300, false), "TweakXL"),
+        ];
+        assert!(nexus_update_candidate(99, Some("1.0.0"), &files).is_none());
     }
 
     #[test]
@@ -8579,5 +8804,31 @@ mod tests {
                 "expected {id} to have collection_id {col_id}"
             );
         }
+    }
+
+    #[test]
+    fn friend_sync_metadata_defaults_auto_sync_to_true_for_legacy_json() {
+        let legacy: FriendSyncMetadata = serde_json::from_str(
+            r#"{
+                "friend_peer_id": "peer1",
+                "friend_collection_id": "saved:c1",
+                "last_synced_hash": "hash1",
+                "last_synced_at": "2026-01-01T00:00:00Z"
+            }"#,
+        )
+        .unwrap();
+        assert!(legacy.auto_sync);
+
+        let explicit_off: FriendSyncMetadata = serde_json::from_str(
+            r#"{
+                "friend_peer_id": "peer1",
+                "friend_collection_id": "saved:c1",
+                "last_synced_hash": "hash1",
+                "last_synced_at": "2026-01-01T00:00:00Z",
+                "auto_sync": false
+            }"#,
+        )
+        .unwrap();
+        assert!(!explicit_off.auto_sync);
     }
 }

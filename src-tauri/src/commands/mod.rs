@@ -233,6 +233,8 @@ pub struct DownloadItem {
     pub speed_bps: u64,
     pub batch_id: Option<String>,
     #[serde(default)]
+    pub batch_label: Option<String>,
+    #[serde(default)]
     pub can_restart: bool,
     /// Chosen file name, when it is distinct from the mod title.
     #[serde(default)]
@@ -259,10 +261,16 @@ impl DownloadItem {
             bytes_total: None,
             speed_bps: 0,
             batch_id,
+            batch_label: None,
             can_restart: false,
             file_name: None,
             page,
         }
+    }
+
+    fn with_batch_label(mut self, batch_label: Option<String>) -> Self {
+        self.batch_label = batch_label;
+        self
     }
 }
 
@@ -518,7 +526,7 @@ fn load_modio_key_with_fallback(paths: &Paths) -> anyhow::Result<Option<String>>
 }
 
 fn is_active_download_status(status: &str) -> bool {
-    status == "downloading" || status == "extracting" || status == "paused"
+    matches!(status, "queued" | "downloading" | "extracting" | "paused")
 }
 
 /// Terminal states that belong in the Recent list and are safe to forget.
@@ -736,6 +744,56 @@ fn push_download(state: &AppState, item: DownloadItem) {
         q.insert(0, item);
     }
     commit_recent_downloads(state);
+}
+
+fn remove_download_row(state: &AppState, id: &str) {
+    if let Ok(mut q) = state.downloads.lock() {
+        q.retain(|d| d.id != id);
+    }
+    clear_download_job(state, id);
+    commit_recent_downloads(state);
+}
+
+fn enqueue_download_row(state: &AppState, item: DownloadItem) {
+    let dl_id = item.id.clone();
+    let batch_id = item.batch_id.clone();
+    push_download(state, item);
+    let _ = ensure_download_job(state, &dl_id, batch_id);
+}
+
+fn is_download_cancelled(state: &AppState, id: &str) -> bool {
+    let job_cancelled = state
+        .download_jobs
+        .lock()
+        .ok()
+        .and_then(|jobs| jobs.get(id).map(|j| j.cancel.load(Ordering::SeqCst)))
+        .unwrap_or(false);
+    if job_cancelled {
+        return true;
+    }
+    state
+        .downloads
+        .lock()
+        .ok()
+        .and_then(|q| q.iter().find(|d| d.id == id).map(|d| d.status == "cancelled"))
+        .unwrap_or(false)
+}
+
+fn is_batch_cancelled(state: &AppState, batch_id: &str) -> bool {
+    let job_cancelled = state
+        .download_jobs
+        .lock()
+        .ok()
+        .map(|jobs| {
+            jobs.values().any(|j| {
+                j.batch_id.as_deref() == Some(batch_id) && j.cancel.load(Ordering::SeqCst)
+            })
+        })
+        .unwrap_or(false);
+    if job_cancelled {
+        return true;
+    }
+    false
 }
 
 fn update_download(state: &AppState, id: &str, status: &str, error: Option<String>) {
@@ -1029,19 +1087,20 @@ fn is_pause_err(msg: &str) -> bool {
 }
 
 fn request_cancel_ids(state: &AppState, ids: &[String], app: Option<&tauri::AppHandle>) {
-    let paused_ids: Vec<String> = {
+    let idle_ids: Vec<String> = {
         let downloads = state.downloads.lock().ok();
         ids.iter()
             .filter(|id| {
                 downloads
                     .as_ref()
                     .and_then(|q| q.iter().find(|d| d.id == **id))
-                    .map(|d| d.status == "paused")
+                    .map(|d| d.status == "paused" || d.status == "queued")
                     .unwrap_or(false)
             })
             .cloned()
             .collect()
     };
+    let batch_emit_only = ids.len() > 1;
 
     if let Ok(mut jobs) = state.download_jobs.lock() {
         for id in ids {
@@ -1053,33 +1112,43 @@ fn request_cancel_ids(state: &AppState, ids: &[String], app: Option<&tauri::AppH
                 }
             }
             mark_cancelled(state, id);
-            if paused_ids.iter().any(|p| p == id) {
+            if idle_ids.iter().any(|p| p == id) {
                 jobs.remove(id);
             }
-            if let Some(handle) = app {
-                let label = download_label(state, id);
-                let _ = handle.emit(
-                    "download-cancelled",
-                    serde_json::json!({
-                        "id": id,
-                        "label": label,
-                    }),
-                );
+            if !batch_emit_only {
+                if let Some(handle) = app {
+                    let label = download_label(state, id);
+                    let _ = handle.emit(
+                        "download-cancelled",
+                        serde_json::json!({
+                            "id": id,
+                            "label": label,
+                        }),
+                    );
+                }
             }
         }
     } else {
         for id in ids {
             mark_cancelled(state, id);
-            if let Some(handle) = app {
-                let label = download_label(state, id);
-                let _ = handle.emit(
-                    "download-cancelled",
-                    serde_json::json!({
-                        "id": id,
-                        "label": label,
-                    }),
-                );
+            if !batch_emit_only {
+                if let Some(handle) = app {
+                    let label = download_label(state, id);
+                    let _ = handle.emit(
+                        "download-cancelled",
+                        serde_json::json!({
+                            "id": id,
+                            "label": label,
+                        }),
+                    );
+                }
             }
+        }
+    }
+
+    if batch_emit_only {
+        if let Some(handle) = app {
+            let _ = handle.emit("downloads-changed", ());
         }
     }
 }
@@ -2043,7 +2112,7 @@ async fn modio_game_logos(
 }
 
 #[tauri::command]
-pub fn list_plugins() -> Vec<games::GamePluginInfo> {
+pub fn list_plugins() -> Vec<games::GamePluginSummary> {
     games::list_plugins()
 }
 
@@ -2888,7 +2957,10 @@ pub fn unmanage_game(state: State<'_, AppState>, id: String) -> Result<(), Strin
 }
 
 #[tauri::command]
-pub fn get_settings(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+pub fn get_settings(
+    state: State<'_, AppState>,
+    tray_state: State<'_, crate::tray::TrayState>,
+) -> Result<serde_json::Value, String> {
     let has_key = state.api_key.lock().map_err(|e| e.to_string())?.is_some();
     let has_modio_api_key = state
         .modio_api_key
@@ -2929,6 +3001,8 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<serde_json::Value, Str
         "modio_website_signed_in": cfg.modio_website_signed_in,
         "auto_sort_before_deploy": cfg.auto_sort_before_deploy,
         "global_launch_options": cfg.global_launch_options,
+        "background": cfg.background,
+        "tray_available": tray_state.is_available(),
         "user": user,
         "config_dir": state.paths.config_dir,
         "data_dir": state.paths.data_dir,
@@ -3000,6 +3074,24 @@ pub fn set_auto_sort_before_deploy(
     let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
     cfg.auto_sort_before_deploy = enabled;
     config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn set_background_settings(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    settings: config::BackgroundSettings,
+) -> Result<(), String> {
+    let autostart_enabled = settings.run_in_background && settings.start_on_login;
+    crate::tray::sync_autostart(autostart_enabled, settings.start_minimized)
+        .map_err(|e| format!("{e:#}"))?;
+    {
+        let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
+        cfg.background = settings;
+        config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())?;
+    }
+    crate::tray::sync_tray_visibility(&app, settings.run_in_background);
+    Ok(())
 }
 
 #[tauri::command]
@@ -4358,6 +4450,50 @@ enum StagePolicy {
     Force,
 }
 
+fn thunderstore_package_keep_existing<'a>(
+    order: &'a mods::LoadOrder,
+    pkg: &TsPackageDetail,
+    policy: StagePolicy,
+    replace_existing: bool,
+) -> Option<&'a StagedMod> {
+    let ver = pkg.versions.first()?;
+    let incoming_ver = &ver.version_number;
+    let candidate = mods::find_thunderstore_package_version(
+        order,
+        &pkg.namespace,
+        &pkg.name,
+        Some(incoming_ver.as_str()),
+    )
+    .or_else(|| {
+        if replace_existing {
+            mods::find_thunderstore_package(order, &pkg.namespace, &pkg.name)
+        } else {
+            None
+        }
+    })?;
+    let intact = mods::check_staged_mod_integrity(candidate).is_none();
+    let keep_existing = intact
+        && match policy {
+            StagePolicy::KeepNewer => {
+                !mods::incoming_is_newer(candidate.version.as_deref(), incoming_ver)
+            }
+            StagePolicy::MatchResolved => candidate
+                .version
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|v| v.eq_ignore_ascii_case(incoming_ver.trim())),
+            StagePolicy::Force => false,
+        };
+    keep_existing.then_some(candidate)
+}
+
+fn thunderstore_download_label(pkg: &TsPackageDetail) -> String {
+    match pkg.versions.first() {
+        Some(ver) => format!("{}-{}", pkg.full_name, ver.version_number),
+        None => pkg.full_name.clone(),
+    }
+}
+
 /// Stage `pkg` at its first listed version.
 #[allow(clippy::too_many_arguments)]
 async fn stage_thunderstore_package(
@@ -4382,6 +4518,8 @@ async fn stage_thunderstore_package(
         display_name,
         enabled,
         reuse_dl_id,
+        None,
+        None,
         policy,
         true,
         None,
@@ -4400,6 +4538,8 @@ async fn stage_thunderstore_package_inner(
     display_name: &str,
     enabled: Option<bool>,
     reuse_dl_id: Option<String>,
+    batch_id: Option<String>,
+    batch_label: Option<String>,
     policy: StagePolicy,
     replace_existing: bool,
     replace_id: Option<&str>,
@@ -4412,53 +4552,48 @@ async fn stage_thunderstore_package_inner(
         .ok_or_else(|| format!("No versions for {}", pkg.full_name))?;
     let incoming_ver = &ver.version_number;
     let order = mods::load_loadorder(&state.paths, game_id).map_err(|e| e.to_string())?;
-    let candidate = mods::find_thunderstore_package_version(
-        &order,
-        &ns,
-        &pkg_name,
-        Some(incoming_ver.as_str()),
-    )
-    .or_else(|| {
-        if replace_existing {
-            mods::find_thunderstore_package(&order, &ns, &pkg_name)
-        } else {
-            None
+    if let Some(existing) =
+        thunderstore_package_keep_existing(&order, pkg, policy, replace_existing)
+    {
+        if let Some(ref queued_id) = reuse_dl_id {
+            remove_download_row(state, queued_id);
+            let _ = app.emit("downloads-changed", ());
         }
-    });
-    if let Some(existing) = candidate {
-        let intact = mods::check_staged_mod_integrity(existing).is_none();
-        let keep_existing = intact
-            && match policy {
-                StagePolicy::KeepNewer => {
-                    !mods::incoming_is_newer(existing.version.as_deref(), incoming_ver)
-                }
-                StagePolicy::MatchResolved => existing
-                    .version
-                    .as_deref()
-                    .map(str::trim)
-                    .is_some_and(|v| v.eq_ignore_ascii_case(incoming_ver.trim())),
-                StagePolicy::Force => false,
-            };
-        if keep_existing {
-            let id = existing.id.clone();
-            let apply_enabled = match enabled {
-                Some(true) => Some(true),
-                _ => None,
-            };
-            return mods::merge_mod_meta(&state.paths, game_id, &id, &[], &[], None, apply_enabled)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| format!("Missing staged package {id}"));
-        }
+        let id = existing.id.clone();
+        let apply_enabled = match enabled {
+            Some(true) => Some(true),
+            _ => None,
+        };
+        return mods::merge_mod_meta(&state.paths, game_id, &id, &[], &[], None, apply_enabled)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("Missing staged package {id}"));
     }
 
-    let label = format!("{}-{}", pkg.full_name, incoming_ver);
+    let label = thunderstore_download_label(pkg);
     let is_new = reuse_dl_id.is_none();
     let dl_id = reuse_dl_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    if !is_new && is_download_cancelled(state, &dl_id) {
+        mark_cancelled(state, &dl_id);
+        clear_download_job(state, &dl_id);
+        let _ = app.emit("downloads-changed", ());
+        return Err("Cancelled".into());
+    }
+
     let dest = state.paths.downloads_dir().join(format!(
         "ts_{}_{}.zip",
         dl_id,
         sanitize_filename::sanitize(&pkg_name)
     ));
+
+    let (cancel, pause) = ensure_download_job(state, &dl_id, batch_id.clone());
+    if cancel.load(Ordering::SeqCst) {
+        mark_cancelled(state, &dl_id);
+        clear_download_job(state, &dl_id);
+        let _ = app.emit("downloads-changed", ());
+        return Err("Cancelled".into());
+    }
+    pause.store(false, Ordering::SeqCst);
 
     if is_new {
         push_download(
@@ -4467,17 +4602,26 @@ async fn stage_thunderstore_package_inner(
                 dl_id.clone(),
                 label.clone(),
                 "downloading",
-                None,
+                batch_id.clone(),
                 thunderstore_page(game_id, community, &ns, &pkg_name),
-            ),
+            )
+            .with_batch_label(batch_label.clone()),
         );
     } else {
         reset_download_row(state, &dl_id);
+        if let Ok(mut q) = state.downloads.lock() {
+            if let Some(item) = q.iter_mut().find(|d| d.id == dl_id) {
+                if item.batch_id.is_none() {
+                    item.batch_id = batch_id.clone();
+                }
+                if item.batch_label.is_none() {
+                    item.batch_label = batch_label.clone();
+                }
+            }
+        }
     }
     let _ = app.emit("downloads-changed", ());
 
-    let cancel = Arc::new(AtomicBool::new(false));
-    let pause = Arc::new(AtomicBool::new(false));
     let ts_source = DownloadResumeSource::Thunderstore {
         game_id: game_id.to_string(),
         community: community.to_string(),
@@ -4486,54 +4630,105 @@ async fn stage_thunderstore_package_inner(
         display_name: display_name.to_string(),
         enabled,
     };
-    {
-        let mut jobs = state.download_jobs.lock().map_err(|e| e.to_string())?;
-        jobs.insert(
-            dl_id.clone(),
-            DownloadJob {
-                cancel: cancel.clone(),
-                pause: pause.clone(),
-                batch_id: None,
-                dest: Some(dest.clone()),
-                source: Some(ts_source.clone()),
-            },
-        );
-    }
-    store_restart_meta(state, &dl_id, ts_source);
+    set_download_resume(state, &dl_id, dest.clone(), ts_source);
 
     let control = TransferControl {
         cancel: cancel.clone(),
         pause: pause.clone(),
     };
     let on_progress = progress_callback(Some(app), dl_id.clone());
-    match client
+
+    let _slot = state.acquire_download_permits().await?;
+    if cancel.load(Ordering::SeqCst) {
+        mark_cancelled(state, &dl_id);
+        clear_download_job(state, &dl_id);
+        let _ = app.emit("downloads-changed", ());
+        return Err("Cancelled".into());
+    }
+
+    let download_result = client
         .download_version(ver, &dest, Some(&control), on_progress.as_ref())
-        .await
-    {
+        .await;
+    drop(_slot);
+
+    match download_result {
         Ok(()) => {
+            if cancel.load(Ordering::SeqCst) {
+                remove_download_archive(&dest, &state.paths.downloads_dir());
+                mark_cancelled(state, &dl_id);
+                clear_download_job(state, &dl_id);
+                let _ = app.emit("downloads-changed", ());
+                return Err("Cancelled".into());
+            }
+            if pause.load(Ordering::SeqCst) {
+                mark_paused(Some(app), state, &dl_id);
+                let _ = app.emit("downloads-changed", ());
+                return Err("Paused".into());
+            }
+
             update_download(state, &dl_id, "extracting", None);
+            let (bytes_downloaded, bytes_total) = state
+                .downloads
+                .lock()
+                .ok()
+                .and_then(|q| {
+                    q.iter()
+                        .find(|d| d.id == dl_id)
+                        .map(|d| (d.bytes_downloaded, d.bytes_total))
+                })
+                .unwrap_or((0, None));
+            let _ = app.emit(
+                "download-progress",
+                serde_json::json!({
+                    "id": dl_id,
+                    "bytes_downloaded": bytes_downloaded,
+                    "bytes_total": bytes_total,
+                    "speed_bps": 0,
+                    "status": "extracting",
+                }),
+            );
             let _ = app.emit("downloads-changed", ());
+
             let ts_file_name = mods::pick_staged_file_name(
                 display_name,
                 None,
                 crate::nexus::filename_from_url(&ver.download_url).as_deref(),
             );
             assign_download_file_name(state, &dl_id, ts_file_name.as_deref());
-            match mods::stage_thunderstore_mod_with_mode(
-                &state.paths,
-                game_id,
-                community,
-                &ns,
-                &pkg_name,
-                incoming_ver,
-                Some(pkg.uuid4.clone()),
-                display_name,
-                ts_file_name,
-                Some(ver.icon.clone()).filter(|icon| !icon.trim().is_empty()),
-                &dest,
-                replace_existing,
-                replace_id,
-            ) {
+
+            let paths_bg = state.paths.clone();
+            let game_id_bg = game_id.to_string();
+            let community_bg = community.to_string();
+            let ns_bg = ns.clone();
+            let pkg_name_bg = pkg_name.clone();
+            let incoming_ver_bg = incoming_ver.clone();
+            let uuid4_bg = Some(pkg.uuid4.clone());
+            let display_name_bg = display_name.to_string();
+            let icon_bg = Some(ver.icon.clone()).filter(|icon| !icon.trim().is_empty());
+            let dest_bg = dest.clone();
+            let replace_id_bg = replace_id.map(|s| s.to_string());
+            let staged_res = tokio::task::spawn_blocking(move || {
+                mods::stage_thunderstore_mod_with_mode(
+                    &paths_bg,
+                    &game_id_bg,
+                    &community_bg,
+                    &ns_bg,
+                    &pkg_name_bg,
+                    &incoming_ver_bg,
+                    uuid4_bg,
+                    &display_name_bg,
+                    ts_file_name,
+                    icon_bg,
+                    &dest_bg,
+                    replace_existing,
+                    replace_id_bg.as_deref(),
+                )
+                .map_err(|e| e.to_string())
+            })
+            .await
+            .map_err(|e| format!("Extraction task failed: {e}"))?;
+
+            match staged_res {
                 Ok(staged) => {
                     if let Some(false) = enabled {
                         let _ = mods::merge_mod_meta(
@@ -4552,8 +4747,7 @@ async fn stage_thunderstore_package_inner(
                     let _ = app.emit("downloads-changed", ());
                     Ok(staged)
                 }
-                Err(e) => {
-                    let msg = e.to_string();
+                Err(msg) => {
                     remove_download_archive(&dest, &state.paths.downloads_dir());
                     update_download(state, &dl_id, "failed", Some(msg.clone()));
                     clear_download_job(state, &dl_id);
@@ -4564,6 +4758,18 @@ async fn stage_thunderstore_package_inner(
         }
         Err(e) => {
             let msg = e.to_string();
+            if is_pause_err(&msg) || pause.load(Ordering::SeqCst) {
+                mark_paused(Some(app), state, &dl_id);
+                let _ = app.emit("downloads-changed", ());
+                return Err("Paused".into());
+            }
+            if is_cancel_err(&msg) || cancel.load(Ordering::SeqCst) {
+                remove_download_archive(&dest, &state.paths.downloads_dir());
+                mark_cancelled(state, &dl_id);
+                clear_download_job(state, &dl_id);
+                let _ = app.emit("downloads-changed", ());
+                return Err("Cancelled".into());
+            }
             remove_download_archive(&dest, &state.paths.downloads_dir());
             update_download(state, &dl_id, "failed", Some(msg.clone()));
             clear_download_job(state, &dl_id);
@@ -4625,6 +4831,8 @@ async fn stage_thunderstore_with_deps_resolved(
             &display,
             enabled,
             None,
+            None,
+            None,
             if is_root {
                 root_policy
             } else {
@@ -4665,6 +4873,23 @@ fn apply_pre_resolution_disables(
     }
 }
 
+fn cancel_remaining_batch_queued(app: &tauri::AppHandle, state: &AppState, batch_id: &str) {
+    let remaining_ids: Vec<String> = state
+        .downloads
+        .lock()
+        .ok()
+        .map(|q| {
+            q.iter()
+                .filter(|d| d.batch_id.as_deref() == Some(batch_id) && d.status == "queued")
+                .map(|d| d.id.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    if !remaining_ids.is_empty() {
+        request_cancel_ids(state, &remaining_ids, Some(app));
+    }
+}
+
 #[tauri::command]
 pub async fn download_thunderstore_mod(
     app: tauri::AppHandle,
@@ -4680,15 +4905,48 @@ pub async fn download_thunderstore_mod(
     let client = ThunderstoreClient::new().map_err(|e| e.to_string())?;
     let before = snapshot_mod_ids(&state.paths, &game_id)?;
     let is_modpack = record_as_modpack.unwrap_or(false);
-    let target_col_id = is_modpack.then(|| mods::thunderstore_modpack_id(&community, &namespace, &name));
-    let install_order = load_ts_install_order(
+    let target_col_id =
+        is_modpack.then(|| mods::thunderstore_modpack_id(&community, &namespace, &name));
+    let batch_id = uuid::Uuid::new_v4().to_string();
+    let batch_label = Some(name.clone());
+
+    let placeholder_id = uuid::Uuid::new_v4().to_string();
+    enqueue_download_row(
+        &state,
+        DownloadItem::new(
+            placeholder_id.clone(),
+            format!("Resolving {name}…"),
+            "queued",
+            Some(batch_id.clone()),
+            thunderstore_page(&game_id, &community, &namespace, &name),
+        )
+        .with_batch_label(batch_label.clone()),
+    );
+    let _ = app.emit("downloads-changed", ());
+
+    let install_order = match load_ts_install_order(
         &state,
         &community,
         &namespace,
         &name,
         version.as_deref(),
     )
-    .await?;
+    .await
+    {
+        Ok(order) => order,
+        Err(e) => {
+            remove_download_row(&state, &placeholder_id);
+            let _ = app.emit("downloads-changed", ());
+            return Err(e);
+        }
+    };
+
+    let cancelled_during_resolve = is_download_cancelled(&state, &placeholder_id);
+    remove_download_row(&state, &placeholder_id);
+    if cancelled_during_resolve {
+        let _ = app.emit("downloads-changed", ());
+        return Err("Cancelled".into());
+    }
 
     let incoming_specs: Vec<IncomingModSpec> = install_order
         .iter()
@@ -4705,8 +4963,8 @@ pub async fn download_thunderstore_mod(
         })
         .collect();
 
+    let initial_order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
     if is_modpack {
-        let initial_order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
         apply_pre_resolution_disables(
             &state.paths,
             &game_id,
@@ -4716,8 +4974,90 @@ pub async fn download_thunderstore_mod(
         );
     }
 
-    let mut staged_all = Vec::new();
+    let post_disable_order = if is_modpack {
+        mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?
+    } else {
+        initial_order
+    };
+
+    // Pre-enqueue every package that needs downloading so the Downloads Queue
+    // immediately shows the full dependency / modpack list upfront.
+    let mut queued_dl_ids: Vec<Option<String>> = Vec::with_capacity(install_order.len());
     for (idx, pkg) in install_order.iter().enumerate() {
+        let is_root = pkg.name.eq_ignore_ascii_case(&name)
+            && pkg.namespace.eq_ignore_ascii_case(&namespace);
+        let needs_download = if is_modpack {
+            match resolution::resolve_mod_execution(
+                &post_disable_order,
+                target_col_id.as_deref(),
+                &incoming_specs,
+                &incoming_specs[idx],
+                resolutions.as_ref(),
+            ) {
+                ModExecutionPlan::ReuseExact { .. } | ModExecutionPlan::KeepExisting { .. } => {
+                    false
+                }
+                ModExecutionPlan::RepairExact { .. } | ModExecutionPlan::ReplaceStaged { .. } => {
+                    true
+                }
+                ModExecutionPlan::DisableOldAndInstallNew { .. }
+                | ModExecutionPlan::InstallFresh
+                | ModExecutionPlan::KeepBothEnabled => {
+                    thunderstore_package_keep_existing(
+                        &post_disable_order,
+                        pkg,
+                        StagePolicy::MatchResolved,
+                        false,
+                    )
+                    .is_none()
+                }
+            }
+        } else {
+            let policy = if is_root {
+                StagePolicy::KeepNewer
+            } else {
+                StagePolicy::MatchResolved
+            };
+            thunderstore_package_keep_existing(&post_disable_order, pkg, policy, true).is_none()
+        };
+
+        if needs_download {
+            let dl_id = uuid::Uuid::new_v4().to_string();
+            enqueue_download_row(
+                &state,
+                DownloadItem::new(
+                    dl_id.clone(),
+                    thunderstore_download_label(pkg),
+                    "queued",
+                    Some(batch_id.clone()),
+                    thunderstore_page(&game_id, &community, &pkg.namespace, &pkg.name),
+                )
+                .with_batch_label(batch_label.clone()),
+            );
+            queued_dl_ids.push(Some(dl_id));
+        } else {
+            queued_dl_ids.push(None);
+        }
+    }
+    let _ = app.emit("downloads-changed", ());
+
+    let mut staged_all = Vec::new();
+    let mut batch_aborted = false;
+    for (idx, pkg) in install_order.iter().enumerate() {
+        if is_batch_cancelled(&state, &batch_id) {
+            batch_aborted = true;
+            break;
+        }
+        let queued_id = queued_dl_ids[idx].take();
+        if let Some(ref dl_id) = queued_id {
+            if is_download_cancelled(&state, dl_id) {
+                if install_order.len() == 1 {
+                    return Err("Cancelled".into());
+                }
+                continue;
+            }
+        }
+
         let is_root = pkg.name.eq_ignore_ascii_case(&name)
             && pkg.namespace.eq_ignore_ascii_case(&namespace);
         let display = if is_root {
@@ -4727,7 +5067,7 @@ pub async fn download_thunderstore_mod(
         };
         let current_order =
             mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
-        let staged = if is_modpack {
+        let step_res: Result<StagedMod, String> = if is_modpack {
             match resolution::resolve_mod_execution(
                 &current_order,
                 target_col_id.as_deref(),
@@ -4739,6 +5079,10 @@ pub async fn download_thunderstore_mod(
                     staged_id,
                     disable_other_ids,
                 } => {
+                    if let Some(ref dl_id) = queued_id {
+                        remove_download_row(&state, dl_id);
+                        let _ = app.emit("downloads-changed", ());
+                    }
                     disable_staged_mod_ids(&state.paths, &game_id, &disable_other_ids);
                     mods::merge_mod_meta(
                         &state.paths,
@@ -4749,20 +5093,26 @@ pub async fn download_thunderstore_mod(
                         None,
                         Some(true),
                     )
-                    .map_err(|e| e.to_string())?
-                    .ok_or_else(|| format!("Missing staged package {staged_id}"))?
+                    .map_err(|e| e.to_string())
+                    .and_then(|opt| opt.ok_or_else(|| format!("Missing staged package {staged_id}")))
                 }
-                ModExecutionPlan::KeepExisting { staged_id } => mods::merge_mod_meta(
-                    &state.paths,
-                    &game_id,
-                    &staged_id,
-                    &[],
-                    &[],
-                    None,
-                    Some(true),
-                )
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| format!("Missing staged package {staged_id}"))?,
+                ModExecutionPlan::KeepExisting { staged_id } => {
+                    if let Some(ref dl_id) = queued_id {
+                        remove_download_row(&state, dl_id);
+                        let _ = app.emit("downloads-changed", ());
+                    }
+                    mods::merge_mod_meta(
+                        &state.paths,
+                        &game_id,
+                        &staged_id,
+                        &[],
+                        &[],
+                        None,
+                        Some(true),
+                    )
+                    .map_err(|e| e.to_string())
+                    .and_then(|opt| opt.ok_or_else(|| format!("Missing staged package {staged_id}")))
+                }
                 ModExecutionPlan::RepairExact {
                     staged_id,
                     disable_other_ids,
@@ -4777,12 +5127,14 @@ pub async fn download_thunderstore_mod(
                         pkg,
                         &display,
                         Some(true),
-                        None,
+                        queued_id,
+                        Some(batch_id.clone()),
+                        batch_label.clone(),
                         StagePolicy::Force,
                         true,
                         Some(&staged_id),
                     )
-                    .await?
+                    .await
                 }
                 ModExecutionPlan::ReplaceStaged { replace_id } => {
                     stage_thunderstore_package_inner(
@@ -4794,12 +5146,14 @@ pub async fn download_thunderstore_mod(
                         pkg,
                         &display,
                         Some(true),
-                        None,
+                        queued_id,
+                        Some(batch_id.clone()),
+                        batch_label.clone(),
                         StagePolicy::Force,
                         true,
                         Some(&replace_id),
                     )
-                    .await?
+                    .await
                 }
                 ModExecutionPlan::DisableOldAndInstallNew { disable_ids } => {
                     disable_staged_mod_ids(&state.paths, &game_id, &disable_ids);
@@ -4812,12 +5166,14 @@ pub async fn download_thunderstore_mod(
                         pkg,
                         &display,
                         Some(true),
-                        None,
+                        queued_id,
+                        Some(batch_id.clone()),
+                        batch_label.clone(),
                         StagePolicy::MatchResolved,
                         false,
                         None,
                     )
-                    .await?
+                    .await
                 }
                 ModExecutionPlan::InstallFresh | ModExecutionPlan::KeepBothEnabled => {
                     stage_thunderstore_package_inner(
@@ -4829,16 +5185,18 @@ pub async fn download_thunderstore_mod(
                         pkg,
                         &display,
                         Some(true),
-                        None,
+                        queued_id,
+                        Some(batch_id.clone()),
+                        batch_label.clone(),
                         StagePolicy::MatchResolved,
                         false,
                         None,
                     )
-                    .await?
+                    .await
                 }
             }
         } else {
-            stage_thunderstore_package(
+            stage_thunderstore_package_inner(
                 &app,
                 &state,
                 &client,
@@ -4847,20 +5205,47 @@ pub async fn download_thunderstore_mod(
                 pkg,
                 &display,
                 None,
-                None,
+                queued_id,
+                Some(batch_id.clone()),
+                batch_label.clone(),
                 if is_root {
                     StagePolicy::KeepNewer
                 } else {
                     StagePolicy::MatchResolved
                 },
+                true,
+                None,
             )
-            .await?
+            .await
         };
-        staged_all.push(staged);
+
+        match step_res {
+            Ok(staged) => staged_all.push(staged),
+            Err(e) if is_cancel_err(&e) => {
+                if is_batch_cancelled(&state, &batch_id) || install_order.len() == 1 {
+                    batch_aborted = true;
+                    break;
+                }
+                // User cancelled just this single queued/active item; continue with the rest.
+            }
+            Err(e) if is_pause_err(&e) => {
+                batch_aborted = true;
+                break;
+            }
+            Err(e) => {
+                cancel_remaining_batch_queued(&app, &state, &batch_id);
+                return Err(e);
+            }
+        }
     }
+
+    if batch_aborted {
+        cancel_remaining_batch_queued(&app, &state, &batch_id);
+    }
+
     apply_ts_depends_on(&state.paths, &game_id, &install_order)?;
 
-    if is_modpack {
+    if is_modpack && !staged_all.is_empty() {
         let member_ids: Vec<String> = staged_all.iter().map(|s| s.id.clone()).collect();
         let new_ids: Vec<String> = member_ids
             .iter()
@@ -4871,7 +5256,8 @@ pub async fn download_thunderstore_mod(
             .iter()
             .find(|p| p.namespace == namespace && p.name == name);
         let collection = InstalledCollection {
-            id: target_col_id.unwrap_or_else(|| mods::thunderstore_modpack_id(&community, &namespace, &name)),
+            id: target_col_id
+                .unwrap_or_else(|| mods::thunderstore_modpack_id(&community, &namespace, &name)),
             source: CollectionSource::Thunderstore,
             kind: CollectionKind::Modpack,
             name: root.map(|p| p.name.clone()).unwrap_or_else(|| name.clone()),
@@ -4928,25 +5314,70 @@ pub async fn import_thunderstore_profile(
     }
 
     let client = ThunderstoreClient::new().map_err(|e| e.to_string())?;
-    let bytes = client
-        .fetch_legacy_profile(&code)
-        .await
-        .map_err(|e| e.to_string())?;
+    let batch_id = uuid::Uuid::new_v4().to_string();
+    let placeholder_id = uuid::Uuid::new_v4().to_string();
+    enqueue_download_row(
+        &state,
+        DownloadItem::new(
+            placeholder_id.clone(),
+            format!("Resolving profile {code}…"),
+            "queued",
+            Some(batch_id.clone()),
+            None,
+        )
+        .with_batch_label(Some(format!("Profile {code}"))),
+    );
+    let _ = app.emit("downloads-changed", ());
+
+    let bytes = match client.fetch_legacy_profile(&code).await {
+        Ok(b) => b,
+        Err(e) => {
+            remove_download_row(&state, &placeholder_id);
+            let _ = app.emit("downloads-changed", ());
+            return Err(e.to_string());
+        }
+    };
     let temp = state
         .paths
         .downloads_dir()
         .join(format!("ts_profile_{}", sanitize_filename::sanitize(&code)));
-    let manifest = thunderstore::extract_profile_zip(&bytes, &temp).map_err(|e| e.to_string())?;
+    let manifest = match thunderstore::extract_profile_zip(&bytes, &temp) {
+        Ok(m) => m,
+        Err(e) => {
+            remove_download_row(&state, &placeholder_id);
+            let _ = app.emit("downloads-changed", ());
+            return Err(e.to_string());
+        }
+    };
     if let Some(slug) = manifest.community.as_deref() {
         if !slug.is_empty() && !thunderstore::community_slug_matches(slug, &community) {
             let _ = std::fs::remove_dir_all(&temp);
+            remove_download_row(&state, &placeholder_id);
+            let _ = app.emit("downloads-changed", ());
             return Err(format!(
                 "This profile is for '{slug}', but this game is set to Thunderstore community '{community}'."
             ));
         }
     }
 
-    let packages = load_ts_packages_cached(&state, &community).await?;
+    let packages = match load_ts_packages_cached(&state, &community).await {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&temp);
+            remove_download_row(&state, &placeholder_id);
+            let _ = app.emit("downloads-changed", ());
+            return Err(e);
+        }
+    };
+
+    let cancelled_during_resolve = is_download_cancelled(&state, &placeholder_id);
+    remove_download_row(&state, &placeholder_id);
+    if cancelled_during_resolve {
+        let _ = std::fs::remove_dir_all(&temp);
+        let _ = app.emit("downloads-changed", ());
+        return Err("Cancelled".into());
+    }
+
     let by_key: HashMap<String, thunderstore::TsPackage> = packages
         .iter()
         .cloned()
@@ -4954,6 +5385,7 @@ pub async fn import_thunderstore_profile(
         .collect();
 
     let target_col_id = mods::thunderstore_profile_id(&code);
+    let batch_label = Some(manifest.profile_name.clone());
     let incoming_specs: Vec<IncomingModSpec> = manifest
         .mods
         .iter()
@@ -4981,12 +5413,29 @@ pub async fn import_thunderstore_profile(
         &incoming_specs,
         resolutions.as_ref(),
     );
+    let post_disable_order =
+        mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
 
     let before = snapshot_mod_ids(&state.paths, &game_id)?;
     let mut member_ids = Vec::new();
     let mut seen_pkg_ids: HashSet<String> = HashSet::new();
     let mut details_for_deps = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
+
+    struct ProfileInstallStep {
+        pkg: TsPackageDetail,
+        display: String,
+        enabled: Option<bool>,
+        policy: StagePolicy,
+        replace_existing: bool,
+        replace_id: Option<String>,
+        queued_dl_id: Option<String>,
+    }
+
+    // Resolve the full deduplicated install order upfront so we can pre-enqueue
+    // every package needing download in the Downloads Queue before starting.
+    let mut planned_steps: Vec<ProfileInstallStep> = Vec::new();
+    let mut planned_keys: HashMap<String, usize> = HashMap::new();
 
     for m in &manifest.mods {
         let Some((ns, pkg_name)) = thunderstore::parse_package_ident(&m.name) else {
@@ -5011,10 +5460,8 @@ pub async fn import_thunderstore_profile(
             version: Some(ver.clone()),
             display_name: pkg_name.clone(),
         };
-        let current_order =
-            mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
         let (root_policy, root_replace, root_replace_id) = match resolution::resolve_mod_execution(
-            &current_order,
+            &post_disable_order,
             Some(&target_col_id),
             &incoming_specs,
             &spec,
@@ -5073,44 +5520,163 @@ pub async fn import_thunderstore_profile(
             }
         };
 
-        match stage_thunderstore_with_deps_resolved(
+        let resolved_order = match thunderstore::resolve_install_order_from(
+            &packages,
+            &community,
+            &ns,
+            &pkg_name,
+            Some(&ver),
+        ) {
+            Ok(order) => order,
+            Err(e) => {
+                let msg = format!("Failed to resolve profile package {ns}-{pkg_name}: {e}");
+                log::warn!("{msg}");
+                warnings.push(msg);
+                continue;
+            }
+        };
+
+        for pkg in resolved_order {
+            let id = mods::thunderstore_mod_id(&pkg.namespace, &pkg.name);
+            if details_for_deps.iter().all(|d: &TsPackageDetail| {
+                mods::thunderstore_mod_id(&d.namespace, &d.name) != id
+            }) {
+                details_for_deps.push(pkg.clone());
+            }
+
+            let is_root = pkg.name.eq_ignore_ascii_case(&pkg_name)
+                && pkg.namespace.eq_ignore_ascii_case(&ns);
+            let pkg_key = format!(
+                "{}-{}-{}",
+                pkg.namespace.to_lowercase(),
+                pkg.name.to_lowercase(),
+                pkg.versions
+                    .first()
+                    .map(|v| v.version_number.as_str())
+                    .unwrap_or("")
+            );
+            let step_policy = if is_root {
+                root_policy
+            } else {
+                StagePolicy::MatchResolved
+            };
+            let step_replace = if is_root { root_replace } else { true };
+            let step_replace_id = if is_root { root_replace_id.clone() } else { None };
+            let step_display = if is_root {
+                pkg.name.clone()
+            } else {
+                format!("{} (dependency)", pkg.name)
+            };
+            let step_enabled = if is_root { enabled } else { None };
+
+            if let Some(&existing_idx) = planned_keys.get(&pkg_key) {
+                if is_root {
+                    let existing = &mut planned_steps[existing_idx];
+                    existing.display = step_display;
+                    existing.enabled = step_enabled;
+                    existing.policy = step_policy;
+                    existing.replace_existing = step_replace;
+                    existing.replace_id = step_replace_id;
+                }
+                continue;
+            }
+
+            let needs_download = thunderstore_package_keep_existing(
+                &post_disable_order,
+                &pkg,
+                step_policy,
+                step_replace,
+            )
+            .is_none();
+            let queued_dl_id = if needs_download {
+                let dl_id = uuid::Uuid::new_v4().to_string();
+                enqueue_download_row(
+                    &state,
+                    DownloadItem::new(
+                        dl_id.clone(),
+                        thunderstore_download_label(&pkg),
+                        "queued",
+                        Some(batch_id.clone()),
+                        thunderstore_page(&game_id, &community, &pkg.namespace, &pkg.name),
+                    )
+                    .with_batch_label(batch_label.clone()),
+                );
+                Some(dl_id)
+            } else {
+                None
+            };
+
+            planned_keys.insert(pkg_key, planned_steps.len());
+            planned_steps.push(ProfileInstallStep {
+                pkg,
+                display: step_display,
+                enabled: step_enabled,
+                policy: step_policy,
+                replace_existing: step_replace,
+                replace_id: step_replace_id,
+                queued_dl_id,
+            });
+        }
+    }
+    let _ = app.emit("downloads-changed", ());
+
+    let mut batch_aborted = false;
+    for step in planned_steps {
+        if is_batch_cancelled(&state, &batch_id) {
+            batch_aborted = true;
+            break;
+        }
+        if let Some(ref dl_id) = step.queued_dl_id {
+            if is_download_cancelled(&state, dl_id) {
+                continue;
+            }
+        }
+        match stage_thunderstore_package_inner(
             &app,
             &state,
             &client,
             &game_id,
             &community,
-            &ns,
-            &pkg_name,
-            Some(&ver),
-            enabled,
-            Some(&pkg_name),
-            root_policy,
-            root_replace,
-            root_replace_id.as_deref(),
+            &step.pkg,
+            &step.display,
+            step.enabled,
+            step.queued_dl_id,
+            Some(batch_id.clone()),
+            batch_label.clone(),
+            step.policy,
+            step.replace_existing,
+            step.replace_id.as_deref(),
         )
         .await
         {
-            Ok((staged, order)) => {
-                for s in staged {
-                    if seen_pkg_ids.insert(s.id.clone()) {
-                        member_ids.push(s.id);
-                    }
-                }
-                for detail in order {
-                    let id = mods::thunderstore_mod_id(&detail.namespace, &detail.name);
-                    if details_for_deps.iter().all(|d: &TsPackageDetail| {
-                        mods::thunderstore_mod_id(&d.namespace, &d.name) != id
-                    }) {
-                        details_for_deps.push(detail);
-                    }
+            Ok(staged) => {
+                if seen_pkg_ids.insert(staged.id.clone()) {
+                    member_ids.push(staged.id);
                 }
             }
+            Err(e) if is_cancel_err(&e) => {
+                if is_batch_cancelled(&state, &batch_id) {
+                    batch_aborted = true;
+                    break;
+                }
+            }
+            Err(e) if is_pause_err(&e) => {
+                batch_aborted = true;
+                break;
+            }
             Err(e) => {
-                let msg = format!("Failed to stage profile package {ns}-{pkg_name}: {e}");
+                let msg = format!(
+                    "Failed to stage profile package {}-{}: {e}",
+                    step.pkg.namespace, step.pkg.name
+                );
                 log::warn!("{msg}");
                 warnings.push(msg);
             }
         }
+    }
+
+    if batch_aborted {
+        cancel_remaining_batch_queued(&app, &state, &batch_id);
     }
 
     apply_ts_depends_on(&state.paths, &game_id, &details_for_deps)?;
@@ -8360,21 +8926,54 @@ pub async fn fill_staged_pictures(
     mods::apply_staged_pictures(&state.paths, &game_id, &updates).map_err(|e| e.to_string())
 }
 
+fn effective_nexus_domain<'a>(staged: &'a StagedMod, fallback: Option<&'a str>) -> &'a str {
+    let domain = staged.domain.trim();
+    if !domain.is_empty() {
+        domain
+    } else {
+        fallback.map(str::trim).unwrap_or("")
+    }
+}
+
 async fn detect_update_for_staged(
     state: &AppState,
     game_id: &str,
     staged: &StagedMod,
+    fallback_nexus_domain: Option<&str>,
+    nexus_files_cache: Option<&HashMap<(String, u64), Vec<ModFileInfo>>>,
 ) -> Option<StagedModUpdate> {
     match staged.source {
         ModSource::Nexus => {
-            if staged.nexus_mod_id == 0 || staged.domain.is_empty() {
+            let domain = effective_nexus_domain(staged, fallback_nexus_domain);
+            if staged.nexus_mod_id == 0 || domain.is_empty() {
                 return None;
             }
-            let client = state.client().ok()?;
-            let files = client
-                .list_mod_files(&staged.domain, staged.nexus_mod_id)
-                .await
-                .ok()?;
+            let fetched_files;
+            let files: &[ModFileInfo] = if let Some(cache) = nexus_files_cache {
+                cache.get(&(domain.to_string(), staged.nexus_mod_id))?
+            } else {
+                let client = match state.client() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        log::warn!(
+                            "check_staged_mod_updates: Nexus client unavailable for {domain}/{}: {e}",
+                            staged.nexus_mod_id
+                        );
+                        return None;
+                    }
+                };
+                fetched_files = match client.list_mod_files(domain, staged.nexus_mod_id).await {
+                    Ok(files) => files,
+                    Err(e) => {
+                        log::warn!(
+                            "check_staged_mod_updates: list_mod_files failed for {domain}/{}: {e}",
+                            staged.nexus_mod_id
+                        );
+                        return None;
+                    }
+                };
+                &fetched_files
+            };
             let metas: Vec<_> = files
                 .iter()
                 .map(|f| mods::NexusFileMeta {
@@ -8494,13 +9093,80 @@ pub async fn check_staged_mod_updates(
     game_id: String,
 ) -> Result<Vec<StagedModUpdate>, String> {
     let order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
+    let fallback_nexus_domain = managed_game(&state, &game_id)
+        .ok()
+        .map(|g| g.nexus_domain);
     let mods_list = order.mods;
-    let mut out = Vec::new();
+
+    // Fetch Nexus file lists once per unique (domain, mod_id) to avoid duplicate API
+    // calls when multiple staged files belong to the same Nexus mod.
+    let mut unique_nexus_mods: Vec<(String, u64)> = Vec::new();
+    let mut seen_nexus: HashSet<(String, u64)> = HashSet::new();
+    for m in &mods_list {
+        if m.source == ModSource::Nexus && m.nexus_mod_id > 0 {
+            let domain = effective_nexus_domain(m, fallback_nexus_domain.as_deref());
+            if !domain.is_empty() {
+                let key = (domain.to_string(), m.nexus_mod_id);
+                if seen_nexus.insert(key.clone()) {
+                    unique_nexus_mods.push(key);
+                }
+            }
+        }
+    }
+
     const CONCURRENCY: usize = 3;
+    let mut nexus_files_cache: HashMap<(String, u64), Vec<ModFileInfo>> = HashMap::new();
+    if !unique_nexus_mods.is_empty() {
+        match state.client() {
+            Ok(client) => {
+                for chunk in unique_nexus_mods.chunks(CONCURRENCY) {
+                    let futs: Vec<_> = chunk
+                        .iter()
+                        .map(|(domain, mod_id)| {
+                            let client = client.clone();
+                            let domain = domain.clone();
+                            let mod_id = *mod_id;
+                            async move {
+                                match client.list_mod_files(&domain, mod_id).await {
+                                    Ok(files) => Some(((domain, mod_id), files)),
+                                    Err(e) => {
+                                        log::warn!(
+                                            "check_staged_mod_updates: list_mod_files failed for {domain}/{mod_id}: {e}"
+                                        );
+                                        None
+                                    }
+                                }
+                            }
+                        })
+                        .collect();
+                    for (key, files) in futures_util::future::join_all(futs)
+                        .await
+                        .into_iter()
+                        .flatten()
+                    {
+                        nexus_files_cache.insert(key, files);
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!("check_staged_mod_updates: Nexus client unavailable: {e}");
+            }
+        }
+    }
+
+    let mut out = Vec::new();
     for chunk in mods_list.chunks(CONCURRENCY) {
         let futs: Vec<_> = chunk
             .iter()
-            .map(|m| detect_update_for_staged(&state, &game_id, m))
+            .map(|m| {
+                detect_update_for_staged(
+                    &state,
+                    &game_id,
+                    m,
+                    fallback_nexus_domain.as_deref(),
+                    Some(&nexus_files_cache),
+                )
+            })
             .collect();
         let results = futures_util::future::join_all(futs).await;
         for upd in results.into_iter().flatten() {
@@ -8526,18 +9192,28 @@ pub async fn update_staged_mod(
         ));
     }
     let order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
+    let fallback_nexus_domain = managed_game(&state, &game_id)
+        .ok()
+        .map(|g| g.nexus_domain);
     let staged = order
         .mods
         .iter()
         .find(|m| m.id == staged_id)
         .cloned()
         .ok_or_else(|| format!("Staged mod not found: {staged_id}"))?;
-    let update = detect_update_for_staged(&state, &game_id, &staged)
-        .await
-        .ok_or_else(|| "No update available for this mod".to_string())?;
+    let update = detect_update_for_staged(
+        &state,
+        &game_id,
+        &staged,
+        fallback_nexus_domain.as_deref(),
+        None,
+    )
+    .await
+    .ok_or_else(|| "No update available for this mod".to_string())?;
 
     match staged.source {
         ModSource::Nexus => {
+            let domain = effective_nexus_domain(&staged, fallback_nexus_domain.as_deref());
             let file_id = update
                 .nexus_file_id
                 .ok_or_else(|| "Missing Nexus update file id".to_string())?;
@@ -8552,7 +9228,7 @@ pub async fn update_staged_mod(
                 Some(&app),
                 &*state,
                 &game_id,
-                &staged.domain,
+                domain,
                 staged.nexus_mod_id,
                 file_id,
                 &staged.name,
@@ -12164,9 +12840,9 @@ pub fn cancel_download(
         .lock()
         .ok()
         .and_then(|q| {
-            q.iter().find(|d| d.id == id).map(|d| {
-                d.status == "downloading" || d.status == "extracting" || d.status == "paused"
-            })
+            q.iter()
+                .find(|d| d.id == id)
+                .map(|d| is_active_download_status(&d.status))
         })
         .unwrap_or(false);
     if !active
@@ -12196,9 +12872,7 @@ pub fn cancel_download_batch(
             .iter()
             .filter(|d| {
                 d.batch_id.as_deref() == Some(batch_id.as_str())
-                    && (d.status == "downloading"
-                        || d.status == "extracting"
-                        || d.status == "paused")
+                    && is_active_download_status(&d.status)
             })
             .map(|d| d.id.clone())
             .collect();
@@ -14141,7 +14815,10 @@ pub fn set_collection_enabled(
 
 #[cfg(test)]
 mod recent_download_limit_tests {
-    use super::{trim_finished_downloads, DownloadItem};
+    use super::{
+        is_active_download_status, is_finished_download_status, trim_finished_downloads,
+        DownloadItem,
+    };
 
     fn row(id: &str, status: &str) -> DownloadItem {
         DownloadItem::new(id.into(), id.into(), status, None, None)
@@ -14152,13 +14829,30 @@ mod recent_download_limit_tests {
         let mut q = vec![
             row("new-done", "done"),
             row("active", "downloading"),
+            row("queued", "queued"),
             row("mid", "failed"),
             row("paused", "paused"),
             row("old", "cancelled"),
         ];
         trim_finished_downloads(&mut q, 2);
         let ids: Vec<_> = q.iter().map(|d| d.id.as_str()).collect();
-        assert_eq!(ids, ["new-done", "active", "mid", "paused"]);
+        assert_eq!(ids, ["new-done", "active", "queued", "mid", "paused"]);
+    }
+
+    #[test]
+    fn queued_status_is_active_and_not_finished() {
+        assert!(is_active_download_status("queued"));
+        assert!(!is_finished_download_status("queued"));
+        let item = DownloadItem::new(
+            "q1".into(),
+            "Owner-Pkg-1.0.0".into(),
+            "queued",
+            Some("batch-1".into()),
+            None,
+        )
+        .with_batch_label(Some("My Modpack".into()));
+        assert_eq!(item.batch_id.as_deref(), Some("batch-1"));
+        assert_eq!(item.batch_label.as_deref(), Some("My Modpack"));
     }
 
     #[test]

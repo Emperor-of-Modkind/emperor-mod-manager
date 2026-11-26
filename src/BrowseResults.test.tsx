@@ -302,4 +302,65 @@ describe("BrowseResults virtualizers", () => {
     await view.unmount();
     scrollEl.remove();
   });
+
+  it("updates scrollMargin when content above BrowseVirtualList in the scroll wrapper resizes", async () => {
+    const scrollEl = document.createElement("div");
+    setClientSize(scrollEl, 800, 600);
+    document.body.appendChild(scrollEl);
+    const scrollRef = createRef<HTMLElement | null>();
+    scrollRef.current = scrollEl;
+
+    let listOffsetTop = 280;
+    vi.spyOn(scrollEl, "getBoundingClientRect").mockImplementation(
+      () => new DOMRect(0, 100, 800, 600),
+    );
+
+    const items = Array.from({ length: 40 }, (_, i) => ({ id: `mod-${i}` }));
+    const view = await mount(
+      <div className="detail-scroll-content">
+        <div className="detail-hero" />
+        <div className="detail-body">
+          <div className="mods-toolbar" />
+          <div className="results-fill">
+            <BrowseVirtualList
+              items={items}
+              scrollRef={scrollRef}
+              active={true}
+              estimateSize={60}
+              rowClassName="row"
+              getKey={(item) => item.id}
+              renderItem={(item) => <span>{item.id}</span>}
+            />
+          </div>
+        </div>
+      </div>,
+      scrollEl,
+    );
+
+    const contentRoot = scrollEl.querySelector(".detail-scroll-content")!;
+    const listEl = scrollEl.querySelector("ul.browse-virtual") as HTMLUListElement;
+    vi.spyOn(listEl, "getBoundingClientRect").mockImplementation(
+      () => new DOMRect(0, 100 + listOffsetTop - scrollEl.scrollTop, 800, 2400),
+    );
+
+    const marginObserver = FakeResizeObserver.instances.find((ro) =>
+      ro.targets.has(contentRoot),
+    );
+    expect(marginObserver).toBeDefined();
+
+    // Simulate filters expanding above the list (+140px) and scrolling past the hero/toolbar.
+    listOffsetTop = 420;
+    scrollEl.scrollTop = 420;
+    await act(async () => {
+      marginObserver!.trigger();
+      scrollEl.dispatchEvent(new Event("scroll"));
+    });
+
+    const firstRow = scrollEl.querySelector('li[data-index="0"]') as HTMLElement | null;
+    expect(firstRow).not.toBeNull();
+    expect(firstRow!.style.transform).toBe("translateY(0px)");
+
+    await view.unmount();
+    scrollEl.remove();
+  });
 });

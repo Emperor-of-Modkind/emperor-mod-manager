@@ -12,6 +12,7 @@ use crate::games::{match_plugin, GamePluginInfo};
 use super::reconcile::games_match;
 use super::DetectedGame;
 
+#[cfg(any(target_os = "windows", test))]
 pub mod epic_library;
 pub mod heroic_library;
 #[cfg(any(target_os = "linux", test))]

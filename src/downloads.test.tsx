@@ -56,6 +56,8 @@ function renderWorkspace(
     onRestartDownload?: (id: string) => void;
     onOpenRecent?: (item: DownloadItem) => void;
     onRemoveDownload?: (id: string) => void;
+    onCancelDownload?: (id: string) => void;
+    onCancelBatch?: (batchId: string) => void;
   },
 ) {
   return render(
@@ -69,7 +71,8 @@ function renderWorkspace(
       onSkip={() => {}}
       onCancel={() => {}}
       onCancelRemaining={() => {}}
-      onCancelDownload={() => {}}
+      onCancelBatch={callbacks?.onCancelBatch}
+      onCancelDownload={callbacks?.onCancelDownload ?? (() => {})}
       onRestartDownload={callbacks?.onRestartDownload ?? (() => {})}
       onRetryAssistOpening={() => {}}
       isDownloadStuck={() => false}
@@ -157,5 +160,87 @@ describe("DownloadsWorkspace recent failed/cancelled rows", () => {
       (actions[0] as HTMLButtonElement).click();
     });
     expect(onRemoveDownload).toHaveBeenCalledWith("l1");
+  });
+});
+
+describe("DownloadsWorkspace queued items and backend batches", () => {
+  it("renders queued downloads in FIFO order inside the Queue pane and excludes them from Recent", async () => {
+    const onCancelDownload = vi.fn();
+    const onCancelBatch = vi.fn();
+    // Backend returns newest-first: q2 was enqueued after q1.
+    const host = await renderWorkspace(
+      [
+        makeItem({
+          id: "q2",
+          label: "Owner-ModB-1.0.0",
+          status: "queued",
+          error: null,
+          batch_id: "batch-ts",
+          batch_label: "My Modpack",
+        }),
+        makeItem({
+          id: "q1",
+          label: "Owner-ModA-1.0.0",
+          status: "queued",
+          error: null,
+          batch_id: "batch-ts",
+          batch_label: "My Modpack",
+        }),
+        makeItem({
+          id: "active-1",
+          label: "BepInEx-BepInExPack-5.4.21",
+          status: "downloading",
+          error: null,
+          bytes_downloaded: 500,
+          bytes_total: 1000,
+          speed_bps: 250,
+          batch_id: "batch-ts",
+          batch_label: "My Modpack",
+        }),
+        makeItem({
+          id: "done-1",
+          label: "Owner-Core-1.0.0",
+          status: "done",
+          error: null,
+          batch_id: "batch-ts",
+          batch_label: "My Modpack",
+        }),
+      ],
+      { onCancelDownload, onCancelBatch },
+    );
+
+    expect(host.querySelector(".downloads-subtitle")?.textContent).toBe(
+      "My Modpack — 1/4 complete",
+    );
+
+    const queueItems = Array.from(host.querySelectorAll(".downloads-queue-item"));
+    expect(queueItems).toHaveLength(2);
+    expect(queueItems[0].textContent).toContain("Owner-ModA-1.0.0");
+    expect(queueItems[0].textContent).toContain("Queued · #1");
+    expect(queueItems[1].textContent).toContain("Owner-ModB-1.0.0");
+    expect(queueItems[1].textContent).toContain("Queued · #2");
+
+    // Recent should only contain the finished item, not queued ones.
+    const recentItems = Array.from(host.querySelectorAll(".downloads-recent li"));
+    expect(recentItems).toHaveLength(1);
+    expect(recentItems[0].textContent).toContain("Owner-Core-1.0.0");
+
+    // Cancel individual queued item.
+    await act(async () => {
+      (queueItems[0].querySelector("button") as HTMLButtonElement).click();
+    });
+    expect(onCancelDownload).toHaveBeenCalledWith("q1");
+
+    // Cancel remaining batch button in header.
+    const cancelBatchBtn = Array.from(
+      host.querySelectorAll(".panel-head-actions button"),
+    ).find((b) => b.textContent?.includes("Cancel remaining downloads")) as
+      | HTMLButtonElement
+      | undefined;
+    expect(cancelBatchBtn).toBeDefined();
+    await act(async () => {
+      cancelBatchBtn!.click();
+    });
+    expect(onCancelBatch).toHaveBeenCalledWith("batch-ts");
   });
 });

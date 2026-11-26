@@ -3,6 +3,7 @@ import type { EmperorOpenMod } from "./modDeepLink";
 import type {
   AutoSortResult,
   AuthorSuggestion,
+  BackgroundSettings,
   BannerPersistence,
   BannerTimeouts,
   BethesdaPluginsState,
@@ -85,6 +86,8 @@ import type {
   AutoHdrVkConfig,
   GameToolOverrides,
   GameToolsResponse,
+  PluginToolStatus,
+  PluginToolActionResult,
   AppInfo,
   AppUpdateStatus,
   AppInstallResult,
@@ -126,6 +129,8 @@ export const api = {
     invoke<void>("set_game_version_warnings", { enabled }),
   setAutoSortBeforeDeploy: (enabled: boolean) =>
     invoke<void>("set_auto_sort_before_deploy", { enabled }),
+  setBackgroundSettings: (settings: BackgroundSettings) =>
+    invoke<void>("set_background_settings", { settings }),
   setAutoclickFreeDownload: (enabled: boolean) =>
     invoke<void>("set_autoclick_free_download", { enabled }),
   setTheme: (theme: ThemePreference) => invoke<void>("set_theme", { theme }),
@@ -736,6 +741,12 @@ export const api = {
       request: { game_id: gameId, overrides },
     }),
   syncGameTools: (gameId: string) => invoke<GameToolsResponse>("sync_game_tools", { gameId }),
+  checkGamePluginToolUpdates: (gameId: string) =>
+    invoke<PluginToolStatus[]>("check_game_plugin_tool_updates", { gameId }),
+  installGamePluginTool: (gameId: string, toolId: string) =>
+    invoke<PluginToolActionResult>("install_game_plugin_tool", { gameId, toolId }),
+  uninstallGamePluginTool: (gameId: string, toolId: string) =>
+    invoke<PluginToolActionResult>("uninstall_game_plugin_tool", { gameId, toolId }),
   getFriendsState: () => invoke<FriendsState>("get_friends_state"),
   setP2pDisplayName: (name: string) =>
     invoke<FriendsState>("set_p2p_display_name", { name }),

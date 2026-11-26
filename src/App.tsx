@@ -70,9 +70,22 @@ import {
   getFriendsSyncingCollection,
   getFriendsWithActiveLoadoutMatching,
 } from "./collectionSyncers";
+import {
+  AutoSyncTracker,
+  GAME_VIEW_FRIEND_REFRESH_TTL_MS,
+  PRE_LAUNCH_FRIEND_REFRESH_TIMEOUT_MS,
+  classifyOutdatedEnabledCollections,
+  createEmptyAutoSyncSummary,
+  isCollectionEnabledForLaunch,
+  isSyncResultComplete,
+  outdatedReasonLabel,
+  raceWithTimeout,
+  type OutdatedSyncedCollection,
+} from "./friendAutoSync";
 import { FriendsPage } from "./FriendsPage";
 import { SettingsSection, SettingsToggle } from "./SettingsSection";
 import { SocialSettingsSection } from "./SocialSettingsSection";
+import { BackgroundTraySettings } from "./BackgroundTraySettings";
 import { MobileDevicesSettings } from "./MobileDevicesSettings";
 import { useFoldableLayout } from "./useFoldableLayout";
 import { Throbber } from "./Throbber";
@@ -684,6 +697,69 @@ function statusSummary(
     return { primary: "Queue", secondary: `${progress} — opening next…` };
   }
 
+  const inFlight = downloads.filter(
+    (d) =>
+      d.status === "downloading" ||
+      d.status === "extracting" ||
+      d.status === "paused",
+  );
+  const queued = downloads.filter((d) => d.status === "queued");
+
+  if (inFlight.length > 0 || queued.length > 0) {
+    const current = inFlight[0] ?? queued[queued.length - 1];
+    const primary =
+      current.status === "extracting"
+        ? "Installing"
+        : current.status === "paused"
+          ? "Paused"
+          : current.status === "queued"
+            ? "Queue"
+            : "Downloading";
+
+    const pct =
+      current.status === "downloading" &&
+      current.bytes_total != null &&
+      current.bytes_total > 0
+        ? Math.min(100, Math.round((current.bytes_downloaded / current.bytes_total) * 100))
+        : null;
+
+    if (current.batch_id) {
+      const batchMembers = downloads.filter((d) => d.batch_id === current.batch_id);
+      if (batchMembers.length > 1) {
+        const doneCount = batchMembers.filter(
+          (d) => d.status === "done" || d.status === "staged",
+        ).length;
+        const step = `${Math.min(doneCount + 1, batchMembers.length)}/${batchMembers.length}`;
+        const pctSuffix = pct != null ? ` · ${pct}%` : "";
+        return { primary, secondary: `${current.label} · ${step}${pctSuffix}` };
+      }
+    }
+
+    if (inFlight.length === 1 && queued.length === 0) {
+      return {
+        primary,
+        secondary: pct != null ? `${current.label} · ${pct}%` : current.label,
+      };
+    }
+    if (inFlight.length === 0 && queued.length > 0) {
+      return {
+        primary,
+        secondary:
+          queued.length === 1
+            ? current.label
+            : `${current.label} · ${queued.length} queued`,
+      };
+    }
+    if (activeBatch?.label) {
+      return { primary, secondary: activeBatch.label };
+    }
+    const remaining = inFlight.length + queued.length;
+    return {
+      primary,
+      secondary: pct != null ? `${current.label} · ${pct}% · ${remaining} left` : `${remaining} remaining`,
+    };
+  }
+
   if (busy) {
     const patterns: [RegExp, string][] = [
       [/^Downloading\s+(.+?)…?$/i, "Downloading"],
@@ -706,22 +782,7 @@ function statusSummary(
     return { primary: busy, secondary: "" };
   }
 
-  const inFlight = downloads.filter(
-    (d) => d.status === "downloading" ||
-              d.status === "extracting" ||
-              d.status === "paused",
-  );
-  if (inFlight.length === 0) return null;
-
-  let secondary: string;
-  if (inFlight.length === 1) {
-    secondary = inFlight[0].label;
-  } else if (activeBatch?.label) {
-    secondary = activeBatch.label;
-  } else {
-    secondary = `${inFlight.length} remaining`;
-  }
-  return { primary: "Downloading", secondary };
+  return null;
 }
 
 const MOD_SORTS = [
@@ -1613,7 +1674,12 @@ const BrowseCollectionGridCard = memo(function BrowseCollectionGridCard({
 });
 
 function isActiveDownloadStatus(status: string): boolean {
-  return status === "downloading" || status === "extracting" || status === "paused";
+  return (
+    status === "queued" ||
+    status === "downloading" ||
+    status === "extracting" ||
+    status === "paused"
+  );
 }
 
 function isFinishedDownloadStatus(status: string): boolean {
@@ -1983,8 +2049,13 @@ export default function App() {
   const [savingCollectionIds, setSavingCollectionIds] = useState<
     Record<string, boolean>
   >({});
-  const autoSyncInFlightRef = useRef<Set<string>>(new Set());
-  const autoSyncNotifiedHashRef = useRef<Map<string, string>>(new Map());
+  const autoSyncTrackerRef = useRef<AutoSyncTracker>(new AutoSyncTracker());
+  const [preLaunchSyncPrompt, setPreLaunchSyncPrompt] = useState<{
+    gameId: string;
+    gameTitle: string;
+    outdated: OutdatedSyncedCollection[];
+    busy: boolean;
+  } | null>(null);
   const [profileImportOpen, setProfileImportOpen] = useState(false);
   const [profileCode, setProfileCode] = useState("");
   const [shareImportOpen, setShareImportOpen] = useState(false);
@@ -3813,23 +3884,41 @@ export default function App() {
     () => {
       if (!activeGame) return;
       const gameId = activeGame.id;
-      const ttlKey = `mod-updates:${gameId}`;
+      const modUpdatesTtlKey = `mod-updates:${gameId}`;
+      const friendSyncTtlKey = `friend-sync:${gameId}`;
       let cancelled = false;
       const poll = (force: boolean) => {
         if (cancelled) return;
-        if (!force && navTtlRef.current.isFresh(ttlKey, 15 * 60_000)) return;
-        navTtlRef.current.mark(ttlKey);
-        void refreshModUpdates(gameId);
-        void api
-          .refreshFriends()
-          .catch(() => {})
-          .finally(() => {
-            if (cancelled) return;
-            void runAutoSyncPassRef.current?.({
-              gameIds: [gameId],
-              forceRetry: true,
+        if (
+          force ||
+          !navTtlRef.current.isFresh(modUpdatesTtlKey, 15 * 60_000)
+        ) {
+          navTtlRef.current.mark(modUpdatesTtlKey);
+          void refreshModUpdates(gameId);
+        }
+        if (
+          force ||
+          !navTtlRef.current.isFresh(
+            friendSyncTtlKey,
+            GAME_VIEW_FRIEND_REFRESH_TTL_MS,
+          )
+        ) {
+          navTtlRef.current.mark(friendSyncTtlKey);
+          void api
+            .refreshFriends()
+            .catch(() => {})
+            .finally(() => {
+              if (cancelled) return;
+              void runAutoSyncPassRef.current?.({
+                gameIds: [gameId],
+                forceRetry: force,
+              });
             });
+        } else {
+          void runAutoSyncPassRef.current?.({
+            gameIds: [gameId],
           });
+        }
       };
       poll(false);
       const id = window.setInterval(() => poll(true), 15 * 60 * 1000);
@@ -4833,6 +4922,18 @@ export default function App() {
     await refreshDownloads();
   }, [refreshDownloads, setActiveBatchState]);
 
+  const cancelBackendBatch = useCallback(
+    async (batchId: string) => {
+      try {
+        await api.cancelDownloadBatch(batchId);
+      } catch (e) {
+        setError(String(e));
+      }
+      await refreshDownloads();
+    },
+    [refreshDownloads],
+  );
+
   const cancelOneDownload = useCallback(
     async (id: string) => {
       try {
@@ -5080,15 +5181,26 @@ export default function App() {
   }, [activeId, refreshManaged, refreshDownloads, refreshMods, refreshCollections]);
 
   useEffect(() => {
-    // A dependency closure emits one event per package; coalesce the bursts.
+    // A dependency closure emits bursts of events; trigger immediately on the
+    // leading edge so new queued/active rows appear with zero lag, then
+    // coalesce rapid follow-ups with a single trailing refresh.
     let changedTimer: number | null = null;
-    const unlistenChanged = listen("downloads-changed", () => {
-      if (changedTimer != null) return;
-      changedTimer = window.setTimeout(() => {
-        changedTimer = null;
+    let changedPending = false;
+    const scheduleDownloadsRefresh = () => {
+      if (changedTimer == null) {
         void refreshDownloads();
-      }, 150);
-    });
+        changedTimer = window.setTimeout(() => {
+          changedTimer = null;
+          if (changedPending) {
+            changedPending = false;
+            void refreshDownloads();
+          }
+        }, 150);
+      } else {
+        changedPending = true;
+      }
+    };
+    const unlistenChanged = listen("downloads-changed", scheduleDownloadsRefresh);
     const unlistenNxm = listen<string>("nxm-url", async (event) => {
       const q = assistQueueRef.current;
       setBusy(
@@ -5366,12 +5478,16 @@ export default function App() {
         status: string;
       }
     >(120, (batch) => {
+      let sawUnknown = false;
       setDownloads((prevList) => {
         let next: DownloadItem[] | null = null;
         for (const p of batch.values()) {
           const list = next ?? prevList;
           const idx = list.findIndex((d) => d.id === p.id);
-          if (idx < 0) continue;
+          if (idx < 0) {
+            sawUnknown = true;
+            continue;
+          }
           // A late progress event must not pull a finished row back into the
           // active list.
           if (isFinishedDownloadStatus(list[idx].status)) continue;
@@ -5396,6 +5512,9 @@ export default function App() {
         }
         return next ?? prevList;
       });
+      if (sawUnknown) {
+        scheduleDownloadsRefresh();
+      }
     });
     const unlistenProgress = listen<{
       id: string;
@@ -6876,26 +6995,30 @@ export default function App() {
     if (hit.source !== "thunderstore" || !hit.community || !hit.namespace || !hit.package_name) {
       return;
     }
+    const gameId = activeGame.id;
     goToDownloadsOnInstall();
-    setBusy(`Installing ${hit.name}…`);
     setError(null);
     try {
-      await api.downloadThunderstoreMod({
-        gameId: activeGame.id,
+      const staged = await api.downloadThunderstoreMod({
+        gameId,
         community: hit.community,
         namespace: hit.namespace,
         name: hit.package_name,
         version: tsVersion || null,
       });
-      await refreshMods(activeGame.id);
-      await refreshCollections(activeGame.id);
+      await refreshMods(gameId);
+      await refreshCollections(gameId);
       await refreshDownloads();
-      setNotice({ kind: "ok", message: `Installed ${hit.name} (with dependencies).` });
+      if (staged.length > 0) {
+        setNotice({ kind: "ok", message: `Installed ${hit.name} (with dependencies).` });
+      }
     } catch (e) {
-      setError(String(e));
+      const msg = String(e);
+      if (!msg.includes("Cancelled") && !msg.includes("Paused")) {
+        setError(msg);
+      }
+      await refreshMods(gameId);
       await refreshDownloads();
-    } finally {
-      setBusy(null);
     }
   }
 
@@ -7130,11 +7253,11 @@ export default function App() {
         return;
       }
       if (!resolutions) return;
+      const gameId = activeGame.id;
       goToDownloadsOnInstall();
-      setBusy(`Installing modpack ${c.name}…`);
       try {
-        await api.downloadThunderstoreMod({
-          gameId: activeGame.id,
+        const staged = await api.downloadThunderstoreMod({
+          gameId,
           community: c.community,
           namespace: c.namespace,
           name: c.package_name,
@@ -7142,15 +7265,20 @@ export default function App() {
           recordAsModpack: true,
           resolutions,
         });
-        await refreshMods(activeGame.id);
-        await refreshCollections(activeGame.id);
+        await refreshMods(gameId);
+        await refreshCollections(gameId);
         await refreshDownloads();
-        setNotice({ kind: "ok", message: `Installed ${c.name}.` });
+        if (staged.length > 0) {
+          setNotice({ kind: "ok", message: `Installed ${c.name}.` });
+        }
       } catch (e) {
-        setError(String(e));
+        const msg = String(e);
+        if (!msg.includes("Cancelled") && !msg.includes("Paused")) {
+          setError(msg);
+        }
+        await refreshMods(gameId);
+        await refreshCollections(gameId);
         await refreshDownloads();
-      } finally {
-        setBusy(null);
       }
       return;
     }
@@ -7403,19 +7531,27 @@ export default function App() {
     });
   }
 
-  async function syncInstalledCollection(c: InstalledCollection) {
-    if (!activeGame) return;
+  async function syncInstalledCollection(
+    c: InstalledCollection,
+  ): Promise<"synced" | "assist" | "cancelled" | "error"> {
+    if (!activeGame) return "cancelled";
     const gameId = activeGame.id;
     setError(null);
     setSyncingCollectionIds((prev) => ({ ...prev, [c.id]: true }));
     try {
       if (c.friend_sync) {
+        if (!friendSyncStates[c.id]?.has_update) {
+          await raceWithTimeout(
+            api.refreshFriends().catch(() => null),
+            PRE_LAUNCH_FRIEND_REFRESH_TIMEOUT_MS,
+          );
+        }
         const resolutions = await resolveCollectionConflicts(gameId, {
           kind: "friend_sync",
           peerId: c.friend_sync.friend_peer_id,
           friendCollectionId: c.friend_sync.friend_collection_id,
         });
-        if (!resolutions) return;
+        if (!resolutions) return "cancelled";
         const res = await api.joinOrSyncFriendCollection({
           gameId,
           peerId: c.friend_sync.friend_peer_id,
@@ -7438,7 +7574,14 @@ export default function App() {
             friendCollectionId: c.friend_sync.friend_collection_id,
           },
         );
-        return;
+        if (res.needs_assist.length > 0) {
+          return "assist";
+        }
+        if (isSyncResultComplete(res)) {
+          autoSyncTrackerRef.current.clearKey(`${gameId}:${c.id}`);
+          return "synced";
+        }
+        return "error";
       }
       if (c.source === "nexus" && c.slug) {
         const detail = await api.getCollection({ slug: c.slug });
@@ -7463,7 +7606,7 @@ export default function App() {
           mod_count: null,
           file_size: null,
         });
-        return;
+        return "synced";
       }
       if (
         c.source === "thunderstore" &&
@@ -7479,25 +7622,29 @@ export default function App() {
           name: c.package_name,
           version: null,
         });
-        if (!resolutions) return;
-        await withBusy(`Updating modpack ${c.name}…`, async () => {
-          await api.downloadThunderstoreMod({
-            gameId,
-            community: c.community!,
-            namespace: c.namespace!,
-            name: c.package_name!,
-            version: null,
-            recordAsModpack: true,
-            resolutions,
-          });
-          await refreshMods(gameId);
-          await refreshCollections(gameId);
-          await refreshDownloads();
-          setNotice({ kind: "ok", message: `Updated ${c.name}.` });
+        if (!resolutions) return "cancelled";
+        goToDownloadsOnInstall();
+        const staged = await api.downloadThunderstoreMod({
+          gameId,
+          community: c.community!,
+          namespace: c.namespace!,
+          name: c.package_name!,
+          version: null,
+          recordAsModpack: true,
+          resolutions,
         });
+        await refreshMods(gameId);
+        await refreshCollections(gameId);
+        await refreshDownloads();
+        if (staged.length > 0) {
+          setNotice({ kind: "ok", message: `Updated ${c.name}.` });
+        }
+        return "synced";
       }
+      return "cancelled";
     } catch (e) {
       setError(String(e));
+      return "error";
     } finally {
       setSyncingCollectionIds((prev) => {
         const next = { ...prev };
@@ -7513,13 +7660,9 @@ export default function App() {
       forceRetry?: boolean;
       silent?: boolean;
     }) => {
-      const summary = {
-        syncedNames: [] as string[],
-        pendingManualNames: [] as string[],
-        conflictNames: [] as string[],
-        assistNames: [] as string[],
-        failedNames: [] as string[],
-      };
+      const tracker = autoSyncTrackerRef.current;
+      const summary = createEmptyAutoSyncSummary();
+      const rerunGameIds = new Set<string>();
       const currentActive = activeGameRef.current;
       if (currentActive) {
         await refreshFriendSyncStates(currentActive.id);
@@ -7535,59 +7678,117 @@ export default function App() {
           continue;
         }
         let installedCols: InstalledCollection[] | null = null;
+        const resolveColName = async (collectionId: string) => {
+          if (!installedCols) {
+            installedCols = await api
+              .listInstalledCollections(game.id)
+              .catch(() => []);
+          }
+          return (
+            installedCols.find((c) => c.id === collectionId)?.name ??
+            "Synced collection"
+          );
+        };
         for (const st of states) {
-          if (!st.has_update) continue;
           const key = `${game.id}:${st.collection_id}`;
-          if (!st.auto_sync) {
-            if (!installedCols) {
-              installedCols = await api
-                .listInstalledCollections(game.id)
-                .catch(() => []);
-            }
-            const colName =
-              installedCols.find((c) => c.id === st.collection_id)?.name ??
-              "Synced collection";
-            summary.pendingManualNames.push(colName);
+          if (!st.has_update) {
+            tracker.recordSuccess(key);
             continue;
           }
-          if (autoSyncInFlightRef.current.has(key)) continue;
+          if (!st.auto_sync) {
+            summary.pendingManualNames.push(await resolveColName(st.collection_id));
+            summary.pendingManualIds.push(st.collection_id);
+            continue;
+          }
+          if (tracker.isInFlight(key)) {
+            tracker.requestRerun(key);
+            continue;
+          }
           if (
-            !opts?.forceRetry &&
-            autoSyncNotifiedHashRef.current.get(key) === st.latest_hash
+            tracker.shouldSkip(key, st.latest_hash, {
+              forceRetry: opts?.forceRetry,
+            })
           ) {
             continue;
           }
-          autoSyncInFlightRef.current.add(key);
-          try {
-            const plan = await api.planCollectionResolution(game.id, {
-              kind: "friend_sync",
-              peerId: st.peer_id,
-              friendCollectionId: st.friend_collection_id,
-            });
-            if (plan.conflicts.length > 0) {
-              summary.conflictNames.push(plan.targetCollectionName);
-              if (
-                !opts?.silent &&
-                (opts?.forceRetry ||
-                  autoSyncNotifiedHashRef.current.get(key) !== st.latest_hash)
-              ) {
-                autoSyncNotifiedHashRef.current.set(key, st.latest_hash);
-                setNotice({
-                  kind: "warn",
-                  message: `${plan.targetCollectionName} has an update with ${plan.conflicts.length} version conflict${plan.conflicts.length === 1 ? "" : "s"}. Click Sync on the game page to resolve.`,
-                });
-              } else {
-                autoSyncNotifiedHashRef.current.set(key, st.latest_hash);
+          const shouldMarkUiSyncing = activeGameRef.current?.id === game.id;
+          if (shouldMarkUiSyncing) {
+            setSyncingCollectionIds((prev) => ({
+              ...prev,
+              [st.collection_id]: true,
+            }));
+          }
+          const task = (async () => {
+            try {
+              const plan = await api.planCollectionResolution(game.id, {
+                kind: "friend_sync",
+                peerId: st.peer_id,
+                friendCollectionId: st.friend_collection_id,
+              });
+              if (plan.conflicts.length > 0) {
+                summary.conflictNames.push(plan.targetCollectionName);
+                summary.conflictIds.push(st.collection_id);
+                const notify =
+                  !opts?.silent &&
+                  tracker.shouldNotify(key, st.latest_hash, {
+                    forceRetry: opts?.forceRetry,
+                  });
+                tracker.recordBlocked(key, st.latest_hash, "conflict");
+                if (notify) {
+                  setNotice({
+                    kind: "warn",
+                    message: `${plan.targetCollectionName} has an update with ${plan.conflicts.length} version conflict${plan.conflicts.length === 1 ? "" : "s"}. Click Sync on the game page to resolve.`,
+                  });
+                }
+                return;
               }
-              continue;
-            }
-            const res = await api.joinOrSyncFriendCollection({
-              gameId: game.id,
-              peerId: st.peer_id,
-              friendCollectionId: st.friend_collection_id,
-            });
-            if (res.needs_assist.length === 0) {
-              autoSyncNotifiedHashRef.current.delete(key);
+              const res = await api.joinOrSyncFriendCollection({
+                gameId: game.id,
+                peerId: st.peer_id,
+                friendCollectionId: st.friend_collection_id,
+              });
+              if (res.needs_assist.length > 0) {
+                summary.assistNames.push(res.name);
+                summary.assistIds.push(st.collection_id);
+                const notify =
+                  !opts?.silent &&
+                  tracker.shouldNotify(key, st.latest_hash, {
+                    forceRetry: opts?.forceRetry,
+                  });
+                tracker.recordBlocked(key, st.latest_hash, "needs_assist");
+                if (notify) {
+                  setNotice({
+                    kind: "warn",
+                    message: `${res.name} has an update that requires manual Nexus download assist. Click Sync on the game page to download.`,
+                  });
+                }
+                return;
+              }
+              if (!isSyncResultComplete(res)) {
+                summary.failedNames.push(res.name);
+                summary.failedIds.push(st.collection_id);
+                const notify =
+                  !opts?.silent &&
+                  tracker.shouldNotify(key, st.latest_hash, {
+                    forceRetry: opts?.forceRetry,
+                  });
+                tracker.recordTransientFailure(key, st.latest_hash);
+                if (activeGameRef.current?.id === game.id) {
+                  await refreshMods(game.id);
+                  await refreshCollections(game.id);
+                  await refreshFriendSyncStates(game.id);
+                  await refreshDownloads();
+                }
+                if (notify) {
+                  setNotice({
+                    kind: "warn",
+                    message: `Auto-sync for ${res.name} finished with ${res.warnings.length} warning${res.warnings.length === 1 ? "" : "s"} and will retry.`,
+                    details: res.warnings.length > 0 ? res.warnings : undefined,
+                  });
+                }
+                return;
+              }
+              tracker.recordSuccess(key);
               summary.syncedNames.push(res.name);
               if (activeGameRef.current?.id === game.id) {
                 await refreshMods(game.id);
@@ -7605,40 +7806,48 @@ export default function App() {
                   details: res.warnings.length > 0 ? res.warnings : undefined,
                 });
               }
-            } else {
-              summary.assistNames.push(res.name);
-              if (
+            } catch (e) {
+              const colName = await resolveColName(st.collection_id);
+              summary.failedNames.push(colName);
+              summary.failedIds.push(st.collection_id);
+              const notify =
                 !opts?.silent &&
-                (opts?.forceRetry ||
-                  autoSyncNotifiedHashRef.current.get(key) !== st.latest_hash)
-              ) {
+                tracker.shouldNotify(key, st.latest_hash, {
+                  forceRetry: opts?.forceRetry,
+                });
+              tracker.recordTransientFailure(key, st.latest_hash);
+              if (notify) {
                 setNotice({
                   kind: "warn",
-                  message: `${res.name} has an update that requires manual Nexus download assist. Click Sync on the game page to download.`,
+                  message: `Auto-sync failed for ${colName}: ${String(e)}`,
                 });
               }
-              autoSyncNotifiedHashRef.current.set(key, st.latest_hash);
+            } finally {
+              tracker.clearInFlight(key);
+              if (shouldMarkUiSyncing) {
+                setSyncingCollectionIds((prev) => {
+                  const next = { ...prev };
+                  delete next[st.collection_id];
+                  return next;
+                });
+              }
+              if (tracker.consumeRerun(key)) {
+                rerunGameIds.add(game.id);
+              }
             }
-          } catch (e) {
-            summary.failedNames.push(st.collection_id);
-            if (
-              !opts?.silent &&
-              (opts?.forceRetry ||
-                autoSyncNotifiedHashRef.current.get(key) !== st.latest_hash)
-            ) {
-              setNotice({
-                kind: "warn",
-                message: `Auto-sync failed for collection: ${String(e)}`,
-              });
-            }
-            autoSyncNotifiedHashRef.current.set(key, st.latest_hash);
-          } finally {
-            autoSyncInFlightRef.current.delete(key);
-          }
+          })();
+          tracker.registerInFlight(key, task);
+          await task;
         }
       }
       if (activeGameRef.current) {
         await refreshFriendSyncStates(activeGameRef.current.id);
+      }
+      if (rerunGameIds.size > 0) {
+        void runAutoSyncPassRef.current?.({
+          gameIds: Array.from(rerunGameIds),
+          silent: opts?.silent,
+        });
       }
       return summary;
     },
@@ -8620,8 +8829,14 @@ export default function App() {
       forceRetry: true,
       silent: true,
     });
-    if (updates == null) return;
-    const count = updates.filter(
+    const hasSyncInfo =
+      syncSummary.syncedNames.length > 0 ||
+      syncSummary.pendingManualNames.length > 0 ||
+      syncSummary.conflictNames.length > 0 ||
+      syncSummary.assistNames.length > 0 ||
+      syncSummary.failedNames.length > 0;
+    if (updates == null && !hasSyncInfo) return;
+    const count = (updates ?? []).filter(
       (u) => !syncedCollectionNameByModId.has(u.staged_id),
     ).length;
     const parts: string[] = [];
@@ -8631,6 +8846,12 @@ export default function App() {
     if (syncSummary.syncedNames.length > 0) {
       parts.push(`synced ${syncSummary.syncedNames.join(", ")}`);
     }
+    const attentionIds = [
+      ...syncSummary.conflictIds,
+      ...syncSummary.assistIds,
+      ...syncSummary.pendingManualIds,
+      ...syncSummary.failedIds,
+    ];
     const attentionCount =
       syncSummary.pendingManualNames.length +
       syncSummary.conflictNames.length +
@@ -8649,12 +8870,27 @@ export default function App() {
       syncSummary.conflictNames.length > 0 ||
       syncSummary.assistNames.length > 0 ||
       syncSummary.failedNames.length > 0;
+    const firstAttentionId = attentionIds[0] ?? null;
     setNotice({
       kind: hasWarn ? "warn" : "ok",
       message:
         parts.length === 0
           ? "No updates available."
           : `${parts.join(" · ")}.`,
+      action: firstAttentionId
+        ? {
+            label: "Sync now",
+            dismiss: true,
+            run: () => {
+              const targetCol = installedCollections.find(
+                (col) => col.id === firstAttentionId,
+              );
+              if (targetCol) {
+                void syncInstalledCollection(targetCol);
+              }
+            },
+          }
+        : undefined,
     });
   }
 
@@ -9236,9 +9472,7 @@ export default function App() {
     });
   }
 
-  async function launchModded() {
-    if (!activeGame) return;
-    const gameId = activeGame.id;
+  async function proceedToFomodAndLaunch(gameId: string) {
     let currentMods = mods;
     let needingIds = shownFomodNeedingIds;
     try {
@@ -9265,6 +9499,63 @@ export default function App() {
       return;
     }
     await runLaunchModded();
+  }
+
+  async function launchModded() {
+    if (!activeGame) return;
+    const gameId = activeGame.id;
+    const gameTitle = activeGame.title;
+
+    const hasEnabledFriendSync = installedCollections.some(
+      (c) => c.friend_sync && isCollectionEnabledForLaunch(c, mods),
+    );
+    if (hasEnabledFriendSync) {
+      let outdated: OutdatedSyncedCollection[] = [];
+      await withBusy("Checking friend pack updates…", async () => {
+        await autoSyncTrackerRef.current.waitForGame(gameId);
+        await raceWithTimeout(
+          api.refreshFriends().catch(() => null),
+          PRE_LAUNCH_FRIEND_REFRESH_TIMEOUT_MS,
+        );
+        const syncSummary = await runAutoSyncPass({
+          gameIds: [gameId],
+          forceRetry: true,
+          silent: true,
+        });
+        if (activeGameRef.current?.id !== gameId) return;
+        const [latestCols, latestMods, latestStates] = await Promise.all([
+          api.listInstalledCollections(gameId).catch(() => installedCollections),
+          api.listMods(gameId).catch(() => mods),
+          api.getFriendCollectionSyncStates(gameId).catch(() => []),
+        ]);
+        if (activeGameRef.current?.id !== gameId) return;
+        setInstalledCollections(latestCols);
+        setMods(latestMods);
+        const map: Record<string, FriendCollectionSyncStatus> = {};
+        for (const s of latestStates) {
+          map[s.collection_id] = s;
+        }
+        setFriendSyncStates(map);
+        outdated = classifyOutdatedEnabledCollections(
+          latestCols,
+          latestStates,
+          latestMods,
+          syncSummary,
+        );
+      });
+      if (activeGameRef.current?.id !== gameId) return;
+      if (outdated.length > 0) {
+        setPreLaunchSyncPrompt({
+          gameId,
+          gameTitle,
+          outdated,
+          busy: false,
+        });
+        return;
+      }
+    }
+
+    await proceedToFomodAndLaunch(gameId);
   }
 
   async function applyWineOverrides() {
@@ -10288,7 +10579,12 @@ export default function App() {
                         >
                           Info
                         </button>
-                        {settings?.platform_linux && (
+                        {(settings?.platform_linux ||
+                          gamePlugins.some(
+                            (p) =>
+                              p.id === libraryDetail.game.plugin_id &&
+                              p.has_tools,
+                          )) && (
                           <button
                             type="button"
                             role="menuitem"
@@ -10337,7 +10633,10 @@ export default function App() {
                     </div>
                   </div>
                 </div>
+                </div>
 
+                <div className="page-scroll" ref={libraryDetailScrollRef}>
+                  <div className="detail-scroll-content">
                 <div className="detail-hero">
                   <div className="detail-cover">
                     {gameCoverSrc(libraryDetail.game) ? (
@@ -10750,10 +11049,8 @@ export default function App() {
                     </div>
                   </div>
                 </div>
-                </div>
 
-                <div className="detail-body page-view">
-                  <div className="page-chrome">
+                <div className="detail-body">
                     <Reveal
                       show={Boolean(
                         settings?.platform_linux &&
@@ -11057,8 +11354,6 @@ export default function App() {
                       mods={fomodNeeding}
                       onConfigure={configureFomods}
                     />
-                  </div>
-                  <div className="page-scroll" ref={libraryDetailScrollRef}>
                     {isBethesdaLootPluginId(libraryDetail.game.plugin_id) &&
                     gameDetailSubTab === "plugins" ? (
                       <BethesdaPluginsView
@@ -11480,6 +11775,7 @@ export default function App() {
                     ) : (
                       <StagedModsSkeleton />
                     )}
+                </div>
                   </div>
                 </div>
               </>
@@ -12049,9 +12345,9 @@ export default function App() {
                   friendSync ?? null,
                 );
               }}
-              onFriendsRefreshed={() =>
-                void runAutoSyncPass({ forceRetry: true })
-              }
+              onFriendsRefreshed={async () => {
+                await runAutoSyncPass({ forceRetry: true });
+              }}
               resolveCollectionConflicts={resolveCollectionConflicts}
               onOpenMod={(hit, targetGameId) =>
                 void openCollectionMod(hit, "friends", targetGameId)
@@ -13674,6 +13970,7 @@ export default function App() {
             onSkip={() => skipAssistCurrent()}
             onCancel={() => cancelAssistQueue()}
             onCancelRemaining={() => cancelRemainingBatch()}
+            onCancelBatch={(batchId) => void cancelBackendBatch(batchId)}
             onCancelDownload={(id) => cancelOneDownload(id)}
             onRestartDownload={(id) => restartOneDownload(id)}
             onRetryAssistOpening={() => retryAssistOpening()}
@@ -14406,7 +14703,19 @@ export default function App() {
                 onError={(msg) => setError(msg)}
               />
             </SettingsSection>
-            {!appInfo?.is_mobile && <MobileDevicesSettings />}
+            {!appInfo?.is_mobile && (
+              <BackgroundTraySettings
+                value={settings?.background}
+                trayAvailable={settings?.tray_available ?? true}
+                onUpdated={refreshSettings}
+                onError={(msg) => setError(msg)}
+              />
+            )}
+            {!appInfo?.is_mobile && (
+              <MobileDevicesSettings
+                runInBackground={Boolean(settings?.background?.run_in_background)}
+              />
+            )}
             <SettingsSection title="Accounts">
               {accountConnections}
             </SettingsSection>
@@ -15402,7 +15711,12 @@ export default function App() {
           </div>
         </Modal>
       )}
-      {libraryDetail && gameModal === "tools" && settings?.platform_linux && (
+      {libraryDetail &&
+        gameModal === "tools" &&
+        (settings?.platform_linux ||
+          gamePlugins.some(
+            (p) => p.id === libraryDetail.game.plugin_id && p.has_tools,
+          )) && (
         <Modal
           title={`${libraryDetail.game.title} — Tools`}
           className="modal-game-detail"
@@ -15975,6 +16289,80 @@ export default function App() {
             resolve(null);
           }}
         />
+      )}
+      {preLaunchSyncPrompt && (
+        <Modal
+          title="Synced pack has an update"
+          subtitle={`${preLaunchSyncPrompt.gameTitle} has ${preLaunchSyncPrompt.outdated.length === 1 ? "an outdated synced collection" : `${preLaunchSyncPrompt.outdated.length} outdated synced collections`}.`}
+          onClose={() => {
+            if (!preLaunchSyncPrompt.busy) setPreLaunchSyncPrompt(null);
+          }}
+          footer={
+            <div className="modal-actions">
+              <button
+                type="button"
+                disabled={preLaunchSyncPrompt.busy}
+                onClick={() => setPreLaunchSyncPrompt(null)}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={preLaunchSyncPrompt.busy}
+                onClick={() => {
+                  const { gameId } = preLaunchSyncPrompt;
+                  setPreLaunchSyncPrompt(null);
+                  void proceedToFomodAndLaunch(gameId);
+                }}
+              >
+                Launch Anyway
+              </button>
+              <button
+                type="button"
+                className="accent"
+                disabled={preLaunchSyncPrompt.busy}
+                onClick={() => {
+                  void (async () => {
+                    const { gameId, outdated } = preLaunchSyncPrompt;
+                    setPreLaunchSyncPrompt((prev) =>
+                      prev ? { ...prev, busy: true } : null,
+                    );
+                    let allSynced = true;
+                    for (const item of outdated) {
+                      const outcome = await syncInstalledCollection(
+                        item.collection,
+                      );
+                      if (outcome !== "synced") {
+                        allSynced = false;
+                        break;
+                      }
+                    }
+                    setPreLaunchSyncPrompt(null);
+                    if (allSynced && activeGameRef.current?.id === gameId) {
+                      await proceedToFomodAndLaunch(gameId);
+                    }
+                  })();
+                }}
+              >
+                {preLaunchSyncPrompt.busy ? "Syncing…" : "Sync & Launch"}
+              </button>
+            </div>
+          }
+        >
+          <p className="hint" style={{ marginTop: 0 }}>
+            Your friend updated the modpack below. Sync before launching so you
+            play on the matching mod list, or launch anyway to keep your current
+            install.
+          </p>
+          <ul className="modal-list">
+            {preLaunchSyncPrompt.outdated.map((item) => (
+              <li key={item.collection.id}>
+                <strong>{item.collection.name}</strong>
+                <div className="hint">{outdatedReasonLabel(item.reason)}</div>
+              </li>
+            ))}
+          </ul>
+        </Modal>
       )}
       {installModalGame && (
         <LauncherInstallModal

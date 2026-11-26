@@ -173,6 +173,36 @@ pub struct AppConfig {
     /// Global add-on launch options combined with detected required commands for games using Emperor launch commands.
     #[serde(default)]
     pub global_launch_options: GlobalLaunchOptions,
+    /// Desktop background execution, system tray, and login autostart preferences.
+    #[serde(default)]
+    pub background: BackgroundSettings,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct BackgroundSettings {
+    /// Master switch: keep a system tray icon active so Emperor can run in the background.
+    pub run_in_background: bool,
+    /// Hide the main window to the tray instead of quitting when closed.
+    pub close_to_tray: bool,
+    /// Hide the main window to the tray instead of the taskbar when minimized.
+    pub minimize_to_tray: bool,
+    /// Launch Emperor automatically when signing in to the OS.
+    pub start_on_login: bool,
+    /// Start hidden in the system tray (requires `run_in_background`).
+    pub start_minimized: bool,
+}
+
+impl Default for BackgroundSettings {
+    fn default() -> Self {
+        Self {
+            run_in_background: false,
+            close_to_tray: true,
+            minimize_to_tray: false,
+            start_on_login: false,
+            start_minimized: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -331,6 +361,7 @@ impl Default for AppConfig {
             steam_id_override: None,
             steam_library_sync_enabled: false,
             global_launch_options: GlobalLaunchOptions::default(),
+            background: BackgroundSettings::default(),
         }
     }
 }
@@ -471,16 +502,19 @@ impl Paths {
     }
 
     /// Mobile-side persisted paired desktop peer info.
+    #[cfg(any(target_os = "android", target_os = "ios", test))]
     pub fn paired_host_file(&self) -> PathBuf {
         self.config_dir.join("paired_host.json")
     }
 
     /// Mobile-side persistent Ed25519 iroh secret key.
+    #[cfg(any(target_os = "android", target_os = "ios", test))]
     pub fn mobile_secret_key_file(&self) -> PathBuf {
         self.config_dir.join("mobile_iroh_key.enc")
     }
 
     /// Mobile-side offline snapshot cache.
+    #[cfg(any(target_os = "android", target_os = "ios", test))]
     pub fn remote_cache_file(&self) -> PathBuf {
         self.data_dir.join("remote_cache.json")
     }
@@ -491,11 +525,13 @@ impl Paths {
     }
 
     /// Mobile-side encrypted Nexus API key file (AES-256-GCM via secret_store).
+    #[cfg(any(target_os = "android", target_os = "ios", test))]
     pub fn mobile_nexus_key_file(&self) -> PathBuf {
         self.config_dir.join("mobile_nexus_api_key.enc")
     }
 
     /// Mobile-side encrypted mod.io API key file (AES-256-GCM via secret_store).
+    #[cfg(any(target_os = "android", target_os = "ios", test))]
     pub fn mobile_modio_key_file(&self) -> PathBuf {
         self.config_dir.join("mobile_modio_api_key.enc")
     }
@@ -835,5 +871,32 @@ plugin_id = "ue"
             reloaded.managed_games[0].custom_raw_command.as_deref(),
             Some("PROTON_LOG=1 %command% -dx12")
         );
+    }
+
+    #[test]
+    fn background_settings_defaults_and_roundtrip() {
+        let cfg: AppConfig = toml::from_str("").unwrap();
+        assert_eq!(
+            cfg.background,
+            BackgroundSettings {
+                run_in_background: false,
+                close_to_tray: true,
+                minimize_to_tray: false,
+                start_on_login: false,
+                start_minimized: false,
+            }
+        );
+
+        let mut custom = cfg;
+        custom.background = BackgroundSettings {
+            run_in_background: true,
+            close_to_tray: true,
+            minimize_to_tray: true,
+            start_on_login: true,
+            start_minimized: true,
+        };
+        let serialized = toml::to_string_pretty(&custom).unwrap();
+        let reloaded: AppConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(reloaded.background, custom.background);
     }
 }

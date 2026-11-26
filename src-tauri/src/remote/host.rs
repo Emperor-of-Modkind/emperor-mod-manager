@@ -129,12 +129,12 @@ impl RemoteHostService {
                 map.retain(|_, t| now.duration_since(*t) < Duration::from_secs(60));
             }
         }
-        let _ = self.events_tx.send(RemoteEvent::DownloadProgress { item });
+        self.emit_event(RemoteEvent::DownloadProgress { item });
     }
 
     pub fn notify_state_invalidated(&self) {
         let rev = self.bump_rev();
-        let _ = self.events_tx.send(RemoteEvent::SnapshotInvalidated { rev });
+        self.emit_event(RemoteEvent::SnapshotInvalidated { rev });
     }
 
     pub fn set_desktop_banners(&self, banners: Vec<RemoteBanner>) {
@@ -145,9 +145,7 @@ impl RemoteHostService {
             *guard = banners.clone();
         }
         let rev = self.bump_rev();
-        let _ = self
-            .events_tx
-            .send(RemoteEvent::BannersChanged { rev, banners });
+        self.emit_event(RemoteEvent::BannersChanged { rev, banners });
     }
 
     pub fn desktop_banners(&self) -> Vec<RemoteBanner> {
@@ -165,9 +163,7 @@ impl RemoteHostService {
             return;
         };
         let rev = self.bump_rev();
-        let _ = self
-            .events_tx
-            .send(RemoteEvent::BannersChanged { rev, banners: next });
+        self.emit_event(RemoteEvent::BannersChanged { rev, banners: next });
     }
 
     pub fn start_pairing(&self) -> Result<MobilePairingSession> {
@@ -226,7 +222,7 @@ impl RemoteHostService {
             .map_err(|e| anyhow!("{e}"))?
             .revoke_device(peer_id)?;
         if removed {
-            let _ = self.events_tx.send(RemoteEvent::Revoked);
+            self.emit_event(RemoteEvent::Revoked);
         }
         Ok(removed)
     }
@@ -400,9 +396,19 @@ impl RemoteHostService {
                                 if let Some(b) = backend.as_ref() {
                                     b.on_paired(&device);
                                 }
+                                let allow_relay = backend
+                                    .as_ref()
+                                    .map(|b| b.allow_relay())
+                                    .unwrap_or(true);
+                                let mut desktop_addr = ep.addr();
+                                if !allow_relay {
+                                    desktop_addr
+                                        .addrs
+                                        .retain(|a| !matches!(a, TransportAddr::Relay(_)));
+                                }
                                 RemoteResponse::PairAccepted {
                                     desktop_name: local_host_name(),
-                                    desktop_addr: ep.addr(),
+                                    desktop_addr,
                                     allow_remote_launch: device.allow_remote_launch,
                                 }
                             }
@@ -565,9 +571,7 @@ impl RemoteHostService {
                                     self.current_rev()
                                 } else {
                                     let next = self.bump_rev();
-                                    let _ = self
-                                        .events_tx
-                                        .send(RemoteEvent::SnapshotInvalidated { rev: next });
+                                    self.emit_event(RemoteEvent::SnapshotInvalidated { rev: next });
                                     next
                                 };
                                 RemoteResponse::Ok { data, rev }

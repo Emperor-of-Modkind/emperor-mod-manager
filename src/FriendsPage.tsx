@@ -359,6 +359,7 @@ export function FriendsPage({
     InstalledCollection[]
   >([]);
   const [syncing, setSyncing] = useState(false);
+  const [syncRefreshTick, setSyncRefreshTick] = useState(0);
   const [installing, setInstalling] = useState(false);
   const [saving, setSaving] = useState(false);
 
@@ -706,7 +707,7 @@ export function FriendsPage({
     return () => {
       cancelled = true;
     };
-  }, [selectedFriend, managedGroupIdsKey, state]);
+  }, [selectedFriend, managedGroupIdsKey, state, syncRefreshTick]);
 
   useEffect(() => {
     if (!selectedCol || !selectedCol.share_code) {
@@ -761,7 +762,7 @@ export function FriendsPage({
     return () => {
       cancelled = true;
     };
-  }, [targetGameId, state]);
+  }, [targetGameId, state, syncRefreshTick]);
 
   const linkedInstalled: InstalledCollection | null = useMemo(() => {
     if (!selectedFriend || !selectedCol) return null;
@@ -905,6 +906,7 @@ export function FriendsPage({
       const next = await api.refreshFriends();
       setState(next);
       await onFriendsRefreshed?.();
+      setSyncRefreshTick((t) => t + 1);
     } catch (err) {
       onError(String(err));
     } finally {

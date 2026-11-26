@@ -67,6 +67,20 @@ pub async fn fetch_latest_release(repo: &str) -> Result<Option<GhRelease>> {
     Ok(Some(resp.json().await?))
 }
 
+#[cfg_attr(any(target_os = "android", target_os = "ios"), allow(dead_code))]
+pub async fn fetch_releases(repo: &str, per_page: u8) -> Result<Vec<GhRelease>> {
+    let url = format!(
+        "https://api.github.com/repos/{repo}/releases?per_page={}",
+        per_page.clamp(1, 100)
+    );
+    let client = api_client()?;
+    let resp = client.get(&url).send().await?;
+    if !resp.status().is_success() {
+        return Err(anyhow!("GitHub API error {} for {url}", resp.status()));
+    }
+    Ok(resp.json().await?)
+}
+
 async fn fetch_all_releases(repo: &str) -> Result<Option<GhRelease>> {
     let url = format!("https://api.github.com/repos/{repo}/releases");
     let client = api_client()?;

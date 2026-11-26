@@ -1,6 +1,6 @@
 [package]
 name = "emperor-mod-manager"
-version = "0.9.4"
+version = "0.9.5"
 description = "Mod manager for Linux and Windows"
 authors = ["emperor-mod-manager contributors"]
 edition = "2021"
@@ -45,6 +45,7 @@ iroh = "1.5"
 modio = "0.14.2"
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-dialog = "2"
 wreq = "0.16"
 wreq-util = "0.2"

@@ -181,11 +181,33 @@ export type AutoHdrVkConfig = {
   profiles: AutoHdrVkProfile[];
 };
 
+export type PluginToolStatus = {
+  id: string;
+  name: string;
+  description: string;
+  homepage_url?: string | null;
+  installed: boolean;
+  installed_version?: string | null;
+  latest_version?: string | null;
+  update_available: boolean;
+  status_detail?: string | null;
+  notes?: string[];
+  can_uninstall?: boolean;
+};
+
+export type PluginToolActionResult = {
+  tool: PluginToolStatus;
+  message: string;
+  warnings?: string[];
+};
+
 export type GameToolsResponse = {
+  platform_linux?: boolean;
   overrides: GameToolOverrides;
   executables: string[];
   steam_app_id: string | null;
   launch_options: string | null;
+  plugin_tools?: PluginToolStatus[];
 };
 
 export type GameHealthStatus = "ok" | "missing" | "relocate_candidate";
@@ -803,6 +825,7 @@ export type GamePluginInfo = {
   id: string;
   display_name: string;
   nexus_domain: string;
+  has_tools?: boolean;
 };
 
 export type WineDllNeed = {
@@ -1323,6 +1346,7 @@ export type DownloadItem = {
   bytes_total: number | null;
   speed_bps: number;
   batch_id: string | null;
+  batch_label?: string | null;
   can_restart?: boolean;
   file_name?: string | null;
   page?: DownloadPageTarget | null;
@@ -1345,11 +1369,21 @@ export type PersistedBanner = {
   created_at: number;
 };
 
+export type BackgroundSettings = {
+  run_in_background: boolean;
+  close_to_tray: boolean;
+  minimize_to_tray: boolean;
+  start_on_login: boolean;
+  start_minimized: boolean;
+};
+
 export type Settings = {
   adult_content: boolean;
   game_version_warnings: boolean;
   auto_sort_before_deploy?: boolean;
   global_launch_options?: GlobalLaunchOptions;
+  background?: BackgroundSettings;
+  tray_available?: boolean;
   autoclick_free_download: boolean;
   last_active_game_id: string | null;
   theme?: ThemePreference;

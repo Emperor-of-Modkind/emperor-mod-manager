@@ -6,7 +6,13 @@ import { PairMobileModal } from "./PairMobileModal";
 import { api } from "./api";
 import type { PairedDevice } from "./types";
 
-export function MobileDevicesSettings() {
+export type MobileDevicesSettingsProps = {
+  runInBackground?: boolean;
+};
+
+export function MobileDevicesSettings({
+  runInBackground = false,
+}: MobileDevicesSettingsProps = {}) {
   const [devices, setDevices] = useState<PairedDevice[]>([]);
   const [allowRelay, setAllowRelay] = useState<boolean>(true);
   const [showPairModal, setShowPairModal] = useState<boolean>(false);
@@ -85,6 +91,14 @@ export function MobileDevicesSettings() {
           Allow remote control outside local network (via iroh relay)
         </SettingsToggle>
       </div>
+
+      {devices.length > 0 && !runInBackground && (
+        <p className="note">
+          Tip: Enable <strong>Run in background</strong> under{" "}
+          <strong>Background &amp; tray</strong> so your mobile companion can still
+          reach this PC after you close the window.
+        </p>
+      )}
 
       {devices.length === 0 ? (
         <p className="muted">No mobile devices paired yet.</p>
