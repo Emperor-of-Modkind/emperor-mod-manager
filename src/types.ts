@@ -93,6 +93,7 @@ export type ManagedGame = {
   custom_raw_command?: string | null;
   use_global_launch_options?: boolean;
   wine_overrides_dismissed?: boolean;
+  dismissed_tool_recommendations?: string[];
 };
 
 export type IgnoredRequirement = {
@@ -199,6 +200,12 @@ export type PluginToolActionResult = {
   tool: PluginToolStatus;
   message: string;
   warnings?: string[];
+};
+
+export type PluginToolRecommendation = {
+  tool_id: string;
+  tool_name: string;
+  reason: string;
 };
 
 export type GameToolsResponse = {
@@ -872,6 +879,8 @@ export type StagedMod = {
   supported_game_versions?: string[] | null;
   /** 0 means the dotted-only tag cache still needs a refresh. */
   version_support_generation?: number;
+  /** Optional plugin tool id when installed via the game's Tools modal. */
+  plugin_tool_id?: string | null;
 };
 
 export type ImportResult = {

@@ -1,15 +1,26 @@
 import type { StagedMod } from "./types";
 
-/** Next or previous row with the same enabled state. Other rows are skipped. */
-export function sameEnabledNeighborIndex(
+export type StagedModGroup = "tools" | "enabled" | "disabled";
+
+/** Section group for a staged mod in the Library staged mods accordion. */
+export function stagedModGroup(
+  mod: Pick<StagedMod, "enabled" | "plugin_tool_id">,
+): StagedModGroup {
+  if (!mod.enabled) return "disabled";
+  return mod.plugin_tool_id ? "tools" : "enabled";
+}
+
+/** Next or previous row in the same accordion group. Other rows are skipped. */
+export function sameGroupNeighborIndex(
   list: StagedMod[],
   index: number,
   dir: -1 | 1,
 ): number {
-  const enabled = list[index]?.enabled;
-  if (enabled === undefined) return -1;
+  const row = list[index];
+  if (!row) return -1;
+  const group = stagedModGroup(row);
   let j = index + dir;
-  while (j >= 0 && j < list.length && list[j].enabled !== enabled) {
+  while (j >= 0 && j < list.length && stagedModGroup(list[j]) !== group) {
     j += dir;
   }
   return j >= 0 && j < list.length ? j : -1;
@@ -21,7 +32,7 @@ export function stagedModsInLoadOrder(mods: StagedMod[]): StagedMod[] {
 }
 
 /**
- * Move one mod one step within its enabled or disabled group.
+ * Move one mod one step within its accordion group (tools, enabled, or disabled).
  * The neighbor is chosen from `order`, then every row is numbered `1..n`.
  * Returns null when the mod is missing or already at the end of its group.
  */
@@ -33,15 +44,15 @@ export function reorderStagedMods(
   const sorted = stagedModsInLoadOrder(mods);
   const i = sorted.findIndex((m) => m.id === modId);
   if (i < 0) return null;
-  const j = sameEnabledNeighborIndex(sorted, i, dir);
+  const j = sameGroupNeighborIndex(sorted, i, dir);
   if (j < 0) return null;
   [sorted[i], sorted[j]] = [sorted[j], sorted[i]];
   return sorted.map((m, index) => ({ ...m, order: index + 1 }));
 }
 
 /**
- * Move one mod to a new index within its enabled or disabled group.
- * Opposite-enabled rows keep their absolute slots; same-enabled slots
+ * Move one mod to a new index within its accordion group (tools, enabled, or disabled).
+ * Rows in other groups keep their absolute slots; same-group slots
  * consume the reordered subsequence. Equivalent to repeated one-step swaps.
  * Returns null when the mod is missing or the group index is unchanged.
  */
@@ -53,8 +64,8 @@ export function reorderStagedModToGroupIndex(
   const sorted = stagedModsInLoadOrder(mods);
   const fromAbs = sorted.findIndex((m) => m.id === modId);
   if (fromAbs < 0) return null;
-  const enabled = sorted[fromAbs].enabled;
-  const group = sorted.filter((m) => m.enabled === enabled);
+  const groupKey = stagedModGroup(sorted[fromAbs]);
+  const group = sorted.filter((m) => stagedModGroup(m) === groupKey);
   const fromGroup = group.findIndex((m) => m.id === modId);
   if (fromGroup < 0) return null;
   const clamped = Math.max(0, Math.min(group.length - 1, targetGroupIndex));
@@ -66,7 +77,7 @@ export function reorderStagedModToGroupIndex(
 
   let gi = 0;
   const next = sorted.map((m) =>
-    m.enabled === enabled ? nextGroup[gi++] : m,
+    stagedModGroup(m) === groupKey ? nextGroup[gi++] : m,
   );
   return next.map((m, index) => ({ ...m, order: index + 1 }));
 }

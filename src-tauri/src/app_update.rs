@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use std::process::Command;
+use std::sync::OnceLock;
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
@@ -285,15 +286,28 @@ fn asset_file_name(name: &str) -> String {
         .unwrap_or_else(|| "update-asset".into())
 }
 
+async fn cached_install_channel() -> Option<UpdateChannel> {
+    static CHANNEL: OnceLock<Option<UpdateChannel>> = OnceLock::new();
+    if let Some(cached) = CHANNEL.get() {
+        return *cached;
+    }
+    let probed = tokio::task::spawn_blocking(current_install_channel)
+        .await
+        .unwrap_or_else(|_| current_install_channel());
+    *CHANNEL.get_or_init(|| probed)
+}
+
 #[tauri::command]
 pub async fn check_app_update() -> Result<AppUpdateStatus, String> {
-    let release = github_release::fetch_latest_release(APP_REPO)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(status_from_release(
-        release.as_ref(),
-        current_install_channel(),
-    ))
+    let (release_res, channel) = tokio::join!(
+        github_release::fetch_latest_release(APP_REPO),
+        cached_install_channel()
+    );
+    let release = release_res.map_err(|e| {
+        log::warn!("App update check failed: {e}");
+        e.to_string()
+    })?;
+    Ok(status_from_release(release.as_ref(), channel))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -305,7 +319,7 @@ pub struct AppInstallResult {
 
 #[tauri::command]
 pub async fn install_app_update(app: AppHandle) -> Result<AppInstallResult, String> {
-    let via = current_install_channel().ok_or_else(|| {
+    let via = cached_install_channel().await.ok_or_else(|| {
         "This install cannot be updated from inside the app. It is not an AppImage, a pacman or apt package, an Android APK, or a user-writable copy.".to_string()
     })?;
 

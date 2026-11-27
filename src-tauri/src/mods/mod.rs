@@ -109,6 +109,10 @@ pub struct StagedMod {
     /// `0` is the old dotted-only tag cache and is fetched again.
     #[serde(default)]
     pub version_support_generation: u32,
+    /// Optional plugin tool id (e.g. `"pz3d"`, `"zombiebuddy"`) when this mod
+    /// was installed via the game's Tools modal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_tool_id: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -145,6 +149,7 @@ impl Default for StagedMod {
             picture_url: None,
             supported_game_versions: None,
             version_support_generation: 0,
+            plugin_tool_id: None,
         }
     }
 }
@@ -2214,6 +2219,98 @@ pub fn stage_overlay_dir(
     committed
 }
 
+pub fn plugin_tool_mod_id(tool_id: &str) -> String {
+    format!("tool:{tool_id}")
+}
+
+pub fn find_plugin_tool_mod(paths: &Paths, game_id: &str, tool_id: &str) -> Option<StagedMod> {
+    let target_id = plugin_tool_mod_id(tool_id);
+    let order = load_loadorder(paths, game_id).ok()?;
+    order.mods.into_iter().find(|m| {
+        m.plugin_tool_id.as_deref() == Some(tool_id) || m.id == target_id
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn stage_plugin_tool_mod(
+    paths: &Paths,
+    game_id: &str,
+    tool_id: &str,
+    name: &str,
+    domain: &str,
+    version: Option<String>,
+    source_dir: &Path,
+    depends_on: &[String],
+) -> Result<StagedMod> {
+    crate::config::ensure_game_dirs(paths, game_id)?;
+    let id = plugin_tool_mod_id(tool_id);
+    let safe = sanitize_filename::sanitize(name);
+    let safe_tool = sanitize_filename::sanitize(tool_id);
+    let staging = paths.mods_dir(game_id).join(format!("{safe}_tool_{safe_tool}"));
+    let temp = temp_extract_dir(&staging);
+    if let Err(e) = copy_dir_all(source_dir, &temp) {
+        let _ = fs::remove_dir_all(&temp);
+        return Err(e);
+    }
+    let committed = mutate_load_order(paths, game_id, |order| {
+        let old_fomod_module = order
+            .mods
+            .iter()
+            .find(|m| m.id == id || m.plugin_tool_id.as_deref() == Some(tool_id))
+            .and_then(|old| {
+                fomod::load_module_in_staging(Path::new(&old.staging_path))
+                    .ok()
+                    .flatten()
+            });
+        swap_extracted_dir(&temp, &staging)?;
+        let removed = take_rows(order, |m| {
+            m.id == id || m.plugin_tool_id.as_deref() == Some(tool_id)
+        });
+        let provenance = provenance_from_removed(
+            removed.first().cloned(),
+            old_fomod_module.as_ref(),
+            &staging,
+            false,
+        );
+        let next_order = provenance
+            .order
+            .unwrap_or_else(|| order.mods.iter().map(|m| m.order).max().unwrap_or(0) + 1);
+        let mut merged_depends = provenance.depends_on;
+        for dep in depends_on {
+            if !merged_depends.iter().any(|existing| existing == dep) {
+                merged_depends.push(dep.clone());
+            }
+        }
+        let staged = StagedMod {
+            id: id.clone(),
+            name: name.to_string(),
+            source: ModSource::Nexus,
+            nexus_mod_id: 0,
+            nexus_file_id: 0,
+            version: version.clone(),
+            domain: domain.to_string(),
+            staging_path: staging.to_string_lossy().to_string(),
+            enabled: provenance.enabled,
+            order: next_order,
+            collection_ids: provenance.collection_ids,
+            independent: provenance.independent,
+            depends_on: merged_depends,
+            staged_file_count: Some(count_staged_files(&staging)),
+            option_selection: provenance.option_selection,
+            fomod_selection: provenance.fomod_selection,
+            fomod_pending: provenance.fomod_pending,
+            picture_url: resolve_picture_url(None, &removed),
+            plugin_tool_id: Some(tool_id.to_string()),
+            ..Default::default()
+        };
+        finish_replacement(paths, game_id, order, &removed, staged)
+    });
+    if committed.is_err() {
+        let _ = fs::remove_dir_all(&temp);
+    }
+    committed
+}
+
 /// Mod payloads that are single files rather than archives (e.g. Sims `.package`
 /// downloads). These are copied into staging as-is.
 pub const LOOSE_MOD_EXTENSIONS: &[&str] = &["package", "ts4script", "dbc", "sims3pack"];
@@ -2679,6 +2776,7 @@ fn stage_filled_mod(
                     (old.nexus_mod_id == mod_id).then_some(old.version_support_generation)
                 })
                 .unwrap_or(0),
+            plugin_tool_id: None,
         };
         finish_replacement(paths, game_id, order, &removed, staged)
     });
@@ -3239,6 +3337,7 @@ pub fn stage_thunderstore_mod_with_mode(
             picture_url: resolve_picture_url(picture_url, &removed),
             supported_game_versions: None,
             version_support_generation: 0,
+            plugin_tool_id: None,
         };
         finish_replacement(paths, game_id, order, &removed, staged)
     });
@@ -3388,6 +3487,7 @@ pub fn stage_modio_mod_with_mode(
             picture_url: resolve_picture_url(picture_url, &removed),
             supported_game_versions: None,
             version_support_generation: 0,
+            plugin_tool_id: None,
         };
         finish_replacement(paths, game_id, order, &removed, staged)
     });
@@ -3694,6 +3794,14 @@ pub fn set_friend_collection_auto_sync(
 }
 
 pub fn remove_mod(paths: &Paths, game_id: &str, mod_uid: &str) -> Result<()> {
+    remove_mod_returning(paths, game_id, mod_uid).map(|_| ())
+}
+
+pub fn remove_mod_returning(
+    paths: &Paths,
+    game_id: &str,
+    mod_uid: &str,
+) -> Result<Option<StagedMod>> {
     with_game_order(game_id, || {
         let mut order = read_loadorder(paths, game_id)?;
         collapse_load_order(paths, game_id, &mut order)?;
@@ -3707,8 +3815,9 @@ pub fn remove_mod(paths: &Paths, game_id: &str, mod_uid: &str) -> Result<()> {
                 }
                 Ok(())
             })?;
+            return Ok(Some(m));
         }
-        Ok(())
+        Ok(None)
     })
 }
 

@@ -235,6 +235,7 @@ mod tests {
             custom_raw_command: None,
             use_global_launch_options: true,
             wine_overrides_dismissed: false,
+            dismissed_tool_recommendations: Vec::new(),
         }
     }
 

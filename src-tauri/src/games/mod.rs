@@ -20,6 +20,7 @@ mod civilization;
 mod controlresonant;
 pub(crate) mod creation_engine;
 mod cyberpunk2077;
+mod darktide_tools;
 mod daysgone;
 mod decima;
 mod diablo2r;
@@ -101,9 +102,7 @@ pub use firstlight::FirstLightPlugin;
 pub use folder_mods::{
     BarotraumaPlugin, DarkestDungeonPlugin, DwarfFortressPlugin, VintageStoryPlugin,
 };
-pub use fromsoft_loaders::{
-    install_legacy_from_archive, me3_game_name, resolve_me3_installation,
-};
+pub use fromsoft_loaders::{me3_game_name, resolve_me3_installation};
 pub use fromsoftware::{
     resolve_game_root as fromsoft_resolve_game_root, ArmoredCore6Plugin, DarkSouls2Plugin,
     DarkSouls3Plugin, DarkSoulsPlugin, DarkSoulsRemasteredPlugin, EldenRingNightreignPlugin,
@@ -185,37 +184,6 @@ pub use xray_engine::{
     StalkerAnomalyPlugin, StalkerCallOfPripyatPlugin, StalkerShadowOfChernobylPlugin,
 };
 
-/// What `deploy_mods` knows about the install while a plugin prepares it.
-pub struct RuntimePrep<'a> {
-    pub paths: &'a Paths,
-    pub install_path: &'a Path,
-    pub nexus: Option<&'a NexusClient>,
-    pub premium: bool,
-    /// Normalized content roots of enabled staged mods.
-    pub content_roots: &'a [&'a Path],
-}
-
-/// Nexus download the command should open in Download Assist, then poll.
-#[derive(Debug, Clone)]
-pub struct LoaderAssistRequest {
-    pub domain: String,
-    pub mod_id: u64,
-    pub file_id: u64,
-    pub plugin_id: String,
-    pub install_path: PathBuf,
-    pub label: String,
-}
-
-/// Result of [`GamePlugin::prepare_runtime`].
-#[derive(Debug)]
-pub enum RuntimePrepOutcome {
-    Done(Vec<String>),
-    NeedsAssist {
-        warnings: Vec<String>,
-        request: LoaderAssistRequest,
-    },
-}
-
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct GamePluginInfo {
     pub id: &'static str,
@@ -263,6 +231,41 @@ pub struct PluginToolActionResult {
     pub message: String,
     #[serde(default)]
     pub warnings: Vec<String>,
+}
+
+/// Recommendation to install an optional plugin tool when enabled mods need it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginToolRecommendation {
+    pub tool_id: String,
+    pub tool_name: String,
+    pub reason: String,
+}
+
+/// Context passed when installing a plugin tool from the Tools modal.
+pub struct PluginToolInstallContext<'a> {
+    pub paths: &'a Paths,
+    pub game_id: &'a str,
+    pub install_path: &'a Path,
+    pub nexus: Option<&'a NexusClient>,
+    pub premium: bool,
+}
+
+/// Download Assist request returned when a free Nexus account installs a Nexus-backed plugin tool.
+#[derive(Debug, Clone)]
+pub struct ToolAssistRequest {
+    pub domain: String,
+    pub mod_id: u64,
+    pub file_id: u64,
+    pub plugin_id: String,
+    pub tool_id: String,
+    pub install_path: PathBuf,
+    pub label: String,
+}
+
+/// Outcome of [`GamePlugin::install_plugin_tool_ctx`].
+pub enum PluginToolInstallOutcome {
+    Done(PluginToolActionResult),
+    NeedsAssist { request: ToolAssistRequest },
 }
 
 pub trait GamePlugin: Send + Sync {
@@ -378,39 +381,6 @@ pub trait GamePlugin: Send + Sync {
         None
     }
 
-    /// Download or cache anything the game needs before files are linked.
-    /// The default installs BepInEx when [`Self::bepinex_loader`] returns a build.
-    fn prepare_runtime<'a>(
-        &'a self,
-        ctx: &'a RuntimePrep<'_>,
-    ) -> Pin<Box<dyn Future<Output = Result<RuntimePrepOutcome>> + Send + 'a>> {
-        let build = self.bepinex_loader(ctx.install_path);
-        let install = unity_bepinex::should_auto_install_bepinex(
-            ctx.install_path,
-            ctx.content_roots,
-            build,
-            |root| self.allows_empty_deploy(root),
-        );
-        Box::pin(async move {
-            let Some(build) = build.filter(|_| install) else {
-                return Ok(RuntimePrepOutcome::Done(Vec::new()));
-            };
-            let warnings =
-                bepinex_install::ensure_bepinex(ctx.paths, ctx.install_path, build).await;
-            Ok(RuntimePrepOutcome::Done(warnings))
-        })
-    }
-
-    /// Copy a loader into the game after Download Assist finishes.
-    fn finish_runtime_prep(&self, _ctx: &RuntimePrep<'_>) -> Result<Vec<String>> {
-        Ok(Vec::new())
-    }
-
-    /// Whether the Assist download requested by `prepare_runtime` is on disk.
-    fn loader_assist_ready(&self, _ctx: &RuntimePrep<'_>) -> bool {
-        false
-    }
-
     /// Place staged files that must not be linked into the game (save overwrites).
     fn deploy_staged_extra(
         &self,
@@ -473,39 +443,126 @@ pub trait GamePlugin: Send + Sync {
     }
 
     /// Fast, offline status of this plugin's optional tools for `install_path`.
-    fn plugin_tools_status(&self, _paths: &Paths, _install_path: &Path) -> Vec<PluginToolStatus> {
+    fn plugin_tools_status(
+        &self,
+        paths: &Paths,
+        _game_id: &str,
+        install_path: &Path,
+    ) -> Vec<PluginToolStatus> {
+        if let Some(build) = self.bepinex_loader(install_path) {
+            return bepinex_install::tools_status(paths, install_path, build);
+        }
         Vec::new()
     }
 
     /// Check remote sources for newer versions of this plugin's optional tools.
     fn check_plugin_tool_updates<'a>(
         &'a self,
-        _paths: &'a Paths,
-        _install_path: &'a Path,
+        paths: &'a Paths,
+        _game_id: &'a str,
+        install_path: &'a Path,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<PluginToolStatus>>> + Send + 'a>> {
-        Box::pin(async { Ok(Vec::new()) })
+        let build = self.bepinex_loader(install_path);
+        Box::pin(async move {
+            if let Some(build) = build {
+                return bepinex_install::check_tool_updates(paths, install_path, build).await;
+            }
+            Ok(Vec::new())
+        })
     }
 
     /// Install or update one of this plugin's optional tools.
     fn install_plugin_tool<'a>(
         &'a self,
-        _paths: &'a Paths,
-        _install_path: &'a Path,
+        paths: &'a Paths,
+        _game_id: &'a str,
+        install_path: &'a Path,
         tool_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<PluginToolActionResult>> + Send + 'a>> {
+        let build = self.bepinex_loader(install_path);
         let id = tool_id.to_string();
-        Box::pin(async move { Err(anyhow::anyhow!("unknown plugin tool: {id}")) })
+        Box::pin(async move {
+            if let Some(build) = build {
+                return bepinex_install::install_tool(paths, install_path, build, &id).await;
+            }
+            Err(anyhow::anyhow!("unknown plugin tool: {id}"))
+        })
+    }
+
+    /// Install or update one of this plugin's optional tools with optional Nexus / Download Assist support.
+    fn install_plugin_tool_ctx<'a>(
+        &'a self,
+        ctx: &'a PluginToolInstallContext<'_>,
+        tool_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<PluginToolInstallOutcome>> + Send + 'a>> {
+        Box::pin(async move {
+            let res = self
+                .install_plugin_tool(ctx.paths, ctx.game_id, ctx.install_path, tool_id)
+                .await?;
+            Ok(PluginToolInstallOutcome::Done(res))
+        })
+    }
+
+    /// Finish installing a Nexus-backed plugin tool from an archive captured by Download Assist.
+    fn install_plugin_tool_from_archive(
+        &self,
+        _paths: &Paths,
+        _install_path: &Path,
+        tool_id: &str,
+        _archive: &Path,
+    ) -> Result<PluginToolActionResult> {
+        Err(anyhow::anyhow!(
+            "plugin tool does not support archive install: {tool_id}"
+        ))
+    }
+
+    /// Whether a Download Assist tool install has completed on disk.
+    fn tool_assist_ready(&self, _paths: &Paths, _install_path: &Path, _tool_id: &str) -> bool {
+        false
     }
 
     /// Uninstall one of this plugin's optional tools.
     fn uninstall_plugin_tool<'a>(
         &'a self,
-        _paths: &'a Paths,
-        _install_path: &'a Path,
+        paths: &'a Paths,
+        _game_id: &'a str,
+        install_path: &'a Path,
         tool_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<PluginToolActionResult>> + Send + 'a>> {
+        let build = self.bepinex_loader(install_path);
         let id = tool_id.to_string();
-        Box::pin(async move { Err(anyhow::anyhow!("unknown plugin tool: {id}")) })
+        Box::pin(async move {
+            if let Some(build) = build {
+                return bepinex_install::uninstall_tool(paths, install_path, build, &id);
+            }
+            Err(anyhow::anyhow!("unknown plugin tool: {id}"))
+        })
+    }
+
+    /// Recommend missing plugin tools needed by the currently enabled staged mods.
+    fn recommended_plugin_tools(
+        &self,
+        _paths: &Paths,
+        install_path: &Path,
+        content_roots: &[&Path],
+    ) -> Vec<PluginToolRecommendation> {
+        if let Some(build) = self.bepinex_loader(install_path) {
+            return bepinex_install::recommended_tools(install_path, content_roots, build, |root| {
+                self.allows_empty_deploy(root)
+            });
+        }
+        Vec::new()
+    }
+
+    /// Adopt any pre-existing unmanaged plugin tool installs into Emperor's staging
+    /// directory so they appear as normal staged mods. Returns true if anything changed.
+    fn adopt_legacy_plugin_tools(
+        &self,
+        _paths: &Paths,
+        _game_id: &str,
+        _install_path: &Path,
+    ) -> Result<bool> {
+        Ok(false)
     }
 }
 

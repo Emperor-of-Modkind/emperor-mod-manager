@@ -286,6 +286,8 @@ pub fn run() {
             commands::set_game_version,
             commands::set_ignored_requirements,
             commands::set_wine_overrides_dismissed,
+            commands::set_tool_recommendations_dismissed,
+            commands::get_game_tool_recommendations,
             commands::detect_ue_layout,
             commands::suggest_catalog_ids,
             commands::suggest_catalog_ids_batch,

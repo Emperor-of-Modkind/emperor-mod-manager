@@ -7381,6 +7381,7 @@ mod tests {
             custom_raw_command: None,
             use_global_launch_options: true,
             wine_overrides_dismissed: false,
+            dismissed_tool_recommendations: Vec::new(),
         };
         let mut cfg = crate::config::AppConfig::default();
         cfg.managed_games.push(game.clone());
@@ -7495,6 +7496,7 @@ mod tests {
             custom_raw_command: None,
             use_global_launch_options: true,
             wine_overrides_dismissed: false,
+            dismissed_tool_recommendations: Vec::new(),
         };
         let mut cfg = crate::config::AppConfig::default();
         cfg.managed_games.push(game.clone());

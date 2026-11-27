@@ -169,6 +169,7 @@ vi.mock("@tauri-apps/api/core", () => {
       case "list_mods_with_config_files":
       case "list_mods_needing_fomod":
       case "check_staged_mod_updates":
+      case "get_game_tool_recommendations":
         return Promise.resolve([]);
       case "scan_mod_orphans":
         return Promise.resolve({

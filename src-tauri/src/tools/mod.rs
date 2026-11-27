@@ -367,7 +367,9 @@ pub fn get_game_tools(
     let launch_options = None;
     let plugin_tools = games::plugin_by_id(&game.plugin_id)
         .map(|plugin| {
-            plugin.plugin_tools_status(&state.paths, std::path::Path::new(&game.install_path))
+            let install = std::path::Path::new(&game.install_path);
+            let _ = plugin.adopt_legacy_plugin_tools(&state.paths, &game_id, install);
+            plugin.plugin_tools_status(&state.paths, &game_id, install)
         })
         .unwrap_or_default();
     Ok(GameToolsResponse {
@@ -457,22 +459,77 @@ pub async fn check_game_plugin_tool_updates(
 ) -> Result<Vec<PluginToolStatus>, String> {
     let (plugin, install_path) = managed_game_plugin_and_install(&state, &game_id)?;
     plugin
-        .check_plugin_tool_updates(&state.paths, &install_path)
+        .check_plugin_tool_updates(&state.paths, &game_id, &install_path)
         .await
         .map_err(|e| format!("{e:#}"))
 }
 
 #[tauri::command]
 pub async fn install_game_plugin_tool(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     game_id: String,
     tool_id: String,
 ) -> Result<PluginToolActionResult, String> {
     let (plugin, install_path) = managed_game_plugin_and_install(&state, &game_id)?;
-    plugin
-        .install_plugin_tool(&state.paths, &install_path, &tool_id)
+    let nexus = state.client().ok();
+    let premium = state.ensure_premium_status().await;
+    let ctx = games::PluginToolInstallContext {
+        paths: &state.paths,
+        game_id: &game_id,
+        install_path: &install_path,
+        nexus: nexus.as_ref(),
+        premium,
+    };
+    match plugin
+        .install_plugin_tool_ctx(&ctx, &tool_id)
         .await
-        .map_err(|e| format!("{e:#}"))
+        .map_err(|e| format!("{e:#}"))?
+    {
+        games::PluginToolInstallOutcome::Done(result) => Ok(result),
+        games::PluginToolInstallOutcome::NeedsAssist { request } => {
+            crate::assist::open_download_assist_inner(
+                &app,
+                &state,
+                game_id.clone(),
+                request.domain.clone(),
+                request.mod_id,
+                request.file_id,
+                request.label.clone(),
+                None,
+                None,
+                None,
+                None,
+                crate::assist::AssistPurpose::PluginTool {
+                    plugin_id: request.plugin_id.clone(),
+                    tool_id: request.tool_id.clone(),
+                    install_path: request.install_path.display().to_string(),
+                },
+            )
+            .await?;
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+            while std::time::Instant::now() < deadline {
+                if plugin.tool_assist_ready(&state.paths, &install_path, &tool_id) {
+                    let tool = plugin
+                        .plugin_tools_status(&state.paths, &game_id, &install_path)
+                        .into_iter()
+                        .find(|t| t.id == tool_id)
+                        .ok_or_else(|| format!("plugin tool status not found: {tool_id}"))?;
+                    return Ok(PluginToolActionResult {
+                        message: format!("Installed {} via Download Assist.", tool.name),
+                        tool,
+                        warnings: Vec::new(),
+                    });
+                }
+                if crate::assist::peek_assist_context(&state).is_none() {
+                    return Err("Download Assist was closed before the tool download finished.".into());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            Err("Timed out waiting for Download Assist to finish installing the tool.".into())
+        }
+    }
 }
 
 #[tauri::command]
@@ -483,7 +540,7 @@ pub async fn uninstall_game_plugin_tool(
 ) -> Result<PluginToolActionResult, String> {
     let (plugin, install_path) = managed_game_plugin_and_install(&state, &game_id)?;
     plugin
-        .uninstall_plugin_tool(&state.paths, &install_path, &tool_id)
+        .uninstall_plugin_tool(&state.paths, &game_id, &install_path, &tool_id)
         .await
         .map_err(|e| format!("{e:#}"))
 }

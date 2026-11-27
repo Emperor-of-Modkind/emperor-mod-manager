@@ -88,6 +88,7 @@ import type {
   GameToolsResponse,
   PluginToolStatus,
   PluginToolActionResult,
+  PluginToolRecommendation,
   AppInfo,
   AppUpdateStatus,
   AppInstallResult,
@@ -212,6 +213,10 @@ export const api = {
     invoke<ManagedGame>("set_ignored_requirements", { id, ignored }),
   setWineOverridesDismissed: (id: string, dismissed: boolean) =>
     invoke<ManagedGame>("set_wine_overrides_dismissed", { id, dismissed }),
+  setToolRecommendationsDismissed: (id: string, toolIds: string[]) =>
+    invoke<ManagedGame>("set_tool_recommendations_dismissed", { id, toolIds }),
+  gameToolRecommendations: (gameId: string) =>
+    invoke<PluginToolRecommendation[]>("get_game_tool_recommendations", { gameId }),
   checkModGameVersions: (gameId: string) =>
     invoke<GameVersionReport>("check_mod_game_versions", { gameId }),
   adviseCollectionVersions: (

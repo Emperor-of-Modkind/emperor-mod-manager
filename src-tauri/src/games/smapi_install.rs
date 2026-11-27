@@ -9,16 +9,47 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
+use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
 use super::stardewvalley::{looks_like_smapi_installer, smapi_present};
+use super::{PluginToolActionResult, PluginToolRecommendation, PluginToolStatus};
 use crate::config::Paths;
 use crate::github_release::{self, GhAsset, GhRelease};
 use crate::tools::install as tool_install;
 
+pub const TOOL_SMAPI: &str = "smapi";
 const SMAPI_REPO: &str = "Pathoschild/SMAPI";
+const SMAPI_HOMEPAGE: &str = "https://github.com/Pathoschild/SMAPI";
+const STATE_FILE: &str = ".emperor-smapi.json";
 #[cfg(target_os = "linux")]
 const STARDEW_STEAM_APP_ID: &str = "413150";
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct SmapiState {
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    installed_files: Vec<String>,
+}
+
+fn load_state(install_path: &Path) -> SmapiState {
+    let path = install_path.join(STATE_FILE);
+    fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_state(install_path: &Path, state: &SmapiState) -> Result<()> {
+    let path = install_path.join(STATE_FILE);
+    let body = serde_json::to_string_pretty(state)?;
+    fs::write(&path, body).with_context(|| format!("write {}", path.display()))
+}
+
+fn remove_state(install_path: &Path) {
+    let _ = fs::remove_file(install_path.join(STATE_FILE));
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SmapiPlatform {
@@ -74,25 +105,167 @@ pub fn should_auto_install_smapi(
     needs
 }
 
-/// Install the latest SMAPI. A download failure is a warning.
-pub async fn ensure_smapi(paths: &Paths, install_path: &Path) -> Vec<String> {
-    match install_smapi(paths, install_path).await {
-        Ok(messages) => messages,
-        Err(e) => vec![format!("Could not auto-install SMAPI: {e:#}")],
+fn build_status(install_path: &Path, latest_version: Option<&str>) -> PluginToolStatus {
+    let installed = smapi_present(install_path);
+    let state = load_state(install_path);
+    let installed_version = if installed { state.version.clone() } else { None };
+    let update_available = match (installed, installed_version.as_deref(), latest_version) {
+        (true, Some(cur), Some(latest)) => cur.trim() != latest.trim(),
+        _ => false,
+    };
+    let platform = smapi_platform(install_path);
+    let mut notes = Vec::new();
+    match platform {
+        SmapiPlatform::Linux => {
+            notes.push("Detected native Linux Stardew Valley install.".into());
+        }
+        SmapiPlatform::Windows => {
+            notes.push("Detected Windows / Proton Stardew Valley install.".into());
+        }
+    }
+    PluginToolStatus {
+        id: TOOL_SMAPI.into(),
+        name: "SMAPI".into(),
+        description: "Stardew Modding API — the official mod loader for Stardew Valley.".into(),
+        homepage_url: Some(SMAPI_HOMEPAGE.into()),
+        installed,
+        installed_version,
+        latest_version: latest_version.map(str::to_string),
+        update_available,
+        status_detail: if installed {
+            Some("SMAPI detected in the game folder.".into())
+        } else {
+            None
+        },
+        notes,
+        can_uninstall: installed,
     }
 }
 
-async fn install_smapi(paths: &Paths, install_path: &Path) -> Result<Vec<String>> {
+pub fn tools_status(_paths: &Paths, install_path: &Path) -> Vec<PluginToolStatus> {
+    vec![build_status(install_path, None)]
+}
+
+pub async fn check_tool_updates(
+    _paths: &Paths,
+    install_path: &Path,
+) -> Result<Vec<PluginToolStatus>> {
+    let release = github_release::fetch_latest_release(SMAPI_REPO)
+        .await?
+        .ok_or_else(|| anyhow!("SMAPI has no GitHub release"))?;
+    Ok(vec![build_status(install_path, Some(&release.tag_name))])
+}
+
+pub async fn install_tool(
+    paths: &Paths,
+    install_path: &Path,
+    tool_id: &str,
+) -> Result<PluginToolActionResult> {
+    if tool_id != TOOL_SMAPI {
+        anyhow::bail!("unknown Stardew Valley tool: {tool_id}");
+    }
     let platform = smapi_platform(install_path);
     let release = github_release::fetch_latest_release(SMAPI_REPO)
         .await?
         .ok_or_else(|| anyhow!("SMAPI has no GitHub release"))?;
     let bundle = cached_bundle(paths, &release, platform).await?;
-    let mut messages = apply_bundle(&bundle, install_path, platform)?;
+    let (mut messages, installed_files) = apply_bundle_tracked(&bundle, install_path, platform)?;
     if platform == SmapiPlatform::Windows {
         messages.extend(ensure_windows_launch(install_path));
     }
-    Ok(messages)
+    save_state(
+        install_path,
+        &SmapiState {
+            version: Some(release.tag_name.clone()),
+            installed_files,
+        },
+    )?;
+    let message = format!("Installed SMAPI {}.", release.tag_name);
+    let warnings: Vec<String> = messages
+        .into_iter()
+        .filter(|m| m != "Installed SMAPI.")
+        .collect();
+    let tool = build_status(install_path, Some(&release.tag_name));
+    Ok(PluginToolActionResult {
+        tool,
+        message,
+        warnings,
+    })
+}
+
+pub fn uninstall_tool(
+    _paths: &Paths,
+    install_path: &Path,
+    tool_id: &str,
+) -> Result<PluginToolActionResult> {
+    if tool_id != TOOL_SMAPI {
+        anyhow::bail!("unknown Stardew Valley tool: {tool_id}");
+    }
+    let state = load_state(install_path);
+    let backup = install_path.join("StardewValley-original");
+    let launcher = install_path.join("StardewValley");
+    if backup.is_file() {
+        if launcher.exists() {
+            let _ = fs::remove_file(&launcher);
+        }
+        let _ = fs::rename(&backup, &launcher);
+    }
+    if !state.installed_files.is_empty() {
+        for rel in &state.installed_files {
+            if rel.to_ascii_lowercase().starts_with("mods/") {
+                continue;
+            }
+            let target = install_path.join(rel);
+            if target.is_file() {
+                let _ = fs::remove_file(&target);
+            }
+        }
+    } else {
+        for name in [
+            "StardewModdingAPI",
+            "StardewModdingAPI.exe",
+            "StardewModdingAPI.dll",
+            "StardewModdingAPI.deps.json",
+            "StardewModdingAPI.runtimeconfig.json",
+            "StardewModdingAPI.xml",
+            "unix-launcher.sh",
+        ] {
+            let target = install_path.join(name);
+            if target.is_file() {
+                let _ = fs::remove_file(&target);
+            }
+        }
+    }
+    let deps = install_path.join("StardewModdingAPI.deps.json");
+    if deps.is_file() {
+        let _ = fs::remove_file(&deps);
+    }
+    let internal = install_path.join("smapi-internal");
+    if internal.is_dir() {
+        let _ = fs::remove_dir_all(&internal);
+    }
+    remove_state(install_path);
+    let tool = build_status(install_path, None);
+    Ok(PluginToolActionResult {
+        tool,
+        message: "Uninstalled SMAPI (preserved your Mods/ folder).".into(),
+        warnings: Vec::new(),
+    })
+}
+
+pub fn recommended_tools(
+    install_path: &Path,
+    content_roots: &[&Path],
+    allows_empty: impl Fn(&Path) -> bool,
+) -> Vec<PluginToolRecommendation> {
+    if !should_auto_install_smapi(install_path, content_roots, allows_empty) {
+        return Vec::new();
+    }
+    vec![PluginToolRecommendation {
+        tool_id: TOOL_SMAPI.into(),
+        tool_name: "SMAPI".into(),
+        reason: "Enabled Stardew Valley mods require SMAPI to load.".into(),
+    }]
 }
 
 async fn cached_bundle(
@@ -178,12 +351,22 @@ fn bundle_ready(bundle: &Path, platform: SmapiPlatform) -> bool {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn apply_bundle(
     bundle: &Path,
     install_path: &Path,
     platform: SmapiPlatform,
 ) -> Result<Vec<String>> {
-    copy_bundle(bundle, install_path)?;
+    let (messages, _) = apply_bundle_tracked(bundle, install_path, platform)?;
+    Ok(messages)
+}
+
+fn apply_bundle_tracked(
+    bundle: &Path,
+    install_path: &Path,
+    platform: SmapiPlatform,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let copied = copy_bundle(bundle, install_path)?;
     let mut messages = vec!["Installed SMAPI.".to_string()];
     if !copy_deps_json(install_path)? {
         messages.push(
@@ -195,11 +378,11 @@ fn apply_bundle(
         swap_unix_launcher(install_path)?;
         messages.push("Replaced the StardewValley launcher with SMAPI.".into());
     }
-    Ok(messages)
+    Ok((messages, copied))
 }
 
-fn copy_bundle(bundle: &Path, install_path: &Path) -> Result<()> {
-    let mut copied = 0usize;
+fn copy_bundle(bundle: &Path, install_path: &Path) -> Result<Vec<String>> {
+    let mut copied = Vec::new();
     for entry in WalkDir::new(bundle)
         .into_iter()
         .filter_map(|entry| entry.ok())
@@ -226,15 +409,15 @@ fn copy_bundle(bundle: &Path, install_path: &Path) -> Result<()> {
         }
         fs::copy(entry.path(), &dest)
             .with_context(|| format!("copy {} to {}", entry.path().display(), dest.display()))?;
-        copied += 1;
+        copied.push(rel.to_string_lossy().replace('\\', "/"));
     }
-    if copied == 0 {
+    if copied.is_empty() {
         anyhow::bail!(
             "SMAPI bundle at {} had no loader files to copy",
             bundle.display()
         );
     }
-    Ok(())
+    Ok(copied)
 }
 
 fn should_copy_bundle_file(rel: &Path) -> bool {
@@ -392,7 +575,6 @@ fn ensure_windows_launch(install_path: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::games::GamePlugin;
 
     fn write_file(path: &Path, body: &str) {
         if let Some(parent) = path.parent() {
@@ -586,37 +768,4 @@ mod tests {
         assert_eq!(picked.name, "SMAPI-4.3.2-installer.zip");
     }
 
-    #[tokio::test]
-    async fn prepare_runtime_skips_download_when_smapi_is_present() {
-        let tmp = tempfile::tempdir().unwrap();
-        let install = tmp.path().join("game");
-        fs::create_dir_all(install.join("smapi-internal")).unwrap();
-        let staged = tempfile::tempdir().unwrap();
-        write_file(&staged.path().join("manifest.json"), "{}");
-        let roots = [staged.path()];
-        let paths = Paths {
-            config_dir: tmp.path().join("config"),
-            data_dir: tmp.path().join("data"),
-            cache_dir: tmp.path().join("cache"),
-        };
-        let ctx = crate::games::RuntimePrep {
-            paths: &paths,
-            install_path: &install,
-            nexus: None,
-            premium: false,
-            content_roots: &roots,
-        };
-        let outcome = crate::games::StardewValleyPlugin
-            .prepare_runtime(&ctx)
-            .await
-            .unwrap();
-        match outcome {
-            crate::games::RuntimePrepOutcome::Done(warnings) => {
-                assert!(warnings.is_empty(), "{warnings:?}");
-            }
-            crate::games::RuntimePrepOutcome::NeedsAssist { .. } => {
-                panic!("SMAPI install does not use Download Assist");
-            }
-        }
-    }
 }

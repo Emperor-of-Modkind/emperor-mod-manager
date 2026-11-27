@@ -28,6 +28,7 @@ use super::projectzomboid::{
 use super::{PluginToolActionResult, PluginToolStatus};
 use crate::config::Paths;
 use crate::github_release::{self, GhRelease};
+use crate::mods;
 
 const TOOL_PZ3D: &str = "pz3d";
 const TOOL_ZOMBIEBUDDY: &str = "zombiebuddy";
@@ -86,21 +87,29 @@ struct ResolvedZombieBuddyAssets {
     native_dll_url: Option<String>,
 }
 
-pub(super) fn tools_status(_paths: &Paths, install_path: &Path) -> Vec<PluginToolStatus> {
-    build_tools_status(install_path, None, None)
+pub(super) fn tools_status(
+    paths: &Paths,
+    game_id: &str,
+    install_path: &Path,
+) -> Vec<PluginToolStatus> {
+    build_tools_status(paths, game_id, install_path, None, None)
 }
 
 pub(super) async fn check_tool_updates(
-    _paths: &Paths,
+    paths: &Paths,
+    game_id: &str,
     install_path: &Path,
 ) -> Result<Vec<PluginToolStatus>> {
-    let (pz3d_res, zb_res) = tokio::join!(fetch_latest_pz3d_release(), fetch_zombiebuddy_assets(false));
+    let (pz3d_res, zb_res) =
+        tokio::join!(fetch_latest_pz3d_release(), fetch_zombiebuddy_assets(false));
     let latest_pz3d = pz3d_res.ok().map(|r| r.version);
     let latest_zb = zb_res.ok().map(|a| a.version);
     if latest_pz3d.is_none() && latest_zb.is_none() {
         anyhow::bail!("Could not reach pz3d.dev or GitHub to check for updates");
     }
     Ok(build_tools_status(
+        paths,
+        game_id,
         install_path,
         latest_pz3d.as_deref(),
         latest_zb.as_deref(),
@@ -109,39 +118,202 @@ pub(super) async fn check_tool_updates(
 
 pub(super) async fn install_tool(
     paths: &Paths,
+    game_id: &str,
     install_path: &Path,
     tool_id: &str,
 ) -> Result<PluginToolActionResult> {
     match tool_id {
-        TOOL_ZOMBIEBUDDY => install_zombiebuddy(install_path).await,
-        TOOL_PZ3D => install_pz3d(paths, install_path).await,
+        TOOL_ZOMBIEBUDDY => install_zombiebuddy(paths, game_id, install_path).await,
+        TOOL_PZ3D => install_pz3d(paths, game_id, install_path).await,
         other => Err(anyhow!("unknown Project Zomboid tool: {other}")),
     }
 }
 
 pub(super) async fn uninstall_tool(
-    _paths: &Paths,
+    paths: &Paths,
+    game_id: &str,
     install_path: &Path,
     tool_id: &str,
 ) -> Result<PluginToolActionResult> {
     match tool_id {
-        TOOL_ZOMBIEBUDDY => uninstall_zombiebuddy(install_path),
-        TOOL_PZ3D => uninstall_pz3d(install_path),
+        TOOL_ZOMBIEBUDDY => uninstall_zombiebuddy(paths, game_id, install_path),
+        TOOL_PZ3D => uninstall_pz3d(paths, game_id, install_path),
         other => Err(anyhow!("unknown Project Zomboid tool: {other}")),
     }
+}
+
+pub(super) fn adopt_legacy_installs(
+    paths: &Paths,
+    game_id: &str,
+    install_path: &Path,
+) -> Result<bool> {
+    let mods = mods_dir(install_path);
+    adopt_legacy_installs_in(paths, game_id, &mods)
+}
+
+fn adopt_legacy_installs_in(paths: &Paths, game_id: &str, mods_root: &Path) -> Result<bool> {
+    let state = load_state(mods_root);
+    if state.zombiebuddy_version.is_none() && state.pz3d_version.is_none() {
+        return Ok(false);
+    }
+    let has_deploy = mods::has_active_deployment(paths, game_id);
+    let mut adopted = false;
+
+    if state.zombiebuddy_version.is_some()
+        && mods::find_plugin_tool_mod(paths, game_id, TOOL_ZOMBIEBUDDY).is_none()
+    {
+        let zb_dir = mods_root.join("ZombieBuddy");
+        if zb_dir.join("42").join("mod.info").is_file() {
+            let tmp = StageTempDir::new(paths, "adopt-zb")?;
+            let dst = tmp.path().join("mods").join("ZombieBuddy");
+            copy_dir_recursive(&zb_dir, &dst)?;
+            mods::stage_plugin_tool_mod(
+                paths,
+                game_id,
+                TOOL_ZOMBIEBUDDY,
+                "ZombieBuddy",
+                "projectzomboid",
+                state.zombiebuddy_version.clone(),
+                tmp.path(),
+                &[],
+            )?;
+            if !has_deploy {
+                let _ = std::fs::remove_dir_all(&zb_dir);
+                let _ = update_default_list_entries(mods_root, &[], &["ZombieBuddy"]);
+            }
+            adopted = true;
+        }
+    }
+
+    if state.pz3d_version.is_some()
+        && mods::find_plugin_tool_mod(paths, game_id, TOOL_PZ3D).is_none()
+    {
+        let dirs: Vec<String> = if state.pz3d_mod_dirs.is_empty() {
+            vec!["pz3d".into(), "pz3d_chainlink".into()]
+        } else {
+            state.pz3d_mod_dirs.clone()
+        };
+        if mods_root.join("pz3d").is_dir() {
+            let tmp = StageTempDir::new(paths, "adopt-pz3d")?;
+            let mut copied_any = false;
+            for dir_name in &dirs {
+                let src = mods_root.join(dir_name);
+                if src.is_dir() {
+                    let dst = tmp.path().join("mods").join(dir_name);
+                    copy_dir_recursive(&src, &dst)?;
+                    copied_any = true;
+                }
+            }
+            if copied_any {
+                mods::stage_plugin_tool_mod(
+                    paths,
+                    game_id,
+                    TOOL_PZ3D,
+                    "PZ3D",
+                    "projectzomboid",
+                    state.pz3d_version.clone(),
+                    tmp.path(),
+                    &[mods::plugin_tool_mod_id(TOOL_ZOMBIEBUDDY)],
+                )?;
+                if !has_deploy {
+                    for dir_name in &dirs {
+                        let target = mods_root.join(dir_name);
+                        if target.exists() {
+                            let _ = std::fs::remove_dir_all(&target);
+                        }
+                    }
+                    let _ = update_default_list_entries(
+                        mods_root,
+                        &[],
+                        &["pz3d", "pz3d_chainlink"],
+                    );
+                }
+                adopted = true;
+            }
+        }
+    }
+
+    Ok(adopted)
+}
+
+struct StageTempDir {
+    path: PathBuf,
+}
+
+impl StageTempDir {
+    fn new(paths: &Paths, label: &str) -> Result<Self> {
+        let root = paths.cache_dir.join("pz3d-stage-tmp");
+        std::fs::create_dir_all(&root)
+            .with_context(|| format!("create {}", root.display()))?;
+        let unique = format!(
+            "{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let path = root.join(unique);
+        std::fs::create_dir_all(&path)
+            .with_context(|| format!("create {}", path.display()))?;
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for StageTempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst).with_context(|| format!("create {}", dst.display()))?;
+    for entry in std::fs::read_dir(src).with_context(|| format!("read {}", src.display()))? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to)
+                .with_context(|| format!("copy {} to {}", from.display(), to.display()))?;
+        }
+    }
+    Ok(())
 }
 
 /// Automatically heal ZombieBuddy / PZ3D loader binaries and `ProjectZomboid64.json` /
 /// `ProjectZomboid64.bat` patches during deploy if a Steam update or file verification
 /// overwrote them.
-pub(super) fn repair_after_deploy(install_path: &Path) -> Result<Vec<String>> {
+pub(super) fn repair_after_deploy(
+    install_path: &Path,
+    enabled_mod_folders: &[String],
+) -> Result<Vec<String>> {
     let mods = mods_dir(install_path);
-    repair_after_deploy_in(install_path, &mods)
+    repair_after_deploy_in(install_path, &mods, enabled_mod_folders)
 }
 
-fn repair_after_deploy_in(install_path: &Path, mods: &Path) -> Result<Vec<String>> {
+fn repair_after_deploy_in(
+    install_path: &Path,
+    mods: &Path,
+    enabled_mod_folders: &[String],
+) -> Result<Vec<String>> {
     let state = load_state(mods);
     if state.zombiebuddy_version.is_none() && state.pz3d_version.is_none() {
+        return Ok(Vec::new());
+    }
+
+    let zb_enabled = enabled_mod_folders
+        .iter()
+        .any(|id| id.eq_ignore_ascii_case("ZombieBuddy"));
+    let pz3d_enabled = enabled_mod_folders
+        .iter()
+        .any(|id| id.eq_ignore_ascii_case("pz3d"));
+    if !zb_enabled && !pz3d_enabled {
         return Ok(Vec::new());
     }
 
@@ -158,7 +330,7 @@ fn repair_after_deploy_in(install_path: &Path, mods: &Path) -> Result<Vec<String
 
     let mut repaired = Vec::new();
     let zb_libs = mods.join("ZombieBuddy").join("libs");
-    if state.zombiebuddy_version.is_some() {
+    if state.zombiebuddy_version.is_some() && zb_enabled {
         let jar_src = zb_libs.join("ZombieBuddy.jar");
         let jar_dst = jvm_dir.join("ZombieBuddy.jar");
         if !jar_dst.is_file() && jar_src.is_file() {
@@ -176,7 +348,7 @@ fn repair_after_deploy_in(install_path: &Path, mods: &Path) -> Result<Vec<String
             }
         }
 
-        let need_6gb = state.pz3d_version.is_some();
+        let need_6gb = state.pz3d_version.is_some() && pz3d_enabled;
         let json_missing_agent = !json_has_zombiebuddy_arg(&json_path, windows);
         let json_needs_ram = need_6gb
             && read_xmx_arg(&json_path)
@@ -207,11 +379,31 @@ fn repair_after_deploy_in(install_path: &Path, mods: &Path) -> Result<Vec<String
     }
 }
 
+fn staged_has_zombiebuddy(staging_path: &Path) -> bool {
+    staging_path
+        .join("mods")
+        .join("ZombieBuddy")
+        .join("42")
+        .join("mod.info")
+        .is_file()
+        || staging_path
+            .join("ZombieBuddy")
+            .join("42")
+            .join("mod.info")
+            .is_file()
+}
+
+fn staged_has_pz3d(staging_path: &Path) -> bool {
+    staging_path.join("mods").join("pz3d").is_dir() || staging_path.join("pz3d").is_dir()
+}
+
 fn is_linux_proton_build(install_path: &Path) -> bool {
     cfg!(target_os = "linux") && is_windows_build(install_path)
 }
 
 fn build_tools_status(
+    paths: &Paths,
+    game_id: &str,
     install_path: &Path,
     latest_pz3d: Option<&str>,
     latest_zb: Option<&str>,
@@ -222,6 +414,9 @@ fn build_tools_status(
     let json_path = find_game_json(install_path, windows);
     let jvm_dir = json_path.as_ref().and_then(|p| p.parent().map(Path::to_path_buf));
 
+    let zb_staged = mods::find_plugin_tool_mod(paths, game_id, TOOL_ZOMBIEBUDDY);
+    let pz3d_staged = mods::find_plugin_tool_mod(paths, game_id, TOOL_PZ3D);
+
     let zb_files_ok = jvm_dir.as_ref().is_some_and(|dir| {
         dir.join("ZombieBuddy.jar").is_file()
             && (!windows || dir.join("zbNative.dll").is_file())
@@ -229,10 +424,16 @@ fn build_tools_status(
     let zb_arg_ok = json_path
         .as_ref()
         .is_some_and(|p| json_has_zombiebuddy_arg(p, windows));
-    let zb_mod_ok = mods.join("ZombieBuddy").join("42").join("mod.info").is_file();
+    let zb_staged_ok = zb_staged
+        .as_ref()
+        .is_some_and(|m| staged_has_zombiebuddy(Path::new(&m.staging_path)));
+    let zb_mod_ok = zb_staged_ok || mods.join("ZombieBuddy").join("42").join("mod.info").is_file();
     let zb_installed = zb_files_ok && zb_arg_ok && zb_mod_ok;
     let zb_version = if zb_installed {
-        state.zombiebuddy_version.clone()
+        zb_staged
+            .as_ref()
+            .and_then(|m| m.version.clone())
+            .or_else(|| state.zombiebuddy_version.clone())
     } else {
         None
     };
@@ -241,9 +442,15 @@ fn build_tools_status(
         _ => false,
     };
 
-    let pz3d_installed = mods.join("pz3d").is_dir() && zb_installed;
+    let pz3d_staged_ok = pz3d_staged
+        .as_ref()
+        .is_some_and(|m| staged_has_pz3d(Path::new(&m.staging_path)));
+    let pz3d_installed = (pz3d_staged_ok || mods.join("pz3d").is_dir()) && zb_installed;
     let pz3d_version = if pz3d_installed {
-        state.pz3d_version.clone()
+        pz3d_staged
+            .as_ref()
+            .and_then(|m| m.version.clone())
+            .or_else(|| state.pz3d_version.clone())
     } else {
         None
     };
@@ -258,6 +465,9 @@ fn build_tools_status(
         .map(|arg| format!("JVM heap: {arg}"));
 
     let mut pz3d_detail_parts = Vec::new();
+    if pz3d_staged.as_ref().is_some_and(|m| !m.enabled) {
+        pz3d_detail_parts.push("Disabled in staged mods".into());
+    }
     if zb_installed {
         let v = zb_version.as_deref().unwrap_or("configured");
         pz3d_detail_parts.push(format!("ZombieBuddy {v}"));
@@ -288,11 +498,16 @@ fn build_tools_status(
     }
 
     let zb_detail = if zb_installed {
-        Some(if windows {
+        let mut parts = Vec::new();
+        if zb_staged.as_ref().is_some_and(|m| !m.enabled) {
+            parts.push("Disabled in staged mods".to_string());
+        }
+        parts.push(if windows {
             "Configured in ProjectZomboid64.json (-agentlib:zbNative)".into()
         } else {
             "Configured in ProjectZomboid64.json (-javaagent:ZombieBuddy.jar)".into()
-        })
+        });
+        Some(parts.join(" · "))
     } else if json_path.is_none() {
         Some("ProjectZomboid64.json not found in game folder".into())
     } else {
@@ -347,7 +562,11 @@ fn build_tools_status(
     ]
 }
 
-async fn install_zombiebuddy(install_path: &Path) -> Result<PluginToolActionResult> {
+async fn install_zombiebuddy(
+    paths: &Paths,
+    game_id: &str,
+    install_path: &Path,
+) -> Result<PluginToolActionResult> {
     let windows = is_windows_build(install_path);
     let json_path = find_game_json(install_path, windows).ok_or_else(|| {
         anyhow!(
@@ -387,20 +606,35 @@ async fn install_zombiebuddy(install_path: &Path) -> Result<PluginToolActionResu
         .await
         .unwrap_or_else(|| FALLBACK_ZOMBIEBUDDY_MOD_INFO.to_string());
 
-    let zb_mod_dir = mods.join("ZombieBuddy");
+    let stage_tmp = StageTempDir::new(paths, "zb")?;
+    let zb_mod_dir = stage_tmp.path().join("mods").join("ZombieBuddy");
     let zb_libs_dir = zb_mod_dir.join("libs");
     let zb_42_dir = zb_mod_dir.join("42");
     std::fs::create_dir_all(&zb_libs_dir)?;
     std::fs::create_dir_all(&zb_42_dir)?;
 
     std::fs::write(zb_libs_dir.join("ZombieBuddy.jar"), &jar_bytes)?;
-    std::fs::write(zb_42_dir.join("mod.info"), mod_info)?;
+    std::fs::write(zb_42_dir.join("mod.info"), &mod_info)?;
+    if let Some(dll) = &dll_bytes {
+        std::fs::write(zb_libs_dir.join("zbNative.dll"), dll)?;
+    }
+
+    mods::stage_plugin_tool_mod(
+        paths,
+        game_id,
+        TOOL_ZOMBIEBUDDY,
+        "ZombieBuddy",
+        "projectzomboid",
+        Some(assets.version.clone()),
+        stage_tmp.path(),
+        &[],
+    )?;
+
     std::fs::write(jvm_dir.join("ZombieBuddy.jar"), &jar_bytes)
         .with_context(|| format!("write {}", jvm_dir.join("ZombieBuddy.jar").display()))?;
 
     let mut copied = vec!["ZombieBuddy.jar".to_string()];
     if let Some(dll) = &dll_bytes {
-        std::fs::write(zb_libs_dir.join("zbNative.dll"), dll)?;
         std::fs::write(jvm_dir.join("zbNative.dll"), dll)
             .with_context(|| format!("write {}", jvm_dir.join("zbNative.dll").display()))?;
         copied.push("zbNative.dll".to_string());
@@ -411,7 +645,15 @@ async fn install_zombiebuddy(install_path: &Path) -> Result<PluginToolActionResu
         Some(path) => Some(patch_game_bat(path, false)?),
         None => None,
     };
-    update_default_list_entries(&mods, &["ZombieBuddy"], &[])?;
+
+    // Clean any legacy unmanaged copy so Emperor's deploy owns Zomboid/mods/ZombieBuddy.
+    if !mods::has_active_deployment(paths, game_id) {
+        let legacy_dir = mods.join("ZombieBuddy");
+        if legacy_dir.exists() {
+            let _ = std::fs::remove_dir_all(&legacy_dir);
+        }
+        let _ = update_default_list_entries(&mods, &[], &["ZombieBuddy"]);
+    }
 
     let mut state = load_state(&mods);
     state.zombiebuddy_version = Some(assets.version.clone());
@@ -437,19 +679,23 @@ async fn install_zombiebuddy(install_path: &Path) -> Result<PluginToolActionResu
         );
     }
 
-    let tool = build_tools_status(install_path, None, Some(&assets.version))
+    let tool = build_tools_status(paths, game_id, install_path, None, Some(&assets.version))
         .into_iter()
         .find(|t| t.id == TOOL_ZOMBIEBUDDY)
         .unwrap();
 
     Ok(PluginToolActionResult {
         tool,
-        message: format!("Installed ZombieBuddy {}.", assets.version),
+        message: format!("Installed ZombieBuddy {} as a staged mod.", assets.version),
         warnings,
     })
 }
 
-async fn install_pz3d(paths: &Paths, install_path: &Path) -> Result<PluginToolActionResult> {
+async fn install_pz3d(
+    paths: &Paths,
+    game_id: &str,
+    install_path: &Path,
+) -> Result<PluginToolActionResult> {
     let windows = is_windows_build(install_path);
     let json_path = find_game_json(install_path, windows).ok_or_else(|| {
         anyhow!(
@@ -475,20 +721,23 @@ async fn install_pz3d(paths: &Paths, install_path: &Path) -> Result<PluginToolAc
 
     let mut warnings = Vec::new();
 
-    // Step 1: Ensure ZombieBuddy 2.3.4+ is installed and wired up.
-    let current_status = build_tools_status(install_path, None, None);
-    let zb_ready = current_status
-        .iter()
-        .find(|t| t.id == TOOL_ZOMBIEBUDDY)
-        .is_some_and(|t| {
-            t.installed
-                && t.installed_version
-                    .as_deref()
-                    .and_then(parse_semver)
-                    .is_some_and(|v| v >= ZOMBIEBUDDY_MIN_VERSION)
-        });
+    // Step 1: Ensure ZombieBuddy 2.3.4+ is installed, staged, and wired up.
+    let current_status = build_tools_status(paths, game_id, install_path, None, None);
+    let zb_staged = mods::find_plugin_tool_mod(paths, game_id, TOOL_ZOMBIEBUDDY)
+        .is_some_and(|m| staged_has_zombiebuddy(Path::new(&m.staging_path)));
+    let zb_ready = zb_staged
+        && current_status
+            .iter()
+            .find(|t| t.id == TOOL_ZOMBIEBUDDY)
+            .is_some_and(|t| {
+                t.installed
+                    && t.installed_version
+                        .as_deref()
+                        .and_then(parse_semver)
+                        .is_some_and(|v| v >= ZOMBIEBUDDY_MIN_VERSION)
+            });
     if !zb_ready {
-        let zb_result = install_zombiebuddy(install_path).await?;
+        let zb_result = install_zombiebuddy(paths, game_id, install_path).await?;
         warnings.extend(zb_result.warnings);
     }
 
@@ -514,10 +763,24 @@ async fn install_pz3d(paths: &Paths, install_path: &Path) -> Result<PluginToolAc
         .await
         .with_context(|| format!("download PZ3D {} from {download_url}", release.version))?;
 
-    // Step 3: Extract `pz3d-standalone/Contents/mods/*` into `Zomboid/mods/`.
-    let extract_res = extract_pz3d_mods_from_zip(&zip_path, &mods);
+    // Step 3: Extract `pz3d-standalone/Contents/mods/*` into a temp dir and stage as a real mod.
+    let stage_tmp = StageTempDir::new(paths, "pz3d")?;
+    let stage_mods = stage_tmp.path().join("mods");
+    std::fs::create_dir_all(&stage_mods)?;
+    let extract_res = extract_pz3d_mods_from_zip(&zip_path, &stage_mods);
     let _ = std::fs::remove_file(&zip_path);
     let extracted_dirs = extract_res?;
+
+    mods::stage_plugin_tool_mod(
+        paths,
+        game_id,
+        TOOL_PZ3D,
+        "PZ3D",
+        "projectzomboid",
+        Some(release.version.clone()),
+        stage_tmp.path(),
+        &[mods::plugin_tool_mod_id(TOOL_ZOMBIEBUDDY)],
+    )?;
 
     // Step 4: Ensure 6 GB heap bump in ProjectZomboid64.json (and .bat on Windows) if still at default 3 GB.
     let patch = patch_game_json(&json_path, windows, true)?;
@@ -535,8 +798,16 @@ async fn install_pz3d(paths: &Paths, install_path: &Path) -> Result<PluginToolAc
         );
     }
 
-    // Step 5: Enable ZombieBuddy & pz3d in Zomboid/mods/default.txt.
-    update_default_list_entries(&mods, &["ZombieBuddy", "pz3d"], &[])?;
+    // Clean any legacy unmanaged copies so Emperor's deploy owns Zomboid/mods/pz3d*.
+    if !mods::has_active_deployment(paths, game_id) {
+        for dir_name in &extracted_dirs {
+            let legacy_dir = mods.join(dir_name);
+            if legacy_dir.exists() {
+                let _ = std::fs::remove_dir_all(&legacy_dir);
+            }
+        }
+        let _ = update_default_list_entries(&mods, &[], &["pz3d", "pz3d_chainlink"]);
+    }
 
     let mut state = load_state(&mods);
     state.pz3d_version = Some(release.version.clone());
@@ -558,7 +829,7 @@ async fn install_pz3d(paths: &Paths, install_path: &Path) -> Result<PluginToolAc
         }
     }
 
-    let tool = build_tools_status(install_path, Some(&release.version), None)
+    let tool = build_tools_status(paths, game_id, install_path, Some(&release.version), None)
         .into_iter()
         .find(|t| t.id == TOOL_PZ3D)
         .unwrap();
@@ -566,14 +837,18 @@ async fn install_pz3d(paths: &Paths, install_path: &Path) -> Result<PluginToolAc
     Ok(PluginToolActionResult {
         tool,
         message: format!(
-            "Installed PZ3D {} with ZombieBuddy. Launch Project Zomboid, approve PZ3D when ZombieBuddy prompts you, then restart the game.",
+            "Installed PZ3D {} and ZombieBuddy as staged mods. Launch Project Zomboid from Emperor, approve PZ3D when ZombieBuddy prompts you, then restart the game.",
             release.version
         ),
         warnings,
     })
 }
 
-fn uninstall_pz3d(install_path: &Path) -> Result<PluginToolActionResult> {
+fn uninstall_pz3d(
+    paths: &Paths,
+    game_id: &str,
+    install_path: &Path,
+) -> Result<PluginToolActionResult> {
     let windows = is_windows_build(install_path);
     let mods = mods_dir(install_path);
     let json_path = find_game_json(install_path, windows);
@@ -582,6 +857,8 @@ fn uninstall_pz3d(install_path: &Path) -> Result<PluginToolActionResult> {
         ensure_files_not_locked(&collect_pz3d_target_files(&mods, jp, bat_path.as_deref()))?;
     }
     let mut state = load_state(&mods);
+
+    let _ = mods::remove_mod(paths, game_id, &mods::plugin_tool_mod_id(TOOL_PZ3D));
 
     let dirs_to_remove: Vec<String> = if state.pz3d_mod_dirs.is_empty() {
         vec!["pz3d".into(), "pz3d_chainlink".into()]
@@ -609,19 +886,23 @@ fn uninstall_pz3d(install_path: &Path) -> Result<PluginToolActionResult> {
     state.pz3d_mod_dirs.clear();
     save_or_clean_state(&mods, &state)?;
 
-    let tool = build_tools_status(install_path, None, None)
+    let tool = build_tools_status(paths, game_id, install_path, None, None)
         .into_iter()
         .find(|t| t.id == TOOL_PZ3D)
         .unwrap();
 
     Ok(PluginToolActionResult {
         tool,
-        message: "Removed PZ3D mod files and disabled pz3d in default.txt.".into(),
+        message: "Removed PZ3D staged mod and restored launch settings.".into(),
         warnings: Vec::new(),
     })
 }
 
-fn uninstall_zombiebuddy(install_path: &Path) -> Result<PluginToolActionResult> {
+fn uninstall_zombiebuddy(
+    paths: &Paths,
+    game_id: &str,
+    install_path: &Path,
+) -> Result<PluginToolActionResult> {
     let windows = is_windows_build(install_path);
     let mods = mods_dir(install_path);
     let json_path = find_game_json(install_path, windows);
@@ -639,6 +920,8 @@ fn uninstall_zombiebuddy(install_path: &Path) -> Result<PluginToolActionResult> 
         ))?;
     }
     let mut state = load_state(&mods);
+
+    let _ = mods::remove_mod(paths, game_id, &mods::plugin_tool_mod_id(TOOL_ZOMBIEBUDDY));
 
     let zb_mod_dir = mods.join("ZombieBuddy");
     if zb_mod_dir.exists() {
@@ -674,14 +957,14 @@ fn uninstall_zombiebuddy(install_path: &Path) -> Result<PluginToolActionResult> 
     state.patched_vm_arg = None;
     save_or_clean_state(&mods, &state)?;
 
-    let tool = build_tools_status(install_path, None, None)
+    let tool = build_tools_status(paths, game_id, install_path, None, None)
         .into_iter()
         .find(|t| t.id == TOOL_ZOMBIEBUDDY)
         .unwrap();
 
     Ok(PluginToolActionResult {
         tool,
-        message: "Removed ZombieBuddy loader files and cleaned game launch config.".into(),
+        message: "Removed ZombieBuddy staged mod, loader files, and game launch config.".into(),
         warnings: Vec::new(),
     })
 }
@@ -1641,7 +1924,12 @@ mod tests {
         )
         .unwrap();
 
-        let warnings = repair_after_deploy_in(&install, &mods).unwrap();
+        let warnings = repair_after_deploy_in(
+            &install,
+            &mods,
+            &["ZombieBuddy".into(), "pz3d".into()],
+        )
+        .unwrap();
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("Re-applied ZombieBuddy / PZ3D"));
         assert!(install.join("ZombieBuddy.jar").is_file());
@@ -1655,6 +1943,152 @@ mod tests {
             Some("-Xmx6144m")
         );
         assert!(bat_has_zombiebuddy_arg(&install.join("ProjectZomboid64.bat")));
+    }
+
+    #[test]
+    fn staged_tool_mods_appear_in_status_and_deploy_cleanly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("emperor");
+        let paths = Paths::from_dirs(
+            root.join("config"),
+            root.join("data"),
+            root.join("cache"),
+        )
+        .unwrap();
+        let game_id = "pz-game-1";
+
+        let install = tmp.path().join("ProjectZomboid");
+        std::fs::create_dir_all(&install).unwrap();
+        std::fs::write(install.join("ProjectZomboid64.json"), sample_json("-Xmx3g")).unwrap();
+        std::fs::write(install.join("ZombieBuddy.jar"), b"jar").unwrap();
+        patch_game_json(&install.join("ProjectZomboid64.json"), false, true).unwrap();
+
+        // Stage ZombieBuddy as a real staged mod.
+        let zb_src = tmp.path().join("zb_src");
+        std::fs::create_dir_all(zb_src.join("mods/ZombieBuddy/42")).unwrap();
+        std::fs::create_dir_all(zb_src.join("mods/ZombieBuddy/libs")).unwrap();
+        std::fs::write(
+            zb_src.join("mods/ZombieBuddy/42/mod.info"),
+            FALLBACK_ZOMBIEBUDDY_MOD_INFO,
+        )
+        .unwrap();
+        std::fs::write(zb_src.join("mods/ZombieBuddy/libs/ZombieBuddy.jar"), b"jar").unwrap();
+        let zb_staged = mods::stage_plugin_tool_mod(
+            &paths,
+            game_id,
+            TOOL_ZOMBIEBUDDY,
+            "ZombieBuddy",
+            "projectzomboid",
+            Some("v2.3.4".into()),
+            &zb_src,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(zb_staged.plugin_tool_id.as_deref(), Some(TOOL_ZOMBIEBUDDY));
+        assert_eq!(zb_staged.id, "tool:zombiebuddy");
+
+        // Stage PZ3D as a real staged mod depending on ZombieBuddy.
+        let pz_src = tmp.path().join("pz_src");
+        std::fs::create_dir_all(pz_src.join("mods/pz3d/42")).unwrap();
+        std::fs::write(
+            pz_src.join("mods/pz3d/42/mod.info"),
+            "name=pz3d\nid=pz3d\n",
+        )
+        .unwrap();
+        let pz_staged = mods::stage_plugin_tool_mod(
+            &paths,
+            game_id,
+            TOOL_PZ3D,
+            "PZ3D",
+            "projectzomboid",
+            Some("0.10.4".into()),
+            &pz_src,
+            &[mods::plugin_tool_mod_id(TOOL_ZOMBIEBUDDY)],
+        )
+        .unwrap();
+        assert_eq!(pz_staged.plugin_tool_id.as_deref(), Some(TOOL_PZ3D));
+        assert_eq!(pz_staged.depends_on, vec!["tool:zombiebuddy"]);
+
+        // Both appear in loadorder.json and tools_status recognizes them as installed.
+        let order = mods::load_loadorder(&paths, game_id).unwrap();
+        assert_eq!(order.mods.len(), 2);
+
+        let statuses = build_tools_status(&paths, game_id, &install, None, None);
+        let pz_status = statuses.iter().find(|t| t.id == TOOL_PZ3D).unwrap();
+        let zb_status = statuses.iter().find(|t| t.id == TOOL_ZOMBIEBUDDY).unwrap();
+        assert!(zb_status.installed);
+        assert_eq!(zb_status.installed_version.as_deref(), Some("v2.3.4"));
+        assert!(pz_status.installed);
+        assert_eq!(pz_status.installed_version.as_deref(), Some("0.10.4"));
+
+        // Disabling PZ3D in staged mods surfaces in tools_status detail.
+        mods::set_enabled(&paths, game_id, &pz_staged.id, false).unwrap();
+        let disabled_statuses = build_tools_status(&paths, game_id, &install, None, None);
+        let pz_disabled = disabled_statuses
+            .iter()
+            .find(|t| t.id == TOOL_PZ3D)
+            .unwrap();
+        assert!(pz_disabled.installed);
+        assert!(pz_disabled
+            .status_detail
+            .as_deref()
+            .is_some_and(|d| d.contains("Disabled in staged mods")));
+    }
+
+    #[test]
+    fn adopt_legacy_installs_migrates_unmanaged_tool_dirs_into_staging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("emperor");
+        let paths = Paths::from_dirs(
+            root.join("config"),
+            root.join("data"),
+            root.join("cache"),
+        )
+        .unwrap();
+        let game_id = "pz-legacy";
+        let mods_root = tmp.path().join("zomboid_mods");
+
+        std::fs::create_dir_all(mods_root.join("ZombieBuddy/42")).unwrap();
+        std::fs::create_dir_all(mods_root.join("ZombieBuddy/libs")).unwrap();
+        std::fs::write(
+            mods_root.join("ZombieBuddy/42/mod.info"),
+            FALLBACK_ZOMBIEBUDDY_MOD_INFO,
+        )
+        .unwrap();
+        std::fs::write(mods_root.join("ZombieBuddy/libs/ZombieBuddy.jar"), b"jar").unwrap();
+
+        std::fs::create_dir_all(mods_root.join("pz3d/42")).unwrap();
+        std::fs::write(mods_root.join("pz3d/42/mod.info"), "name=pz3d\nid=pz3d\n").unwrap();
+
+        save_state(
+            &mods_root,
+            &Pz3dState {
+                zombiebuddy_version: Some("v2.3.4".into()),
+                pz3d_version: Some("0.10.4".into()),
+                pz3d_mod_dirs: vec!["pz3d".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let adopted = adopt_legacy_installs_in(&paths, game_id, &mods_root).unwrap();
+        assert!(adopted);
+        // Second call is a no-op once staged.
+        assert!(!adopt_legacy_installs_in(&paths, game_id, &mods_root).unwrap());
+
+        let order = mods::load_loadorder(&paths, game_id).unwrap();
+        assert_eq!(order.mods.len(), 2);
+        assert!(order
+            .mods
+            .iter()
+            .any(|m| m.plugin_tool_id.as_deref() == Some(TOOL_ZOMBIEBUDDY)));
+        assert!(order
+            .mods
+            .iter()
+            .any(|m| m.plugin_tool_id.as_deref() == Some(TOOL_PZ3D)));
+        // Unmanaged copies were cleaned up since there was no active deployment.
+        assert!(!mods_root.join("ZombieBuddy").exists());
+        assert!(!mods_root.join("pz3d").exists());
     }
 
     #[test]

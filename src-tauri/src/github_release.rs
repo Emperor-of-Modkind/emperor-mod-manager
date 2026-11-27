@@ -1,12 +1,26 @@
 //! GitHub release checking and download (app + tools).
 
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use futures_util::StreamExt;
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, ETAG, IF_NONE_MATCH, LOCATION};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
+
+#[derive(Debug, Clone)]
+struct CachedLatestRelease {
+    etag: Option<String>,
+    release: GhRelease,
+}
+
+fn latest_release_cache() -> &'static Mutex<HashMap<String, CachedLatestRelease>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, CachedLatestRelease>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct GhRelease {
@@ -25,11 +39,30 @@ pub struct GhAsset {
 }
 
 fn api_client() -> Result<reqwest::Client> {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        ACCEPT,
+        HeaderValue::from_static("application/vnd.github+json"),
+    );
+    headers.insert(
+        "X-GitHub-Api-Version",
+        HeaderValue::from_static("2022-11-28"),
+    );
     reqwest::Client::builder()
         .user_agent("emperor-mod-manager")
+        .default_headers(headers)
         .timeout(Duration::from_secs(15))
         .build()
         .context("building HTTP client")
+}
+
+fn no_redirect_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .user_agent("emperor-mod-manager")
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(15))
+        .build()
+        .context("building no-redirect HTTP client")
 }
 
 fn download_client() -> Result<reqwest::Client> {
@@ -57,14 +90,110 @@ pub async fn fetch_release_by_tag(repo: &str, tag: &str) -> Result<Option<GhRele
 pub async fn fetch_latest_release(repo: &str) -> Result<Option<GhRelease>> {
     let url = format!("https://api.github.com/repos/{repo}/releases/latest");
     let client = api_client()?;
-    let resp = client.get(&url).send().await?;
-    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+    let cached = latest_release_cache()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.get(repo).cloned());
+
+    let mut req = client.get(&url);
+    if let Some(etag) = cached.as_ref().and_then(|entry| entry.etag.as_deref()) {
+        req = req.header(IF_NONE_MATCH, etag);
+    }
+
+    let resp = req.send().await?;
+    let status = resp.status();
+
+    if status == reqwest::StatusCode::NOT_MODIFIED {
+        if let Some(entry) = cached {
+            return Ok(Some(entry.release));
+        }
+    }
+    if status == reqwest::StatusCode::NOT_FOUND {
         return fetch_all_releases(repo).await;
     }
-    if !resp.status().is_success() {
-        return Err(anyhow!("GitHub API error {} for {url}", resp.status()));
+    if status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+    {
+        if let Ok(Some(fallback)) =
+            fetch_latest_release_via_redirect(repo, cached.as_ref().map(|c| &c.release)).await
+        {
+            return Ok(Some(fallback));
+        }
+        return Err(anyhow!("GitHub API error {status} for {url}"));
     }
-    Ok(Some(resp.json().await?))
+    if !status.is_success() {
+        return Err(anyhow!("GitHub API error {status} for {url}"));
+    }
+
+    let etag = resp
+        .headers()
+        .get(ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let release: GhRelease = resp.json().await?;
+    if let Ok(mut guard) = latest_release_cache().lock() {
+        guard.insert(
+            repo.to_string(),
+            CachedLatestRelease {
+                etag,
+                release: release.clone(),
+            },
+        );
+    }
+    Ok(Some(release))
+}
+
+fn parse_release_tag_from_location(location: &str) -> Option<String> {
+    let without_query = location.split(['?', '#']).next().unwrap_or(location);
+    let trimmed = without_query.trim_end_matches('/');
+    let (_, tag) = trimmed.rsplit_once("/releases/tag/")?;
+    let tag = tag.trim();
+    if tag.is_empty() || tag.contains('/') {
+        None
+    } else {
+        Some(tag.to_string())
+    }
+}
+
+fn merge_redirect_release(
+    tag: String,
+    location: String,
+    cached: Option<&GhRelease>,
+) -> GhRelease {
+    if let Some(prev) = cached {
+        if prev.tag_name.trim().trim_start_matches('v') == tag.trim().trim_start_matches('v') {
+            return prev.clone();
+        }
+    }
+    GhRelease {
+        tag_name: tag,
+        prerelease: false,
+        html_url: Some(location),
+        assets: Vec::new(),
+    }
+}
+
+async fn fetch_latest_release_via_redirect(
+    repo: &str,
+    cached: Option<&GhRelease>,
+) -> Result<Option<GhRelease>> {
+    let url = format!("https://github.com/{repo}/releases/latest");
+    let client = no_redirect_client()?;
+    let resp = client.get(&url).send().await?;
+    if !resp.status().is_redirection() {
+        return Ok(None);
+    }
+    let Some(location) = resp
+        .headers()
+        .get(LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+    else {
+        return Ok(None);
+    };
+    let Some(tag) = parse_release_tag_from_location(&location) else {
+        return Ok(None);
+    };
+    Ok(Some(merge_redirect_release(tag, location, cached)))
 }
 
 #[cfg_attr(any(target_os = "android", target_os = "ios"), allow(dead_code))]
@@ -558,5 +687,52 @@ mod tests {
         );
         assert!(verify_file_sha256(&file, &digest).is_ok());
         assert!(verify_file_sha256(&file, &"0".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn parse_release_tag_from_location_handles_github_redirects() {
+        assert_eq!(
+            parse_release_tag_from_location(
+                "https://github.com/LewisTansley/emperor-mod-manager/releases/tag/v0.9.6"
+            )
+            .as_deref(),
+            Some("v0.9.6")
+        );
+        assert_eq!(
+            parse_release_tag_from_location(
+                "https://github.com/LewisTansley/emperor-mod-manager/releases/tag/v0.9.6/?foo=bar#top"
+            )
+            .as_deref(),
+            Some("v0.9.6")
+        );
+        assert_eq!(
+            parse_release_tag_from_location(
+                "https://github.com/LewisTansley/emperor-mod-manager/releases"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn merge_redirect_release_preserves_cached_assets_when_tag_matches() {
+        let cached = sample_release();
+        let same = merge_redirect_release(
+            "v0.4.0".into(),
+            "https://github.com/org/repo/releases/tag/v0.4.0".into(),
+            Some(&cached),
+        );
+        assert_eq!(same.assets.len(), cached.assets.len());
+
+        let newer = merge_redirect_release(
+            "v0.5.0".into(),
+            "https://github.com/org/repo/releases/tag/v0.5.0".into(),
+            Some(&cached),
+        );
+        assert_eq!(newer.tag_name, "v0.5.0");
+        assert_eq!(
+            newer.html_url.as_deref(),
+            Some("https://github.com/org/repo/releases/tag/v0.5.0")
+        );
+        assert!(newer.assets.is_empty());
     }
 }

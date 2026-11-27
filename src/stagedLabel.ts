@@ -18,6 +18,12 @@ export function chosenFileLabel(
 
 /** Second line under a staged mod: the file name plus version, or the source line. */
 export function stagedModSourceLine(mod: StagedMod): string {
+  if (mod.plugin_tool_id) {
+    const version = mod.version?.trim();
+    if (!version) return "Tool";
+    const prefixed = /^[vV]/.test(version) ? version : `v${version}`;
+    return `Tool · ${prefixed}`;
+  }
   const source =
     mod.source === "thunderstore"
       ? `Thunderstore · ${mod.ts_namespace ?? "?"}-${mod.ts_name ?? "?"}`

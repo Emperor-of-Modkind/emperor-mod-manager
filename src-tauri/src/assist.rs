@@ -1274,9 +1274,10 @@ pub enum AssistPurpose {
     /// Stage into the managed game's mod list (normal free/premium assist).
     #[default]
     StageMod,
-    /// Extract legacy Mod Engine (`dinput8.dll`) into the game folder.
-    FromsoftLegacyLoader {
+    /// Extract a Nexus-backed plugin tool archive into the game folder.
+    PluginTool {
         plugin_id: String,
+        tool_id: String,
         install_path: String,
     },
     /// Sign in on the Nexus website so later downloads reuse the session cookie.
@@ -1674,7 +1675,7 @@ fn nexus_sign_in_url() -> Result<url::Url, String> {
 fn download_assist_in_use(state: &AppState) -> bool {
     matches!(
         peek_assist_context(state).as_ref().map(|c| &c.purpose),
-        Some(AssistPurpose::StageMod) | Some(AssistPurpose::FromsoftLegacyLoader { .. })
+        Some(AssistPurpose::StageMod) | Some(AssistPurpose::PluginTool { .. })
     )
 }
 
@@ -2507,11 +2508,11 @@ pub async fn open_download_assist_inner(
         )
         .map_err(|e| e.to_string())?;
 
-    // Loader installs run mid-deploy: force the panel visible. Normal assist still
-    // respects the Downloads-tab desired-visible flag.
+    // Plugin tool installs run on demand from the Tools modal: force the panel visible.
+    // Normal assist still respects the Downloads-tab desired-visible flag.
     if matches!(
         peek_assist_context(state).as_ref().map(|c| &c.purpose),
-        Some(AssistPurpose::FromsoftLegacyLoader { .. })
+        Some(AssistPurpose::PluginTool { .. })
     ) {
         state.assist_desired_visible.store(true, Ordering::SeqCst);
     }

@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{anyhow, Context, Result};
+use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
 use crate::config::Paths;
@@ -12,27 +13,29 @@ use crate::nexus::NexusClient;
 use crate::tools::install::{self as tool_install};
 
 use super::fromsoftware::{self, resolve_game_root};
+use super::{
+    PluginToolActionResult, PluginToolInstallContext, PluginToolInstallOutcome,
+    PluginToolRecommendation, PluginToolStatus, ToolAssistRequest,
+};
 
-/// Free-account Download Assist target for a curated legacy Mod Engine pack.
-#[derive(Debug, Clone)]
-pub struct LegacyAssistRequest {
-    pub domain: String,
-    pub mod_id: u64,
-    pub file_id: u64,
-    pub plugin_id: String,
-    pub install_path: PathBuf,
-    pub label: String,
+pub const TOOL_ME3: &str = "me3";
+pub const TOOL_LEGACY_MODENGINE: &str = "legacy_modengine";
+const ME3_HOMEPAGE: &str = "https://github.com/garyttierney/me3";
+const ME3_STATE_FILE: &str = ".emperor-me3.json";
+const LEGACY_STATE_FILE: &str = ".emperor-modengine.json";
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct Me3State {
+    #[serde(default)]
+    version: Option<String>,
 }
 
-/// Outcome of [`ensure_fromsoft_loaders`].
-#[derive(Debug)]
-pub enum EnsureLoadersOutcome {
-    Done(Vec<String>),
-    /// Open Download Assist for this request, wait for install, then finish deploy.
-    NeedsAssist {
-        warnings: Vec<String>,
-        request: LegacyAssistRequest,
-    },
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct LegacyModEngineState {
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
 }
 
 const ME3_REPO: &str = "garyttierney/me3";
@@ -67,179 +70,6 @@ fn legacy_nexus_source(plugin_id: &str) -> Option<(&'static str, u64)> {
         "darksoulsremastered" => Some(("darksoulsremastered", 790)),
         _ => None,
     }
-}
-
-pub fn is_fromsoft_plugin(plugin_id: &str) -> bool {
-    matches!(
-        plugin_id,
-        "eldenring"
-            | "eldenringnightreign"
-            | "armoredcore6firesofrubicon"
-            | "sekiro"
-            | "darksouls3"
-            | "darksouls2"
-            | "darksoulsremastered"
-            | "darksouls"
-    )
-}
-
-fn is_legacy_plugin(plugin_id: &str) -> bool {
-    matches!(
-        plugin_id,
-        "darksouls" | "darksoulsremastered" | "darksouls2" | "sekiro"
-    )
-}
-
-/// Download / cache missing loaders for a FromSoft title.
-pub async fn ensure_fromsoft_loaders(
-    paths: &Paths,
-    plugin_id: &str,
-    install_path: &Path,
-    nexus: Option<&NexusClient>,
-    nexus_premium: bool,
-) -> EnsureLoadersOutcome {
-    if !is_fromsoft_plugin(plugin_id) {
-        return EnsureLoadersOutcome::Done(Vec::new());
-    }
-    if is_legacy_plugin(plugin_id) {
-        match ensure_legacy_modengine(paths, plugin_id, install_path, nexus, nexus_premium).await {
-            Ok(outcome) => outcome,
-            Err(e) => EnsureLoadersOutcome::Done(vec![format!(
-                "Could not auto-install legacy Mod Engine: {e:#}"
-            )]),
-        }
-    } else {
-        match ensure_modern_loaders(paths, plugin_id, install_path).await {
-            Ok(extra) => EnsureLoadersOutcome::Done(extra),
-            Err(e) => EnsureLoadersOutcome::Done(vec![format!(
-                "Could not auto-install Mod Engine 3 (me3): {e:#}"
-            )]),
-        }
-    }
-}
-
-/// After Assist installs the loader, copy cache → game if needed and build warnings.
-pub fn finish_legacy_after_assist(
-    paths: &Paths,
-    plugin_id: &str,
-    install_path: &Path,
-) -> Result<Vec<String>> {
-    let mut warnings = Vec::new();
-    let cache = paths.fromsoft_legacy_modengine_dir(plugin_id);
-    if !cache_has_dinput8(&cache) && !fromsoftware::legacy_modengine_present(install_path) {
-        return Err(anyhow!("Mod Engine was not installed via Download Assist"));
-    }
-    let game_root = resolve_game_root(install_path);
-    let installed = copy_legacy_into_game(&cache, &game_root)?;
-    if installed {
-        warnings.push(format!(
-            "Installed legacy Mod Engine (dinput8.dll) into {}.",
-            game_root.display()
-        ));
-        if cfg!(target_os = "linux") {
-            warnings.push(
-                "On Proton, add WINEDLLOVERRIDES=\"dinput8=n,b\" %command% to the game's Steam launch options so Mod Engine loads."
-                    .into(),
-            );
-        }
-    }
-    Ok(warnings)
-}
-
-pub fn legacy_loader_ready(paths: &Paths, plugin_id: &str, install_path: &Path) -> bool {
-    cache_has_dinput8(&paths.fromsoft_legacy_modengine_dir(plugin_id))
-        || fromsoftware::legacy_modengine_present(install_path)
-}
-
-async fn ensure_legacy_modengine(
-    paths: &Paths,
-    plugin_id: &str,
-    install_path: &Path,
-    nexus: Option<&NexusClient>,
-    nexus_premium: bool,
-) -> Result<EnsureLoadersOutcome> {
-    let mut warnings = Vec::new();
-    let game_root = resolve_game_root(install_path);
-
-    // DS2: warm the tools cache only. Copying into Game is deferred to after_deploy so
-    // Lighting Engine / Seamless-only deploys do not leave a conflicting dinput8.dll.
-    if plugin_id == "darksouls2" {
-        let cache = paths.fromsoft_legacy_modengine_dir(plugin_id);
-        if !cache_has_dinput8(&cache) {
-            match download_ds2_modengine_github(&cache).await {
-                Ok(()) => {}
-                Err(e) => warnings.push(format!(
-                    "Could not cache Mod Engine for Dark Souls 2 (needed only for loose asset mods): {e:#}"
-                )),
-            }
-        }
-        return Ok(EnsureLoadersOutcome::Done(warnings));
-    }
-
-    if fromsoftware::legacy_modengine_present(install_path) {
-        return Ok(EnsureLoadersOutcome::Done(warnings));
-    }
-
-    let cache = paths.fromsoft_legacy_modengine_dir(plugin_id);
-    if !cache_has_dinput8(&cache) {
-        if let Some((domain, mod_id)) = legacy_nexus_source(plugin_id) {
-            match (nexus, nexus_premium) {
-                (Some(client), true) => {
-                    download_legacy_from_nexus(client, domain, mod_id, &cache).await?;
-                }
-                (Some(client), false) => {
-                    let files = client.list_mod_files(domain, mod_id).await?;
-                    let file = files
-                        .iter()
-                        .find(|f| f.is_primary)
-                        .or_else(|| files.first())
-                        .ok_or_else(|| anyhow!("Nexus mod {domain}/{mod_id} has no files"))?;
-                    warnings.push(
-                        "Download Assist opened for Mod Engine — use Mod Manager Download or Slow Download, then wait for deploy to continue."
-                            .into(),
-                    );
-                    return Ok(EnsureLoadersOutcome::NeedsAssist {
-                        warnings,
-                        request: LegacyAssistRequest {
-                            domain: domain.to_string(),
-                            mod_id,
-                            file_id: file.file_id,
-                            plugin_id: plugin_id.to_string(),
-                            install_path: install_path.to_path_buf(),
-                            label: format!("Mod Engine ({plugin_id})"),
-                        },
-                    });
-                }
-                (None, _) => {
-                    warnings.push(
-                        "No Nexus API key configured; cannot auto-download legacy Mod Engine. Add an API key in Settings or install dinput8.dll manually."
-                            .into(),
-                    );
-                    return Ok(EnsureLoadersOutcome::Done(warnings));
-                }
-            }
-        } else {
-            warnings.push(format!(
-                "No known Mod Engine download source for {plugin_id}; install dinput8.dll manually."
-            ));
-            return Ok(EnsureLoadersOutcome::Done(warnings));
-        }
-    }
-
-    let installed = copy_legacy_into_game(&cache, &game_root)?;
-    if installed {
-        warnings.push(format!(
-            "Installed legacy Mod Engine (dinput8.dll) into {}.",
-            game_root.display()
-        ));
-        if cfg!(target_os = "linux") {
-            warnings.push(
-                "On Proton, add WINEDLLOVERRIDES=\"dinput8=n,b\" %command% to the game's Steam launch options so Mod Engine loads."
-                    .into(),
-            );
-        }
-    }
-    Ok(EnsureLoadersOutcome::Done(warnings))
 }
 
 /// Extract a downloaded Mod Engine archive into the tools cache and Game folder.
@@ -363,27 +193,6 @@ fn copy_legacy_into_game(cache: &Path, game_root: &Path) -> Result<bool> {
     Ok(copied_dll)
 }
 
-async fn ensure_modern_loaders(
-    paths: &Paths,
-    plugin_id: &str,
-    install_path: &Path,
-) -> Result<Vec<String>> {
-    let mut warnings = Vec::new();
-    let game_root = resolve_game_root(install_path);
-
-    match ensure_me3(paths).await {
-        Ok(true) => warnings.push(format!(
-            "Installed Mod Engine 3 (me3) into {}.",
-            paths.me3_install_dir().display()
-        )),
-        Ok(false) => {}
-        Err(e) => warnings.push(format!("Mod Engine 3 (me3) install skipped: {e:#}")),
-    }
-
-    write_modern_launch_helpers(paths, plugin_id, &game_root)?;
-    Ok(warnings)
-}
-
 /// Resolve Emperor's managed `me3` installation, falling back to `me3` on `PATH`.
 pub fn resolve_me3_installation(paths: &Paths) -> Option<Me3Installation> {
     let dest = paths.me3_install_dir();
@@ -401,41 +210,6 @@ pub fn resolve_me3_installation(paths: &Paths) -> Option<Me3Installation> {
         });
     }
     None
-}
-
-async fn ensure_me3(paths: &Paths) -> Result<bool> {
-    let dest = paths.me3_install_dir();
-    if let Some(bin) = me3_binary(&dest) {
-        let has_win_bins = find_me3_windows_binaries_dir(&dest).is_some();
-        if has_win_bins {
-            ensure_executable(&bin);
-            return Ok(false);
-        }
-    }
-    let release = match github_release::fetch_latest_release(ME3_REPO).await {
-        Ok(Some(r)) => r,
-        Ok(None) => {
-            if me3_binary(&dest).is_some() || me3_on_path() {
-                return Ok(false);
-            }
-            return Err(anyhow!("no me3 releases found"));
-        }
-        Err(e) => {
-            if me3_binary(&dest).is_some() || me3_on_path() {
-                return Ok(false);
-            }
-            return Err(e);
-        }
-    };
-    let asset = pick_me3_asset(&release, std::env::consts::OS)
-        .ok_or_else(|| anyhow!("no me3 portable asset for this OS"))?;
-    let bytes = github_release::download_bytes(&asset.browser_download_url).await?;
-    tool_install::extract_archive(&bytes, &asset.name, &dest)?;
-    tool_install::normalize_install_root(&dest)?;
-    let bin = me3_binary(&dest)
-        .ok_or_else(|| anyhow!("me3 archive extracted but me3 binary was not found"))?;
-    ensure_executable(&bin);
-    Ok(true)
 }
 
 #[cfg(unix)]
@@ -559,6 +333,408 @@ fn sh_double_quote_escape(s: &str) -> String {
         .replace('`', "\\`")
 }
 
+pub fn has_plugin_tools(plugin_id: &str) -> bool {
+    me3_game_name(plugin_id).is_some()
+        || matches!(plugin_id, "darksouls" | "darksoulsremastered" | "darksouls2")
+}
+
+fn load_me3_state(paths: &Paths) -> Me3State {
+    let path = paths.me3_install_dir().join(ME3_STATE_FILE);
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_me3_state(paths: &Paths, state: &Me3State) -> Result<()> {
+    let dir = paths.me3_install_dir();
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(ME3_STATE_FILE);
+    std::fs::write(&path, serde_json::to_string_pretty(state)?)
+        .with_context(|| format!("write {}", path.display()))
+}
+
+fn load_legacy_state(game_root: &Path) -> LegacyModEngineState {
+    let path = game_root.join(LEGACY_STATE_FILE);
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_legacy_state(game_root: &Path, state: &LegacyModEngineState) -> Result<()> {
+    std::fs::create_dir_all(game_root)?;
+    let path = game_root.join(LEGACY_STATE_FILE);
+    std::fs::write(&path, serde_json::to_string_pretty(state)?)
+        .with_context(|| format!("write {}", path.display()))
+}
+
+fn legacy_homepage(plugin_id: &str) -> Option<String> {
+    if plugin_id == "darksouls2" {
+        Some("https://github.com/vawser/Vestiges-DS2".into())
+    } else {
+        legacy_nexus_source(plugin_id)
+            .map(|(domain, mod_id)| format!("https://www.nexusmods.com/{domain}/mods/{mod_id}"))
+    }
+}
+
+fn build_me3_status(paths: &Paths, latest_version: Option<&str>) -> PluginToolStatus {
+    let dest = paths.me3_install_dir();
+    let managed = me3_binary(&dest).is_some();
+    let on_path = !managed && me3_on_path();
+    let installed = managed || on_path;
+    let state = load_me3_state(paths);
+    let installed_version = if managed { state.version.clone() } else { None };
+    let update_available = match (managed, installed_version.as_deref(), latest_version) {
+        (true, Some(cur), Some(latest)) => cur.trim() != latest.trim(),
+        _ => false,
+    };
+    let mut notes = Vec::new();
+    let status_detail = if managed {
+        Some(format!("Managed by Emperor in {}.", dest.display()))
+    } else if on_path {
+        notes.push("Using system me3 from PATH. Install here to let Emperor manage updates.".into());
+        Some("Detected me3 on system PATH.".into())
+    } else {
+        None
+    };
+    PluginToolStatus {
+        id: TOOL_ME3.into(),
+        name: "Mod Engine 3 (me3)".into(),
+        description: "Mod loader and runtime injector for modern FromSoftware titles (loads emperor.me3 profiles).".into(),
+        homepage_url: Some(ME3_HOMEPAGE.into()),
+        installed,
+        installed_version,
+        latest_version: latest_version.map(str::to_string),
+        update_available,
+        status_detail,
+        notes,
+        can_uninstall: managed,
+    }
+}
+
+fn build_legacy_status(
+    plugin_id: &str,
+    install_path: &Path,
+    latest_version: Option<&str>,
+) -> PluginToolStatus {
+    let game_root = resolve_game_root(install_path);
+    let installed = fromsoftware::legacy_modengine_present(install_path);
+    let state = load_legacy_state(&game_root);
+    let installed_version = if installed { state.version.clone() } else { None };
+    let mut notes = Vec::new();
+    if cfg!(target_os = "linux") {
+        notes.push(
+            "On Proton, ensure WINEDLLOVERRIDES=\"dinput8=n,b\" %command% is set in Steam launch options."
+                .into(),
+        );
+    }
+    if plugin_id == "darksouls2" {
+        notes.push(
+            "Only needed for loose asset overlay mods under Game/mod/. Skip if using Lighting Engine or Seamless Co-op alone."
+                .into(),
+        );
+    }
+    PluginToolStatus {
+        id: TOOL_LEGACY_MODENGINE.into(),
+        name: "Mod Engine (dinput8.dll)".into(),
+        description: "Legacy Mod Engine DLL injector for loading loose asset overrides.".into(),
+        homepage_url: legacy_homepage(plugin_id),
+        installed,
+        installed_version,
+        latest_version: latest_version.map(str::to_string),
+        update_available: false,
+        status_detail: if installed {
+            Some(format!("dinput8.dll found in {}.", game_root.display()))
+        } else {
+            None
+        },
+        notes,
+        can_uninstall: installed,
+    }
+}
+
+pub fn tools_status(paths: &Paths, plugin_id: &str, install_path: &Path) -> Vec<PluginToolStatus> {
+    if me3_game_name(plugin_id).is_some() {
+        vec![build_me3_status(paths, None)]
+    } else if matches!(plugin_id, "darksouls" | "darksoulsremastered" | "darksouls2") {
+        vec![build_legacy_status(plugin_id, install_path, None)]
+    } else {
+        Vec::new()
+    }
+}
+
+pub async fn check_tool_updates(
+    paths: &Paths,
+    plugin_id: &str,
+    install_path: &Path,
+) -> Result<Vec<PluginToolStatus>> {
+    if me3_game_name(plugin_id).is_some() {
+        let release = github_release::fetch_latest_release(ME3_REPO)
+            .await?
+            .ok_or_else(|| anyhow!("no me3 releases found"))?;
+        Ok(vec![build_me3_status(paths, Some(&release.tag_name))])
+    } else if matches!(plugin_id, "darksouls" | "darksoulsremastered" | "darksouls2") {
+        Ok(vec![build_legacy_status(plugin_id, install_path, None)])
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+pub async fn install_tool_ctx(
+    ctx: &PluginToolInstallContext<'_>,
+    plugin_id: &str,
+    tool_id: &str,
+) -> Result<PluginToolInstallOutcome> {
+    if tool_id == TOOL_ME3 && me3_game_name(plugin_id).is_some() {
+        let dest = ctx.paths.me3_install_dir();
+        let release = github_release::fetch_latest_release(ME3_REPO)
+            .await?
+            .ok_or_else(|| anyhow!("no me3 releases found"))?;
+        let asset = pick_me3_asset(&release, std::env::consts::OS)
+            .ok_or_else(|| anyhow!("no me3 portable asset for this OS"))?;
+        let bytes = github_release::download_bytes(&asset.browser_download_url).await?;
+        if dest.exists() {
+            let _ = std::fs::remove_dir_all(&dest);
+        }
+        tool_install::extract_archive(&bytes, &asset.name, &dest)?;
+        tool_install::normalize_install_root(&dest)?;
+        let bin = me3_binary(&dest)
+            .ok_or_else(|| anyhow!("me3 archive extracted but me3 binary was not found"))?;
+        ensure_executable(&bin);
+        save_me3_state(
+            ctx.paths,
+            &Me3State {
+                version: Some(release.tag_name.clone()),
+            },
+        )?;
+        let game_root = resolve_game_root(ctx.install_path);
+        write_modern_launch_helpers(ctx.paths, plugin_id, &game_root)?;
+        let tool = build_me3_status(ctx.paths, Some(&release.tag_name));
+        return Ok(PluginToolInstallOutcome::Done(PluginToolActionResult {
+            tool,
+            message: format!("Installed Mod Engine 3 ({}).", release.tag_name),
+            warnings: Vec::new(),
+        }));
+    }
+
+    if tool_id == TOOL_LEGACY_MODENGINE
+        && matches!(plugin_id, "darksouls" | "darksoulsremastered" | "darksouls2")
+    {
+        let game_root = resolve_game_root(ctx.install_path);
+        let cache = ctx.paths.fromsoft_legacy_modengine_dir(plugin_id);
+        let mut warnings = Vec::new();
+
+        if plugin_id == "darksouls2" {
+            download_ds2_modengine_github(&cache).await?;
+            let _ = copy_legacy_into_game(&cache, &game_root)?;
+            fromsoftware::write_modengine_ini(&game_root)?;
+            save_legacy_state(
+                &game_root,
+                &LegacyModEngineState {
+                    version: Some("Vestiges-DS2".into()),
+                    source: Some("github".into()),
+                },
+            )?;
+            if cfg!(target_os = "linux") {
+                warnings.push(
+                    "On Proton, add WINEDLLOVERRIDES=\"dinput8=n,b\" %command% to the game's Steam launch options so Mod Engine loads."
+                        .into(),
+                );
+            }
+            let tool = build_legacy_status(plugin_id, ctx.install_path, None);
+            return Ok(PluginToolInstallOutcome::Done(PluginToolActionResult {
+                tool,
+                message: format!(
+                    "Installed Mod Engine (dinput8.dll) into {}.",
+                    game_root.display()
+                ),
+                warnings,
+            }));
+        }
+
+        if let Some((domain, mod_id)) = legacy_nexus_source(plugin_id) {
+            if !cache_has_dinput8(&cache) {
+                match (ctx.nexus, ctx.premium) {
+                    (Some(client), true) => {
+                        download_legacy_from_nexus(client, domain, mod_id, &cache).await?;
+                    }
+                    (Some(client), false) => {
+                        let files = client.list_mod_files(domain, mod_id).await?;
+                        let file = files
+                            .iter()
+                            .find(|f| f.is_primary)
+                            .or_else(|| files.first())
+                            .ok_or_else(|| anyhow!("Nexus mod {domain}/{mod_id} has no files"))?;
+                        return Ok(PluginToolInstallOutcome::NeedsAssist {
+                            request: ToolAssistRequest {
+                                domain: domain.to_string(),
+                                mod_id,
+                                file_id: file.file_id,
+                                plugin_id: plugin_id.to_string(),
+                                tool_id: TOOL_LEGACY_MODENGINE.to_string(),
+                                install_path: ctx.install_path.to_path_buf(),
+                                label: format!("Mod Engine ({plugin_id})"),
+                            },
+                        });
+                    }
+                    (None, _) => {
+                        return Err(anyhow!(
+                            "No Nexus API key configured. Sign in to Nexus in Settings or install dinput8.dll manually."
+                        ));
+                    }
+                }
+            }
+            let _ = copy_legacy_into_game(&cache, &game_root)?;
+            fromsoftware::write_modengine_ini(&game_root)?;
+            save_legacy_state(
+                &game_root,
+                &LegacyModEngineState {
+                    version: Some("Nexus".into()),
+                    source: Some("nexus".into()),
+                },
+            )?;
+            if cfg!(target_os = "linux") {
+                warnings.push(
+                    "On Proton, add WINEDLLOVERRIDES=\"dinput8=n,b\" %command% to the game's Steam launch options so Mod Engine loads."
+                        .into(),
+                );
+            }
+            let tool = build_legacy_status(plugin_id, ctx.install_path, None);
+            return Ok(PluginToolInstallOutcome::Done(PluginToolActionResult {
+                tool,
+                message: format!(
+                    "Installed Mod Engine (dinput8.dll) into {}.",
+                    game_root.display()
+                ),
+                warnings,
+            }));
+        }
+    }
+
+    Err(anyhow!("unknown FromSoftware tool: {tool_id}"))
+}
+
+pub fn install_tool_from_archive(
+    paths: &Paths,
+    plugin_id: &str,
+    install_path: &Path,
+    tool_id: &str,
+    archive: &Path,
+) -> Result<PluginToolActionResult> {
+    if tool_id != TOOL_LEGACY_MODENGINE {
+        anyhow::bail!("unknown FromSoftware archive tool: {tool_id}");
+    }
+    install_legacy_from_archive(paths, plugin_id, install_path, archive)?;
+    let game_root = resolve_game_root(install_path);
+    fromsoftware::write_modengine_ini(&game_root)?;
+    save_legacy_state(
+        &game_root,
+        &LegacyModEngineState {
+            version: Some("Nexus".into()),
+            source: Some("nexus".into()),
+        },
+    )?;
+    let mut warnings = Vec::new();
+    if cfg!(target_os = "linux") {
+        warnings.push(
+            "On Proton, add WINEDLLOVERRIDES=\"dinput8=n,b\" %command% to the game's Steam launch options so Mod Engine loads."
+                .into(),
+        );
+    }
+    let tool = build_legacy_status(plugin_id, install_path, None);
+    Ok(PluginToolActionResult {
+        tool,
+        message: format!(
+            "Installed Mod Engine (dinput8.dll) into {}.",
+            game_root.display()
+        ),
+        warnings,
+    })
+}
+
+pub fn tool_assist_ready(plugin_id: &str, install_path: &Path, tool_id: &str) -> bool {
+    tool_id == TOOL_LEGACY_MODENGINE
+        && matches!(plugin_id, "darksouls" | "darksoulsremastered" | "darksouls2")
+        && fromsoftware::legacy_modengine_present(install_path)
+}
+
+pub fn uninstall_tool(
+    paths: &Paths,
+    plugin_id: &str,
+    install_path: &Path,
+    tool_id: &str,
+) -> Result<PluginToolActionResult> {
+    let game_root = resolve_game_root(install_path);
+    if tool_id == TOOL_ME3 && me3_game_name(plugin_id).is_some() {
+        let dest = paths.me3_install_dir();
+        if dest.is_dir() {
+            std::fs::remove_dir_all(&dest)
+                .with_context(|| format!("remove {}", dest.display()))?;
+        }
+        for name in ["emperor.me3", "launch_emperor_me3.sh", "launch_emperor_me3.bat"] {
+            let p = game_root.join(name);
+            if p.is_file() {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+        let tool = build_me3_status(paths, None);
+        return Ok(PluginToolActionResult {
+            tool,
+            message: "Uninstalled Emperor-managed Mod Engine 3 (me3).".into(),
+            warnings: Vec::new(),
+        });
+    }
+
+    if tool_id == TOOL_LEGACY_MODENGINE
+        && matches!(plugin_id, "darksouls" | "darksoulsremastered" | "darksouls2")
+    {
+        for name in ["dinput8.dll", "modengine.ini", LEGACY_STATE_FILE] {
+            let p = game_root.join(name);
+            if p.is_file() {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+        let tool = build_legacy_status(plugin_id, install_path, None);
+        return Ok(PluginToolActionResult {
+            tool,
+            message: format!("Uninstalled Mod Engine from {}.", game_root.display()),
+            warnings: Vec::new(),
+        });
+    }
+
+    Err(anyhow!("unknown FromSoftware tool: {tool_id}"))
+}
+
+pub fn recommended_tools(
+    paths: &Paths,
+    plugin_id: &str,
+    install_path: &Path,
+    needs_loader: bool,
+) -> Vec<PluginToolRecommendation> {
+    if !needs_loader {
+        return Vec::new();
+    }
+    if me3_game_name(plugin_id).is_some() {
+        if resolve_me3_installation(paths).is_none() {
+            return vec![PluginToolRecommendation {
+                tool_id: TOOL_ME3.into(),
+                tool_name: "Mod Engine 3 (me3)".into(),
+                reason: "Enabled mods require Mod Engine 3 (me3) to load via emperor.me3.".into(),
+            }];
+        }
+    } else if matches!(plugin_id, "darksouls" | "darksoulsremastered" | "darksouls2")
+        && !fromsoftware::legacy_modengine_present(install_path)
+    {
+        return vec![PluginToolRecommendation {
+            tool_id: TOOL_LEGACY_MODENGINE.into(),
+            tool_name: "Mod Engine (dinput8.dll)".into(),
+            reason: "Enabled loose asset mods require Mod Engine (dinput8.dll) to load.".into(),
+        }];
+    }
+    Vec::new()
+}
+
 fn find_named_file(root: &Path, name: &str) -> Option<PathBuf> {
     if !root.exists() {
         return None;
@@ -582,13 +758,6 @@ fn find_named_file(root: &Path, name: &str) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use std::io::Write;
-
-    #[test]
-    fn recognizes_fromsoft_plugins() {
-        assert!(is_fromsoft_plugin("darksouls2"));
-        assert!(is_fromsoft_plugin("eldenring"));
-        assert!(!is_fromsoft_plugin("stardewvalley"));
-    }
 
     #[test]
     fn maps_modern_plugins_to_me3_game_names() {
@@ -711,7 +880,7 @@ mod tests {
             b"dll-bytes"
         );
         assert!(game_root.join("modengine.ini").is_file());
-        assert!(legacy_loader_ready(&paths, "darksouls", &install));
+        assert!(tool_assist_ready("darksouls", &install, TOOL_LEGACY_MODENGINE));
     }
 
     #[test]

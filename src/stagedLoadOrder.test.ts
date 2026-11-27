@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   reorderStagedMods,
   reorderStagedModToGroupIndex,
+  stagedModGroup,
 } from "./stagedLoadOrder";
 import type { StagedMod } from "./types";
 
@@ -102,5 +103,45 @@ describe("reorderStagedModToGroupIndex", () => {
   it("moves an enabled mod upward across peers", () => {
     const next = reorderStagedModToGroupIndex(mods, "c", 0);
     expect(next?.map((m) => m.id)).toEqual(["c", "d", "a", "b", "e"]);
+  });
+});
+
+describe("stagedModGroup and tools isolation", () => {
+  const mixed = [
+    staged({ id: "t1", name: "Tool 1", order: 1, enabled: true, plugin_tool_id: "tool-1" }),
+    staged({ id: "a", name: "A", order: 2, enabled: true }),
+    staged({ id: "t2", name: "Tool 2", order: 3, enabled: true, plugin_tool_id: "tool-2" }),
+    staged({ id: "b", name: "B", order: 4, enabled: true }),
+    staged({ id: "d1", name: "D1", order: 5, enabled: false }),
+    staged({ id: "td", name: "Tool Disabled", order: 6, enabled: false, plugin_tool_id: "tool-3" }),
+  ];
+
+  it("classifies enabled tools, enabled mods, and disabled items", () => {
+    expect(mixed.map((m) => [m.id, stagedModGroup(m)])).toEqual([
+      ["t1", "tools"],
+      ["a", "enabled"],
+      ["t2", "tools"],
+      ["b", "enabled"],
+      ["d1", "disabled"],
+      ["td", "disabled"],
+    ]);
+  });
+
+  it("skips tools when reordering enabled mods", () => {
+    const next = reorderStagedMods(mixed, "a", 1);
+    expect(next?.map((m) => m.id)).toEqual(["t1", "b", "t2", "a", "d1", "td"]);
+    expect(reorderStagedMods(mixed, "a", -1)).toBeNull();
+  });
+
+  it("reorders enabled tools within the tools group without touching mods", () => {
+    const next = reorderStagedMods(mixed, "t1", 1);
+    expect(next?.map((m) => m.id)).toEqual(["t2", "a", "t1", "b", "d1", "td"]);
+    expect(reorderStagedMods(mixed, "t1", -1)).toBeNull();
+    expect(reorderStagedMods(mixed, "t2", 1)).toBeNull();
+  });
+
+  it("keeps disabled tools in the disabled group", () => {
+    const next = reorderStagedModToGroupIndex(mixed, "td", 0);
+    expect(next?.map((m) => m.id)).toEqual(["t1", "a", "t2", "b", "td", "d1"]);
   });
 });

@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 
 use super::{
     content_folder_wrap_name, normalize_relative, GamePlugin, GamePluginInfo,
-    PluginToolActionResult, PluginToolStatus,
+    PluginToolActionResult, PluginToolRecommendation, PluginToolStatus,
 };
 use crate::config::Paths;
 
@@ -100,7 +100,15 @@ impl GamePlugin for ProjectZomboidPlugin {
         let mods = mods_dir(install_path);
         std::fs::create_dir_all(&mods).with_context(|| format!("create {}", mods.display()))?;
         write_default_list(&mods, enabled_mod_folders)?;
-        super::projectzomboid_pz3d::repair_after_deploy(install_path)
+        super::projectzomboid_pz3d::repair_after_deploy(install_path, enabled_mod_folders)
+    }
+
+    fn on_revert(&self, install_path: &Path) -> Result<()> {
+        let mods = mods_dir(install_path);
+        if mods.is_dir() {
+            write_default_list(&mods, &[])?;
+        }
+        Ok(())
     }
 
     fn load_log_sources(&self, install_path: &Path) -> Vec<super::LogSource> {
@@ -118,17 +126,24 @@ impl GamePlugin for ProjectZomboidPlugin {
         true
     }
 
-    fn plugin_tools_status(&self, paths: &Paths, install_path: &Path) -> Vec<PluginToolStatus> {
-        super::projectzomboid_pz3d::tools_status(paths, install_path)
+    fn plugin_tools_status(
+        &self,
+        paths: &Paths,
+        game_id: &str,
+        install_path: &Path,
+    ) -> Vec<PluginToolStatus> {
+        super::projectzomboid_pz3d::tools_status(paths, game_id, install_path)
     }
 
     fn check_plugin_tool_updates<'a>(
         &'a self,
         paths: &'a Paths,
+        game_id: &'a str,
         install_path: &'a Path,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<PluginToolStatus>>> + Send + 'a>> {
         Box::pin(super::projectzomboid_pz3d::check_tool_updates(
             paths,
+            game_id,
             install_path,
         ))
     }
@@ -136,11 +151,13 @@ impl GamePlugin for ProjectZomboidPlugin {
     fn install_plugin_tool<'a>(
         &'a self,
         paths: &'a Paths,
+        game_id: &'a str,
         install_path: &'a Path,
         tool_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<PluginToolActionResult>> + Send + 'a>> {
         Box::pin(super::projectzomboid_pz3d::install_tool(
             paths,
+            game_id,
             install_path,
             tool_id,
         ))
@@ -149,15 +166,97 @@ impl GamePlugin for ProjectZomboidPlugin {
     fn uninstall_plugin_tool<'a>(
         &'a self,
         paths: &'a Paths,
+        game_id: &'a str,
         install_path: &'a Path,
         tool_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<PluginToolActionResult>> + Send + 'a>> {
         Box::pin(super::projectzomboid_pz3d::uninstall_tool(
             paths,
+            game_id,
             install_path,
             tool_id,
         ))
     }
+
+    fn adopt_legacy_plugin_tools(
+        &self,
+        paths: &Paths,
+        game_id: &str,
+        install_path: &Path,
+    ) -> Result<bool> {
+        super::projectzomboid_pz3d::adopt_legacy_installs(paths, game_id, install_path)
+    }
+
+    fn recommended_plugin_tools(
+        &self,
+        _paths: &Paths,
+        install_path: &Path,
+        content_roots: &[&Path],
+    ) -> Vec<PluginToolRecommendation> {
+        recommended_pz_tools(install_path, content_roots)
+    }
+}
+
+fn recommended_pz_tools(
+    install_path: &Path,
+    content_roots: &[&Path],
+) -> Vec<PluginToolRecommendation> {
+    let mut needs_zb = false;
+    let mut needs_pz3d = false;
+    let mut staged_zb = false;
+    let mut staged_pz3d = false;
+
+    for root in content_roots {
+        for dir in mod_directories(root) {
+            if let Some(id) = mod_id_of(&dir) {
+                if id.eq_ignore_ascii_case("zombiebuddy") {
+                    staged_zb = true;
+                } else if id.eq_ignore_ascii_case("pz3d") {
+                    staged_pz3d = true;
+                }
+            }
+            if let Some(info_path) = winning_mod_info(&dir) {
+                if let Ok(text) = std::fs::read_to_string(&info_path) {
+                    for line in text.lines() {
+                        let trimmed = line.trim();
+                        if let Some((key, val)) = trimmed.split_once('=') {
+                            if key.trim().eq_ignore_ascii_case("require") {
+                                for req in val.split([',', ';']) {
+                                    let clean = req.trim().trim_start_matches('\\');
+                                    if clean.eq_ignore_ascii_case("zombiebuddy") {
+                                        needs_zb = true;
+                                    } else if clean.eq_ignore_ascii_case("pz3d") {
+                                        needs_pz3d = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mods = mods_dir(install_path);
+    let zb_installed = staged_zb || mods.join("ZombieBuddy").is_dir();
+    let pz3d_installed = staged_pz3d || mods.join("pz3d").is_dir();
+
+    let mut recs = Vec::new();
+    if needs_zb && !zb_installed {
+        recs.push(PluginToolRecommendation {
+            tool_id: "zombiebuddy".into(),
+            tool_name: "ZombieBuddy".into(),
+            reason: "An enabled Project Zomboid mod declares ZombieBuddy as a requirement.".into(),
+        });
+    }
+    if needs_pz3d && !pz3d_installed {
+        recs.push(PluginToolRecommendation {
+            tool_id: "pz3d".into(),
+            tool_name: "PZ3D".into(),
+            reason: "An enabled Project Zomboid mod declares PZ3D as a requirement.".into(),
+        });
+    }
+    recs
 }
 
 pub(super) fn is_windows_build(install_path: &Path) -> bool {

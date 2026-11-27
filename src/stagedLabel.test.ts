@@ -35,6 +35,45 @@ describe("stagedModSourceLine", () => {
       ),
     ).toBe("#12604 · file 35491 · v5.2");
   });
+
+  it("formats plugin tool staged mods cleanly", () => {
+    expect(
+      stagedModSourceLine(
+        staged({
+          id: "tool:pz3d",
+          name: "PZ3D",
+          nexus_mod_id: 0,
+          nexus_file_id: 0,
+          version: "0.10.4",
+          plugin_tool_id: "pz3d",
+        }),
+      ),
+    ).toBe("Tool · v0.10.4");
+    expect(
+      stagedModSourceLine(
+        staged({
+          id: "tool:zombiebuddy",
+          name: "ZombieBuddy",
+          nexus_mod_id: 0,
+          nexus_file_id: 0,
+          version: "v2.3.4",
+          plugin_tool_id: "zombiebuddy",
+        }),
+      ),
+    ).toBe("Tool · v2.3.4");
+    expect(
+      stagedModSourceLine(
+        staged({
+          id: "tool:pz3d",
+          name: "PZ3D",
+          nexus_mod_id: 0,
+          nexus_file_id: 0,
+          version: null,
+          plugin_tool_id: "pz3d",
+        }),
+      ),
+    ).toBe("Tool");
+  });
 });
 
 describe("chosenFileLabel", () => {

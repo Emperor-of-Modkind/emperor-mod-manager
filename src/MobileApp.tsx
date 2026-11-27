@@ -789,12 +789,6 @@ export default function MobileApp({ appInfo }: MobileAppProps) {
     }
   };
 
-  const currentNavLabel =
-    navItems.find((item) => item.id === tab)?.label ?? "Emperor";
-  const topbarTitle =
-    tab === "library" && libraryView === "game" && activeGame
-      ? activeGame.title
-      : currentNavLabel;
   const activeDownloadCount = downloads.filter(
     (d) => d.status === "downloading" || d.status === "queued" || d.status === "extracting",
   ).length;
@@ -863,7 +857,37 @@ export default function MobileApp({ appInfo }: MobileAppProps) {
                 <FontAwesomeIcon icon={faArrowLeft} />
               </button>
             )}
-            <h1 className="mobile-topbar-title">{topbarTitle}</h1>
+            {activeGame ? (
+              <button
+                type="button"
+                className={`mobile-topbar-active-game${
+                  tab === "library" && libraryView === "game" ? " active" : ""
+                }`}
+                onClick={() => openGamePage(activeGame.id)}
+                title={`Active game: ${activeGame.title} — tap to manage`}
+              >
+                {activeGameCoverSrc ? (
+                  <img
+                    src={activeGameCoverSrc}
+                    alt=""
+                    className="mobile-topbar-active-cover"
+                  />
+                ) : (
+                  <span className="mobile-topbar-active-cover placeholder" aria-hidden="true">
+                    <FontAwesomeIcon icon={faGamepad} />
+                  </span>
+                )}
+                <span className="mobile-topbar-active-meta">
+                  <span className="mobile-topbar-active-kicker">Active Game</span>
+                  <strong className="mobile-topbar-active-title">{activeGame.title}</strong>
+                </span>
+                <span className="mobile-topbar-active-count">
+                  {activeEnabledModCount}/{activeMods.length}
+                </span>
+              </button>
+            ) : (
+              <span className="mobile-topbar-empty">No active game</span>
+            )}
           </div>
           <div className="mobile-topbar-right">
             <MobileStatusBar
@@ -1328,6 +1352,9 @@ export default function MobileApp({ appInfo }: MobileAppProps) {
 
           {tab === "settings" && (
             <div className="mobile-settings-pane">
+              <div className="mobile-toolbar-row">
+                <h2>Settings</h2>
+              </div>
               <section className="mobile-surface-card mobile-settings-card mobile-profile-card">
                 <FriendAvatar name={userName} src={userAvatar} size="lg" />
                 <div>
@@ -1455,35 +1482,6 @@ export default function MobileApp({ appInfo }: MobileAppProps) {
 
         {!isWide && (
           <div className="mobile-bottom-dock">
-            {activeGame && (
-              <button
-                type="button"
-                className={`mobile-bottom-active-game${
-                  tab === "library" && libraryView === "game" ? " active" : ""
-                }`}
-                onClick={() => openGamePage(activeGame.id)}
-                title={`Active game: ${activeGame.title} — tap to manage`}
-              >
-                {activeGameCoverSrc ? (
-                  <img
-                    src={activeGameCoverSrc}
-                    alt=""
-                    className="mobile-bottom-active-cover"
-                  />
-                ) : (
-                  <span className="mobile-bottom-active-cover placeholder" aria-hidden="true">
-                    <FontAwesomeIcon icon={faGamepad} />
-                  </span>
-                )}
-                <span className="mobile-bottom-active-meta">
-                  <span className="mobile-bottom-active-kicker">Active Game</span>
-                  <strong className="mobile-bottom-active-title">{activeGame.title}</strong>
-                </span>
-                <span className="mobile-bottom-active-count">
-                  {activeEnabledModCount}/{activeMods.length}
-                </span>
-              </button>
-            )}
             <nav className="mobile-bottom-nav" aria-label="Primary navigation">
               {navItems.map((item) => (
                 <button

@@ -1,10 +1,17 @@
+use std::future::Future;
 use std::path::{Component, Path, PathBuf};
+use std::pin::Pin;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-use super::{content_folder_wrap_name, normalize_relative, GamePlugin, GamePluginInfo};
+use super::{
+    content_folder_wrap_name, normalize_relative, GamePlugin, GamePluginInfo,
+    PluginToolActionResult, PluginToolInstallContext, PluginToolInstallOutcome,
+    PluginToolRecommendation, PluginToolStatus,
+};
+use crate::config::Paths;
 
 /// Top-level folders that belong at the Darktide install root (Mod Loader layout).
 pub const DARKTIDE_ROOT_DIRS: &[&str] = &["mods", "tools", "binaries", "bundle"];
@@ -106,6 +113,73 @@ impl GamePlugin for Warhammer40kDarktidePlugin {
         }
         Ok(warnings)
     }
+
+    fn has_plugin_tools(&self) -> bool {
+        true
+    }
+
+    fn plugin_tools_status(
+        &self,
+        paths: &Paths,
+        _game_id: &str,
+        install_path: &Path,
+    ) -> Vec<PluginToolStatus> {
+        super::darktide_tools::tools_status(paths, install_path)
+    }
+
+    fn check_plugin_tool_updates<'a>(
+        &'a self,
+        paths: &'a Paths,
+        _game_id: &'a str,
+        install_path: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<PluginToolStatus>>> + Send + 'a>> {
+        Box::pin(super::darktide_tools::check_tool_updates(
+            paths,
+            install_path,
+        ))
+    }
+
+    fn install_plugin_tool_ctx<'a>(
+        &'a self,
+        ctx: &'a PluginToolInstallContext<'_>,
+        tool_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<PluginToolInstallOutcome>> + Send + 'a>> {
+        Box::pin(super::darktide_tools::install_tool_ctx(ctx, tool_id))
+    }
+
+    fn install_plugin_tool_from_archive(
+        &self,
+        paths: &Paths,
+        install_path: &Path,
+        tool_id: &str,
+        archive: &Path,
+    ) -> Result<PluginToolActionResult> {
+        super::darktide_tools::install_tool_from_archive(paths, install_path, tool_id, archive)
+    }
+
+    fn tool_assist_ready(&self, _paths: &Paths, install_path: &Path, tool_id: &str) -> bool {
+        super::darktide_tools::tool_assist_ready(install_path, tool_id)
+    }
+
+    fn uninstall_plugin_tool<'a>(
+        &'a self,
+        paths: &'a Paths,
+        _game_id: &'a str,
+        install_path: &'a Path,
+        tool_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<PluginToolActionResult>> + Send + 'a>> {
+        let id = tool_id.to_string();
+        Box::pin(async move { super::darktide_tools::uninstall_tool(paths, install_path, &id) })
+    }
+
+    fn recommended_plugin_tools(
+        &self,
+        _paths: &Paths,
+        install_path: &Path,
+        content_roots: &[&Path],
+    ) -> Vec<PluginToolRecommendation> {
+        super::darktide_tools::recommended_tools(install_path, content_roots)
+    }
 }
 
 fn root_mod_ids(content_root: &Path) -> Vec<String> {
@@ -132,7 +206,7 @@ fn root_mod_ids(content_root: &Path) -> Vec<String> {
         .collect()
 }
 
-fn is_loader_or_framework_root(content_root: &Path) -> bool {
+pub(super) fn is_loader_or_framework_root(content_root: &Path) -> bool {
     if content_root.join("toggle_darktide_mods.bat").is_file() {
         return true;
     }
@@ -244,7 +318,7 @@ fn wine_available() -> bool {
         .unwrap_or(false)
 }
 
-fn bundle_already_patched(install_path: &Path) -> bool {
+pub(super) fn bundle_already_patched(install_path: &Path) -> bool {
     let db = install_path.join("bundle").join("bundle_database.data");
     let Ok(bytes) = std::fs::read(&db) else {
         return false;

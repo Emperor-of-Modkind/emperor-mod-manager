@@ -1009,6 +1009,7 @@ mod tests {
             custom_raw_command: None,
             use_global_launch_options: true,
             wine_overrides_dismissed: false,
+            dismissed_tool_recommendations: Vec::new(),
         };
         let order = LoadOrder {
             mods: vec![
@@ -1089,6 +1090,7 @@ mod tests {
             custom_raw_command: None,
             use_global_launch_options: true,
             wine_overrides_dismissed: false,
+            dismissed_tool_recommendations: Vec::new(),
         };
         let hint = sample_manifest().game;
         assert!(catalogs_overlap(&hint, &game).is_ok());
@@ -1119,6 +1121,7 @@ mod tests {
             custom_raw_command: None,
             use_global_launch_options: true,
             wine_overrides_dismissed: false,
+            dismissed_tool_recommendations: Vec::new(),
         };
         let hint = ShareGameHint {
             id: None,
@@ -1163,6 +1166,7 @@ mod tests {
             custom_raw_command: None,
             use_global_launch_options: true,
             wine_overrides_dismissed: false,
+            dismissed_tool_recommendations: Vec::new(),
         };
         let manifest = sample_manifest();
         let code = encode_share_manifest(&manifest).unwrap();
@@ -1223,6 +1227,7 @@ mod tests {
             custom_raw_command: None,
             use_global_launch_options: true,
             wine_overrides_dismissed: false,
+            dismissed_tool_recommendations: Vec::new(),
         };
         let mut selected = std::collections::BTreeMap::new();
         selected.insert("step_1".to_string(), vec!["opt_b".to_string()]);
@@ -1337,6 +1342,7 @@ mod tests {
             custom_raw_command: None,
             use_global_launch_options: true,
             wine_overrides_dismissed: false,
+            dismissed_tool_recommendations: Vec::new(),
         };
         let mut order = LoadOrder {
             mods: vec![

@@ -448,6 +448,9 @@ pub struct ManagedGame {
     /// Whether the user dismissed the inline Proton launch options notice for this game.
     #[serde(default)]
     pub wine_overrides_dismissed: bool,
+    /// Plugin tool IDs whose inline recommendation notice the user dismissed for this game.
+    #[serde(default)]
+    pub dismissed_tool_recommendations: Vec<String>,
 }
 
 /// A requirement the user chose to hide for one managed game.

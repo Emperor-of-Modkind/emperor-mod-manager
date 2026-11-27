@@ -482,6 +482,14 @@ function AutoHdrSettingsDialog({
 const TOOLS_REFRESH_TTL_MS = 60_000;
 const gameToolsCache = new Map<string, GameToolsResponse>();
 
+export function invalidateGameToolsCache(gameId?: string): void {
+  if (gameId) {
+    gameToolsCache.delete(gameId);
+  } else {
+    gameToolsCache.clear();
+  }
+}
+
 export const ToolsWorkspace = memo(function ToolsWorkspace({
   active = true,
 }: {
@@ -686,10 +694,13 @@ export const ToolsWorkspace = memo(function ToolsWorkspace({
 export const GameToolsPanel = memo(function GameToolsPanel({
   game,
   entered = true,
+  onModsChanged,
 }: {
   game: ManagedGame;
   /** False while the tools view is still entering. The form waits, the fetch does not. */
   entered?: boolean;
+  /** Called after a plugin tool install/uninstall changes the game's staged mods. */
+  onModsChanged?: () => void;
 }) {
   const cached = gameToolsCache.get(game.id) ?? null;
   const [data, setData] = useState<GameToolsResponse | null>(cached);
@@ -798,6 +809,7 @@ export const GameToolsPanel = memo(function GameToolsPanel({
       setPluginNotice(res.message);
       setPluginWarnings(res.warnings ?? []);
       await load(true);
+      onModsChanged?.();
     } catch (e) {
       setError(String(e));
     } finally {
@@ -818,6 +830,7 @@ export const GameToolsPanel = memo(function GameToolsPanel({
       setPluginNotice(res.message);
       setPluginWarnings(res.warnings ?? []);
       await load(true);
+      onModsChanged?.();
     } catch (e) {
       setError(String(e));
     } finally {

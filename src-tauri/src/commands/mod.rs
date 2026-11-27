@@ -2238,6 +2238,7 @@ pub fn manage_game(
         custom_raw_command: None,
         use_global_launch_options: true,
         wine_overrides_dismissed: false,
+        dismissed_tool_recommendations: Vec::new(),
     };
     let install_exists = Path::new(&install_path).is_dir();
     let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
@@ -2372,6 +2373,53 @@ pub fn set_wine_overrides_dismissed(
     let managed = game.clone();
     config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())?;
     Ok(managed)
+}
+
+#[tauri::command]
+pub fn set_tool_recommendations_dismissed(
+    state: State<'_, AppState>,
+    id: String,
+    tool_ids: Vec<String>,
+) -> Result<ManagedGame, String> {
+    let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
+    let game = cfg
+        .managed_games
+        .iter_mut()
+        .find(|g| g.id == id)
+        .ok_or_else(|| "Managed game not found".to_string())?;
+    for tool_id in tool_ids {
+        let trimmed = tool_id.trim();
+        if !trimmed.is_empty()
+            && !game
+                .dismissed_tool_recommendations
+                .iter()
+                .any(|existing| existing == trimmed)
+        {
+            game.dismissed_tool_recommendations
+                .push(trimmed.to_string());
+        }
+    }
+    let managed = game.clone();
+    config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())?;
+    Ok(managed)
+}
+
+#[tauri::command]
+pub fn get_game_tool_recommendations(
+    state: State<'_, AppState>,
+    game_id: String,
+) -> Result<Vec<games::PluginToolRecommendation>, String> {
+    let game = managed_game(&state, &game_id)?;
+    let Some(plugin) = games::plugin_by_id(&game.plugin_id) else {
+        return Ok(Vec::new());
+    };
+    if !plugin.has_plugin_tools() {
+        return Ok(Vec::new());
+    }
+    let install = PathBuf::from(&game.install_path);
+    let content_roots = enabled_deploy_roots(&state.paths, &game_id, &game.plugin_id);
+    let content_refs: Vec<&Path> = content_roots.iter().map(PathBuf::as_path).collect();
+    Ok(plugin.recommended_plugin_tools(&state.paths, &install, &content_refs))
 }
 
 #[tauri::command]
@@ -6996,7 +7044,19 @@ async fn download_and_stage_inner(
     }
 }
 
-/// Download via Nexus API / NXM key, then install as a FromSoft legacy loader.
+fn install_plugin_tool_from_archive_by_id(
+    paths: &Paths,
+    plugin_id: &str,
+    tool_id: &str,
+    install_path: &Path,
+    archive: &Path,
+) -> anyhow::Result<games::PluginToolActionResult> {
+    let plugin = games::plugin_by_id(plugin_id)
+        .ok_or_else(|| anyhow::anyhow!("unknown game plugin: {plugin_id}"))?;
+    plugin.install_plugin_tool_from_archive(paths, install_path, tool_id, archive)
+}
+
+/// Download via Nexus API / NXM key, then install as a Nexus-backed plugin tool.
 async fn download_and_install_loader_inner(
     app: Option<&tauri::AppHandle>,
     state: &AppState,
@@ -7010,6 +7070,7 @@ async fn download_and_install_loader_inner(
     existing_dl_id: Option<String>,
     batch_id: Option<String>,
     plugin_id: &str,
+    tool_id: &str,
     install_path: &Path,
 ) -> Result<(), String> {
     let client = state.client()?;
@@ -7164,8 +7225,14 @@ async fn download_and_install_loader_inner(
         );
     }
 
-    match games::install_legacy_from_archive(&state.paths, plugin_id, install_path, &dest) {
-        Ok(()) => {
+    match install_plugin_tool_from_archive_by_id(
+        &state.paths,
+        plugin_id,
+        tool_id,
+        install_path,
+        &dest,
+    ) {
+        Ok(_) => {
             if cancel.load(Ordering::SeqCst) {
                 let _ = std::fs::remove_file(&dest);
                 mark_cancelled(state, &dl_id);
@@ -7470,10 +7537,11 @@ pub async fn handle_nxm(
     let staged_version = assist.as_ref().and_then(|a| a.version.clone());
     let staged_file_name = assist.as_ref().and_then(|a| a.file_name.clone());
     let loader_purpose = match assist.as_ref().map(|a| &a.purpose) {
-        Some(crate::assist::AssistPurpose::FromsoftLegacyLoader {
+        Some(crate::assist::AssistPurpose::PluginTool {
             plugin_id,
+            tool_id,
             install_path,
-        }) => Some((plugin_id.clone(), install_path.clone())),
+        }) => Some((plugin_id.clone(), tool_id.clone(), install_path.clone())),
         _ => None,
     };
     let game = {
@@ -7572,7 +7640,7 @@ pub async fn handle_nxm(
 
     tauri::async_runtime::spawn(async move {
         let state = app_bg.state::<AppState>();
-        if let Some((plugin_id, install_path)) = loader_purpose {
+        if let Some((plugin_id, tool_id, install_path)) = loader_purpose {
             let result = download_and_install_loader_inner(
                 Some(&app_bg),
                 &*state,
@@ -7586,19 +7654,21 @@ pub async fn handle_nxm(
                 Some(queued_id.clone()),
                 batch_id_bg,
                 &plugin_id,
+                &tool_id,
                 Path::new(&install_path),
             )
             .await;
             match result {
                 Ok(()) => {
-                    log::info!("nxm loader install finished: {label}");
+                    log::info!("nxm plugin tool install finished: {label}");
                     let _ = app_bg.emit(
-                        "fromsoft-loader-installed",
+                        "plugin-tool-installed",
                         serde_json::json!({
                             "id": queued_id,
                             "label": label,
                             "game_id": game_id,
                             "plugin_id": plugin_id,
+                            "tool_id": tool_id,
                         }),
                     );
                     let _ = app_bg.emit(
@@ -7751,10 +7821,11 @@ pub async fn start_assist_cdn_download(
     let ctx = crate::assist::peek_assist_context(state)
         .ok_or_else(|| "No active Download Assist context".to_string())?;
     let loader_purpose = match &ctx.purpose {
-        crate::assist::AssistPurpose::FromsoftLegacyLoader {
+        crate::assist::AssistPurpose::PluginTool {
             plugin_id,
+            tool_id,
             install_path,
-        } => Some((plugin_id.clone(), install_path.clone())),
+        } => Some((plugin_id.clone(), tool_id.clone(), install_path.clone())),
         crate::assist::AssistPurpose::StageMod => None,
         crate::assist::AssistPurpose::WebsiteLogin
         | crate::assist::AssistPurpose::ApiKeyCapture
@@ -7846,7 +7917,7 @@ pub async fn start_assist_cdn_download(
 
     tauri::async_runtime::spawn(async move {
         let state = app_bg.state::<AppState>();
-        if let Some((plugin_id, install_path)) = loader_purpose {
+        if let Some((plugin_id, tool_id, install_path)) = loader_purpose {
             let result = fetch_cdn_and_install_loader(
                 &app_bg,
                 &*state,
@@ -7860,19 +7931,21 @@ pub async fn start_assist_cdn_download(
                 &queued_id,
                 batch_id_bg,
                 &plugin_id,
+                &tool_id,
                 Path::new(&install_path),
             )
             .await;
             match result {
                 Ok(()) => {
-                    log::info!("cdn loader install finished: {label}");
+                    log::info!("cdn plugin tool install finished: {label}");
                     let _ = app_bg.emit(
-                        "fromsoft-loader-installed",
+                        "plugin-tool-installed",
                         serde_json::json!({
                             "id": queued_id,
                             "label": label,
                             "game_id": game_id,
                             "plugin_id": plugin_id,
+                            "tool_id": tool_id,
                         }),
                     );
                     let _ = app_bg.emit(
@@ -8311,7 +8384,7 @@ async fn fetch_and_stage_cdn(
     }
 }
 
-/// Same CDN download as [`fetch_and_stage_cdn`], but installs a FromSoft loader.
+/// Same CDN download as [`fetch_and_stage_cdn`], but installs a Nexus-backed plugin tool.
 async fn fetch_cdn_and_install_loader(
     app: &tauri::AppHandle,
     state: &AppState,
@@ -8325,6 +8398,7 @@ async fn fetch_cdn_and_install_loader(
     dl_id: &str,
     batch_id: Option<String>,
     plugin_id: &str,
+    tool_id: &str,
     install_path: &Path,
 ) -> Result<(), String> {
     let (dest, cancel) = download_cdn_archive(
@@ -8346,8 +8420,14 @@ async fn fetch_cdn_and_install_loader(
     .await?;
 
     report_cdn_extracting(app, state, dl_id, &dest);
-    match games::install_legacy_from_archive(&state.paths, plugin_id, install_path, &dest) {
-        Ok(()) => {
+    match install_plugin_tool_from_archive_by_id(
+        &state.paths,
+        plugin_id,
+        tool_id,
+        install_path,
+        &dest,
+    ) {
+        Ok(_) => {
             if cancel.load(Ordering::SeqCst) {
                 let _ = std::fs::remove_file(&dest);
                 mark_cancelled(state, dl_id);
@@ -8387,7 +8467,7 @@ pub fn import_assist_download(
     let batch_id = ctx.batch_id.clone();
     let page = if matches!(
         ctx.purpose,
-        crate::assist::AssistPurpose::FromsoftLegacyLoader { .. }
+        crate::assist::AssistPurpose::PluginTool { .. }
     ) {
         None
     } else {
@@ -8411,19 +8491,21 @@ pub fn import_assist_download(
         return Err("Cancelled".into());
     }
 
-    if let crate::assist::AssistPurpose::FromsoftLegacyLoader {
+    if let crate::assist::AssistPurpose::PluginTool {
         plugin_id,
+        tool_id,
         install_path,
     } = &ctx.purpose
     {
         let archive = PathBuf::from(&path);
-        match games::install_legacy_from_archive(
+        match install_plugin_tool_from_archive_by_id(
             &state.paths,
             plugin_id,
+            tool_id,
             Path::new(install_path),
             &archive,
         ) {
-            Ok(()) => {
+            Ok(_) => {
                 remove_download_archive(&archive, &state.paths.downloads_dir());
                 if cancel.load(Ordering::SeqCst) {
                     mark_cancelled(&state, &dl_id);
@@ -8441,7 +8523,7 @@ pub fn import_assist_download(
                 }
                 let _ = crate::assist::close_assist_intentionally(&app, &state);
                 let _ = app.emit(
-                    "fromsoft-loader-installed",
+                    "plugin-tool-installed",
                     serde_json::json!({
                         "id": dl_id,
                         "label": ctx.label,
@@ -8589,7 +8671,16 @@ pub async fn list_mods(
     game_id: String,
 ) -> Result<Vec<StagedMod>, String> {
     let paths = state.paths.clone();
+    let game_plugin_install = managed_game(&state, &game_id)
+        .ok()
+        .and_then(|game| {
+            games::plugin_by_id(&game.plugin_id)
+                .map(|plugin| (plugin, PathBuf::from(game.install_path)))
+        });
     blocking(move || {
+        if let Some((plugin, install_path)) = game_plugin_install {
+            let _ = plugin.adopt_legacy_plugin_tools(&paths, &game_id, &install_path);
+        }
         let mut order = mods::load_loadorder(&paths, &game_id).map_err(|e| e.to_string())?;
         order.mods.sort_by_key(|m| m.order);
         Ok(order.mods)
@@ -11890,7 +11981,7 @@ pub async fn list_mods_needing_fomod(
 }
 
 #[tauri::command]
-pub fn remove_mod(
+pub async fn remove_mod(
     state: State<'_, AppState>,
     game_id: String,
     mod_id: String,
@@ -11903,8 +11994,22 @@ pub fn remove_mod(
             "Cannot remove a mod managed by synced collection \"{col_name}\". Uninstall the collection instead."
         ));
     }
-    mods::remove_mod(&state.paths, &game_id, &mod_id).map_err(|e| e.to_string())?;
+    let removed =
+        mods::remove_mod_returning(&state.paths, &game_id, &mod_id).map_err(|e| e.to_string())?;
     if let Ok(game) = managed_game(&state, &game_id) {
+        if let Some(tool_id) = removed.and_then(|m| m.plugin_tool_id) {
+            if let Some(plugin) = games::plugin_by_id(&game.plugin_id) {
+                plugin
+                    .uninstall_plugin_tool(
+                        &state.paths,
+                        &game_id,
+                        Path::new(&game.install_path),
+                        &tool_id,
+                    )
+                    .await
+                    .map_err(|e| format!("{e:#}"))?;
+            }
+        }
         if maybe_auto_save_collections(&state.paths, &game).unwrap_or(false) {
             state.p2p.trigger_local_activity_sync();
         }
@@ -11913,20 +12018,46 @@ pub fn remove_mod(
 }
 
 #[tauri::command]
-pub fn remove_all_mods(state: State<'_, AppState>, game_id: String) -> Result<(), String> {
-    let cfg = state.config.lock().map_err(|e| e.to_string())?;
-    let install_path = cfg
-        .managed_games
-        .iter()
-        .find(|g| g.id == game_id)
-        .map(|g| g.install_path.clone());
-    drop(cfg);
+pub async fn remove_all_mods(state: State<'_, AppState>, game_id: String) -> Result<(), String> {
+    let game_info = {
+        let cfg = state.config.lock().map_err(|e| e.to_string())?;
+        cfg.managed_games
+            .iter()
+            .find(|g| g.id == game_id)
+            .map(|g| (g.plugin_id.clone(), g.install_path.clone()))
+    };
+    let tool_ids: Vec<String> = mods::load_loadorder(&state.paths, &game_id)
+        .ok()
+        .map(|mut order| {
+            order.mods.sort_by_key(|m| std::cmp::Reverse(m.order));
+            order
+                .mods
+                .into_iter()
+                .filter_map(|m| m.plugin_tool_id)
+                .collect()
+        })
+        .unwrap_or_default();
     mods::remove_all_mods(
         &state.paths,
         &game_id,
-        install_path.as_deref().map(Path::new),
+        game_info.as_ref().map(|(_, p)| Path::new(p.as_str())),
     )
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    if let Some((plugin_id, install_path)) = game_info {
+        if let Some(plugin) = games::plugin_by_id(&plugin_id) {
+            for tool_id in tool_ids {
+                let _ = plugin
+                    .uninstall_plugin_tool(
+                        &state.paths,
+                        &game_id,
+                        Path::new(&install_path),
+                        &tool_id,
+                    )
+                    .await;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Download Thunderstore packages whose staging lost files, so a deploy links a
@@ -12022,7 +12153,7 @@ async fn deploy_game_inner(
     let preferred = saved_plugin.preferred_plugin_id(&install);
     let mut plugin_id = game.plugin_id.clone();
     let mut plugin_warning = None;
-    let plugin: &dyn GamePlugin = if preferred != game.plugin_id {
+    if preferred != game.plugin_id {
         if let Some(next) = games::plugin_by_id(preferred) {
             let display = next.info().display_name;
             plugin_id = preferred.to_string();
@@ -12044,39 +12175,8 @@ async fn deploy_game_inner(
                     ));
                 }
             }
-            next
-        } else {
-            saved_plugin
         }
-    } else {
-        saved_plugin
-    };
-    let nexus = state.client().ok();
-    let premium = state.is_premium();
-    let content_roots = enabled_deploy_roots(&state.paths, &game_id, &plugin_id);
-    let content_refs: Vec<&Path> = content_roots.iter().map(PathBuf::as_path).collect();
-    let prep = games::RuntimePrep {
-        paths: &state.paths,
-        install_path: &install,
-        nexus: nexus.as_ref(),
-        premium,
-        content_roots: &content_refs,
-    };
-    let mut loader_warnings = match plugin.prepare_runtime(&prep).await {
-        Ok(games::RuntimePrepOutcome::Done(warnings)) => warnings,
-        Ok(games::RuntimePrepOutcome::NeedsAssist { warnings, request }) => {
-            let mut warnings = warnings;
-            if let Err(e) =
-                wait_for_loader_assist(app, state, game_id, plugin, &prep, &request).await
-            {
-                warnings.push(e);
-            } else if let Ok(extra) = plugin.finish_runtime_prep(&prep) {
-                warnings.extend(extra);
-            }
-            warnings
-        }
-        Err(e) => vec![format!("{e:#}")],
-    };
+    }
     let mut result = mods::deploy(
         &state.paths,
         game_id,
@@ -12088,7 +12188,6 @@ async fn deploy_game_inner(
     if let Some(warning) = plugin_warning {
         result.warnings.insert(0, warning);
     }
-    result.warnings.splice(0..0, loader_warnings.drain(..));
     result.warnings.splice(0..0, repair_warnings);
     if !result.plugin_skips.is_empty() {
         if let Ok(order) = mods::load_loadorder(&state.paths, game_id) {
@@ -12115,46 +12214,6 @@ async fn deploy_game_inner(
         }
     }
     Ok((result, game))
-}
-
-async fn wait_for_loader_assist(
-    app: &tauri::AppHandle,
-    state: &AppState,
-    game_id: &str,
-    plugin: &dyn GamePlugin,
-    prep: &games::RuntimePrep<'_>,
-    request: &games::LoaderAssistRequest,
-) -> Result<(), String> {
-    crate::assist::open_download_assist_inner(
-        app,
-        state,
-        game_id.to_string(),
-        request.domain.clone(),
-        request.mod_id,
-        request.file_id,
-        request.label.clone(),
-        None,
-        None,
-        None,
-        None,
-        crate::assist::AssistPurpose::FromsoftLegacyLoader {
-            plugin_id: request.plugin_id.clone(),
-            install_path: request.install_path.display().to_string(),
-        },
-    )
-    .await?;
-
-    let deadline = Instant::now() + Duration::from_secs(180);
-    while Instant::now() < deadline {
-        if plugin.loader_assist_ready(prep) {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-    Err(format!(
-        "Timed out waiting for {} (180s). Complete the download in Assist and deploy again.",
-        request.label
-    ))
 }
 
 fn ensure_launch_idle(state: &AppState, game_id: &str) -> Result<(), String> {
@@ -15041,6 +15100,7 @@ mod recent_download_restart_meta_tests {
             custom_raw_command: None,
             use_global_launch_options: true,
             wine_overrides_dismissed: false,
+        dismissed_tool_recommendations: Vec::new(),
         };
         let initial_order = mods::LoadOrder {
             mods: vec![StagedMod {

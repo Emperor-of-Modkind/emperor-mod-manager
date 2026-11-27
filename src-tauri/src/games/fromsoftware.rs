@@ -914,8 +914,9 @@ fn legacy_after_deploy(plugin_id: &str, install_path: &Path) -> Result<Vec<Strin
         warnings.extend(ensure_seamless_launch(install_path));
         warnings.extend(ds2_combo_warnings(install_path, &root));
     } else {
-        warnings.extend(restore_legacy_loader_from_cache(plugin_id, install_path));
-        write_modengine_ini(&root)?;
+        if legacy_modengine_present(install_path) {
+            write_modengine_ini(&root)?;
+        }
         warnings.extend(ensure_fromsoft_proton_overrides(install_path));
     }
 
@@ -948,8 +949,9 @@ fn reconcile_ds2_modengine(plugin_id: &str, install_path: &Path) -> Result<Vec<S
     let mut warnings = Vec::new();
 
     if needs_me {
-        warnings.extend(restore_legacy_loader_from_cache(plugin_id, install_path));
-        write_modengine_ini(&root)?;
+        if legacy_modengine_present(install_path) {
+            write_modengine_ini(&root)?;
+        }
     } else if has_injectors {
         warnings.extend(remove_emperor_modengine_if_safe(plugin_id, &root));
     } else {
@@ -1017,72 +1019,6 @@ fn files_same_len(a: &Path, b: &Path) -> bool {
         (Ok(ma), Ok(mb)) => ma.len() == mb.len(),
         _ => false,
     }
-}
-
-/// After purge, restore `dinput8.dll` / refresh a stub ini from the tools cache when present.
-fn restore_legacy_loader_from_cache(plugin_id: &str, install_path: &Path) -> Vec<String> {
-    let Ok(paths) = crate::config::Paths::resolve() else {
-        return Vec::new();
-    };
-    let cache = paths.fromsoft_legacy_modengine_dir(plugin_id);
-    let game_root = resolve_game_root(install_path);
-    let mut warnings = Vec::new();
-
-    let cache_dll = find_file_ci(&cache, "dinput8.dll").or_else(|| {
-        WalkDir::new(&cache)
-            .max_depth(3)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .find(|e| {
-                e.file_type().is_file()
-                    && e.file_name()
-                        .to_str()
-                        .is_some_and(|n| n.eq_ignore_ascii_case("dinput8.dll"))
-            })
-            .map(|e| e.path().to_path_buf())
-    });
-
-    if let Some(dll_src) = cache_dll {
-        let dll_dest = game_root.join("dinput8.dll");
-        if !dll_dest.is_file() {
-            if let Err(e) = std::fs::create_dir_all(&game_root) {
-                warnings.push(format!("Could not create {}: {e}", game_root.display()));
-            } else if let Err(e) = std::fs::copy(&dll_src, &dll_dest) {
-                warnings.push(format!("Could not restore dinput8.dll after deploy: {e}"));
-            } else {
-                warnings.push(format!(
-                    "Restored legacy Mod Engine (dinput8.dll) into {}.",
-                    game_root.display()
-                ));
-            }
-        }
-    }
-
-    if let Some(ini_src) = find_file_ci(&cache, "modengine.ini") {
-        let ini_dest = find_file_ci(&game_root, "modengine.ini")
-            .unwrap_or_else(|| game_root.join("modengine.ini"));
-        let game_ini = if ini_dest.is_file() {
-            std::fs::read_to_string(&ini_dest).unwrap_or_default()
-        } else {
-            String::new()
-        };
-        let cache_ini = std::fs::read_to_string(&ini_src).unwrap_or_default();
-        let game_is_stub = !game_ini.to_ascii_lowercase().contains("blocknetworkaccess")
-            && !game_ini.to_ascii_lowercase().contains("[files]");
-        let cache_is_full = cache_ini
-            .to_ascii_lowercase()
-            .contains("blocknetworkaccess")
-            || cache_ini
-                .to_ascii_lowercase()
-                .contains("usemodoverridedirectory");
-        if cache_is_full && (game_ini.is_empty() || game_is_stub) {
-            if let Err(e) = std::fs::copy(&ini_src, &ini_dest) {
-                warnings.push(format!("Could not refresh modengine.ini from cache: {e}"));
-            }
-        }
-    }
-
-    warnings
 }
 
 const SEAMLESS_SED: &str =
@@ -1540,43 +1476,6 @@ fn dinput8_override_warnings(install_path: &Path) -> Vec<String> {
     }
 }
 
-fn prepare_fromsoft_runtime<'a>(
-    plugin_id: &'static str,
-    ctx: &'a super::RuntimePrep<'_>,
-) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<super::RuntimePrepOutcome>> + Send + 'a>,
-> {
-    Box::pin(async move {
-        let outcome = crate::games::fromsoft_loaders::ensure_fromsoft_loaders(
-            ctx.paths,
-            plugin_id,
-            ctx.install_path,
-            ctx.nexus,
-            ctx.premium,
-        )
-        .await;
-        Ok(match outcome {
-            crate::games::fromsoft_loaders::EnsureLoadersOutcome::Done(warnings) => {
-                super::RuntimePrepOutcome::Done(warnings)
-            }
-            crate::games::fromsoft_loaders::EnsureLoadersOutcome::NeedsAssist {
-                warnings,
-                request,
-            } => super::RuntimePrepOutcome::NeedsAssist {
-                warnings,
-                request: super::LoaderAssistRequest {
-                    domain: request.domain,
-                    mod_id: request.mod_id,
-                    file_id: request.file_id,
-                    plugin_id: request.plugin_id,
-                    install_path: request.install_path,
-                    label: request.label,
-                },
-            },
-        })
-    })
-}
-
 fn ini_has_empty_cooppassword(ini: &Path) -> bool {
     let Ok(text) = std::fs::read_to_string(ini) else {
         return false;
@@ -1788,34 +1687,124 @@ macro_rules! fromsoft_legacy_plugin {
                 legacy_after_deploy($id, install_path)
             }
 
-            fn prepare_runtime<'a>(
+            fn has_plugin_tools(&self) -> bool {
+                crate::games::fromsoft_loaders::has_plugin_tools($id)
+            }
+
+            fn plugin_tools_status(
+                &self,
+                paths: &crate::config::Paths,
+                _game_id: &str,
+                install_path: &Path,
+            ) -> Vec<super::PluginToolStatus> {
+                crate::games::fromsoft_loaders::tools_status(paths, $id, install_path)
+            }
+
+            fn check_plugin_tool_updates<'a>(
                 &'a self,
-                ctx: &'a super::RuntimePrep<'_>,
+                paths: &'a crate::config::Paths,
+                _game_id: &'a str,
+                install_path: &'a Path,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<Vec<super::PluginToolStatus>>> + Send + 'a>,
+            > {
+                Box::pin(crate::games::fromsoft_loaders::check_tool_updates(
+                    paths,
+                    $id,
+                    install_path,
+                ))
+            }
+
+            fn install_plugin_tool_ctx<'a>(
+                &'a self,
+                ctx: &'a super::PluginToolInstallContext<'_>,
+                tool_id: &'a str,
             ) -> std::pin::Pin<
                 Box<
-                    dyn std::future::Future<Output = Result<super::RuntimePrepOutcome>> + Send + 'a,
+                    dyn std::future::Future<Output = Result<super::PluginToolInstallOutcome>>
+                        + Send
+                        + 'a,
                 >,
             > {
-                prepare_fromsoft_runtime($id, ctx)
+                Box::pin(crate::games::fromsoft_loaders::install_tool_ctx(
+                    ctx,
+                    $id,
+                    tool_id,
+                ))
             }
 
-            fn finish_runtime_prep(&self, ctx: &super::RuntimePrep<'_>) -> Result<Vec<String>> {
-                crate::games::fromsoft_loaders::finish_legacy_after_assist(
-                    ctx.paths,
+            fn install_plugin_tool_from_archive(
+                &self,
+                paths: &crate::config::Paths,
+                install_path: &Path,
+                tool_id: &str,
+                archive: &Path,
+            ) -> Result<super::PluginToolActionResult> {
+                crate::games::fromsoft_loaders::install_tool_from_archive(
+                    paths,
                     $id,
-                    ctx.install_path,
+                    install_path,
+                    tool_id,
+                    archive,
                 )
             }
 
-            fn loader_assist_ready(&self, ctx: &super::RuntimePrep<'_>) -> bool {
-                crate::games::fromsoft_loaders::legacy_loader_ready(
-                    ctx.paths,
-                    $id,
-                    ctx.install_path,
-                )
+            fn tool_assist_ready(
+                &self,
+                _paths: &crate::config::Paths,
+                install_path: &Path,
+                tool_id: &str,
+            ) -> bool {
+                crate::games::fromsoft_loaders::tool_assist_ready($id, install_path, tool_id)
+            }
+
+            fn uninstall_plugin_tool<'a>(
+                &'a self,
+                paths: &'a crate::config::Paths,
+                _game_id: &'a str,
+                install_path: &'a Path,
+                tool_id: &'a str,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<super::PluginToolActionResult>>
+                        + Send
+                        + 'a,
+                >,
+            > {
+                let id = tool_id.to_string();
+                Box::pin(async move {
+                    crate::games::fromsoft_loaders::uninstall_tool(paths, $id, install_path, &id)
+                })
+            }
+
+            fn recommended_plugin_tools(
+                &self,
+                paths: &crate::config::Paths,
+                install_path: &Path,
+                content_roots: &[&Path],
+            ) -> Vec<super::PluginToolRecommendation> {
+                let needs = legacy_content_needs_modengine($id, content_roots);
+                crate::games::fromsoft_loaders::recommended_tools(paths, $id, install_path, needs)
             }
         }
     };
+}
+
+fn legacy_content_needs_modengine(plugin_id: &str, content_roots: &[&Path]) -> bool {
+    if content_roots.is_empty() {
+        return false;
+    }
+    for root in content_roots {
+        if find_file_ci(root, "dinput8.dll").is_some() {
+            return false;
+        }
+    }
+    if plugin_id == "darksouls2" {
+        return content_roots
+            .iter()
+            .any(|root| !game_has_root_injector_pack(root));
+    }
+    true
 }
 
 macro_rules! fromsoft_modern_plugin {
@@ -1911,15 +1900,81 @@ macro_rules! fromsoft_modern_plugin {
                 modern_on_revert(install_path)
             }
 
-            fn prepare_runtime<'a>(
+            fn has_plugin_tools(&self) -> bool {
+                crate::games::fromsoft_loaders::has_plugin_tools($id)
+            }
+
+            fn plugin_tools_status(
+                &self,
+                paths: &crate::config::Paths,
+                _game_id: &str,
+                install_path: &Path,
+            ) -> Vec<super::PluginToolStatus> {
+                crate::games::fromsoft_loaders::tools_status(paths, $id, install_path)
+            }
+
+            fn check_plugin_tool_updates<'a>(
                 &'a self,
-                ctx: &'a super::RuntimePrep<'_>,
+                paths: &'a crate::config::Paths,
+                _game_id: &'a str,
+                install_path: &'a Path,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<Vec<super::PluginToolStatus>>> + Send + 'a>,
+            > {
+                Box::pin(crate::games::fromsoft_loaders::check_tool_updates(
+                    paths,
+                    $id,
+                    install_path,
+                ))
+            }
+
+            fn install_plugin_tool_ctx<'a>(
+                &'a self,
+                ctx: &'a super::PluginToolInstallContext<'_>,
+                tool_id: &'a str,
             ) -> std::pin::Pin<
                 Box<
-                    dyn std::future::Future<Output = Result<super::RuntimePrepOutcome>> + Send + 'a,
+                    dyn std::future::Future<Output = Result<super::PluginToolInstallOutcome>>
+                        + Send
+                        + 'a,
                 >,
             > {
-                prepare_fromsoft_runtime($id, ctx)
+                Box::pin(crate::games::fromsoft_loaders::install_tool_ctx(
+                    ctx,
+                    $id,
+                    tool_id,
+                ))
+            }
+
+            fn uninstall_plugin_tool<'a>(
+                &'a self,
+                paths: &'a crate::config::Paths,
+                _game_id: &'a str,
+                install_path: &'a Path,
+                tool_id: &'a str,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<super::PluginToolActionResult>>
+                        + Send
+                        + 'a,
+                >,
+            > {
+                let id = tool_id.to_string();
+                Box::pin(async move {
+                    crate::games::fromsoft_loaders::uninstall_tool(paths, $id, install_path, &id)
+                })
+            }
+
+            fn recommended_plugin_tools(
+                &self,
+                paths: &crate::config::Paths,
+                install_path: &Path,
+                content_roots: &[&Path],
+            ) -> Vec<super::PluginToolRecommendation> {
+                let needs = content_roots
+                    .iter()
+                    .any(|root| !self.load_order_entries(root, "mod").is_empty());
+                crate::games::fromsoft_loaders::recommended_tools(paths, $id, install_path, needs)
             }
         }
     };
@@ -2019,38 +2074,6 @@ fromsoft_legacy_plugin!(
 mod tests {
     use super::*;
     use crate::games::{match_plugin, normalize_staging_root};
-
-    #[tokio::test]
-    async fn prepare_runtime_skips_when_legacy_loader_is_present() {
-        let tmp = tempfile::tempdir().unwrap();
-        let install = tmp.path().join("DARK SOULS REMASTERED");
-        std::fs::create_dir_all(&install).unwrap();
-        std::fs::write(install.join("dinput8.dll"), b"x").unwrap();
-        let paths = crate::config::Paths {
-            config_dir: tmp.path().join("config"),
-            data_dir: tmp.path().join("data"),
-            cache_dir: tmp.path().join("cache"),
-        };
-        let ctx = crate::games::RuntimePrep {
-            paths: &paths,
-            install_path: &install,
-            nexus: None,
-            premium: false,
-            content_roots: &[],
-        };
-        let outcome = DarkSoulsRemasteredPlugin
-            .prepare_runtime(&ctx)
-            .await
-            .unwrap();
-        match outcome {
-            crate::games::RuntimePrepOutcome::Done(warnings) => {
-                assert!(warnings.is_empty(), "{warnings:?}");
-            }
-            crate::games::RuntimePrepOutcome::NeedsAssist { .. } => {
-                panic!("loader already on disk should not open Download Assist");
-            }
-        }
-    }
 
     #[test]
     fn prefers_game_subdir_when_present() {

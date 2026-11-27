@@ -20,6 +20,7 @@ import {
   faBars,
   faCaretDown,
   faChevronRight,
+  faCircleInfo,
   faCopy,
   faDownload,
   faEye,
@@ -38,6 +39,7 @@ import {
   faRotateLeft,
   faStop,
   faTrashCan,
+  faWrench,
   faXmark,
 } from "@fortawesome/free-solid-svg-icons";
 import {
@@ -90,6 +92,7 @@ import { MobileDevicesSettings } from "./MobileDevicesSettings";
 import { useFoldableLayout } from "./useFoldableLayout";
 import { Throbber } from "./Throbber";
 import { CheckingFriendUpdatesToast, CheckingUpdatesToast, UpdateToast } from "./UpdateToast";
+import { createAppUpdateScheduler, type AppUpdateScheduler } from "./appUpdateScheduler";
 import { api } from "./api";
 import { setupCanFinish } from "./setupGate";
 import {
@@ -100,7 +103,12 @@ import {
   type AssistQueueEntry,
   type AssistQueueState,
 } from "./downloads";
-import { GameToolsPanel, ToolsErrorBoundary, ToolsWorkspace } from "./tools";
+import {
+  GameToolsPanel,
+  ToolsErrorBoundary,
+  ToolsWorkspace,
+  invalidateGameToolsCache,
+} from "./tools";
 import {
   catalogFilterMismatchMessage,
   clampCatalogSourceFilter,
@@ -159,8 +167,10 @@ import { chosenFileLabel, stagedModSourceLine } from "./stagedLabel";
 import {
   reorderStagedMods,
   reorderStagedModToGroupIndex,
-  sameEnabledNeighborIndex,
+  sameGroupNeighborIndex,
+  stagedModGroup,
   stagedModsInLoadOrder,
+  type StagedModGroup,
 } from "./stagedLoadOrder";
 import { useStagedModDrag } from "./useStagedModDrag";
 import { Modal } from "./Modal";
@@ -213,6 +223,7 @@ import {
   type StatusNotice,
 } from "./StatusBanner";
 import { WineOverrideNotice } from "./WineOverrideNotice";
+import { ToolRecommendationNotice } from "./ToolRecommendationNotice";
 import { CollectionIntegrityDialog } from "./CollectionIntegrityDialog";
 import { CollectionConflictDialog } from "./CollectionConflictDialog";
 import {
@@ -263,6 +274,7 @@ import type {
   StagedMod,
   StagedModUpdate,
   WineOverrideAdvice,
+  PluginToolRecommendation,
   TagFilterState,
   ThemePreference,
   ThemeStyle,
@@ -864,7 +876,7 @@ function stagedModSearchText(m: StagedMod, collectionNames: string[] = []): stri
   return [
     m.name,
     m.version ?? "",
-    stagedModSource(m),
+    m.plugin_tool_id ? `tool ${m.plugin_tool_id}` : stagedModSource(m),
     String(m.nexus_mod_id),
     String(m.nexus_file_id),
     m.ts_namespace ?? "",
@@ -904,7 +916,9 @@ function filterAndSortStagedMods(
     filtered = filtered.filter((m) => !m.enabled);
   }
   if (opts.source !== "all") {
-    filtered = filtered.filter((m) => stagedModSource(m) === opts.source);
+    filtered = filtered.filter(
+      (m) => !m.plugin_tool_id && stagedModSource(m) === opts.source,
+    );
   }
   if (opts.collectionId === MODS_COLLECTION_FILTER_NONE) {
     filtered = filtered.filter((m) => !(m.collection_ids ?? []).length);
@@ -934,12 +948,19 @@ function filterAndSortStagedMods(
     return next;
   };
 
-  if (opts.status === "enabled" || opts.status === "disabled") {
+  if (opts.status === "disabled") {
     return sortPartition(filtered);
   }
+  if (opts.status === "enabled") {
+    return [
+      ...sortPartition(filtered.filter((m) => stagedModGroup(m) === "tools")),
+      ...sortPartition(filtered.filter((m) => stagedModGroup(m) === "enabled")),
+    ];
+  }
   return [
-    ...sortPartition(filtered.filter((m) => m.enabled)),
-    ...sortPartition(filtered.filter((m) => !m.enabled)),
+    ...sortPartition(filtered.filter((m) => stagedModGroup(m) === "tools")),
+    ...sortPartition(filtered.filter((m) => stagedModGroup(m) === "enabled")),
+    ...sortPartition(filtered.filter((m) => stagedModGroup(m) === "disabled")),
   ];
 }
 
@@ -1981,6 +2002,7 @@ export default function App() {
   const [mods, setMods] = useState<StagedMod[]>([]);
   const [modsReadyGameId, setModsReadyGameId] = useState<string | null>(null);
   const [wineAdvice, setWineAdvice] = useState<WineOverrideAdvice | null>(null);
+  const [toolRecommendations, setToolRecommendations] = useState<PluginToolRecommendation[]>([]);
   const [wineApplyBusy, setWineApplyBusy] = useState(false);
   const [missingRequirements, setMissingRequirements] =
     useState<MissingRequirements | null>(null);
@@ -2026,7 +2048,8 @@ export default function App() {
     useState<CatalogSourceFilter>("all");
   const [modsSort, setModsSort] = useState<ModsSort>("loadOrder");
   const [modsCollectionFilter, setModsCollectionFilter] = useState("");
-  const [disabledModsExpanded, setDisabledModsExpanded] = useState(false);
+  const [openStagedSection, setOpenStagedSection] =
+    useState<StagedModGroup | null>("enabled");
   const [collectionIntegrityById, setCollectionIntegrityById] = useState<
     Record<string, CollectionIntegrityReport>
   >({});
@@ -2400,9 +2423,12 @@ export default function App() {
   const modUpdatesReqRef = useRef(0);
   const checkingModUpdatesTimerRef = useRef<number | null>(null);
   const checkingFriendUpdatesTimerRef = useRef<number | null>(null);
+  const appUpdateCheckInFlightRef = useRef<Promise<AppUpdateStatus> | null>(null);
+  const appUpdateSchedulerRef = useRef<AppUpdateScheduler | null>(null);
   const modFilesReqRef = useRef(0);
   const modFilesModIdRef = useRef<number | null>(null);
   const wineAdviceReqRef = useRef(0);
+  const toolRecommendationsReqRef = useRef(0);
   const missingReqRef = useRef(0);
   const gameVersionReqRef = useRef(0);
   const pendingRequirementLinksRef = useRef<Map<string, string[]>>(new Map());
@@ -2853,11 +2879,14 @@ export default function App() {
   });
 
   useEffect(() => {
-    setDisabledModsExpanded(false);
+    setOpenStagedSection("enabled");
   }, [activeGame?.id]);
 
-  const showDisabledModsExpanded =
-    disabledModsExpanded || Boolean(deferredModsQuery.trim());
+  const searchingStagedMods = Boolean(deferredModsQuery.trim());
+  const isStagedSectionExpanded = (section: StagedModGroup) =>
+    searchingStagedMods || openStagedSection === section;
+  const toggleStagedSection = (section: StagedModGroup) =>
+    setOpenStagedSection((cur) => (cur === section ? null : section));
 
   const stagedUpdateCount = useMemo(
     () =>
@@ -2996,15 +3025,23 @@ export default function App() {
     }
   }, []);
 
-  const checkForAppUpdate = useCallback(async (quiet = false) => {
+  const checkForAppUpdate = useCallback(async (quiet = false): Promise<boolean> => {
     setCheckingAppUpdate(true);
     if (!quiet) {
       setAppUpdateMessage(null);
       setError(null);
     }
+    let pending = appUpdateCheckInFlightRef.current;
+    let ownsRequest = false;
+    if (!pending) {
+      pending = api.checkAppUpdate();
+      appUpdateCheckInFlightRef.current = pending;
+      ownsRequest = true;
+    }
     try {
-      const status = await api.checkAppUpdate();
+      const status = await pending;
       navTtlRef.current.mark("app-update");
+      appUpdateSchedulerRef.current?.recordExternalSuccess();
       setAppUpdate(status);
       setAppInfo((prev) =>
         prev
@@ -3025,13 +3062,22 @@ export default function App() {
           setAppUpdateMessage("No releases found on GitHub.");
         }
       }
+      return true;
     } catch (e) {
-      if (!quiet) {
+      if (quiet) {
+        console.warn("check_app_update failed", e);
+      } else {
         setAppUpdateMessage(null);
         setError(String(e));
       }
+      return false;
     } finally {
-      setCheckingAppUpdate(false);
+      if (ownsRequest && appUpdateCheckInFlightRef.current === pending) {
+        appUpdateCheckInFlightRef.current = null;
+      }
+      if (!appUpdateCheckInFlightRef.current) {
+        setCheckingAppUpdate(false);
+      }
     }
   }, []);
 
@@ -3088,6 +3134,18 @@ export default function App() {
     }
   }, []);
 
+  const refreshToolRecommendations = useCallback(async (gameId: string) => {
+    const req = ++toolRecommendationsReqRef.current;
+    try {
+      const recs = await api.gameToolRecommendations(gameId);
+      if (req !== toolRecommendationsReqRef.current) return;
+      if (activeGameRef.current?.id !== gameId) return;
+      setToolRecommendations(Array.isArray(recs) ? recs : []);
+    } catch (e) {
+      console.warn("get_game_tool_recommendations failed", e);
+    }
+  }, []);
+
   const refreshMods = useCallback(async (gameId: string) => {
     let revealed = false;
     try {
@@ -3124,13 +3182,14 @@ export default function App() {
         console.warn("list_mods_needing_fomod failed", e);
       }
       void refreshWineAdvice(gameId);
+      void refreshToolRecommendations(gameId);
       return { list, needing };
     } finally {
       if (!revealed && activeGameRef.current?.id === gameId) {
         setModsReadyGameId(gameId);
       }
     }
-  }, [refreshWineAdvice]);
+  }, [refreshWineAdvice, refreshToolRecommendations]);
 
   const openModInstaller = useCallback(
     async (m: StagedMod) => {
@@ -3654,7 +3713,17 @@ export default function App() {
 
   useEffect(() => {
     if (!settings?.initial_setup_complete) return;
-    void checkForAppUpdate(true);
+    const scheduler = createAppUpdateScheduler({
+      check: () => checkForAppUpdate(true),
+    });
+    appUpdateSchedulerRef.current = scheduler;
+    scheduler.start();
+    return () => {
+      scheduler.stop();
+      if (appUpdateSchedulerRef.current === scheduler) {
+        appUpdateSchedulerRef.current = null;
+      }
+    };
   }, [settings?.initial_setup_complete, checkForAppUpdate]);
 
   useNavSettledEffect(
@@ -3713,6 +3782,8 @@ export default function App() {
       setCheckingModUpdates(false);
       wineAdviceReqRef.current += 1;
       setWineAdvice(null);
+      toolRecommendationsReqRef.current += 1;
+      setToolRecommendations([]);
       if (prevId !== null) {
         resetBrowseState();
         resetLibraryEphemeralState();
@@ -4207,6 +4278,7 @@ export default function App() {
           });
         }
         void refreshWineAdvice(next.game_id);
+        void refreshToolRecommendations(next.game_id);
       } else if (next.mode === "modded" && next.phase === "running") {
         setActiveDeploymentByGame((prev) => ({ ...prev, [next.game_id]: true }));
       }
@@ -9453,6 +9525,7 @@ export default function App() {
       setActiveDeploymentByGame((prev) => ({ ...prev, [game.id]: true }));
       void refreshMissingRequirements(game.id);
       void refreshWineAdvice(game.id);
+      void refreshToolRecommendations(game.id);
       if (res.deploy_result) {
         const full = res.deploy_result.missing_requirements;
         setNotice(
@@ -9611,6 +9684,35 @@ export default function App() {
     }
   }
 
+  async function dismissToolRecommendations(toolIds: string[]) {
+    if (!activeGame || toolIds.length === 0) return;
+    const gameId = activeGame.id;
+    setError(null);
+    try {
+      const updated = await api.setToolRecommendationsDismissed(gameId, toolIds);
+      setManaged((prev) =>
+        prev.map((game) => (game.id === updated.id ? updated : game)),
+      );
+      setLibraryDetail((detail) =>
+        detail && detail.game.id === updated.id
+          ? { ...detail, game: updated }
+          : detail,
+      );
+      setNotice({
+        kind: "warn",
+        message:
+          "Tool recommendation dismissed. You can install game tools anytime from the Tools modal.",
+        action: {
+          label: "Open Tools",
+          run: () => setGameModal("tools"),
+          dismiss: true,
+        },
+      });
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
   async function checkLoadLogs() {
     if (!activeGame) return;
     await withBusy("Checking loader logs…", async () => {
@@ -9627,6 +9729,7 @@ export default function App() {
       setLaunchStates((prev) => ({ ...prev, [game.id]: st }));
       setActiveDeploymentByGame((prev) => ({ ...prev, [game.id]: false }));
       void refreshWineAdvice(game.id);
+      void refreshToolRecommendations(game.id);
       setNotice({ kind: "ok", message: `Launched ${game.title} unmodded.` });
     });
   }
@@ -9638,6 +9741,7 @@ export default function App() {
       await api.revertDeployment(game.id);
       setActiveDeploymentByGame((prev) => ({ ...prev, [game.id]: false }));
       void refreshWineAdvice(game.id);
+      void refreshToolRecommendations(game.id);
       setNotice({ kind: "ok", message: "Reverted deployed files." });
     });
   }
@@ -9802,6 +9906,7 @@ export default function App() {
     if (!activeGame || mods.length === 0) return;
     await withBusy("Removing all mods…", async () => {
       await api.removeAllMods(activeGame.id);
+      invalidateGameToolsCache(activeGame.id);
       await refreshMods(activeGame.id);
       await refreshCollections(activeGame.id);
       setModsCollectionFilter("");
@@ -10548,6 +10653,31 @@ export default function App() {
                         </div>
                       );
                     })()}
+                    {(settings?.platform_linux ||
+                      gamePlugins.some(
+                        (p) =>
+                          p.id === libraryDetail.game.plugin_id &&
+                          p.has_tools,
+                      )) && (
+                      <button
+                        type="button"
+                        className="mods-toolbar-icon-btn"
+                        aria-label="Tools"
+                        title="Tools"
+                        onClick={() => setGameModal("tools")}
+                      >
+                        <FontAwesomeIcon icon={faWrench} />
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      className="mods-toolbar-icon-btn"
+                      aria-label="Info"
+                      title="Info"
+                      onClick={() => setGameModal("info")}
+                    >
+                      <FontAwesomeIcon icon={faCircleInfo} />
+                    </button>
                     <div
                       className="mods-actions-menu game-settings-menu"
                       ref={gameSettingsMenuRef}
@@ -10569,33 +10699,6 @@ export default function App() {
                         className="mods-actions-menu-popup game-settings-menu-popup"
                         role="menu"
                       >
-                        <button
-                          type="button"
-                          role="menuitem"
-                          onClick={() => {
-                            setGameSettingsMenuOpen(false);
-                            setGameModal("info");
-                          }}
-                        >
-                          Info
-                        </button>
-                        {(settings?.platform_linux ||
-                          gamePlugins.some(
-                            (p) =>
-                              p.id === libraryDetail.game.plugin_id &&
-                              p.has_tools,
-                          )) && (
-                          <button
-                            type="button"
-                            role="menuitem"
-                            onClick={() => {
-                              setGameSettingsMenuOpen(false);
-                              setGameModal("tools");
-                            }}
-                          >
-                            Tools
-                          </button>
-                        )}
                         <button
                           type="button"
                           role="menuitem"
@@ -11069,6 +11172,29 @@ export default function App() {
                         />
                       ) : null}
                     </Reveal>
+                    {(() => {
+                      const dismissed = new Set(
+                        libraryDetail.game.dismissed_tool_recommendations ?? [],
+                      );
+                      const visibleRecs = toolRecommendations.filter(
+                        (rec) => !dismissed.has(rec.tool_id),
+                      );
+                      return (
+                        <Reveal show={visibleRecs.length > 0}>
+                          {visibleRecs.length > 0 ? (
+                            <ToolRecommendationNotice
+                              recommendations={visibleRecs}
+                              onOpenTools={() => setGameModal("tools")}
+                              onDismiss={() =>
+                                void dismissToolRecommendations(
+                                  visibleRecs.map((rec) => rec.tool_id),
+                                )
+                              }
+                            />
+                          ) : null}
+                        </Reveal>
+                      );
+                    })()}
                     {isBethesdaLootPluginId(libraryDetail.game.plugin_id) && (
                       <div className="game-detail-subtabs" role="tablist" aria-label="Mod views">
                         <button
@@ -11399,12 +11525,12 @@ export default function App() {
                           canReorderMods &&
                           !syncedCollectionName &&
                           idx >= 0 &&
-                          sameEnabledNeighborIndex(modsInLoadOrder, idx, -1) >= 0;
+                          sameGroupNeighborIndex(modsInLoadOrder, idx, -1) >= 0;
                         const canMoveDown =
                           canReorderMods &&
                           !syncedCollectionName &&
                           idx >= 0 &&
-                          sameEnabledNeighborIndex(modsInLoadOrder, idx, 1) >= 0;
+                          sameGroupNeighborIndex(modsInLoadOrder, idx, 1) >= 0;
                         const pageHit = activeGame
                           ? catalogHitFromStaged(m, activeGame)
                           : null;
@@ -11625,6 +11751,9 @@ export default function App() {
                                   withBusy("Removing mod…", async () => {
                                     if (!activeGame) return;
                                     await api.removeMod(activeGame.id, m.id);
+                                    if (m.plugin_tool_id) {
+                                      invalidateGameToolsCache(activeGame.id);
+                                    }
                                     await refreshMods(activeGame.id);
                                     await refreshCollections(activeGame.id);
                                     setModUpdates((prev) => {
@@ -11697,77 +11826,96 @@ export default function App() {
                         );
                       }
 
+                      const accordionSections: {
+                        id: StagedModGroup;
+                        title: string;
+                        items: StagedMod[];
+                        listRef: typeof modDrag.listRef;
+                        staggerEnter: boolean;
+                      }[] = (
+                        [
+                          {
+                            id: "tools" as const,
+                            title: "Tools",
+                            items: modDrag.toolsDisplayMods,
+                            listRef: modDrag.toolsListRef,
+                            staggerEnter: false,
+                          },
+                          {
+                            id: "enabled" as const,
+                            title: "Installed",
+                            items: modDrag.enabledDisplayMods,
+                            listRef: modDrag.listRef,
+                            staggerEnter: !modDrag.isDragging,
+                          },
+                          {
+                            id: "disabled" as const,
+                            title: "Disabled",
+                            items: modDrag.disabledDisplayMods,
+                            listRef: modDrag.disabledListRef,
+                            staggerEnter: false,
+                          },
+                        ]
+                      ).filter((section) => section.items.length > 0);
+
                       return (
                         <>
-                          {modDrag.enabledDisplayMods.length > 0 && (
-                            <BrowseVirtualList
-                              items={modDrag.enabledDisplayMods}
-                              scrollRef={libraryDetailScrollRef}
-                              active={tab === "library"}
-                              staggerEnter={!modDrag.isDragging}
-                              staggerKey={activeGame?.id}
-                              listRef={modDrag.listRef}
-                              listClassName={listClassName}
-                              estimateSize={rowEstimate}
-                              getKey={(m) => m.id}
-                              onRowPointerDown={handleStagedModPointerDown}
-                              rowClassName={stagedModRowClassName}
-                              renderItem={renderStagedModItem}
-                            />
-                          )}
-                          {modDrag.disabledDisplayMods.length > 0 && (
-                            <section
-                              className={
-                                modDrag.enabledDisplayMods.length > 0
-                                  ? "staged-disabled-section"
-                                  : "staged-disabled-section staged-disabled-section-solo"
-                              }
-                              data-expanded={
-                                showDisabledModsExpanded ? "true" : "false"
-                              }
-                            >
-                              <button
-                                type="button"
-                                className="staged-disabled-toggle"
-                                aria-expanded={showDisabledModsExpanded}
-                                onClick={() =>
-                                  setDisabledModsExpanded((open) => !open)
+                          {accordionSections.map((section, sectionIndex) => {
+                            const expanded = isStagedSectionExpanded(section.id);
+                            return (
+                              <section
+                                key={section.id}
+                                className={
+                                  sectionIndex === 0
+                                    ? "staged-disabled-section staged-disabled-section-solo"
+                                    : "staged-disabled-section"
                                 }
+                                data-expanded={expanded ? "true" : "false"}
                               >
-                                <FontAwesomeIcon
-                                  icon={faChevronRight}
-                                  className="staged-disabled-chevron"
-                                  aria-hidden="true"
-                                />
-                                <span className="staged-disabled-title">
-                                  Disabled
-                                </span>
-                                <span className="pill muted">
-                                  {modDrag.disabledDisplayMods.length}
-                                </span>
-                              </button>
-                              <Collapse
-                                show={showDisabledModsExpanded}
-                                className="staged-disabled-body"
-                              >
-                                <BrowseVirtualList
-                                  items={modDrag.disabledDisplayMods}
-                                  scrollRef={libraryDetailScrollRef}
-                                  active={
-                                    tab === "library" && showDisabledModsExpanded
-                                  }
-                                  staggerEnter={false}
-                                  listRef={modDrag.disabledListRef}
-                                  listClassName={listClassName}
-                                  estimateSize={rowEstimate}
-                                  getKey={(m) => m.id}
-                                  onRowPointerDown={handleStagedModPointerDown}
-                                  rowClassName={stagedModRowClassName}
-                                  renderItem={renderStagedModItem}
-                                />
-                              </Collapse>
-                            </section>
-                          )}
+                                <button
+                                  type="button"
+                                  className="staged-disabled-toggle"
+                                  aria-expanded={expanded}
+                                  onClick={() => toggleStagedSection(section.id)}
+                                >
+                                  <FontAwesomeIcon
+                                    icon={faChevronRight}
+                                    className="staged-disabled-chevron"
+                                    aria-hidden="true"
+                                  />
+                                  <span className="staged-disabled-title">
+                                    {section.title}
+                                  </span>
+                                  <span className="pill muted">
+                                    {section.items.length}
+                                  </span>
+                                </button>
+                                <Collapse
+                                  show={expanded}
+                                  className="staged-disabled-body"
+                                >
+                                  <BrowseVirtualList
+                                    items={section.items}
+                                    scrollRef={libraryDetailScrollRef}
+                                    active={tab === "library" && expanded}
+                                    staggerEnter={section.staggerEnter}
+                                    staggerKey={
+                                      section.staggerEnter
+                                        ? activeGame?.id
+                                        : undefined
+                                    }
+                                    listRef={section.listRef}
+                                    listClassName={listClassName}
+                                    estimateSize={rowEstimate}
+                                    getKey={(m) => m.id}
+                                    onRowPointerDown={handleStagedModPointerDown}
+                                    rowClassName={stagedModRowClassName}
+                                    renderItem={renderStagedModItem}
+                                  />
+                                </Collapse>
+                              </section>
+                            );
+                          })}
                         </>
                       );
                     })()}
@@ -15722,7 +15870,12 @@ export default function App() {
           className="modal-game-detail"
           onClose={() => setGameModal(null)}
         >
-          <GameToolsPanel game={libraryDetail.game} />
+          <GameToolsPanel
+            game={libraryDetail.game}
+            onModsChanged={() => {
+              void refreshMods(libraryDetail.game.id);
+            }}
+          />
         </Modal>
       )}
       {libraryDetail && gameModal === "launch" && (

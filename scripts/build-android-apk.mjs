@@ -18,6 +18,7 @@
  *   --target <arch>         Target arch: aarch64 (default), armv7, x86_64, i686
  *   --all-targets           Build universal APK across all Android ABIs
  *   --skip-rustup           Do not auto-install missing Rust targets
+ *   --no-sign               Skip local dev keystore signing (leave *-unsigned.apk for CI)
  *   --help, -h              Show this help message
  */
 import fs from "node:fs";
@@ -105,6 +106,7 @@ function parseArgs(argv) {
     target: "aarch64",
     allTargets: false,
     skipRustup: false,
+    noSign: false,
     help: false,
   };
   for (let i = 0; i < argv.length; i++) {
@@ -115,6 +117,8 @@ function parseArgs(argv) {
       opts.allTargets = true;
     } else if (arg === "--skip-rustup") {
       opts.skipRustup = true;
+    } else if (arg === "--no-sign") {
+      opts.noSign = true;
     } else if (arg === "--help" || arg === "-h") {
       opts.help = true;
     } else if (arg === "--target") {
@@ -429,6 +433,8 @@ function signUnsignedApks(apkRoot, env) {
       apksigner,
       [
         "sign",
+        "--v4-signing-enabled",
+        "false",
         "--ks",
         ksPath,
         "--ks-pass",
@@ -458,6 +464,7 @@ Options:
   --target <arch>         Target arch: aarch64 (default), armv7, x86_64, i686
   --all-targets           Build universal APK across all Android ABIs
   --skip-rustup           Do not auto-install missing Rust targets
+  --no-sign               Skip local dev keystore signing (leave *-unsigned.apk for CI)
   --help, -h              Show this help message`);
     process.exit(0);
   }
@@ -478,7 +485,9 @@ Options:
   run("npx", tauriArgs, env);
 
   const apkRoot = path.join(GEN_ANDROID, "app", "build", "outputs", "apk");
-  signUnsignedApks(apkRoot, env);
+  if (!opts.noSign) {
+    signUnsignedApks(apkRoot, env);
+  }
 
   let apks = findApks(apkRoot).filter((p) => !p.endsWith("-unsigned.apk"));
   if (apks.length === 0) apks = findApks(apkRoot);

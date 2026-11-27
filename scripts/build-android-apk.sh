@@ -11,6 +11,7 @@ set -euo pipefail
 #   --target <arch>         Target arch: aarch64 (default), armv7, x86_64, i686
 #   --all-targets           Build universal APK across all Android ABIs
 #   --skip-rustup           Do not auto-install missing Rust targets
+#   --no-sign               Skip local dev keystore signing (leave *-unsigned.apk for CI)
 #   --help, -h              Show this help message
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -30,6 +31,7 @@ DEBUG=0
 TARGET="aarch64"
 ALL_TARGETS=0
 SKIP_RUSTUP=0
+NO_SIGN=0
 
 log() {
   printf '[build:android] %s\n' "$*"
@@ -49,6 +51,7 @@ Options:
   --target <arch>         Target arch: aarch64 (default), armv7, x86_64, i686
   --all-targets           Build universal APK across all Android ABIs
   --skip-rustup           Do not auto-install missing Rust targets
+  --no-sign               Skip local dev keystore signing (leave *-unsigned.apk for CI)
   --help, -h              Show this help message
 EOF
 }
@@ -75,6 +78,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-rustup)
       SKIP_RUSTUP=1
+      shift
+      ;;
+    --no-sign)
+      NO_SIGN=1
       shift
       ;;
     --target)
@@ -244,43 +251,46 @@ if [[ -d "$APK_DIR" ]]; then
     fi
   fi
 
-  mapfile -t UNSIGNED_APKS < <(find "$APK_DIR" -type f -name '*-unsigned.apk' | sort)
-  if [[ "${#UNSIGNED_APKS[@]}" -gt 0 && -n "$BT_DIR" && -x "$BT_DIR/apksigner" ]]; then
-    KS_PATH="${ANDROID_KEYSTORE:-$HOME/.android/emperor-local.keystore}"
-    KS_PASS="${ANDROID_KEYSTORE_PASSWORD:-emperor-local-dev}"
-    KS_ALIAS="${ANDROID_KEY_ALIAS:-emperor}"
-    KEY_PASS="${ANDROID_KEY_PASSWORD:-$KS_PASS}"
+  if [[ "$NO_SIGN" -eq 0 ]]; then
+    mapfile -t UNSIGNED_APKS < <(find "$APK_DIR" -type f -name '*-unsigned.apk' | sort)
+    if [[ "${#UNSIGNED_APKS[@]}" -gt 0 && -n "$BT_DIR" && -x "$BT_DIR/apksigner" ]]; then
+      KS_PATH="${ANDROID_KEYSTORE:-$HOME/.android/emperor-local.keystore}"
+      KS_PASS="${ANDROID_KEYSTORE_PASSWORD:-emperor-local-dev}"
+      KS_ALIAS="${ANDROID_KEY_ALIAS:-emperor}"
+      KEY_PASS="${ANDROID_KEY_PASSWORD:-$KS_PASS}"
 
-    if [[ ! -f "$KS_PATH" ]]; then
-      mkdir -p "$(dirname "$KS_PATH")"
-      log "Generating persistent local signing keystore at $KS_PATH..."
-      keytool -genkeypair -v \
-        -keystore "$KS_PATH" \
-        -storepass "$KS_PASS" \
-        -keypass "$KEY_PASS" \
-        -alias "$KS_ALIAS" \
-        -keyalg RSA -keysize 2048 -validity 10000 \
-        -dname "CN=Emperor Mod Manager, OU=Dev, O=Emperor, L=Local, ST=Local, C=US" >/dev/null 2>&1
-    fi
-
-    for unsigned_apk in "${UNSIGNED_APKS[@]}"; do
-      aligned_apk="${unsigned_apk%-unsigned.apk}-aligned.apk"
-      signed_apk="${unsigned_apk%-unsigned.apk}-signed.apk"
-      if [[ -x "$BT_DIR/zipalign" ]]; then
-        "$BT_DIR/zipalign" -p -f 4 "$unsigned_apk" "$aligned_apk"
-      else
-        cp "$unsigned_apk" "$aligned_apk"
+      if [[ ! -f "$KS_PATH" ]]; then
+        mkdir -p "$(dirname "$KS_PATH")"
+        log "Generating persistent local signing keystore at $KS_PATH..."
+        keytool -genkeypair -v \
+          -keystore "$KS_PATH" \
+          -storepass "$KS_PASS" \
+          -keypass "$KEY_PASS" \
+          -alias "$KS_ALIAS" \
+          -keyalg RSA -keysize 2048 -validity 10000 \
+          -dname "CN=Emperor Mod Manager, OU=Dev, O=Emperor, L=Local, ST=Local, C=US" >/dev/null 2>&1
       fi
-      "$BT_DIR/apksigner" sign \
-        --ks "$KS_PATH" \
-        --ks-pass "pass:$KS_PASS" \
-        --ks-key-alias "$KS_ALIAS" \
-        --key-pass "pass:$KEY_PASS" \
-        --out "$signed_apk" \
-        "$aligned_apk"
-      rm -f "$aligned_apk"
-      log "Signed APK -> ${signed_apk#"$ROOT/"}"
-    done
+
+      for unsigned_apk in "${UNSIGNED_APKS[@]}"; do
+        aligned_apk="${unsigned_apk%-unsigned.apk}-aligned.apk"
+        signed_apk="${unsigned_apk%-unsigned.apk}-signed.apk"
+        if [[ -x "$BT_DIR/zipalign" ]]; then
+          "$BT_DIR/zipalign" -p -f 4 "$unsigned_apk" "$aligned_apk"
+        else
+          cp "$unsigned_apk" "$aligned_apk"
+        fi
+        "$BT_DIR/apksigner" sign \
+          --v4-signing-enabled false \
+          --ks "$KS_PATH" \
+          --ks-pass "pass:$KS_PASS" \
+          --ks-key-alias "$KS_ALIAS" \
+          --key-pass "pass:$KEY_PASS" \
+          --out "$signed_apk" \
+          "$aligned_apk"
+        rm -f "$aligned_apk"
+        log "Signed APK -> ${signed_apk#"$ROOT/"}"
+      done
+    fi
   fi
 
   mapfile -t APKS < <(find "$APK_DIR" -type f -name '*.apk' ! -name '*-unsigned.apk' | sort)

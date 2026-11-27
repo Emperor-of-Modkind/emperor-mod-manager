@@ -415,11 +415,16 @@ describe("MobileApp", () => {
     await flush();
     expect(container.querySelector(".mobile-library-grid")).not.toBeNull();
 
-    // Titlebar has no app icon, no user avatar icon, and no active-game chip
+    // Titlebar has no duplicate page title, no app icon, no user avatar, and shows active game status
     expect(container.querySelector(".mobile-topbar-logo")).toBeNull();
     expect(container.querySelector(".mobile-topbar-avatar-btn")).toBeNull();
-    expect(container.querySelector(".mobile-active-game-chip")).toBeNull();
-    expect(container.querySelector(".mobile-topbar-title")?.textContent).toBe("Library");
+    expect(container.querySelector(".mobile-topbar-title")).toBeNull();
+    const wideActiveGameBtn = container.querySelector<HTMLButtonElement>(
+      ".mobile-topbar-active-game",
+    );
+    expect(wideActiveGameBtn).not.toBeNull();
+    expect(wideActiveGameBtn!.textContent).toContain("Skyrim Special Edition");
+    expect(wideActiveGameBtn!.textContent).toContain("2/2");
 
     // Browse tab loads catalog results from desktop with NO game selector dropdown
     const browseBtn = Array.from(container.querySelectorAll("button")).find((b) =>
@@ -614,29 +619,30 @@ describe("MobileApp", () => {
       expect(container.querySelector(".mobile-layout-compact")).not.toBeNull();
       expect(invoked).not.toContain("sync_mobile_now");
 
-      // Titlebar has no app icon, no user avatar, no active game chip, and uses compact status pill
+      // Titlebar has no duplicate page title, shows active game status, and uses compact status pill
       expect(container.querySelector(".mobile-topbar-logo")).toBeNull();
       expect(container.querySelector(".mobile-topbar-avatar-btn")).toBeNull();
-      expect(container.querySelector(".mobile-active-game-chip")).toBeNull();
-      expect(container.querySelector(".mobile-topbar-title")?.textContent).toBe("Library");
+      expect(container.querySelector(".mobile-topbar-title")).toBeNull();
+      expect(container.querySelector(".mobile-bottom-active-game")).toBeNull();
       expect(container.querySelector(".mobile-status-pill.compact")?.textContent).toContain(
         "Offline",
       );
 
-      // Active game is docked in the bottom navigation bar
+      // Active game status is in the top header
       const activeGameBar = container.querySelector<HTMLButtonElement>(
-        ".mobile-bottom-active-game",
+        ".mobile-topbar-active-game",
       );
       expect(activeGameBar).not.toBeNull();
       expect(activeGameBar!.textContent).toContain("Skyrim Special Edition");
       expect(activeGameBar!.textContent).toContain("1/1");
 
-      // Tapping active game bar opens its loadout page
+      // Tapping active game status in header opens its loadout page
       await act(async () => {
         activeGameBar!.click();
       });
       await flush();
-      expect(container.querySelector(".mobile-topbar-title")?.textContent).toBe(
+      expect(container.querySelector(".mobile-topbar-active-game.active")).not.toBeNull();
+      expect(container.querySelector(".mobile-game-header h2")?.textContent).toBe(
         "Skyrim Special Edition",
       );
 

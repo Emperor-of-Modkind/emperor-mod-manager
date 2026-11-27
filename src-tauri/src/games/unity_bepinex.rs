@@ -463,7 +463,8 @@ pub fn bepinex_cache_ready(cache: &Path) -> bool {
 }
 
 /// Copy a cached pack into the game root. Files are copied, not linked.
-pub fn copy_bepinex_tree(cache: &Path, install_path: &Path) -> Result<()> {
+/// Returns the relative paths (using `/` separators) of files copied into `install_path`.
+pub fn copy_bepinex_tree(cache: &Path, install_path: &Path) -> Result<Vec<String>> {
     let plugin = BepInExPlugin;
     let root = super::normalize_staging_root(cache, &plugin)?;
     let from = if plugin.deploys_to_install_root(&root) {
@@ -471,7 +472,7 @@ pub fn copy_bepinex_tree(cache: &Path, install_path: &Path) -> Result<()> {
     } else {
         root
     };
-    let mut copied = 0usize;
+    let mut copied = Vec::new();
     for entry in walkdir::WalkDir::new(&from)
         .into_iter()
         .filter_map(|e| e.ok())
@@ -497,15 +498,17 @@ pub fn copy_bepinex_tree(cache: &Path, install_path: &Path) -> Result<()> {
         }
         std::fs::copy(entry.path(), &dest)
             .with_context(|| format!("copy {} to {}", entry.path().display(), dest.display()))?;
-        copied += 1;
+        if let Ok(rel_dest) = dest.strip_prefix(install_path) {
+            copied.push(rel_dest.to_string_lossy().replace('\\', "/"));
+        }
     }
-    if copied == 0 {
+    if copied.is_empty() {
         anyhow::bail!(
             "BepInEx cache at {} had no loader files to copy",
             cache.display()
         );
     }
-    Ok(())
+    Ok(copied)
 }
 
 fn find_named_file(dir: &Path, file_name: &str) -> Option<PathBuf> {
@@ -1313,6 +1316,10 @@ macro_rules! bepinex_title_plugin {
                 select_bepinex_build($id, detect_unity_runtime(install_path))
             }
 
+            fn has_plugin_tools(&self) -> bool {
+                is_bepinex_auto_plugin($id) && !$id.eq_ignore_ascii_case("schedule1")
+            }
+
             fn after_deploy(
                 &self,
                 install_path: &Path,
@@ -1533,6 +1540,10 @@ impl GamePlugin for ChefRpgPlugin {
         Some(mono_github_build())
     }
 
+    fn has_plugin_tools(&self) -> bool {
+        true
+    }
+
     fn deploy_staged_extra(
         &self,
         install_path: &Path,
@@ -1625,6 +1636,10 @@ impl GamePlugin for BepInExPlugin {
 
     fn bepinex_loader(&self, install_path: &Path) -> Option<BepInExBuild> {
         select_bepinex_build(self.info().id, detect_unity_runtime(install_path))
+    }
+
+    fn has_plugin_tools(&self) -> bool {
+        true
     }
 
     fn after_deploy(
@@ -2214,38 +2229,6 @@ mod tests {
         fs::write(save_only.path().join("UnassignedStaffData.dat"), b"staff").unwrap();
         assert!(!wants(&chef, fresh.path(), &[save_only.path()]));
         assert!(!wants(&Schedule1Plugin, fresh.path(), &roots));
-    }
-
-    #[tokio::test]
-    async fn prepare_runtime_skips_download_when_bepinex_is_present() {
-        let tmp = tempfile::tempdir().unwrap();
-        let install = tmp.path().join("game");
-        fs::create_dir_all(install.join("BepInEx").join("core")).unwrap();
-        fs::write(install.join("winhttp.dll"), b"x").unwrap();
-        let dll = tempfile::tempdir().unwrap();
-        fs::write(dll.path().join("CoolMod.dll"), b"x").unwrap();
-        let roots = [dll.path()];
-        let paths = crate::config::Paths {
-            config_dir: tmp.path().join("config"),
-            data_dir: tmp.path().join("data"),
-            cache_dir: tmp.path().join("cache"),
-        };
-        let ctx = crate::games::RuntimePrep {
-            paths: &paths,
-            install_path: &install,
-            nexus: None,
-            premium: false,
-            content_roots: &roots,
-        };
-        let outcome = BepInExPlugin.prepare_runtime(&ctx).await.unwrap();
-        match outcome {
-            crate::games::RuntimePrepOutcome::Done(warnings) => {
-                assert!(warnings.is_empty(), "{warnings:?}");
-            }
-            crate::games::RuntimePrepOutcome::NeedsAssist { .. } => {
-                panic!("BepInEx install does not use Download Assist");
-            }
-        }
     }
 
     #[test]

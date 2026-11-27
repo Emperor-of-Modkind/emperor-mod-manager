@@ -124,36 +124,69 @@ jobs:
         run: npm ci
 
       - name: Build Android APK
-        run: ./scripts/build-android-apk.sh --all-targets --skip-rustup
+        run: ./scripts/build-android-apk.sh --all-targets --skip-rustup --no-sign
         env:
           NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.2.12479018
 
       - name: Sign & package Android APK
         run: |
+          set -euo pipefail
+          trap 'rm -f /tmp/release.keystore /tmp/aligned.apk' EXIT
+
           mkdir -p dist-android
           VERSION="$(node -p "require('./package.json').version")"
-          SRC_APK="$(find src-tauri/gen/android/app/build/outputs/apk -type f -name '*.apk' | head -n 1)"
+          SRC_APK="$(find src-tauri/gen/android/app/build/outputs/apk -type f -name '*-unsigned.apk' | sort | head -n 1)"
           if [[ -z "$SRC_APK" ]]; then
-            echo "No APK produced" >&2
+            echo "::error::No unsigned release APK produced under src-tauri/gen/android/app/build/outputs/apk" >&2
             exit 1
           fi
+
           OUT_APK="dist-android/emperor-mod-manager-${VERSION}-universal.apk"
           if [[ -n "${ANDROID_KEYSTORE_BASE64:-}" ]]; then
-            echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > /tmp/release.keystore
-            APKSIGNER="${ANDROID_HOME}/build-tools/35.0.0/apksigner"
-            "$APKSIGNER" sign \
+            missing=()
+            [[ -n "${ANDROID_KEYSTORE_PASSWORD:-}" ]] || missing+=(ANDROID_KEYSTORE_PASSWORD)
+            [[ -n "${ANDROID_KEY_ALIAS:-}" ]] || missing+=(ANDROID_KEY_ALIAS)
+            [[ -n "${ANDROID_KEY_PASSWORD:-}" ]] || missing+=(ANDROID_KEY_PASSWORD)
+            if [[ "${#missing[@]}" -gt 0 ]]; then
+              echo "::error::ANDROID_KEYSTORE_BASE64 is set, but missing required secret(s): ${missing[*]}" >&2
+              exit 1
+            fi
+
+            BT_DIR=""
+            if [[ -d "${ANDROID_HOME}/build-tools/35.0.0" ]]; then
+              BT_DIR="${ANDROID_HOME}/build-tools/35.0.0"
+            elif [[ -d "${ANDROID_HOME}/build-tools" ]]; then
+              latest_bt="$(ls -1 "${ANDROID_HOME}/build-tools" | sort -V | tail -n 1 || true)"
+              if [[ -n "$latest_bt" ]]; then
+                BT_DIR="${ANDROID_HOME}/build-tools/${latest_bt}"
+              fi
+            fi
+            if [[ -z "$BT_DIR" || ! -x "${BT_DIR}/apksigner" || ! -x "${BT_DIR}/zipalign" ]]; then
+              echo "::error::Android build-tools (zipalign/apksigner) not found under ${ANDROID_HOME}/build-tools" >&2
+              exit 1
+            fi
+
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" | tr -d '[:space:]' | base64 -d > /tmp/release.keystore
+            "${BT_DIR}/zipalign" -p -f 4 "$SRC_APK" /tmp/aligned.apk
+            "${BT_DIR}/apksigner" sign \
+              --v4-signing-enabled false \
               --ks /tmp/release.keystore \
               --ks-pass "env:ANDROID_KEYSTORE_PASSWORD" \
               --ks-key-alias "${ANDROID_KEY_ALIAS}" \
               --key-pass "env:ANDROID_KEY_PASSWORD" \
               --out "$OUT_APK" \
-              "$SRC_APK"
-            rm -f /tmp/release.keystore
+              /tmp/aligned.apk
+            "${BT_DIR}/apksigner" verify --verbose --print-certs "$OUT_APK"
+          elif [[ "${IS_RELEASE:-false}" == "true" ]]; then
+            echo "::error::ANDROID_KEYSTORE_BASE64 is not configured. Refusing to publish an unsigned APK on a release build. Configure ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, and ANDROID_KEY_PASSWORD in GitHub Actions Secrets." >&2
+            exit 1
           else
+            echo "::warning::ANDROID_KEYSTORE_BASE64 is not set; producing unsigned APK for non-release build."
             cp "$SRC_APK" "dist-android/emperor-mod-manager-${VERSION}-universal-unsigned.apk"
           fi
           (cd dist-android && sha256sum *.apk > SHA256SUMS-android)
         env:
+          IS_RELEASE: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) }}
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}

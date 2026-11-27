@@ -1174,6 +1174,7 @@ mod tests {
             custom_raw_command: None,
             use_global_launch_options: true,
             wine_overrides_dismissed: false,
+            dismissed_tool_recommendations: Vec::new(),
         };
 
         let target = resolve_modded_launch_target(&paths, &game).unwrap();

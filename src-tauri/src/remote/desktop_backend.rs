@@ -640,7 +640,27 @@ impl RemoteBackend for TauriDesktopBackend {
                     Ok(Some(serde_json::to_value(res)?))
                 }
                 RemoteRequest::RemoveMod { game_id, mod_id } => {
-                    mods::remove_mod(&state.paths, &game_id, &mod_id)?;
+                    let removed = mods::remove_mod_returning(&state.paths, &game_id, &mod_id)?;
+                    if let Some(tool_id) = removed.and_then(|m| m.plugin_tool_id) {
+                        let game_info = state.config.lock().ok().and_then(|cfg| {
+                            cfg.managed_games
+                                .iter()
+                                .find(|g| g.id == game_id)
+                                .map(|g| (g.plugin_id.clone(), g.install_path.clone()))
+                        });
+                        if let Some((plugin_id, install_path)) = game_info {
+                            if let Some(plugin) = crate::games::plugin_by_id(&plugin_id) {
+                                plugin
+                                    .uninstall_plugin_tool(
+                                        &state.paths,
+                                        &game_id,
+                                        std::path::Path::new(&install_path),
+                                        &tool_id,
+                                    )
+                                    .await?;
+                            }
+                        }
+                    }
                     state.p2p.trigger_local_activity_sync();
                     let _ = app.emit("remote-state-changed", ());
                     Ok(None)

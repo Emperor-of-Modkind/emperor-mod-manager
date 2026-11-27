@@ -6,6 +6,7 @@ import {
   useState,
   type PointerEvent as ReactPointerEvent,
 } from "react";
+import { stagedModGroup, type StagedModGroup } from "./stagedLoadOrder";
 import type { StagedMod } from "./types";
 
 const LONG_PRESS_MS = 350;
@@ -22,7 +23,7 @@ export type StagedModDragLift = {
 
 type DragSession = {
   modId: string;
-  enabled: boolean;
+  group: StagedModGroup;
   startGroupIndex: number;
   pointerId: number;
   startX: number;
@@ -32,20 +33,22 @@ type DragSession = {
 };
 
 /**
- * Where to insert `modId` inside its enabled group, based on the list's box.
+ * Where to insert `modId` inside its accordion group, based on the list's box.
  * `display` is the on-screen order. The result is an index among the other
  * rows in that group, or that group's length when the pointer is past the end.
  * Unmounted rows still count: each slot is an equal share of the list height.
  */
 export function stagedDropGroupIndex(
-  display: readonly { id: string; enabled: boolean }[],
+  display: readonly { id: string; enabled: boolean; plugin_tool_id?: string | null }[],
   modId: string,
-  enabled: boolean,
+  group: StagedModGroup,
   pointerY: number,
   listTop: number,
   listHeight: number,
 ): number {
-  const others = display.filter((m) => m.enabled === enabled && m.id !== modId);
+  const others = display.filter(
+    (m) => stagedModGroup(m) === group && m.id !== modId,
+  );
   if (others.length === 0 || !(listHeight > 0) || display.length === 0) {
     return others.length;
   }
@@ -54,7 +57,7 @@ export function stagedDropGroupIndex(
   let insertAt = 0;
   for (let i = 0; i < display.length; i++) {
     const item = display[i];
-    if (item.enabled !== enabled || item.id === modId) continue;
+    if (stagedModGroup(item) !== group || item.id === modId) continue;
     if (y < i * stride + stride / 2) return insertAt;
     insertAt += 1;
   }
@@ -64,8 +67,9 @@ export function stagedDropGroupIndex(
 function groupIndexOf(mods: StagedMod[], modId: string): number {
   const mod = mods.find((m) => m.id === modId);
   if (!mod) return -1;
+  const group = stagedModGroup(mod);
   return mods
-    .filter((m) => m.enabled === mod.enabled)
+    .filter((m) => stagedModGroup(m) === group)
     .findIndex((m) => m.id === modId);
 }
 
@@ -84,7 +88,7 @@ function findScrollParent(el: HTMLElement | null): HTMLElement | null {
   return null;
 }
 
-/** Preview display order while dragging within the enabled or disabled block. */
+/** Preview display order while dragging within the tools, enabled, or disabled block. */
 export function previewVisibleMods(
   visibleMods: StagedMod[],
   draggingId: string | null,
@@ -93,18 +97,25 @@ export function previewVisibleMods(
   if (!draggingId || previewGroupIndex == null) return visibleMods;
   const dragged = visibleMods.find((m) => m.id === draggingId);
   if (!dragged) return visibleMods;
-  const enabled = visibleMods.filter((m) => m.enabled);
-  const disabled = visibleMods.filter((m) => !m.enabled);
-  const group = dragged.enabled ? [...enabled] : [...disabled];
+  const groupKey = stagedModGroup(dragged);
+  const tools = visibleMods.filter((m) => stagedModGroup(m) === "tools");
+  const enabled = visibleMods.filter((m) => stagedModGroup(m) === "enabled");
+  const disabled = visibleMods.filter((m) => stagedModGroup(m) === "disabled");
+  const group =
+    groupKey === "tools"
+      ? [...tools]
+      : groupKey === "enabled"
+        ? [...enabled]
+        : [...disabled];
   const from = group.findIndex((m) => m.id === draggingId);
   if (from < 0) return visibleMods;
   const clamped = Math.max(0, Math.min(group.length - 1, previewGroupIndex));
   const nextGroup = [...group];
   const [moved] = nextGroup.splice(from, 1);
   nextGroup.splice(clamped, 0, moved);
-  return dragged.enabled
-    ? [...nextGroup, ...disabled]
-    : [...enabled, ...nextGroup];
+  if (groupKey === "tools") return [...nextGroup, ...enabled, ...disabled];
+  if (groupKey === "enabled") return [...tools, ...nextGroup, ...disabled];
+  return [...tools, ...enabled, ...nextGroup];
 }
 
 type UseStagedModDragArgs = {
@@ -128,6 +139,7 @@ export function useStagedModDrag({
   const sessionRef = useRef<DragSession | null>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const rowRefs = useRef(new Map<string, HTMLElement>());
+  const toolsListRef = useRef<HTMLUListElement | null>(null);
   const listRef = useRef<HTMLUListElement | null>(null);
   const disabledListRef = useRef<HTMLUListElement | null>(null);
   const visibleModsRef = useRef(visibleMods);
@@ -138,8 +150,10 @@ export function useStagedModDrag({
   onCommitRef.current = onCommit;
   previewRef.current = previewGroupIndex;
 
-  const activeListFor = useCallback((enabled: boolean) => {
-    return enabled ? listRef.current : (disabledListRef.current ?? listRef.current);
+  const activeListFor = useCallback((group: StagedModGroup) => {
+    if (group === "tools") return toolsListRef.current ?? listRef.current;
+    if (group === "disabled") return disabledListRef.current ?? listRef.current;
+    return listRef.current;
   }, []);
 
   const clearTimer = useCallback(() => {
@@ -155,7 +169,7 @@ export function useStagedModDrag({
   }, []);
 
   const clearListDragStyle = useCallback(() => {
-    for (const el of [listRef.current, disabledListRef.current]) {
+    for (const el of [toolsListRef.current, listRef.current, disabledListRef.current]) {
       if (el) {
         el.style.touchAction = "";
         el.style.userSelect = "";
@@ -180,7 +194,7 @@ export function useStagedModDrag({
       session.activated = true;
       session.offsetY = session.startY - rect.top;
       // Capture on the list so the row can unmount into a placeholder + floating clone.
-      const activeList = activeListFor(session.enabled);
+      const activeList = activeListFor(session.group);
       const captureEl = activeList ?? target;
       if (activeList) {
         activeList.style.touchAction = "none";
@@ -206,27 +220,31 @@ export function useStagedModDrag({
   );
 
   const indexFromPointerY = useCallback(
-    (pointerY: number, modId: string, enabled: boolean) => {
-      const list = activeListFor(enabled);
+    (pointerY: number, modId: string, group: StagedModGroup) => {
+      const list = activeListFor(group);
       const display = previewVisibleMods(
         visibleModsRef.current,
         modId,
         previewRef.current,
       );
       if (!list) {
-        return display.filter((m) => m.enabled === enabled && m.id !== modId).length;
+        return display.filter((m) => stagedModGroup(m) === group && m.id !== modId)
+          .length;
       }
       const splitList =
+        toolsListRef.current != null ||
         disabledListRef.current != null ||
-        (enabled && listRef.current != null && display.some((m) => !m.enabled));
+        (group === "enabled" &&
+          listRef.current != null &&
+          display.some((m) => stagedModGroup(m) !== "enabled"));
       const scopedDisplay = splitList
-        ? display.filter((m) => m.enabled === enabled)
+        ? display.filter((m) => stagedModGroup(m) === group)
         : display;
       const rect = list.getBoundingClientRect();
       return stagedDropGroupIndex(
         scopedDisplay,
         modId,
-        enabled,
+        group,
         pointerY,
         rect.top,
         rect.height,
@@ -260,14 +278,14 @@ export function useStagedModDrag({
       const nextIndex = indexFromPointerY(
         event.clientY,
         session.modId,
-        session.enabled,
+        session.group,
       );
       if (nextIndex !== previewRef.current) {
         previewRef.current = nextIndex;
         setPreviewGroupIndex(nextIndex);
       }
 
-      const scrollParent = findScrollParent(activeListFor(session.enabled));
+      const scrollParent = findScrollParent(activeListFor(session.group));
       if (scrollParent) {
         const bounds = scrollParent.getBoundingClientRect();
         if (event.clientY < bounds.top + EDGE_SCROLL_PX) {
@@ -351,7 +369,7 @@ export function useStagedModDrag({
       clearTimer();
       const session: DragSession = {
         modId,
-        enabled: mod.enabled,
+        group: stagedModGroup(mod),
         startGroupIndex,
         pointerId: event.pointerId,
         startX: event.clientX,
@@ -375,21 +393,28 @@ export function useStagedModDrag({
     [visibleMods, draggingId, previewGroupIndex],
   );
 
+  const toolsDisplayMods = useMemo(
+    () => displayMods.filter((m) => stagedModGroup(m) === "tools"),
+    [displayMods],
+  );
+
   const enabledDisplayMods = useMemo(
-    () => displayMods.filter((m) => m.enabled),
+    () => displayMods.filter((m) => stagedModGroup(m) === "enabled"),
     [displayMods],
   );
 
   const disabledDisplayMods = useMemo(
-    () => displayMods.filter((m) => !m.enabled),
+    () => displayMods.filter((m) => stagedModGroup(m) === "disabled"),
     [displayMods],
   );
 
   return {
+    toolsListRef,
     listRef,
     disabledListRef,
     setRowRef,
     displayMods,
+    toolsDisplayMods,
     enabledDisplayMods,
     disabledDisplayMods,
     draggingId,

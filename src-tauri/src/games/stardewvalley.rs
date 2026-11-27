@@ -1,8 +1,14 @@
+use std::future::Future;
 use std::path::{Component, Path, PathBuf};
+use std::pin::Pin;
 
 use anyhow::Result;
 
-use super::{content_folder_wrap_name, normalize_relative, GamePlugin, GamePluginInfo};
+use super::{
+    content_folder_wrap_name, normalize_relative, GamePlugin, GamePluginInfo,
+    PluginToolActionResult, PluginToolRecommendation, PluginToolStatus,
+};
+use crate::config::Paths;
 
 pub const STARDEW_ROOT_DIRS: &[&str] = &["Mods"];
 
@@ -104,23 +110,61 @@ impl GamePlugin for StardewValleyPlugin {
         Ok(install_path.join("Mods").join(&normalized))
     }
 
-    fn prepare_runtime<'a>(
+    fn has_plugin_tools(&self) -> bool {
+        true
+    }
+
+    fn plugin_tools_status(
+        &self,
+        paths: &Paths,
+        _game_id: &str,
+        install_path: &Path,
+    ) -> Vec<PluginToolStatus> {
+        super::smapi_install::tools_status(paths, install_path)
+    }
+
+    fn check_plugin_tool_updates<'a>(
         &'a self,
-        ctx: &'a super::RuntimePrep<'_>,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<super::RuntimePrepOutcome>> + Send + 'a>,
-    > {
-        let install = super::smapi_install::should_auto_install_smapi(
-            ctx.install_path,
-            ctx.content_roots,
-            |root| self.allows_empty_deploy(root),
-        );
-        Box::pin(async move {
-            if !install {
-                return Ok(super::RuntimePrepOutcome::Done(Vec::new()));
-            }
-            let warnings = super::smapi_install::ensure_smapi(ctx.paths, ctx.install_path).await;
-            Ok(super::RuntimePrepOutcome::Done(warnings))
+        paths: &'a Paths,
+        _game_id: &'a str,
+        install_path: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<PluginToolStatus>>> + Send + 'a>> {
+        Box::pin(super::smapi_install::check_tool_updates(paths, install_path))
+    }
+
+    fn install_plugin_tool<'a>(
+        &'a self,
+        paths: &'a Paths,
+        _game_id: &'a str,
+        install_path: &'a Path,
+        tool_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<PluginToolActionResult>> + Send + 'a>> {
+        Box::pin(super::smapi_install::install_tool(
+            paths,
+            install_path,
+            tool_id,
+        ))
+    }
+
+    fn uninstall_plugin_tool<'a>(
+        &'a self,
+        paths: &'a Paths,
+        _game_id: &'a str,
+        install_path: &'a Path,
+        tool_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<PluginToolActionResult>> + Send + 'a>> {
+        let id = tool_id.to_string();
+        Box::pin(async move { super::smapi_install::uninstall_tool(paths, install_path, &id) })
+    }
+
+    fn recommended_plugin_tools(
+        &self,
+        _paths: &Paths,
+        install_path: &Path,
+        content_roots: &[&Path],
+    ) -> Vec<PluginToolRecommendation> {
+        super::smapi_install::recommended_tools(install_path, content_roots, |root| {
+            self.allows_empty_deploy(root)
         })
     }
 }

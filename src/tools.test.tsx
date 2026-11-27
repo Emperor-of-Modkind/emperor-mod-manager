@@ -91,7 +91,10 @@ describe("GameToolsPanel plugin tools", () => {
       warnings: [],
     });
 
-    const container = renderPanel(<GameToolsPanel game={sampleGame} />);
+    const onModsChanged = vi.fn();
+    const container = renderPanel(
+      <GameToolsPanel game={sampleGame} onModsChanged={onModsChanged} />,
+    );
     await act(async () => {
       await Promise.resolve();
     });
@@ -114,6 +117,7 @@ describe("GameToolsPanel plugin tools", () => {
     });
 
     expect(installSpy).toHaveBeenCalledWith(sampleGame.id, "pz3d");
+    expect(onModsChanged).toHaveBeenCalledTimes(1);
     expect(container.textContent).toContain("Installed PZ3D 0.10.4 with ZombieBuddy.");
     expect(container.textContent).toContain("0.10.4");
     expect(container.textContent).toContain("Uninstall");
